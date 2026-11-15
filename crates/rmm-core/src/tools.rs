@@ -470,6 +470,7 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
         })?;
         if let Some(old) = &previous {
             inst.trash_mod(&old.id)?;
+            crate::rules::rename(inst, &old.id, &new_id)?;
         }
         r.mod_id = Some(new_id);
     }

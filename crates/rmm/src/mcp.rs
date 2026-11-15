@@ -9,7 +9,7 @@ use rmcp::{
 };
 use rmm_core::fomod::Choices;
 use rmm_core::tools::ToolSpec;
-use rmm_core::{Instance, conflicts, deploy, health, install, loot, ops, plugins, tools};
+use rmm_core::{Instance, conflicts, deploy, health, install, loot, ops, plugins, rules, tools};
 use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ FOMOD installers: fomod_options shows the steps, options and the resolved choice
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
 Tools: add_tool registers a program (presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first. Long runs (DynDOLOD, grass) can go in the background (run_tool background=true, then poll tool_job).
 launch_game deploys and starts the game through its script extender after checking the versions match.
+Mod rules (set_mod_rule: a mod loads after others) are suggestions: health_check reports broken ones and sort_mods reorders the list to satisfy them.
 Profiles: each has its own enabled mods, mod order, plugin order and undo history. switch_profile changes the active one and previews the deploy that applies it; deploy to apply.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
 re-run health_check after changes.";
@@ -268,6 +269,21 @@ impl Rmm {
     #[tool(description = "Download the latest LOOT masterlist and prelude now. Returns warnings, if any.")]
     async fn update_masterlist(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| loot::update_masterlist(&i, true)))
+    }
+
+    #[tool(description = "Mod rules (rules.toml, shared by all profiles): each mod and the mods it loads after, i.e. wins file conflicts against.")]
+    async fn mod_rules(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| rules::rules(&i)))
+    }
+
+    #[tool(description = "Replace a mod's rule: the mods it loads after. An empty list removes it. Rules never block manual ordering; health_check reports broken ones and sort_mods applies them. Not in undo history, so it returns the previous rule.")]
+    async fn set_mod_rule(&self, Parameters(a): Parameters<rules::ModRule>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| rules::set_rule(&i, &a)))
+    }
+
+    #[tool(description = "Reorder the profile's mods to satisfy the mod rules, moving only what a rule forces. dry_run defaults to true and returns the new order, the mods that move and rules dropped because they form a cycle; otherwise the order is saved (undoable).")]
+    async fn sort_mods(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rules::sort(&i, a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Reorder plugins. Masters still load before non-masters regardless.")]

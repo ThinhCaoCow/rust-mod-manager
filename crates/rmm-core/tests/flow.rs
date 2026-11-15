@@ -631,10 +631,13 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert_eq!(read(&root.join("backup/Data/vanilla.ini")), "vanilla");
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 
-    // A second run replaces the output; undo brings the first one back.
+    // A second run replaces the output; undo brings the first one back. Mod rules follow the new id.
+    use rmm_core::rules::{self, ModRule};
+    rules::set_rule(&inst, &ModRule { id: "gen Output".into(), after: vec!["Plain".into()] }).unwrap();
     let r2 = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
     assert_eq!(r2.previous.as_deref(), Some("gen Output"));
     assert_eq!(r2.mod_id.as_deref(), Some("gen Output (2)"));
+    assert_eq!(rules::rules(&inst).unwrap()[0].id, "gen Output (2)");
     let ids: Vec<String> = inst.profile().unwrap().mods.into_iter().map(|m| m.id).collect();
     assert_eq!(ids, ["BodySlide", "Plain", "gen Output (2)"]);
     assert!(root.join("trash/gen Output").is_dir());
@@ -1126,4 +1129,53 @@ fn profiles() {
     inst.delete_profile("Lean").unwrap();
     assert_eq!(inst.profiles().unwrap(), ["default", "Full"]);
     assert!(root.join("profiles/.deleted/Lean/profile.toml").is_file());
+}
+
+/// Mod rules: suggestions the health check reports and sort_mods applies, never a block on
+/// manual ordering.
+#[test]
+fn mod_rules() {
+    use rmm_core::ops::{move_mod, set_mod_enabled};
+    use rmm_core::rules::{self, ModRule};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    fs::create_dir_all(game.join("Data")).unwrap();
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    for id in ["A", "B", "C"] {
+        write(&src.join(id).join("textures/sky.dds"), id);
+        install::install(&inst, &src.join(id), None, true, None).unwrap();
+    }
+    let rule = |id: &str, after: &[&str]| ModRule { id: id.into(), after: after.iter().map(|s| s.to_string()).collect() };
+    let ids = |inst: &Instance| inst.profile().unwrap().mods.into_iter().map(|m| m.id).collect::<Vec<_>>().join(" ");
+    let broken = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "mod_rule_broken").map(|i| format!("{}: {}", i.subject, i.message)).collect::<Vec<_>>();
+
+    for bad in [rule("A", &["A"]), rule("A", &["Nope"]), rule("Nope", &["A"]), rule("A", &["<overwrite>"])] {
+        assert!(rules::set_rule(&inst, &bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(rules::set_rule(&inst, &rule("A", &["C", "C"])).unwrap(), None);
+    assert_eq!(rules::rules(&inst).unwrap(), [rule("A", &["C"])]);
+    assert_eq!(broken(&inst), ["A: should load after C (a mod rule); sort_mods fixes the order"]);
+
+    // Manual ordering still works; a rule between a disabled mod and others isn't reported.
+    move_mod(&inst, "C", 2).unwrap();
+    set_mod_enabled(&inst, "C", false).unwrap();
+    assert!(broken(&inst).is_empty());
+    set_mod_enabled(&inst, "C", true).unwrap();
+
+    // The sort moves only what the rule forces, and is undoable.
+    let plan = rules::sort(&inst, true).unwrap();
+    assert_eq!((plan.order.join(" "), ids(&inst)), ("B C A".into(), "A B C".into()));
+    rules::sort(&inst, false).unwrap();
+    assert_eq!(ids(&inst), "B C A");
+    assert!(broken(&inst).is_empty());
+    assert_eq!(inst.history().unwrap()[0], "sort mods by rules");
+
+    // A cycle is reported and one of its rules left out; the others still apply.
+    assert_eq!(rules::set_rule(&inst, &rule("C", &["A"])).unwrap(), None);
+    let plan = rules::sort(&inst, true).unwrap();
+    assert_eq!(plan.cycles.len(), 1, "{plan:?}");
+    // An empty rule removes it and returns it.
+    assert_eq!(rules::set_rule(&inst, &rule("C", &[])).unwrap(), Some(rule("C", &["A"])));
+    assert_eq!(rules::rules(&inst).unwrap(), [rule("A", &["C"])]);
 }

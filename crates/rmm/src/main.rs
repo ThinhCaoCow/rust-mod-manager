@@ -2,7 +2,7 @@ mod mcp;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, conflicts, deploy, game, health, install, loot, ops, plugins, tools};
+use rmm_core::{Game, Instance, conflicts, deploy, game, health, install, loot, ops, plugins, rules, tools};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -110,6 +110,18 @@ enum Cmd {
         /// Stop the tool after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
+    },
+    /// Mod rules; with a mod, replace its rule (no --after removes it).
+    ModRule {
+        id: Option<String>,
+        /// Mod it loads after, i.e. wins conflicts against (repeatable).
+        #[arg(long)]
+        after: Vec<String>,
+    },
+    /// Reorder mods to satisfy the mod rules; --apply saves the order (undoable).
+    SortMods {
+        #[arg(long)]
+        apply: bool,
     },
     /// Profiles: each has its own mod order, plugin order and undo history.
     #[command(subcommand)]
@@ -249,6 +261,9 @@ fn main() -> Result<()> {
             let vars = vars.into_iter().collect();
             print(&tools::run(&open()?, &id, &vars, !apply, timeout.map(std::time::Duration::from_secs))?)
         }
+        Cmd::ModRule { id: None, .. } => print(&rules::rules(&open()?)?),
+        Cmd::ModRule { id: Some(id), after } => print(&serde_json::json!({ "previous": rules::set_rule(&open()?, &rules::ModRule { id, after })? })),
+        Cmd::SortMods { apply } => print(&rules::sort(&open()?, !apply)?),
         Cmd::Profile(ProfileCmd::List) => {
             let inst = open()?;
             print(&serde_json::json!({ "active": inst.config.profile, "profiles": inst.profiles()? }))

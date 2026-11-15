@@ -42,6 +42,7 @@ rmm run xedit-qac --var plugin=Update.esm --apply  # deploy, run, capture output
 rmm launch --apply                                 # deploy, check the SKSE/F4SE build matches the game, start it
 rmm rule MyPatch.esp --after "Some Mod.esp"       # LOOT user rule; `rmm rule` lists them
 rmm profile create Lean --empty && rmm profile switch Lean   # per-profile mods and plugin order
+rmm mod-rule "My Patch" --after "Big Mod"         # suggestion; `rmm sort-mods --apply` satisfies them
 rmm undo                                           # every change is undoable
 rmm purge --apply                                  # restore the vanilla game folder
 ```
@@ -60,12 +61,12 @@ How deploys behave:
 claude mcp add rmm -- D:\Games\Rust_Mod_Manager\target\release\rmm.exe -i D:\Mods\skyrim mcp
 ```
 
-The server exposes 33 tools covering inspection, install (including FOMOD installers), profiles, ordering, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change to a profile lands in its undo history, so anything the AI does to a setup can be reversed.
+The server exposes 36 tools covering inspection, install (including FOMOD installers), profiles, ordering and mod rules, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change to a profile lands in its undo history, so anything the AI does to a setup can be reversed.
 
 ## Layout
 
 ```
-crates/rmm-core   game detection, instances, install, fomod, conflicts, archives, deploy, plugins, loot, health, tools, launch, proton, ops
+crates/rmm-core   game detection, instances, install, fomod, conflicts, archives, deploy, plugins, loot, health, tools, launch, proton, rules, ops
 crates/rmm        CLI + MCP server (one binary)
 ```
 

@@ -27,6 +27,10 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         }
     }
 
+    for (id, after) in crate::rules::broken(inst, &profile)? {
+        add("warning", "mod_rule_broken", &id, format!("should load after {after} (a mod rule); sort_mods fixes the order"));
+    }
+
     let plugins = crate::plugins::list(inst, &profile)?;
     for p in &plugins {
         if let Some(e) = &p.error {
