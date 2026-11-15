@@ -111,6 +111,9 @@ enum Cmd {
         #[arg(long)]
         timeout: Option<u64>,
     },
+    /// Profiles: each has its own mod order, plugin order and undo history.
+    #[command(subcommand)]
+    Profile(ProfileCmd),
     Undo,
     Redo,
     History,
@@ -153,6 +156,23 @@ enum ToolCmd {
         args: Vec<String>,
     },
     Remove { id: String },
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// Profiles and the active one.
+    List,
+    /// New profile, copied from the active one (--empty: every mod disabled).
+    Create {
+        name: String,
+        #[arg(long)]
+        empty: bool,
+    },
+    /// Make a profile active and show the deploy that would apply it.
+    Switch { name: String },
+    Rename { from: String, to: String },
+    /// Delete a profile other than the active one (kept in profiles/.deleted/).
+    Delete { name: String },
 }
 
 fn main() -> Result<()> {
@@ -229,6 +249,18 @@ fn main() -> Result<()> {
             let vars = vars.into_iter().collect();
             print(&tools::run(&open()?, &id, &vars, !apply, timeout.map(std::time::Duration::from_secs))?)
         }
+        Cmd::Profile(ProfileCmd::List) => {
+            let inst = open()?;
+            print(&serde_json::json!({ "active": inst.config.profile, "profiles": inst.profiles()? }))
+        }
+        Cmd::Profile(ProfileCmd::Create { name, empty }) => done(open()?.create_profile(&name, !empty)),
+        Cmd::Profile(ProfileCmd::Switch { name }) => {
+            let mut inst = open()?;
+            inst.switch_profile(&name)?;
+            print(&deploy::deploy(&inst, true)?)
+        }
+        Cmd::Profile(ProfileCmd::Rename { from, to }) => done(open()?.rename_profile(&from, &to)),
+        Cmd::Profile(ProfileCmd::Delete { name }) => done(open()?.delete_profile(&name)),
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
         Cmd::History => print(&open()?.history()?),

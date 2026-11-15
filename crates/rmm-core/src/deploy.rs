@@ -128,10 +128,10 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             let e = man.files[key].clone();
             let path = game.join(&e.target);
             let want = desired.get(key);
-            // A copy is stale once its source is newer (Windows copies keep the source's mtime,
-            // Linux copies get the copy time; either way an edit after deploy is newer).
+            // Copies keep their source's size and mtime, so a source that no longer matches the
+            // recorded state was edited after the deploy and the copy is stale.
             let fresh = if e.copied {
-                state(&inst.mod_dir(&e.mod_id).join(&e.src)).is_none_or(|(_, m)| m <= e.mtime)
+                state(&inst.mod_dir(&e.mod_id).join(&e.src)).is_none_or(|s| s == (e.size, e.mtime))
             } else {
                 !rewritten_in_play(key)
             };
@@ -183,7 +183,7 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             create_parents(game, &path, &mut man.dirs)?;
             let src = inst.mod_dir(&w.mod_id).join(&w.src);
             let copied = if rewritten_in_play(&key) {
-                fs::copy(&src, &path)?;
+                copy_keep_mtime(&src, &path)?;
                 true
             } else {
                 link_or_copy(&src, &path)?
@@ -476,8 +476,17 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<bool> {
     if fs::hard_link(src, dst).is_ok() {
         return Ok(false);
     }
-    fs::copy(src, dst)?;
+    copy_keep_mtime(src, dst)?;
     Ok(true)
+}
+
+/// Copy a file and give the copy its source's mtime. Windows copies keep it anyway; Linux ones
+/// would get the copy time, whose coarse clock can equal a source edit made right after.
+fn copy_keep_mtime(src: &Path, dst: &Path) -> Result<()> {
+    fs::copy(src, dst)?;
+    let t = fs::metadata(src)?.modified()?;
+    fs::File::options().write(true).open(dst)?.set_modified(t)?;
+    Ok(())
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<()> {

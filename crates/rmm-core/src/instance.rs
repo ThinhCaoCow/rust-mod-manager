@@ -118,6 +118,112 @@ impl Instance {
         Ok(toml::from_str(&fs::read_to_string(self.profile_file())?)?)
     }
 
+    /// Profile names, sorted. Each profile has its own mod order, plugin order and undo history;
+    /// mods, overwrite/, tools and the LOOT userlist are shared.
+    pub fn profiles(&self) -> Result<Vec<String>> {
+        let mut names: Vec<String> = fs::read_dir(self.root.join("profiles"))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("profile.toml").is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        Ok(names)
+    }
+
+    /// The stored spelling of a profile name (folder names are case-insensitive on Windows).
+    fn find_profile(&self, name: &str) -> Result<String> {
+        let want = name.to_lowercase();
+        self.profiles()?.into_iter().find(|n| n.to_lowercase() == want).with_context(|| format!("no profile '{name}'"))
+    }
+
+    /// A new profile: a copy of the active one, or empty (every mod is added, disabled, when it
+    /// is first switched to).
+    pub fn create_profile(&self, name: &str, copy: bool) -> Result<()> {
+        check_profile_name(name)?;
+        self.locked(|| {
+            if self.find_profile(name).is_ok() {
+                bail!("profile '{name}' already exists");
+            }
+            let p = if copy { self.profile()? } else { Profile::default() };
+            let dir = self.root.join("profiles").join(name);
+            fs::create_dir_all(&dir)?;
+            write_atomic(&dir.join("profile.toml"), &toml::to_string_pretty(&p)?)
+        })
+    }
+
+    /// Make `name` the active profile. Mods installed while another profile was active are added
+    /// at the end, disabled, and mods uninstalled since are dropped. The game folder follows on
+    /// the next deploy.
+    pub fn switch_profile(&mut self, name: &str) -> Result<()> {
+        let mut config = self.config.clone();
+        config.profile = self.find_profile(name)?;
+        let next = Instance { root: self.root.clone(), config };
+        self.locked(|| {
+            let before = next.profile()?;
+            let mut p = before.clone();
+            p.mods.retain(|m| next.mod_dir(&m.id).is_dir());
+            let mut installed: Vec<String> = fs::read_dir(next.mods_dir())?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            installed.sort_by_key(|n| n.to_lowercase());
+            for id in installed {
+                if p.mods.iter().any(|m| m.id == id) {
+                    continue;
+                }
+                for pl in next.mod_files(&id)?.into_iter().filter(|f| !f.contains('/') && crate::install::is_plugin(f)) {
+                    if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(&pl)) {
+                        p.plugins.push(PluginEntry { name: pl, enabled: false });
+                    }
+                }
+                p.mods.push(ModEntry { id, enabled: false });
+            }
+            if p != before {
+                write_atomic(&next.profile_file(), &toml::to_string_pretty(&p)?)?;
+            }
+            write_atomic(&self.root.join(CONFIG), &toml::to_string_pretty(&next.config)?)
+        })?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn rename_profile(&mut self, from: &str, to: &str) -> Result<()> {
+        check_profile_name(to)?;
+        let from = self.find_profile(from)?;
+        let mut config = Instance::open(&self.root)?.config;
+        self.locked(|| {
+            if self.find_profile(to).is_ok_and(|n| n != from) {
+                bail!("profile '{to}' already exists");
+            }
+            let dir = self.root.join("profiles");
+            fs::rename(dir.join(&from), dir.join(to))?;
+            if config.profile == from {
+                config.profile = to.into();
+                write_atomic(&self.root.join(CONFIG), &toml::to_string_pretty(&config)?)?;
+            }
+            Ok(())
+        })?;
+        self.config = config;
+        Ok(())
+    }
+
+    /// Move a profile to `profiles/.deleted/`, replacing an earlier deleted one of that name.
+    pub fn delete_profile(&self, name: &str) -> Result<()> {
+        let name = self.find_profile(name)?;
+        self.locked(|| {
+            if Instance::open(&self.root)?.config.profile == name {
+                bail!("'{name}' is the active profile; switch to another one first");
+            }
+            let bin = self.root.join("profiles").join(".deleted");
+            fs::create_dir_all(&bin)?;
+            let _ = fs::remove_dir_all(bin.join(&name));
+            fs::rename(self.root.join("profiles").join(&name), bin.join(&name))?;
+            Ok(())
+        })
+    }
+
     pub fn mod_meta(&self, id: &str) -> ModMeta {
         fs::read_to_string(self.mod_dir(id).join(MOD_META))
             .ok()
@@ -250,6 +356,20 @@ impl Instance {
         }
         Ok(())
     }
+}
+
+/// Profile names are folder names: no path characters, no leading dot (`.deleted` is rmm's).
+fn check_profile_name(name: &str) -> Result<()> {
+    let bad = name.is_empty()
+        || name.len() > 64
+        || name.trim() != name
+        || name.starts_with('.')
+        || name.ends_with('.')
+        || name.chars().any(|c| r#"<>:"/\|?*"#.contains(c) || c.is_control());
+    if bad {
+        bail!("invalid profile name '{name}': up to 64 characters, no <>:\"/\\|?*, no leading dot or surrounding spaces");
+    }
+    Ok(())
 }
 
 pub(crate) fn index_dir(dir: &Path) -> Result<Vec<String>> {

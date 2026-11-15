@@ -27,6 +27,7 @@ FOMOD installers: fomod_options shows the steps, options and the resolved choice
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
 Tools: add_tool registers a program (presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first. Long runs (DynDOLOD, grass) can go in the background (run_tool background=true, then poll tool_job).
 launch_game deploys and starts the game through its script extender after checking the versions match.
+Profiles: each has its own enabled mods, mod order, plugin order and undo history. switch_profile changes the active one and previews the deploy that applies it; deploy to apply.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
 re-run health_check after changes.";
 
@@ -55,6 +56,23 @@ fn now() -> u64 {
 struct ModId {
     /// Mod id as shown by list_mods.
     id: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ProfileName {
+    /// Profile name as shown by profiles.
+    name: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CreateProfileArgs {
+    /// Folder name: up to 64 characters, no <>:"/\|?* and no leading dot.
+    name: String,
+    /// Copy the active profile (default true); false starts with every mod disabled.
+    copy: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct RenameProfileArgs {
+    from: String,
+    to: String,
 }
 #[derive(Deserialize, JsonSchema)]
 struct DetailsArgs {
@@ -262,7 +280,7 @@ impl Rmm {
         out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| deploy::deploy(&i, a.dry_run.unwrap_or(true))))
     }
 
-    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one). Windows only for now. dry_run defaults to true and returns the deploy plan, game version and checks.")]
+    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one), through Proton on Linux. dry_run defaults to true and returns the deploy plan, game version and checks.")]
     async fn launch_game(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
         out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::launch::launch(&i, a.dry_run.unwrap_or(true))))
     }
@@ -313,6 +331,34 @@ impl Rmm {
             let text = std::fs::read_to_string(i.root.join("tools").join(&id).join("last-run.json")).map_err(|_| anyhow::anyhow!("tool '{id}' has no run on record"))?;
             Ok(Job::Done { report: serde_json::from_str(&text)? })
         }))
+    }
+
+    #[tool(description = "Profiles and the active one. Each profile has its own enabled mods, mod order, plugin order and undo history; installed mods, overwrite/, tools and LOOT rules are shared.")]
+    async fn profiles(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| Ok(serde_json::json!({ "active": i.config.profile, "profiles": i.profiles()? }))))
+    }
+
+    #[tool(description = "Create a profile from the active one: a copy (copy defaults to true) or empty, with every installed mod disabled. Doesn't switch to it.")]
+    async fn create_profile(&self, Parameters(a): Parameters<CreateProfileArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| i.create_profile(&a.name, a.copy.unwrap_or(true))))
+    }
+
+    #[tool(description = "Make a profile active. Mods installed under another profile are added to it disabled. Returns the deploy plan (dry run) that would apply it; the game folder changes only on deploy.")]
+    async fn switch_profile(&self, Parameters(a): Parameters<ProfileName>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|mut i| {
+            i.switch_profile(&a.name)?;
+            deploy::deploy(&i, true)
+        }))
+    }
+
+    #[tool(description = "Rename a profile (the active one too).")]
+    async fn rename_profile(&self, Parameters(a): Parameters<RenameProfileArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|mut i| i.rename_profile(&a.from, &a.to)))
+    }
+
+    #[tool(description = "Delete a profile other than the active one. It moves to profiles/.deleted/, which keeps the last deleted profile of each name.")]
+    async fn delete_profile(&self, Parameters(a): Parameters<ProfileName>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| i.delete_profile(&a.name)))
     }
 
     #[tool(description = "Undo the last change to the profile. Returns its label, or null if nothing to undo.")]

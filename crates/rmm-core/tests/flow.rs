@@ -96,7 +96,7 @@ fn full_flow() {
     assert_eq!(plan.link.len(), 6);
     assert_eq!(read(&game.join("Data/textures/sky.dds")), "B");
     assert_eq!(read(&game.join("skse64_loader.exe")), "loader");
-    let txt = read(&local.join("plugins.txt"));
+    let txt = read(&local.join("Plugins.txt")); // libloadorder's spelling; Linux is case-sensitive
     assert!(txt.find("*A.esp").unwrap() < txt.find("*B.esp").unwrap(), "plugins.txt was: {txt}");
     assert!(deploy::deploy(&inst, true).unwrap().is_noop());
 
@@ -663,7 +663,8 @@ fn tool_settings_kept_files_and_sort() {
     write(&src.join("Settings.json"), "\u{feff}{\"app\":{\"theme\":1},\"games\":{\"SkyrimSE\":{\"outputPath\":\"old\"}}}");
     write(
         &src.join("tool.bat"),
-        [r"@echo off", r#"mkdir "%~1\Pandora_Engine" 2>nul"#, r#"echo run>> "%~1\Pandora_Engine\ActiveMods.json""#, r#"copy /y "%~2" "%~1\New.esp" >nul"#].join("\r\n"),
+        // The tool keeps a copy of the settings it saw (it runs in its own folder).
+        [r"@echo off", r#"mkdir "%~1\Pandora_Engine" 2>nul"#, r#"echo run>> "%~1\Pandora_Engine\ActiveMods.json""#, r#"copy /y "%~2" "%~1\New.esp" >nul"#, r#"copy /y Settings.json "%~1\seen.json" >nul"#].join("\r\n"),
     );
     let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
     write(&root.join("loot/masterlist.yaml"), "plugins: []\n");
@@ -680,10 +681,13 @@ fn tool_settings_kept_files_and_sort() {
 
     let r = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
     assert_eq!(r.mod_id.as_deref(), Some("gen Output"), "{r:?}");
-    let json: serde_json::Value = serde_json::from_str(&read(&src.join("Settings.json"))).unwrap();
-    assert_eq!(json["app"]["theme"], 1);
-    assert_eq!(json["games"]["SkyrimSE"]["gameDataPath"].as_str().unwrap().replace('/', "\\"), inst.data_dir().display().to_string().replace('/', "\\"));
-    assert!(json["games"]["SkyrimSE"]["outputPath"].as_str().unwrap().ends_with("tool-gen"));
+    let seen: serde_json::Value = serde_json::from_str(&read(&root.join("mods/gen Output/seen.json"))).unwrap();
+    assert_eq!(seen["app"]["theme"], 1);
+    assert_eq!(seen["games"]["SkyrimSE"]["gameDataPath"].as_str().unwrap().replace('/', "\\"), inst.data_dir().display().to_string().replace('/', "\\"));
+    assert!(seen["games"]["SkyrimSE"]["outputPath"].as_str().unwrap().ends_with("tool-gen"));
+    // After the run, rmm's keys are back as they were: outputPath restored, gameDataPath gone.
+    let after: serde_json::Value = serde_json::from_str(&read(&src.join("Settings.json"))).unwrap();
+    assert_eq!(after, serde_json::json!({"app": {"theme": 1}, "games": {"SkyrimSE": {"outputPath": "old"}}}));
     assert!(r.sort.is_some(), "{r:?}");
     assert!(inst.profile().unwrap().plugins.iter().any(|p| p.name == "New.esp" && p.enabled));
 
@@ -959,4 +963,167 @@ fn vortex_planner_rows() {
     assert_eq!(read(&game.join("Data/SkyUI/config.txt")), "config");
     deploy::purge(&inst, false).unwrap();
     assert!(!game.join("Data/SkyUI").exists());
+}
+
+/// Linux: a Windows tool and the game run through the Proton build named in the prefix's
+/// config_info, as `proton run <exe> <args>` with Steam's compat variables and Z: paths. The
+/// Steam library and Proton are fakes: `proton` is a shell script that records its call and acts
+/// like the Windows tool by writing into the folder it was given. Fallout 4, because on Linux a
+/// running "game" is any process naming its exe, and the other tests deploy Skyrim in parallel.
+#[cfg(unix)]
+#[test]
+fn proton_runs_windows_tools_and_the_game() {
+    use rmm_core::{launch, tools::{self, ToolSpec}};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let game = base.join("lib/steamapps/common/Fallout 4");
+    let compat = base.join("lib/steamapps/compatdata/377160");
+    let mut exe = b"MZ".to_vec(); // a version resource for 1.10.163.0
+    exe.extend([0xBD, 0x04, 0xEF, 0xFE, 0, 0, 1, 0]);
+    exe.extend(((1u32 << 16) | 10).to_le_bytes());
+    exe.extend((163u32 << 16).to_le_bytes());
+    write(&game.join("Fallout4.exe"), exe);
+    fs::create_dir_all(game.join("Data")).unwrap();
+    let proton = base.join("Proton 9.0/files");
+    write(
+        &compat.join("config_info"),
+        format!("9.0-201\n{p}/share/fonts/\n{p}/lib/\n{p}/lib64/\n{s}/\n", p = proton.display(), s = base.join("steam").display()),
+    );
+    let script = base.join("Proton 9.0/proton");
+    write(
+        &script,
+        r#"#!/bin/sh
+{ printf '%s\n' "$@"; env | grep -E '^(STEAM_COMPAT_|SteamAppId|SteamGameId)' | sort; } > "$STEAM_COMPAT_DATA_PATH/last-call"
+shift 2
+[ -n "$1" ] && out=$(printf '%s' "$1" | sed 's/^Z://; s#\\#/#g') && echo made > "$out/made.txt"
+exit 0
+"#,
+    );
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let call = || fs::read_to_string(compat.join("last-call")).unwrap_or_default();
+
+    let inst = Instance::create(&base.join("inst"), Game::Fallout4, &game, &base.join("local")).unwrap();
+    write(&base.join("tools/Tool.exe"), "MZ");
+    let spec = ToolSpec { exe: base.join("tools/Tool.exe"), args: Some(vec!["{output}".into()]), ..Default::default() };
+    tools::add(&inst, "gen", spec).unwrap();
+    let r = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!(r.mod_id.as_deref(), Some("gen Output"), "{r:?}\n{}", call());
+    assert_eq!(read(&base.join("inst/mods/gen Output/made.txt")).trim(), "made");
+    let lines: Vec<String> = call().lines().map(str::to_owned).collect();
+    assert_eq!(lines[0], "run");
+    assert_eq!(lines[1], base.join("tools/Tool.exe").display().to_string());
+    assert!(lines[2].starts_with(r"Z:\") && lines[2].ends_with(r"\.staging\tool-gen"), "{lines:?}");
+    for want in [format!("STEAM_COMPAT_DATA_PATH={}", compat.display()), format!("STEAM_COMPAT_CLIENT_INSTALL_PATH={}", base.join("steam").display()), "SteamAppId=377160".into(), "SteamGameId=377160".into()] {
+        assert!(lines.contains(&want), "missing {want}: {lines:?}");
+    }
+
+    // Plugin settings are deployed as copies, and an edited mod file is copied again: Linux
+    // copies get the copy time as mtime, unlike Windows, where they keep the source's.
+    write(&base.join("src/Logger/F4SE/Plugins/Logger.ini"), "installed");
+    install::install(&inst, &base.join("src/Logger"), None, true, None).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    let (ini, src) = (game.join("Data/F4SE/Plugins/Logger.ini"), base.join("inst/mods/Logger/F4SE/Plugins/Logger.ini"));
+    assert!(!same_file::is_same_file(&ini, &src).unwrap(), "configs are copies");
+    assert!(deploy::deploy(&inst, true).unwrap().is_noop());
+    write(&src, "updated");
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&ini), "updated");
+
+    // The game starts the same way, without waiting.
+    fs::remove_file(compat.join("last-call")).unwrap();
+    let r = launch::launch(&inst, false).unwrap();
+    assert_eq!(r.game_version, "1.10.163.0");
+    for _ in 0..50 {
+        if call().lines().count() > 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let lines: Vec<String> = call().lines().map(str::to_owned).collect();
+    assert_eq!(lines.get(..2), Some(&["run".to_string(), game.join("Fallout4.exe").display().to_string()][..]), "{lines:?}");
+
+    // What the game writes during play is captured by the next deploy.
+    write(&game.join("Data/MCM/Settings/mod.ini"), "user setting");
+    write(&ini, "rewritten on launch");
+    let plan = deploy::deploy(&inst, true).unwrap();
+    assert_eq!((plan.played.as_slice(), plan.external_changes.as_slice()), (["Data/MCM/Settings/mod.ini".to_string()].as_slice(), ["Data/F4SE/Plugins/Logger.ini".to_string()].as_slice()));
+    // The fake game may still be exiting; deploy refuses while it runs.
+    let mut tries = 0;
+    while let Err(e) = deploy::deploy(&inst, false) {
+        assert!(e.to_string().contains("running") && tries < 50, "{e:#}");
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(read(&base.join("inst/overwrite/MCM/Settings/mod.ini")), "user setting");
+    assert_eq!(read(&base.join("inst/overwrite/F4SE/Plugins/Logger.ini")), "rewritten on launch");
+    assert_eq!(read(&src), "updated");
+}
+
+/// Profiles: each has its own enabled mods, order, plugins and undo history; switching brings
+/// in mods installed elsewhere (disabled) and drops uninstalled ones; deploy follows the switch.
+#[test]
+fn profiles() {
+    use rmm_core::ops::set_mod_enabled;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    for id in ["A", "B", "C"] {
+        write(&src.join(id).join(format!("{id}.esp")), plugin_bytes(&["Skyrim.esm"], false));
+        write(&src.join(id).join("textures/sky.dds"), id);
+    }
+    let mut inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
+    install::install(&inst, &src.join("A"), None, true, None).unwrap();
+    install::install(&inst, &src.join("B"), None, true, None).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    let state = |inst: &Instance| {
+        let p = inst.profile().unwrap();
+        let on = |v: Vec<(String, bool)>| v.into_iter().map(|(n, e)| format!("{}{n}", if e { "+" } else { "-" })).collect::<Vec<_>>().join(" ");
+        (on(p.mods.into_iter().map(|m| (m.id, m.enabled)).collect()), on(p.plugins.into_iter().map(|e| (e.name, e.enabled)).collect()))
+    };
+
+    // Names are folder names, unique without regard to case.
+    for bad in ["", "../x", ".hidden", "a:b", " pad"] {
+        assert!(inst.create_profile(bad, true).is_err(), "{bad:?}");
+    }
+    inst.create_profile("Lean", false).unwrap();
+    inst.create_profile("Copy", true).unwrap();
+    assert!(inst.create_profile("lean", true).is_err());
+    assert_eq!(inst.profiles().unwrap(), ["Copy", "default", "Lean"]);
+
+    // An empty profile gets every installed mod, disabled, on the first switch.
+    inst.switch_profile("lean").unwrap();
+    assert_eq!(inst.config.profile, "Lean");
+    assert_eq!(Instance::open(&root).unwrap().config.profile, "Lean");
+    assert_eq!(state(&inst), ("-A -B".into(), "-A.esp -B.esp".into()));
+    assert!(inst.history().unwrap().is_empty(), "history is per profile");
+    set_mod_enabled(&inst, "A", true).unwrap();
+    let plan = deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&game.join("Data/textures/sky.dds")), "A");
+    assert!(plan.link.contains(&"Data/textures/sky.dds".to_string()) && !game.join("Data/B.esp").exists(), "{plan:?}");
+    let txt = read(&local.join("Plugins.txt"));
+    assert!(txt.contains("*A.esp") && !txt.contains("B.esp"), "{txt}");
+
+    // A mod installed here shows up in the others, disabled, after its plugins.
+    install::install(&inst, &src.join("C"), None, true, None).unwrap();
+    inst.switch_profile("default").unwrap();
+    assert_eq!(state(&inst), ("+A +B -C".into(), "+A.esp +B.esp -C.esp".into()));
+    assert_eq!(inst.history().unwrap(), ["install B", "install A"]);
+    assert_eq!(deploy::deploy(&inst, true).unwrap().link.len(), 2, "B.esp and sky.dds come back");
+
+    // A mod uninstalled here leaves the others on the next switch.
+    install::uninstall(&inst, "B").unwrap();
+    inst.switch_profile("Copy").unwrap();
+    assert_eq!(state(&inst), ("+A -C".into(), "+A.esp +B.esp -C.esp".into()), "plugins keep their slot");
+
+    // Rename (the active one too) and delete (never the active one).
+    inst.rename_profile("Copy", "Full").unwrap();
+    assert_eq!((inst.config.profile.as_str(), Instance::open(&root).unwrap().config.profile.as_str()), ("Full", "Full"));
+    assert!(inst.rename_profile("Lean", "default").is_err());
+    assert!(inst.delete_profile("full").is_err());
+    inst.delete_profile("Lean").unwrap();
+    assert_eq!(inst.profiles().unwrap(), ["default", "Full"]);
+    assert!(root.join("profiles/.deleted/Lean/profile.toml").is_file());
 }

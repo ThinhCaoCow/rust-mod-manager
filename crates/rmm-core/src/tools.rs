@@ -321,8 +321,17 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
             copy_file(&dir.join(&f), &staging.join(&f))?;
         }
     }
+    // rmm's keys go back to their old values after the run; anything else the tool saves stays.
+    let mut restore = None;
     if let (Some(s), Some(path)) = (&tool.settings, &r.settings_file) {
-        merge_settings(path, &s.set, &vars)?;
+        let set = s.set.iter().map(|(k, v)| {
+            let v = match v {
+                Value::String(t) => Value::String(expand(t, &vars)?),
+                v => v.clone(),
+            };
+            Ok((k.clone(), Some(v)))
+        });
+        restore = Some((path.clone(), edit_json(path, set.collect::<Result<_>>()?)?));
     }
     let man = deploy::manifest_files(inst)?;
     let swapped = swaps(&man, &rewrites);
@@ -340,15 +349,22 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     }
 
     let log = state.join("last-run.log");
-    match launch(inst, tool, &args, &log, timeout) {
-        Ok((code, timed_out)) => {
-            (r.exit_code, r.timed_out) = (code, timed_out);
-            if let Some(exe) = tool.wait_for.as_deref().filter(|_| !timed_out)
-                && !wait_for(game, exe)
-            {
-                r.warnings.push(format!("{exe} never started, so the run didn't wait for it"));
-            }
+    let launched = launch(inst, tool, &args, &log, timeout);
+    if let Ok((code, timed_out)) = launched {
+        (r.exit_code, r.timed_out) = (code, timed_out);
+        if let Some(exe) = tool.wait_for.as_deref().filter(|_| !timed_out)
+            && !wait_for(game, exe)
+        {
+            r.warnings.push(format!("{exe} never started, so the run didn't wait for it"));
         }
+    }
+    if let Some((path, previous)) = restore
+        && let Err(e) = edit_json(&path, previous)
+    {
+        r.warnings.push(format!("couldn't put back the settings rmm changed in {}: {e:#}", path.display()));
+    }
+    match launched {
+        Ok(_) => {}
         Err(e) => {
             // Nothing ran: drop the copies and put the previous output back.
             for t in &r.swapped {
@@ -508,29 +524,45 @@ fn vars(inst: &Instance, tool: &Tool, state: &Path, staging: &Path, given: &BTre
     v
 }
 
-/// Set dotted keys in a JSON settings file, keeping the rest of it.
-fn merge_settings(path: &Path, set: &BTreeMap<String, Value>, vars: &BTreeMap<String, String>) -> Result<()> {
+/// Set (Some) or remove (None) dotted keys in a JSON settings file, keeping the rest of it.
+/// Returns each key's previous value: passing that back undoes the edit.
+fn edit_json(path: &Path, changes: Vec<(String, Option<Value>)>) -> Result<Vec<(String, Option<Value>)>> {
     let mut root = match fs::read(path) {
         // .NET tools may write a byte-order mark.
         Ok(b) => serde_json::from_slice(b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b)).with_context(|| format!("cannot parse {}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Default::default()),
         Err(e) => return Err(e.into()),
     };
-    for (key, v) in set {
+    let mut previous = Vec::new();
+    'keys: for (key, v) in changes {
+        let k = key.clone();
+        let parts: Vec<&str> = k.split('.').collect();
+        let (leaf, parents) = parts.split_last().unwrap();
         let mut node = &mut root;
-        for part in key.split('.') {
+        for part in parents.iter().chain([&""]) {
             if !node.is_object() {
+                if v.is_none() {
+                    previous.push((key, None)); // nothing there to remove
+                    continue 'keys;
+                }
                 *node = Value::Object(Default::default());
             }
-            node = node.as_object_mut().unwrap().entry(part).or_insert(Value::Null);
+            if part.is_empty() {
+                break;
+            }
+            node = node.as_object_mut().unwrap().entry(*part).or_insert_with(|| Value::Object(Default::default()));
         }
-        *node = match v {
-            Value::String(t) => Value::String(expand(t, vars)?),
-            v => v.clone(),
+        let obj = node.as_object_mut().unwrap();
+        let old = match v {
+            Some(v) => obj.insert(leaf.to_string(), v),
+            None => obj.remove(*leaf),
         };
+        previous.push((key, old));
     }
+    previous.reverse();
     fs::create_dir_all(path.parent().unwrap())?;
-    write_atomic(path, &serde_json::to_string_pretty(&root)?)
+    write_atomic(path, &serde_json::to_string_pretty(&root)?)?;
+    Ok(previous)
 }
 
 /// Fill `{name}` placeholders. Braces around anything but a name stay as they are.
