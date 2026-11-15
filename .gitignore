@@ -2,3 +2,6 @@
 # Raw research notes contain copied third-party forum text; the finished report in reports/ is published instead.
 /research_notes/
 /reference/
+
+# Written by tauri-build on every build.
+/crates/rmm-app/gen/

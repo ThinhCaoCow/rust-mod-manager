@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/rmm-core", "crates/rmm"]
+members = ["crates/rmm-core", "crates/rmm", "crates/rmm-app"]
+# The desktop app needs WebView2 (Windows) or WebKitGTK (Linux); plain `cargo build`/`test` skip it.
+default-members = ["crates/rmm-core", "crates/rmm"]
 
 [workspace.package]
 version = "0.1.0"

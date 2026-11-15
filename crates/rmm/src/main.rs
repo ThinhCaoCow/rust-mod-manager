@@ -81,7 +81,7 @@ enum Cmd {
     },
     /// Health check.
     Check,
-    /// Deploy, check the script extender matches the game, and start it (Windows); --apply to do it.
+    /// Deploy, check the script extender matches the game, and start it (through Proton on Linux); --apply to do it.
     Launch {
         #[arg(long)]
         apply: bool,

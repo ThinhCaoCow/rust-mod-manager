@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "The main window: core events (file drops) and the open-file dialog.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open"]
+}

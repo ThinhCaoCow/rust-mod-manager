@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rmm</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="busy" hidden><div></div></div>
+
+<section id="welcome" hidden>
+  <div class="welcome">
+    <h1>rmm</h1>
+    <p class="muted">Mod manager for Skyrim Special Edition and Fallout 4.</p>
+    <button id="open-instance" class="primary">Open an instance folder…</button>
+    <div id="create-games"></div>
+    <p class="muted small">An instance folder holds your mods, profiles and undo history. The game folder only changes when you deploy or play.</p>
+  </div>
+</section>
+
+<div id="app" hidden>
+  <header class="top">
+    <div class="game">
+      <b id="game-name"></b>
+      <span id="instance-path" class="muted small"></span>
+    </div>
+    <div class="menu">
+      <button id="profile-btn" title="Profiles"><span class="muted">Profile</span> <b id="profile-name"></b> <span class="caret">▾</span></button>
+      <div id="profile-pop" class="pop" hidden></div>
+    </div>
+    <div class="spacer"></div>
+    <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+    <button id="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
+    <button id="deploy" title="Preview and apply the changes to the game folder"></button>
+    <button id="play" class="primary" title="Deploy, check the script extender and start the game">▶ Play</button>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="mods">Mods <span class="count" id="n-mods"></span></button>
+    <button data-tab="plugins">Plugins <span class="count" id="n-plugins"></span></button>
+    <button data-tab="problems">Problems <span class="count" id="n-problems"></span></button>
+    <button data-tab="history">History</button>
+    <div class="spacer"></div>
+    <input id="filter" type="search" placeholder="Filter" spellcheck="false">
+    <button id="install">＋ Install mod…</button>
+  </nav>
+
+  <main>
+    <section class="pane" id="pane-mods">
+      <div class="notice" id="rules-notice" hidden></div>
+      <div class="scroll">
+        <table class="list" id="mods">
+          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Mod</th><th>Conflicts</th><th class="num">Files</th><th class="num" title="Priority: higher wins file conflicts">#</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="mods-empty" hidden>No mods yet. Drop a .zip or .7z here, or use Install mod.</p>
+      </div>
+    </section>
+    <section class="pane" id="pane-plugins" hidden>
+      <div class="toolbar"><span class="muted small">Masters always load before other plugins. Drag to reorder.</span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
+      <div class="scroll">
+        <table class="list" id="plugins">
+          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th>Type</th><th>From</th><th>Issues</th><th class="num">#</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="pane" id="pane-problems" hidden>
+      <div class="toolbar"><span class="muted small" id="problems-note"></span><div class="spacer"></div><button id="recheck">Check again</button></div>
+      <div class="scroll"><ul class="issues" id="issues"></ul></div>
+    </section>
+    <section class="pane" id="pane-history" hidden>
+      <div class="toolbar"><span class="muted small">Every change to this profile, newest first. Undo steps back through them.</span></div>
+      <div class="scroll"><ol class="history" id="history"></ol></div>
+    </section>
+    <aside id="details" hidden></aside>
+  </main>
+</div>
+
+<div id="dropzone" hidden><div>Drop to install</div></div>
+<dialog id="dlg"></dialog>
+<div id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

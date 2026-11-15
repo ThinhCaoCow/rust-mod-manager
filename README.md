@@ -2,19 +2,20 @@
 
 A mod manager for Skyrim SE/AE and Fallout 4 that an AI can drive over MCP. The design is in [SPEC.md](SPEC.md). The research behind it is in [reports/](reports/).
 
-**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting and rules, archive conflicts, tool runs and launching through the script extender work, with Proton on Linux (tested natively against a fake Steam library and Proton; testing with the real game in a Linux VM comes in the final milestone). That covers the milestone 2 list; the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
+**Status: milestone 3 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting and rules, archive conflicts, tool runs and launching through the script extender work, with Proton on Linux (tested natively against a fake Steam library and Proton; testing with the real game in a Linux VM comes in the final milestone). Profiles, mod rules and a first desktop app are in; the Nexus integration, add-ons and the in-game test harness come later (see SPEC.md "Milestones").
 
 ## Build
 
 ```
-cargo build --release
+cargo build --release              # CLI and MCP server
+cargo build --release -p rmm-app   # desktop app (Tauri 2; WebView2 on Windows, WebKitGTK on Linux)
 ```
 
-Compile-check the Linux code from Windows (Zstandard zips need a C compiler for the target, so they are left out; LLVM's clang assembles one file of `psm`):
+Plain `cargo build` and `cargo test` skip the desktop app, so they need no web view libraries. Compile-check the Linux code from Windows (Zstandard zips need a C compiler for the target, so they are left out; LLVM's clang assembles one file of `psm`):
 
 ```
 rustup target add x86_64-unknown-linux-gnu
-CC_x86_64_unknown_linux_gnu=clang CFLAGS_x86_64_unknown_linux_gnu=--target=x86_64-unknown-linux-gnu AR_x86_64_unknown_linux_gnu=llvm-ar cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --no-default-features
+CC_x86_64_unknown_linux_gnu=clang CFLAGS_x86_64_unknown_linux_gnu=--target=x86_64-unknown-linux-gnu AR_x86_64_unknown_linux_gnu=llvm-ar cargo clippy --workspace --exclude rmm-app --all-targets --target x86_64-unknown-linux-gnu --no-default-features
 ```
 
 Run the tests on Linux from WSL (a separate target folder keeps the Windows build intact):
@@ -55,6 +56,14 @@ How deploys behave:
 - **Tool runs.** `rmm run` deploys, runs the tool, then captures what it wrote into a generated mod: its `{output}` folder plus new or changed Data files. That mod replaces the tool's previous output. Files a tool rewrites in place (its `rewrites`) are swapped from hard links to copies first, so your installed mods aren't changed through the link. Pandora and PGPatcher get their paths written into their JSON settings, and keep their mod list or plugin between runs. New plugins are sorted with LOOT if you already sort with it.
 - **Lost manifest.** If `deploy.json` is lost, `rmm purge --apply` still finds rmm's hard links by file identity.
 
+## Desktop app
+
+```
+rmm-app --instance D:\Mods\skyrim     # or pick or create an instance on the welcome screen
+```
+
+The mod list with drag and drop and conflict markers (select a mod to see who it wins and loses against), plugins, profiles, mod rules, problems and history, a deploy preview, and Play. Drop a .zip or .7z on the window to install it. The window reloads when the CLI or an AI changes the instance. It is plain HTML and JavaScript in `crates/rmm-app/ui/`, with no build step; every action is one call into rmm-core (`crates/rmm-app/src/main.rs`).
+
 ## AI (MCP)
 
 ```
@@ -68,6 +77,7 @@ The server exposes 36 tools covering inspection, install (including FOMOD instal
 ```
 crates/rmm-core   game detection, instances, install, fomod, conflicts, archives, deploy, plugins, loot, health, tools, launch, proton, rules, ops
 crates/rmm        CLI + MCP server (one binary)
+crates/rmm-app    desktop app (Tauri 2): src/main.rs bridges to rmm-core, ui/ is the window
 ```
 
 Licence: GPL-3.0-or-later, as required by libloadorder and esplugin.
