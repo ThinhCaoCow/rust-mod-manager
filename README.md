@@ -2,7 +2,7 @@
 
 A mod manager for Skyrim SE/AE and Fallout 4 that an AI can drive over MCP. The design is in [SPEC.md](SPEC.md). The research behind it is in [reports/](reports/).
 
-**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers and tool runs work. LOOT sorting, the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
+**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting and tool runs work. Conflicts inside BSA/BA2 and Proton launching finish milestone 2; the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
 
 ## Build
 
@@ -20,6 +20,7 @@ rmm install "C:\Downloads\SkyUI_5_2_SE.7z"
 rmm fomod "C:\Downloads\SomeFomodMod.7z"           # show a FOMOD installer's steps and defaults
 rmm install "C:\Downloads\SomeFomodMod.7z" --choices "{}"   # defaults; or JSON / @file from 'rmm fomod'
 rmm mods | rmm conflicts | rmm plugins | rmm check
+rmm sort                                           # LOOT order preview; --apply saves it (undoable)
 rmm move "SkyUI_5_2_SE" 0                          # priority 0 = lowest; higher wins conflicts
 rmm deploy                                         # preview what changes in the game folder
 rmm deploy --apply                                 # hard-link mods in, write plugins.txt
@@ -43,12 +44,12 @@ How deploys behave:
 claude mcp add rmm -- D:\Games\Rust_Mod_Manager\target\release\rmm.exe -i D:\Mods\skyrim mcp
 ```
 
-The server exposes 22 tools covering inspection, install (including FOMOD installers), ordering, plugins, health checks, tool runs, deploy, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change lands in undo history, so anything the AI does can be reversed.
+The server exposes 24 tools covering inspection, install (including FOMOD installers), ordering, LOOT sorting, plugins, health checks, tool runs, deploy, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change lands in undo history, so anything the AI does can be reversed.
 
 ## Layout
 
 ```
-crates/rmm-core   game detection, instances, install, fomod, conflicts, deploy, plugins, health, tools, ops
+crates/rmm-core   game detection, instances, install, fomod, conflicts, deploy, plugins, loot, health, tools, ops
 crates/rmm        CLI + MCP server (one binary)
 ```
 

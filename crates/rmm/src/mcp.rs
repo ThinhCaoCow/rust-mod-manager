@@ -9,7 +9,7 @@ use rmcp::{
 };
 use rmm_core::fomod::Choices;
 use rmm_core::tools::ToolSpec;
-use rmm_core::{Instance, conflicts, deploy, health, install, ops, plugins, tools};
+use rmm_core::{Instance, conflicts, deploy, health, install, loot, ops, plugins, tools};
 use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ rmm manages one Skyrim SE or Fallout 4 instance.
 Model: mods are an ordered list; later (higher priority) mods win loose-file conflicts. \
 Plugins (.esp/.esm/.esl) have their own load order; masters always load before non-masters.
 Workflow: inspect (list_mods, list_conflicts, list_plugins, health_check) -> change (install_mod, \
-set_mod_enabled, move_mod, set_mod_order, set_plugin_order...) -> deploy with dry_run=true to \
+set_mod_enabled, move_mod, set_mod_order, sort_plugins, set_plugin_order...) -> deploy with dry_run=true to \
 preview, then dry_run=false to apply. Nothing reaches the game folder until deploy is applied.
 FOMOD installers: fomod_options shows the steps, options and the resolved choices; edit those \
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
@@ -154,7 +154,7 @@ impl Rmm {
         out(self.inst().and_then(|i| plugins::list(&i, &i.profile()?)))
     }
 
-    #[tool(description = "Problems to fix: missing masters, plugin limits, missing script extender, fully overridden mods, undeployed or externally changed files.")]
+    #[tool(description = "Problems to fix: missing masters, plugin limits, missing script extender, fully overridden mods, undeployed or externally changed files, LOOT warnings and dirty plugins.")]
     async fn health_check(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| health::check(&i)))
     }
@@ -192,6 +192,16 @@ impl Rmm {
     #[tool(description = "Enable or disable a single plugin.")]
     async fn set_plugin_enabled(&self, Parameters(a): Parameters<PluginEnableArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| ops::set_plugin_enabled(&i, &a.name, a.enabled)))
+    }
+
+    #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move; otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy.")]
+    async fn sort_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::sort(&i, a.dry_run.unwrap_or(true))))
+    }
+
+    #[tool(description = "Download the latest LOOT masterlist and prelude now. Returns warnings, if any.")]
+    async fn update_masterlist(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::update_masterlist(&i, true)))
     }
 
     #[tool(description = "Reorder plugins. Masters still load before non-masters regardless.")]

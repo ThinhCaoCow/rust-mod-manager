@@ -20,6 +20,7 @@ schemars = "1"
 same-file = "1"
 dirs = "6"
 roxmltree = "0.21.2"
+libloot = "0.29.7"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

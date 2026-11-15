@@ -418,6 +418,65 @@ fn fomod_installers() {
     assert!(!inst.root.join(".staging/preview").exists());
 }
 
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for b in bytes {
+        crc ^= *b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// LOOT sorting and messages from a cached masterlist (no network: the cache is fresh).
+#[test]
+fn loot_sorts_and_reports() {
+    use rmm_core::loot;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let dirty = plugin_bytes(&["Skyrim.esm"], false);
+    for name in ["First", "Second"] {
+        write(&src.join(name).join(format!("{name}.esp")), plugin_bytes(&["Skyrim.esm"], false));
+    }
+    write(&src.join("Dirty/Dirty.esp"), &dirty);
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
+    for name in ["First", "Second", "Dirty"] {
+        install::install(&inst, &src.join(name), None, true, None).unwrap();
+    }
+    write(
+        &root.join("loot/masterlist.yaml"),
+        format!(
+            "plugins:\n  - name: 'First.esp'\n    after: ['Second.esp']\n    msg:\n      - type: warn\n        content: 'First needs a patch'\n  \
+             - name: 'Dirty.esp'\n    dirty:\n      - crc: 0x{:08X}\n        util: 'SSEEdit v4.1.5'\n        itm: 3\n",
+            crc32(&dirty)
+        ),
+    );
+    write(&root.join("loot/prelude.yaml"), "common: []\n");
+    deploy::deploy(&inst, false).unwrap();
+
+    let plan = loot::sort(&inst, true).unwrap();
+    let pos = |order: &[String], n: &str| order.iter().position(|x| x == n).unwrap();
+    assert!(pos(&plan.order, "Second.esp") < pos(&plan.order, "First.esp"), "{plan:?}");
+    assert!(!plan.moved.is_empty() && plan.warnings.is_empty(), "{plan:?}");
+    let names = |inst: &Instance| inst.profile().unwrap().plugins.into_iter().map(|p| p.name).collect::<Vec<_>>();
+    assert_eq!(names(&inst), ["First.esp", "Second.esp", "Dirty.esp"], "a dry run changes nothing");
+
+    loot::sort(&inst, false).unwrap();
+    let sorted = names(&inst);
+    assert!(sorted.iter().position(|n| n == "Second.esp") < sorted.iter().position(|n| n == "First.esp"));
+    assert!(!sorted.iter().any(|n| n == "Skyrim.esm"), "base masters stay out of the profile");
+    assert!(loot::sort(&inst, true).unwrap().moved.is_empty(), "sorting is stable");
+    inst.undo().unwrap();
+    assert_eq!(names(&inst), ["First.esp", "Second.esp", "Dirty.esp"]);
+
+    let issues = health::check(&inst).unwrap();
+    assert!(issues.iter().any(|i| i.kind == "loot_message" && i.subject == "First.esp" && i.message.contains("patch")), "{issues:?}");
+    assert!(issues.iter().any(|i| i.kind == "dirty_plugin" && i.subject == "Dirty.esp" && i.message.starts_with("3 ITMs")), "{issues:?}");
+}
+
 /// A fake tool (a .bat) exercising every capture path: directed output, a new Data file, an
 /// in-place edit of a swapped link, a rewrite of a vanilla file kept for restore, and an
 /// in-place write through a link that isn't in the tool's rewrites.

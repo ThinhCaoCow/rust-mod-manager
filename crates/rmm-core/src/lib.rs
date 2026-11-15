@@ -6,6 +6,7 @@ pub mod game;
 pub mod health;
 pub mod install;
 pub mod instance;
+pub mod loot;
 pub mod ops;
 pub mod plugins;
 pub mod tools;

@@ -72,6 +72,10 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         }
     }
     issues.extend(fallout4_ini(inst)?);
+    match crate::loot::issues(inst) {
+        Ok(loot) => issues.extend(loot),
+        Err(e) => issues.push(Issue { severity: "warning", kind: "loot_failed", subject: "LOOT".into(), message: format!("{e:#}") }),
+    }
     Ok(issues)
 }
 

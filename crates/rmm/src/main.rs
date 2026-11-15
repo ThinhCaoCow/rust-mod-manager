@@ -2,7 +2,7 @@ mod mcp;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, conflicts, deploy, game, health, install, ops, plugins, tools};
+use rmm_core::{Game, Instance, conflicts, deploy, game, health, install, loot, ops, plugins, tools};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -61,6 +61,13 @@ enum Cmd {
     Move { id: String, priority: usize },
     Conflicts,
     Plugins,
+    /// Sort plugins with LOOT; --apply saves the order to the profile.
+    Sort {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Download the latest LOOT masterlist now (sort refreshes it daily by itself).
+    Masterlist,
     /// Health check.
     Check,
     /// Show what deploying would change; --apply to do it.
@@ -170,6 +177,8 @@ fn main() -> Result<()> {
             let inst = open()?;
             print(&plugins::list(&inst, &inst.profile()?)?)
         }
+        Cmd::Sort { apply } => print(&loot::sort(&open()?, !apply)?),
+        Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
         Cmd::Check => print(&health::check(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
