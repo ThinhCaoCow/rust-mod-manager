@@ -24,7 +24,8 @@ set_mod_enabled, move_mod, set_mod_order, sort_plugins, set_plugin_order...) -> 
 preview, then dry_run=false to apply. Nothing reaches the game folder until deploy is applied.
 FOMOD installers: fomod_options shows the steps, options and the resolved choices; edit those \
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
-Tools: add_tool registers a program (presets: xedit, xedit-qac, bodyslide, synthesis); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first.
+Tools: add_tool registers a program (presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first.
+launch_game deploys and starts the game through its script extender after checking the versions match.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
 re-run health_check after changes.";
 
@@ -212,6 +213,11 @@ impl Rmm {
     #[tool(description = "Apply the profile to the game folder (hard links, incremental) and write plugins.txt. dry_run defaults to true and returns the plan.")]
     async fn deploy(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
         out(self.inst().and_then(|i| deploy::deploy(&i, a.dry_run.unwrap_or(true))))
+    }
+
+    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one). Windows only for now. dry_run defaults to true and returns the deploy plan, game version and checks.")]
+    async fn launch_game(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::launch::launch(&i, a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Remove all deployed files and restore originals. dry_run defaults to true.")]

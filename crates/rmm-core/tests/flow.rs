@@ -629,3 +629,74 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert_eq!(read(&game.join("Data/vanilla.ini")), "vanilla");
     assert!(!game.join("Data/newfile.txt").exists() && !game.join("Data/meshes/body.nif").exists());
 }
+
+/// A JSON settings file is merged before the run (other keys and a BOM survive), kept files carry
+/// over from the previous output, and a run that adds a plugin is sorted with the cached masterlist.
+#[cfg(windows)]
+#[test]
+fn tool_settings_kept_files_and_sort() {
+    use rmm_core::tools::{self, Settings, ToolSpec};
+    use std::collections::BTreeMap;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&src.join("New.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Settings.json"), "\u{feff}{\"app\":{\"theme\":1},\"games\":{\"SkyrimSE\":{\"outputPath\":\"old\"}}}");
+    write(
+        &src.join("tool.bat"),
+        [r"@echo off", r#"mkdir "%~1\Pandora_Engine" 2>nul"#, r#"echo run>> "%~1\Pandora_Engine\ActiveMods.json""#, r#"copy /y "%~2" "%~1\New.esp" >nul"#].join("\r\n"),
+    );
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
+    write(&root.join("loot/masterlist.yaml"), "plugins: []\n");
+    let set = BTreeMap::from([("games.SkyrimSE.gameDataPath".to_string(), "{data}".into()), ("games.SkyrimSE.outputPath".to_string(), "{output}".into())]);
+    let spec = ToolSpec {
+        exe: src.join("tool.bat"),
+        args: Some(vec!["{output}".into(), "{esp}".into()]),
+        vars: BTreeMap::from([("esp".to_string(), src.join("New.esp").display().to_string())]),
+        keep: Some(vec!["Pandora_Engine/*.json".into()]),
+        settings: Some(Settings { file: "Settings.json".into(), set }),
+        ..Default::default()
+    };
+    tools::add(&inst, "gen", spec).unwrap();
+
+    let r = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!(r.mod_id.as_deref(), Some("gen Output"), "{r:?}");
+    let json: serde_json::Value = serde_json::from_str(&read(&src.join("Settings.json"))).unwrap();
+    assert_eq!(json["app"]["theme"], 1);
+    assert_eq!(json["games"]["SkyrimSE"]["gameDataPath"].as_str().unwrap().replace('/', "\\"), inst.data_dir().display().to_string().replace('/', "\\"));
+    assert!(json["games"]["SkyrimSE"]["outputPath"].as_str().unwrap().ends_with("tool-gen"));
+    assert!(r.sort.is_some(), "{r:?}");
+    assert!(inst.profile().unwrap().plugins.iter().any(|p| p.name == "New.esp" && p.enabled));
+
+    // The kept file is carried into the next run, which appends to it; no new plugin, no sort.
+    let r2 = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!(read(&root.join("mods/gen Output (2)/Pandora_Engine/ActiveMods.json")).matches("run").count(), 2);
+    assert!(r2.sort.is_none() && r2.warnings.is_empty(), "{r2:?}");
+}
+
+/// Launch reads the game's version resource, refuses a script extender built for another version,
+/// and starts the matching loader from the game folder. PING.EXE stands in for game and loader.
+#[cfg(windows)]
+#[test]
+fn launch_checks_the_script_extender() {
+    use rmm_core::launch;
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    fs::copy(r"C:\Windows\System32\PING.EXE", game.join("SkyrimSE.exe")).unwrap();
+    let plain = launch::launch(&inst, true).unwrap();
+    assert_eq!(plain.exe, game.join("SkyrimSE.exe"));
+    assert!(plain.pid.is_none() && plain.script_extender.is_none(), "{plain:?}");
+
+    fs::copy(r"C:\Windows\System32\PING.EXE", game.join("skse64_loader.exe")).unwrap();
+    write(&game.join("skse64_1_5_97.dll"), "");
+    let err = launch::launch(&inst, true).unwrap_err().to_string();
+    assert!(err.contains("1.5.97") && err.contains(&plain.game_version), "{err}");
+
+    let v: Vec<&str> = plain.game_version.split('.').collect();
+    let dll = format!("skse64_{}_{}_{}.dll", v[0], v[1], v[2]);
+    write(&game.join(&dll), "");
+    let r = launch::launch(&inst, false).unwrap();
+    assert_eq!(r.script_extender.as_deref(), Some(dll.as_str()));
+    assert!(r.exe.ends_with("skse64_loader.exe") && r.pid.is_some(), "{r:?}");
+}

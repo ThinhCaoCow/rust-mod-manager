@@ -13,6 +13,7 @@ use crate::{Game, Instance, ModEntry, PluginEntry, ops, path_key};
 use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 
 const TOOLS: &str = "tools.toml";
 /// Presets `add` knows. The exe always comes from the user.
-pub const PRESETS: &[&str] = &["xedit", "xedit-qac", "bodyslide", "synthesis"];
+pub const PRESETS: &[&str] = &["xedit", "xedit-qac", "xlodgen", "bodyslide", "synthesis", "pandora", "pgpatcher", "texgen", "dyndolod"];
 const LIST_CAP: usize = 100;
 
 /// A configured tool, stored in the instance's `tools.toml` under its id.
@@ -44,6 +45,23 @@ pub struct Tool {
     /// Working directory; defaults to the exe's folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// Globs of files from the previous output copied into {output} before a run: state the tool
+    /// reads back, such as Pandora's mod list or PGPatcher's plugin (stable FormIDs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keep: Vec<String>,
+    /// A JSON settings file edited before each run, for tools that take paths only from there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
+}
+
+/// Keys rmm sets in a tool's JSON settings file before each run. Everything else in it stays.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, Default, PartialEq)]
+pub struct Settings {
+    /// The JSON file, relative to the exe's folder unless absolute. Created if missing.
+    pub file: PathBuf,
+    /// Dotted key path -> value, e.g. {"games.SkyrimSE.gameDataPath": "{data}"}. Placeholders
+    /// in string values are filled in.
+    pub set: BTreeMap<String, Value>,
 }
 
 /// What `add` takes: a preset and/or explicit fields. Fields given override the preset's.
@@ -51,7 +69,8 @@ pub struct Tool {
 pub struct ToolSpec {
     /// Path to the tool's executable.
     pub exe: PathBuf,
-    /// xedit, xedit-qac, bodyslide or synthesis. Defaults to the tool id when it names a preset.
+    /// xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen or dyndolod.
+    /// Defaults to the tool id when it names a preset.
     #[serde(default)]
     pub preset: Option<String>,
     #[serde(default)]
@@ -70,6 +89,12 @@ pub struct ToolSpec {
     /// Name of the generated mod.
     #[serde(default)]
     pub output_mod: Option<String>,
+    /// Globs of files from the previous output copied into {output} before a run.
+    #[serde(default)]
+    pub keep: Option<Vec<String>>,
+    /// JSON settings keys set before each run.
+    #[serde(default)]
+    pub settings: Option<Settings>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -84,6 +109,8 @@ pub struct RunReport {
     pub previous: Option<String>,
     /// Deployed files whose hard links are swapped for copies while the tool runs.
     pub swapped: Vec<String>,
+    /// The settings file rmm edits before the run.
+    pub settings_file: Option<PathBuf>,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     /// The new generated mod; none when the tool wrote nothing.
@@ -101,6 +128,8 @@ pub struct RunReport {
     pub log_tail: String,
     /// What deploying now would do (dry run), or what the final deploy did.
     pub deploy: Option<DeployPlan>,
+    /// LOOT's sort after a run that added plugins (only once a masterlist is cached).
+    pub sort: Option<crate::loot::SortReport>,
 }
 
 pub fn list(inst: &Instance) -> Result<BTreeMap<String, Tool>> {
@@ -121,7 +150,7 @@ pub fn add(inst: &Instance, id: &str, spec: ToolSpec) -> Result<Tool> {
     }
     let preset_name = spec.preset.as_deref().or(PRESETS.contains(&id).then_some(id));
     let mut tool = match preset_name {
-        Some(p) => preset(inst.config.game, p).with_context(|| format!("no preset '{p}' (presets: {})", PRESETS.join(", ")))?,
+        Some(p) => preset(inst.config.game, p).with_context(|| format!("no preset '{p}' for this game (presets: {})", PRESETS.join(", ")))?,
         None => Tool { name: id.into(), ..Default::default() },
     };
     tool.exe = spec.exe;
@@ -137,6 +166,12 @@ pub fn add(inst: &Instance, id: &str, spec: ToolSpec) -> Result<Tool> {
     }
     if spec.output_mod.is_some() {
         tool.output_mod = spec.output_mod;
+    }
+    if let Some(k) = spec.keep {
+        tool.keep = k;
+    }
+    if spec.settings.is_some() {
+        tool.settings = spec.settings;
     }
     inst.locked(|| {
         let mut tools = list(inst)?;
@@ -166,7 +201,11 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
     // xEdit only finds Steam installs by itself, and keeps backups and its cache inside Data.
     // -C: gets no trailing separator from xEdit, so it is written here.
     let xedit_args = [switch, "-D:{data}", "-P:{plugins}", "-M:{ini_dir}", "-I:{ini}", r"-B:{state}\backups", r"-C:{state}\cache\"];
+    // DynDOLOD's tools (xEdit-based, case-insensitive switches) want a trailing backslash on folders.
+    let lod_args = [switch, r"-o:{output}\", r"-d:{data}\", "-p:{plugins}", r"-m:{ini_dir}\"];
     let tool = |name: &str, args: Vec<String>| Tool { name: name.into(), args, ..Default::default() };
+    let settings = |file: &str, set: &[(&str, Value)]| Some(Settings { file: file.into(), set: set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() });
+    let skyrim = game == Game::SkyrimSe;
     Some(match name {
         // Saves by writing a new file and renaming it over the plugin, so links are safe.
         "xedit" => tool(xedit, s(&xedit_args)),
@@ -186,6 +225,29 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
             "Synthesis",
             s(&["run-pipeline", "-s", "{settings}", "-p", "{profile}", "-d", "{data}", "-l", "{plugins}", "-o", "{output}", "-m", "Text", "-r", r"{state}\persistence"]),
         ),
+        // xEdit in LOD mode: terrain LOD for both games. Without -o: it writes to the game folder.
+        "xlodgen" => tool("xLODGen", s(&[&xedit_args[..], &["-lodgen", r"-o:{output}\"]].concat())),
+        // GUI only: someone has to click through. TexGen runs before DynDOLOD, and its output
+        // must be enabled when DynDOLOD runs. DynDOLOD has no Fallout 4 object LOD.
+        "texgen" => tool("TexGen", s(&lod_args)),
+        "dyndolod" if skyrim => tool("DynDOLOD", s(&lod_args)),
+        // -o is never read; paths come from Settings.json, and outputPath must exist or output
+        // silently goes to Data. Its mod list lives in the output folder, so it carries over.
+        "pandora" if skyrim => Tool {
+            settings: settings("Settings.json", &[("games.SkyrimSE.gameDataPath", "{data}".into()), ("games.SkyrimSE.outputPath", "{output}".into())]),
+            keep: s(&["Pandora_Engine/ActiveMods.json"]),
+            ..tool("Pandora", s(&["--auto_run", "--auto_close"]))
+        },
+        // Mod manager 0 (None) reads the deployed Data folder. It reuses the previous
+        // PGPatcher.esp for stable FormIDs. The run ends in a dialog someone has to close.
+        "pgpatcher" if skyrim => Tool {
+            settings: settings(
+                "cfg/settings.json",
+                &[("params.game.dir", "{game}".into()), ("params.modmanager.type", 0.into()), ("params.output.dir", "{output}".into()), ("params.output.zip", false.into())],
+            ),
+            keep: s(&["PGPatcher.esp"]),
+            ..tool("PGPatcher", s(&["--autostart"]))
+        },
         _ => return None,
     })
 }
@@ -221,6 +283,7 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
         ..Default::default()
     };
     let disable_previous = previous.as_ref().filter(|m| m.enabled).map(|m| m.id.clone());
+    r.settings_file = tool.settings.as_ref().map(|s| tool.exe.parent().unwrap_or(Path::new("")).join(&s.file));
 
     if dry_run {
         r.swapped = swaps(&deploy::manifest_files(inst)?, &rewrites).into_iter().map(|e| e.target).collect();
@@ -244,6 +307,16 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     let _ = fs::remove_dir_all(&stash);
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
+    let kept = |f: &str| tool.keep.iter().any(|g| glob(g, f));
+    if let Some(old) = &previous {
+        let dir = inst.mod_dir(&old.id);
+        for f in index_dir(&dir)?.into_iter().filter(|f| kept(f)) {
+            copy_file(&dir.join(&f), &staging.join(&f))?;
+        }
+    }
+    if let (Some(s), Some(path)) = (&tool.settings, &r.settings_file) {
+        merge_settings(path, &s.set, &vars)?;
+    }
     let man = deploy::manifest_files(inst)?;
     let swapped = swaps(&man, &rewrites);
     for e in &swapped {
@@ -277,6 +350,7 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     r.log = Some(log);
 
     let after = snapshot(&data)?;
+    let mut added_plugins = false;
     let new_id = unique_id(inst, &sanitize(&output_mod));
     let dest = inst.mod_dir(&new_id);
     fs::rename(&staging, &dest)?;
@@ -337,7 +411,7 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     }
     let files = index_dir(&dest)?;
     r.files = files.len();
-    if files.is_empty() {
+    if files.iter().all(|f| kept(f)) {
         fs::remove_dir_all(&dest)?;
         r.warnings.push("the tool wrote nothing to Data or {output}".into());
         if let Some(p) = &disable_previous {
@@ -346,6 +420,8 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     } else {
         inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), fomod: None })?;
         let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect();
+        let known = inst.profile()?.plugins;
+        added_plugins = plugins.iter().any(|pl| !known.iter().any(|e| e.name.eq_ignore_ascii_case(pl)));
         inst.edit(&format!("run {id}"), |p| {
             let entry = ModEntry { id: new_id.clone(), enabled: true };
             match previous.as_ref().and_then(|old| p.mods.iter().position(|m| m.id == old.id)) {
@@ -366,6 +442,19 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
         r.mod_id = Some(new_id);
     }
     r.deploy = Some(deploy::deploy(inst, false)?);
+    // New plugins land at the end of the list. Sort them in if the user sorts with LOOT already;
+    // the first sort, with its download, stays the user's call.
+    if added_plugins && inst.root.join("loot").join("masterlist.yaml").is_file() {
+        match crate::loot::sort(inst, false) {
+            Ok(s) => {
+                if !s.moved.is_empty() {
+                    crate::plugins::write_plugins_txt(inst, &inst.profile()?)?;
+                }
+                r.sort = Some(s);
+            }
+            Err(e) => r.warnings.push(format!("LOOT couldn't sort the new plugins: {e:#}")),
+        }
+    }
     for v in [&mut r.new, &mut r.changed, &mut r.deleted] {
         if v.len() > LIST_CAP {
             let more = v.len() - LIST_CAP;
@@ -393,6 +482,31 @@ fn vars(inst: &Instance, tool: &Tool, state: &Path, staging: &Path, given: &BTre
     v.extend(tool.vars.clone());
     v.extend(given.clone());
     v
+}
+
+/// Set dotted keys in a JSON settings file, keeping the rest of it.
+fn merge_settings(path: &Path, set: &BTreeMap<String, Value>, vars: &BTreeMap<String, String>) -> Result<()> {
+    let mut root = match fs::read(path) {
+        // .NET tools may write a byte-order mark.
+        Ok(b) => serde_json::from_slice(b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b)).with_context(|| format!("cannot parse {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Default::default()),
+        Err(e) => return Err(e.into()),
+    };
+    for (key, v) in set {
+        let mut node = &mut root;
+        for part in key.split('.') {
+            if !node.is_object() {
+                *node = Value::Object(Default::default());
+            }
+            node = node.as_object_mut().unwrap().entry(part).or_insert(Value::Null);
+        }
+        *node = match v {
+            Value::String(t) => Value::String(expand(t, vars)?),
+            v => v.clone(),
+        };
+    }
+    fs::create_dir_all(path.parent().unwrap())?;
+    write_atomic(path, &serde_json::to_string_pretty(&root)?)
 }
 
 /// Fill `{name}` placeholders. Braces around anything but a name stay as they are.

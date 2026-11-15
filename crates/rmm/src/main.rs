@@ -70,6 +70,11 @@ enum Cmd {
     Masterlist,
     /// Health check.
     Check,
+    /// Deploy, check the script extender matches the game, and start it (Windows); --apply to do it.
+    Launch {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Show what deploying would change; --apply to do it.
     Deploy {
         #[arg(long)]
@@ -124,6 +129,9 @@ enum ToolCmd {
         /// Name of the generated mod.
         #[arg(long)]
         output_mod: Option<String>,
+        /// Glob of files from the previous output copied into {output} before a run (repeatable).
+        #[arg(long)]
+        keep: Vec<String>,
         /// Arguments after --, replacing the preset's. Placeholders: {data} {game} {plugins} {ini}
         /// {ini_dir} {output} {state} and any --var.
         #[arg(last = true)]
@@ -181,9 +189,10 @@ fn main() -> Result<()> {
         Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
         Cmd::Check => print(&health::check(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
+        Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
         Cmd::Tool(ToolCmd::List) => print(&serde_json::json!({ "tools": tools::list(&open()?)?, "presets": tools::PRESETS })),
-        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, args }) => {
+        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, args }) => {
             let spec = tools::ToolSpec {
                 exe,
                 preset,
@@ -192,6 +201,8 @@ fn main() -> Result<()> {
                 vars: vars.into_iter().collect(),
                 rewrites: (!rewrites.is_empty()).then_some(rewrites),
                 output_mod,
+                keep: (!keep.is_empty()).then_some(keep),
+                settings: None, // JSON settings: presets, MCP, or tools.toml
             };
             print(&tools::add(&open()?, &id, spec)?)
         }
