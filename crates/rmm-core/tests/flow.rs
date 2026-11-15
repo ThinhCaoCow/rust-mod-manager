@@ -75,9 +75,9 @@ fn full_flow() {
     write(&src.join("skse/skse64_2/Data/Scripts/skse.pex"), "pex");
 
     let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
-    let a = install::install(&inst, &src.join("A"), None, true).unwrap();
-    let b = install::install(&inst, &zip_path, Some("B"), true).unwrap();
-    let s = install::install(&inst, &src.join("skse"), Some("SKSE"), true).unwrap();
+    let a = install::install(&inst, &src.join("A"), None, true, None).unwrap();
+    let b = install::install(&inst, &zip_path, Some("B"), true, None).unwrap();
+    let s = install::install(&inst, &src.join("skse"), Some("SKSE"), true, None).unwrap();
     assert_eq!(a.plugins, vec!["A.esp"]);
     assert_eq!(b.plugins, vec!["B.esp"]);
     assert_eq!((s.root_files, s.files), (1, 2));
@@ -163,7 +163,7 @@ fn deployed_setup(tmp: &Path) -> (Instance, std::path::PathBuf) {
     write(&tmp.join("A/textures/sky.dds"), "A");
     write(&tmp.join("A/meshes/a.nif"), "a-mesh");
     let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.join("local")).unwrap();
-    install::install(&inst, &tmp.join("A"), None, true).unwrap();
+    install::install(&inst, &tmp.join("A"), None, true, None).unwrap();
     deploy::deploy(&inst, false).unwrap();
     (inst, game)
 }
@@ -252,7 +252,7 @@ fn fallout4_ini_checks() {
     write(&tmp.path().join("M/textures/x.dds"), "x");
     let mut inst = Instance::create(&tmp.path().join("inst"), Game::Fallout4, &game, &tmp.path().join("local")).unwrap();
     inst.config.ini_path = Some(ini.clone());
-    install::install(&inst, &tmp.path().join("M"), None, true).unwrap();
+    install::install(&inst, &tmp.path().join("M"), None, true, None).unwrap();
     let kinds = |inst: &Instance| health::fallout4_ini(inst).unwrap().into_iter().map(|i| i.kind).collect::<Vec<_>>();
 
     assert!(kinds(&inst).is_empty(), "no INIs yet: the game has never run");
@@ -263,15 +263,157 @@ fn fallout4_ini_checks() {
     assert!(kinds(&inst).is_empty());
 }
 
+/// Steps are listed out of order (the schema sorts them by name). Picking Blue sets a flag that
+/// reveals "2 Extras"; the default (Red) triggers a conditional patch. Green is NotUsable until
+/// Core.esp is active. base/tex.dds has priority 5, so it beats either colour's tex.dds.
+const MODULE_CONFIG: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+  <moduleName>Test Mod</moduleName>
+  <requiredInstallFiles>
+    <file source="core\Core.esp" destination="Core.esp"/>
+    <file source="docs\readme.txt"/>
+    <file source="base\tex.dds" destination="textures\" priority="5"/>
+    <folder source="" destination=""/>
+  </requiredInstallFiles>
+  <installSteps>
+    <installStep name="2 Extras">
+      <visible><flagDependency flag="colour" value="blue"/></visible>
+      <optionalFileGroups>
+        <group name="Extras" type="SelectAny">
+          <plugins>
+            <plugin name="Glow">
+              <description>Glowing bits</description>
+              <files><file source="extras\glow.dds" destination="textures\glow.dds"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="1 Colour">
+      <optionalFileGroups>
+        <group name="Colour" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Red">
+              <description>Red textures</description>
+              <files><folder source="red" destination="textures"/></files>
+              <conditionFlags><flag name="colour">red</flag></conditionFlags>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+            <plugin name="Blue">
+              <description>Blue textures</description>
+              <files><folder source="blue" destination="textures"/></files>
+              <conditionFlags><flag name="colour">blue</flag></conditionFlags>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+            <plugin name="Green">
+              <description>Needs Core.esp active</description>
+              <files><folder source="blue" destination="textures"/></files>
+              <typeDescriptor><dependencyType>
+                <defaultType name="NotUsable"/>
+                <patterns><pattern>
+                  <dependencies><fileDependency file="Core.esp" state="Active"/></dependencies>
+                  <type name="Optional"/>
+                </pattern></patterns>
+              </dependencyType></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+  <conditionalFileInstalls><patterns>
+    <pattern>
+      <dependencies><flagDependency flag="colour" value="red"/></dependencies>
+      <files><file source="patches\red_patch.esp" destination="RedPatch.esp"/></files>
+    </pattern>
+    <pattern>
+      <dependencies operator="Or">
+        <fileDependency file="Skyrim.esm" state="Active"/>
+        <fileDependency file="Nope.esp" state="Active"/>
+      </dependencies>
+      <files><file source="patches\vanilla.txt" destination="vanilla.txt"/></files>
+    </pattern>
+  </patterns></conditionalFileInstalls>
+</config>"#;
+
+fn fomod_source(dir: &Path) {
+    let xml: Vec<u8> = [0xFF, 0xFE].into_iter().chain(MODULE_CONFIG.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+    write(&dir.join("fomod/ModuleConfig.xml"), xml);
+    write(&dir.join("core/Core.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&dir.join("docs/readme.txt"), "readme");
+    write(&dir.join("base/tex.dds"), "base");
+    write(&dir.join("red/tex.dds"), "red");
+    write(&dir.join("red/sub/r.dds"), "r");
+    write(&dir.join("blue/tex.dds"), "blue");
+    write(&dir.join("extras/glow.dds"), "glow");
+    write(&dir.join("patches/red_patch.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&dir.join("patches/vanilla.txt"), "v");
+}
+
+fn choices(v: serde_json::Value) -> rmm_core::fomod::Choices {
+    serde_json::from_value(v).unwrap()
+}
+
 #[test]
-fn fomod_archives_are_refused_clearly() {
+fn fomod_installers() {
+    use rmm_core::fomod::Kind;
     let tmp = tempfile::tempdir().unwrap();
     let game = tmp.path().join("game");
     write(&game.join("SkyrimSE.exe"), "exe");
-    write(&tmp.path().join("m/fomod/ModuleConfig.xml"), "<config/>");
-    write(&tmp.path().join("m/opt1/textures/x.dds"), "x");
-    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("l")).unwrap();
-    let err = install::install(&inst, &tmp.path().join("m"), None, true).unwrap_err();
-    assert!(err.to_string().contains("FOMOD"));
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let src = tmp.path().join("F wrapper/F");
+    fomod_source(&src);
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+
+    let err = install::install(&inst, &src, None, true, None).unwrap_err().to_string();
+    assert!(err.contains("fomod_options"), "{err}");
     assert!(inst.profile().unwrap().mods.is_empty());
+
+    // Defaults: Red is recommended, so "2 Extras" stays hidden and the red patch is added.
+    let walk = install::fomod_options(&inst, &src, None).unwrap();
+    assert_eq!(walk.module, "Test Mod");
+    assert_eq!(walk.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["1 Colour"]);
+    let opts = &walk.steps[0].groups[0].options;
+    assert_eq!(opts.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["Blue", "Green", "Red"]);
+    assert_eq!(opts.iter().map(|o| o.selected).collect::<Vec<_>>(), [false, false, true]);
+    assert_eq!(opts[1].kind, Kind::NotUsable);
+    assert_eq!(walk.files, 6, "{walk:#?}"); // Core.esp, readme, tex, sub/r, RedPatch.esp, vanilla.txt
+
+    let blue = choices(serde_json::json!({"options": [{"name": "1 Colour", "groups": [{"name": "Colour", "choices": [{"name": "Blue"}]}]}]}));
+    let walk = install::fomod_options(&inst, &src, Some(&blue)).unwrap();
+    assert_eq!(walk.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["1 Colour", "2 Extras"]);
+
+    let green = choices(serde_json::json!({"options": [{"name": "1 Colour", "groups": [{"name": "Colour", "choices": [{"name": "Green"}]}]}]}));
+    assert!(format!("{:#}", install::fomod_options(&inst, &src, Some(&green)).unwrap_err()).contains("can't be used"));
+    let two = choices(serde_json::json!({"options": [{"name": "1 Colour", "groups": [{"name": "Colour", "choices": [{"name": "Red"}, {"name": "Blue"}]}]}]}));
+    assert!(format!("{:#}", install::fomod_options(&inst, &src, Some(&two)).unwrap_err()).contains("exactly one"));
+
+    let mut picks = walk.choices.clone();
+    picks.options[1].groups[0].choices.push(rmm_core::fomod::PluginChoice { name: "Glow".into(), idx: None });
+    let r = install::install(&inst, &src, Some("Blue"), true, Some(&picks)).unwrap();
+    let files = inst.mod_files(&r.id).unwrap();
+    assert_eq!(files, ["Core.esp", "docs/readme.txt", "textures/glow.dds", "textures/tex.dds", "vanilla.txt"]);
+    assert_eq!(read(&inst.mod_dir(&r.id).join("textures/tex.dds")), "base");
+    assert_eq!(r.plugins, ["Core.esp"]);
+    let meta = inst.mod_meta(&r.id).fomod.unwrap();
+    assert_eq!(meta.options[1].groups[0].choices[0].name, "Glow");
+    assert!(read(&inst.mod_dir(&r.id).join("rmm-mod.toml")).contains("type = \"fomod\""));
+
+    // Zip: preview, then install with defaults from the same unpacked copy.
+    let zip_path = tmp.path().join("F.zip");
+    {
+        let mut z = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
+        for e in walkdir::WalkDir::new(&src).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()) {
+            let rel = e.path().strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+            z.start_file(rel, zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(&fs::read(e.path()).unwrap()).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    assert_eq!(install::fomod_options(&inst, &zip_path, None).unwrap().files, 6);
+    let r = install::install(&inst, &zip_path, Some("Red"), true, Some(&Default::default())).unwrap();
+    assert_eq!(r.plugins, ["Core.esp", "RedPatch.esp"]);
+    assert_eq!(read(&inst.mod_dir(&r.id).join("textures/sub/r.dds")), "r");
+    assert!(!inst.root.join(".staging/preview").exists());
 }

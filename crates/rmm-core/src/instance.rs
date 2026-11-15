@@ -53,6 +53,9 @@ pub struct ModMeta {
     pub name: String,
     #[serde(default)]
     pub source: Option<String>,
+    /// FOMOD choices the mod was installed with (Vortex's `installerChoices` format).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fomod: Option<crate::fomod::Choices>,
 }
 
 pub struct Instance {
@@ -119,7 +122,7 @@ impl Instance {
         fs::read_to_string(self.mod_dir(id).join(MOD_META))
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_else(|| ModMeta { name: id.into(), source: None })
+            .unwrap_or_else(|| ModMeta { name: id.into(), ..Default::default() })
     }
 
     pub fn write_mod_meta(&self, id: &str, meta: &ModMeta) -> Result<()> {

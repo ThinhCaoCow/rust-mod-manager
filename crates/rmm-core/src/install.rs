@@ -1,6 +1,8 @@
-//! Install a mod from a folder, .zip or .7z: extract, find the Data root, store under mods/<id>.
+//! Install a mod from a folder, .zip or .7z: extract, find the Data root (or run its FOMOD
+//! installer), store under mods/<id>.
+use crate::fomod::{Choices, Env, FileState, Installer, Walk};
 use crate::instance::{ModMeta, index_dir};
-use crate::{Instance, ModEntry, PluginEntry};
+use crate::{Instance, ModEntry, PluginEntry, path_key};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::fs;
@@ -23,9 +25,13 @@ pub struct InstallReport {
     pub root_files: usize,
     pub plugins: Vec<String>,
     pub warnings: Vec<String>,
+    /// FOMOD choices used, stored in rmm-mod.toml for reinstalls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fomod: Option<Choices>,
 }
 
-pub fn install(inst: &Instance, source: &Path, name: Option<&str>, enable: bool) -> Result<InstallReport> {
+/// `choices` is required when the mod has a FOMOD installer (`Choices::default()` takes its defaults).
+pub fn install(inst: &Instance, source: &Path, name: Option<&str>, enable: bool, choices: Option<&Choices>) -> Result<InstallReport> {
     let name = name
         .map(str::to_owned)
         .or_else(|| source.file_stem().map(|s| s.to_string_lossy().into_owned()))
@@ -33,19 +39,65 @@ pub fn install(inst: &Instance, source: &Path, name: Option<&str>, enable: bool)
     let id = unique_id(inst, &sanitize(&name));
     let staging = inst.root.join(".staging").join(&id);
     let _ = fs::remove_dir_all(&staging);
-    let result = install_inner(inst, source, &staging, &id, &name, enable);
+    let result = install_inner(inst, source, &staging, &id, &name, enable, choices);
     let _ = fs::remove_dir_all(&staging);
+    if result.is_ok() {
+        let _ = fs::remove_dir_all(preview_dir(inst));
+    }
     result
 }
 
-fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name: &str, enable: bool) -> Result<InstallReport> {
-    let raw = staging.join("raw");
-    fs::create_dir_all(&raw)?;
-    extract(source, &raw)?;
+/// Steps, groups and options of a mod's FOMOD installer as they play out with `choices`
+/// (anything not chosen takes the installer's default), and how many files that installs.
+pub fn fomod_options(inst: &Instance, source: &Path, choices: Option<&Choices>) -> Result<Walk> {
+    let raw = if source.is_dir() { source.to_path_buf() } else { unpack(inst, source)? };
+    let Layout::Fomod(root) = find_layout(raw)? else {
+        bail!("{} has no FOMOD installer; install it directly", source.display());
+    };
+    let mut walk = fomod_walk(inst, &root, choices.unwrap_or(&Choices::default()))?;
+    let (files, warnings) = walk.resolve(&root)?;
+    walk.files = files.len();
+    walk.warnings.extend(warnings);
+    Ok(walk)
+}
+
+fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name: &str, enable: bool, choices: Option<&Choices>) -> Result<InstallReport> {
+    let archive = !source.is_dir();
+    let raw = if archive {
+        unpack(inst, source)?
+    } else {
+        let raw = staging.join("raw");
+        fs::create_dir_all(&raw)?;
+        copy_dir(source, &raw)?;
+        raw
+    };
 
     let mut warnings = Vec::new();
+    let mut fomod = None;
     let dest = inst.mod_dir(id);
-    match find_layout(raw)? {
+    let layout = find_layout(raw)?;
+    if archive && !matches!(layout, Layout::Fomod(_)) {
+        // The moves below take files out of the unpacked archive, so it can't be reused.
+        let _ = fs::remove_file(preview_dir(inst).join(".key"));
+    }
+    match layout {
+        Layout::Fomod(root) => {
+            let choices = choices.context("this mod has a FOMOD installer: look at its options with fomod_options, then install with choices ({} takes the defaults)")?;
+            let walk = fomod_walk(inst, &root, choices)?;
+            let (files, w) = walk.resolve(&root)?;
+            warnings.extend(walk.warnings.iter().cloned().chain(w));
+            if files.is_empty() {
+                bail!("the chosen options install no files");
+            }
+            for (rel, src) in files.values() {
+                let d = dest.join(rel);
+                fs::create_dir_all(d.parent().unwrap())?;
+                if fs::hard_link(src, &d).is_err() {
+                    fs::copy(src, &d)?;
+                }
+            }
+            fomod = Some(walk.choices);
+        }
         Layout::Data(d, guessed) => {
             if guessed {
                 warnings.push("no Data folder markers found; installed the archive contents as Data files".into());
@@ -69,7 +121,7 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
 
     let files = index_dir(&dest)?;
     fs::write(dest.join(".rmm-index"), files.join("\n"))?;
-    inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()) })?;
+    inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone() })?;
     let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect();
 
     inst.edit(&format!("install {id}"), |p| {
@@ -89,7 +141,52 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
         files: files.len(),
         plugins,
         warnings,
+        fomod,
     })
+}
+
+/// Run a FOMOD installer found at `root` against the instance's current setup.
+fn fomod_walk(inst: &Instance, root: &Path, choices: &Choices) -> Result<Walk> {
+    let config = child_ci(root, "fomod").and_then(|f| child_ci(&f, "moduleconfig.xml")).context("fomod/ModuleConfig.xml is missing")?;
+    let installer = Installer::parse(&fs::read(config)?)?;
+    let profile = inst.profile()?;
+    let winners = crate::conflicts::file_map(inst, &profile)?.winners();
+    let state = |f: &str| {
+        if !winners.contains_key(&path_key(f)) && !inst.data_dir().join(f.replace('\\', "/")).exists() {
+            return FileState::Missing;
+        }
+        // Plugins the profile doesn't list (base game, Creation Club) are loaded by the game.
+        let off = is_plugin(f) && profile.plugins.iter().any(|p| p.name.eq_ignore_ascii_case(f) && !p.enabled);
+        if off { FileState::Inactive } else { FileState::Active }
+    };
+    let loader = inst.config.game.loader();
+    let script_extender = inst.config.game_path.join(loader).is_file() || winners.contains_key(&path_key(&format!("root/{loader}")));
+    installer.walk(choices, &Env { file_state: &state, script_extender })
+}
+
+fn preview_dir(inst: &Instance) -> PathBuf {
+    inst.root.join(".staging").join("preview")
+}
+
+/// Unpack an archive into the one-slot preview cache, so fomod_options and the install that
+/// follows extract it once. Keyed by path, size and mtime.
+fn unpack(inst: &Instance, source: &Path) -> Result<PathBuf> {
+    let meta = fs::metadata(source).with_context(|| format!("cannot read {}", source.display()))?;
+    let key = format!("{}|{}|{:?}", source.display(), meta.len(), meta.modified().ok());
+    let dir = preview_dir(inst);
+    let raw = dir.join("raw");
+    if fs::read_to_string(dir.join(".key")).is_ok_and(|k| k == key) && raw.is_dir() {
+        return Ok(raw);
+    }
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&raw)?;
+    extract(source, &raw)?;
+    fs::write(dir.join(".key"), key)?;
+    Ok(raw)
+}
+
+fn child_ci(dir: &Path, name: &str) -> Option<PathBuf> {
+    fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name)).map(|e| e.path())
 }
 
 pub fn uninstall(inst: &Instance, id: &str) -> Result<()> {
@@ -139,6 +236,8 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
 }
 
 enum Layout {
+    /// Folder holds `fomod/ModuleConfig.xml`; its installer decides what goes where.
+    Fomod(PathBuf),
     /// Folder is Data contents. `bool` = guessed (no markers found).
     Data(PathBuf, bool),
     /// Folder is game-root contents (ENB, script extender loaders).
@@ -153,8 +252,8 @@ fn find_layout(mut dir: PathBuf) -> Result<Layout> {
         let lower = |e: &fs::DirEntry| e.file_name().to_string_lossy().to_lowercase();
         let is_dir = |e: &fs::DirEntry| e.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
-        if entries.iter().any(|e| is_dir(e) && lower(e) == "fomod" && has_module_config(&e.path())) {
-            bail!("this mod uses a FOMOD installer, which arrives in milestone 2");
+        if entries.iter().any(|e| is_dir(e) && lower(e) == "fomod" && child_ci(&e.path(), "moduleconfig.xml").is_some()) {
+            return Ok(Layout::Fomod(dir));
         }
         if let Some(data) = entries.iter().find(|e| is_dir(e) && lower(e) == "data") {
             return Ok(Layout::DataWithRoot { data: data.path(), root: dir });
@@ -176,12 +275,6 @@ fn find_layout(mut dir: PathBuf) -> Result<Layout> {
         }
         return Ok(Layout::Data(dir, true));
     }
-}
-
-fn has_module_config(fomod: &Path) -> bool {
-    fs::read_dir(fomod)
-        .map(|rd| rd.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case("moduleconfig.xml")))
-        .unwrap_or(false)
 }
 
 fn sanitize(name: &str) -> String {

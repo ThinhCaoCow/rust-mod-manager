@@ -2,7 +2,7 @@
 
 A mod manager for Skyrim SE/AE and Fallout 4 that an AI can drive over MCP. The design is in [SPEC.md](SPEC.md). The research behind it is in [reports/](reports/).
 
-**Status: milestone 1 of 6.** The core library, CLI and MCP server work. The UI, LOOT sorting, FOMOD, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
+**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server and FOMOD installers work. LOOT sorting, the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
 
 ## Build
 
@@ -17,6 +17,8 @@ rmm detect                                         # find installed games
 rmm init D:\Mods\skyrim --game skyrim-se           # create an instance (paths auto-detected)
 set RMM_INSTANCE=D:\Mods\skyrim                    # or pass -i <dir> to every command
 rmm install "C:\Downloads\SkyUI_5_2_SE.7z"
+rmm fomod "C:\Downloads\SomeFomodMod.7z"           # show a FOMOD installer's steps and defaults
+rmm install "C:\Downloads\SomeFomodMod.7z" --choices "{}"   # defaults; or JSON / @file from 'rmm fomod'
 rmm mods | rmm conflicts | rmm plugins | rmm check
 rmm move "SkyUI_5_2_SE" 0                          # priority 0 = lowest; higher wins conflicts
 rmm deploy                                         # preview what changes in the game folder
@@ -38,7 +40,7 @@ How deploys behave:
 claude mcp add rmm -- D:\Games\Rust_Mod_Manager\target\release\rmm.exe -i D:\Mods\skyrim mcp
 ```
 
-The server exposes 18 tools covering inspection, install, ordering, plugins, health checks, deploy, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change lands in undo history, so anything the AI does can be reversed.
+The server exposes 19 tools covering inspection, install (including FOMOD installers), ordering, plugins, health checks, deploy, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change lands in undo history, so anything the AI does can be reversed.
 
 ## Layout
 

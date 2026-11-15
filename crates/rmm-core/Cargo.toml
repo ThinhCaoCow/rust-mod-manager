@@ -19,6 +19,7 @@ schemars = "1"
 # Both already come in through libloadorder/walkdir.
 same-file = "1"
 dirs = "6"
+roxmltree = "0.21.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

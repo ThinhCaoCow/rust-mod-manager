@@ -44,6 +44,15 @@ enum Cmd {
         name: Option<String>,
         #[arg(long)]
         disabled: bool,
+        /// FOMOD choices as JSON, or @file holding it; '{}' takes the installer's defaults.
+        #[arg(long)]
+        choices: Option<String>,
+    },
+    /// Show a FOMOD installer's steps and options; --choices previews a selection.
+    Fomod {
+        path: PathBuf,
+        #[arg(long)]
+        choices: Option<String>,
     },
     Uninstall { id: String },
     Enable { id: String },
@@ -96,7 +105,14 @@ fn main() -> Result<()> {
         Cmd::Info => print(&ops::instance_info(&open()?)?),
         Cmd::Mods => print(&ops::list_mods(&open()?)?),
         Cmd::Show { id } => print(&ops::mod_details(&open()?, &id, usize::MAX)?),
-        Cmd::Install { path, name, disabled } => print(&install::install(&open()?, &path, name.as_deref(), !disabled)?),
+        Cmd::Install { path, name, disabled, choices } => {
+            let choices = choices.as_deref().map(parse_choices).transpose()?;
+            print(&install::install(&open()?, &path, name.as_deref(), !disabled, choices.as_ref())?)
+        }
+        Cmd::Fomod { path, choices } => {
+            let choices = choices.as_deref().map(parse_choices).transpose()?;
+            print(&install::fomod_options(&open()?, &path, choices.as_ref())?)
+        }
         Cmd::Uninstall { id } => done(install::uninstall(&open()?, &id)),
         Cmd::Enable { id } => done(ops::set_mod_enabled(&open()?, &id, true)),
         Cmd::Disable { id } => done(ops::set_mod_enabled(&open()?, &id, false)),
@@ -129,6 +145,14 @@ fn main() -> Result<()> {
 fn print<T: Serialize + ?Sized>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
+}
+
+fn parse_choices(arg: &str) -> Result<rmm_core::fomod::Choices> {
+    let text = match arg.strip_prefix('@') {
+        Some(file) => std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?,
+        None => arg.to_owned(),
+    };
+    serde_json::from_str(&text).context("--choices is not valid FOMOD choices JSON")
 }
 
 fn done(r: Result<()>) -> Result<()> {

@@ -7,6 +7,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
+use rmm_core::fomod::Choices;
 use rmm_core::{Instance, conflicts, deploy, health, install, ops, plugins};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ Plugins (.esp/.esm/.esl) have their own load order; masters always load before n
 Workflow: inspect (list_mods, list_conflicts, list_plugins, health_check) -> change (install_mod, \
 set_mod_enabled, move_mod, set_mod_order, set_plugin_order...) -> deploy with dry_run=true to \
 preview, then dry_run=false to apply. Nothing reaches the game folder until deploy is applied.
+FOMOD installers: fomod_options shows the steps, options and the resolved choices; edit those \
+choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
 re-run health_check after changes.";
 
@@ -47,6 +50,16 @@ struct InstallArgs {
     name: Option<String>,
     /// Enable after install (default true).
     enable: Option<bool>,
+    /// Required for mods with a FOMOD installer: the choices from fomod_options, edited as
+    /// needed. {} takes the installer's defaults.
+    choices: Option<Choices>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct FomodArgs {
+    /// Path to a mod folder, .zip or .7z on this machine.
+    path: String,
+    /// Choices to preview; steps and groups left out take their defaults.
+    choices: Option<Choices>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct EnableArgs {
@@ -123,9 +136,14 @@ impl Rmm {
         out(self.inst().and_then(|i| health::check(&i)))
     }
 
-    #[tool(description = "Install a mod from a local folder, .zip or .7z. Detects the Data root and game-root files.")]
+    #[tool(description = "Install a mod from a local folder, .zip or .7z. Detects the Data root and game-root files. Mods with a FOMOD installer need choices (see fomod_options).")]
     async fn install_mod(&self, Parameters(a): Parameters<InstallArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| install::install(&i, a.path.as_ref(), a.name.as_deref(), a.enable.unwrap_or(true))))
+        out(self.inst().and_then(|i| install::install(&i, a.path.as_ref(), a.name.as_deref(), a.enable.unwrap_or(true), a.choices.as_ref())))
+    }
+
+    #[tool(description = "Show a mod's FOMOD installer as it plays out with the given choices: visible steps, groups, options (type, description, selected), the full resolved choices, and the file count. Conditions are checked against the current setup.")]
+    async fn fomod_options(&self, Parameters(a): Parameters<FomodArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| install::fomod_options(&i, a.path.as_ref(), a.choices.as_ref())))
     }
 
     #[tool(description = "Uninstall a mod. Its files go to trash and come back on undo.")]
