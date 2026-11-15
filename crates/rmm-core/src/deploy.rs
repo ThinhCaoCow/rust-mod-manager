@@ -22,14 +22,14 @@ struct Manifest {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Deployed {
-    target: String,
-    mod_id: String,
-    src: String,
+pub(crate) struct Deployed {
+    pub target: String,
+    pub mod_id: String,
+    pub src: String,
     size: u64,
     mtime: u64,
     backed_up: bool,
-    copied: bool,
+    pub copied: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -270,7 +270,12 @@ fn purge_by_identity(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
 
 /// Path keys (game-relative, e.g. `data/foo.esp`) of every deployed file.
 pub fn managed_keys(inst: &Instance) -> Result<HashSet<String>> {
-    Ok(load_manifest(inst)?.files.into_keys().collect())
+    Ok(manifest_files(inst)?.into_keys().collect())
+}
+
+/// Every deployed file, keyed like `managed_keys`.
+pub(crate) fn manifest_files(inst: &Instance) -> Result<BTreeMap<String, Deployed>> {
+    Ok(load_manifest(inst)?.files)
 }
 
 fn check_owner(inst: &Instance) -> Result<()> {
@@ -355,7 +360,7 @@ fn overwrite_rel(target: &str) -> String {
     target.strip_prefix("Data/").map(str::to_owned).unwrap_or_else(|| format!("root/{target}"))
 }
 
-fn state(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn state(path: &Path) -> Option<(u64, u64)> {
     let m = fs::metadata(path).ok()?;
     let mtime = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
     Some((m.len(), mtime))

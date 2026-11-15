@@ -2,7 +2,7 @@ mod mcp;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, conflicts, deploy, game, health, install, ops, plugins};
+use rmm_core::{Game, Instance, conflicts, deploy, game, health, install, ops, plugins, tools};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -73,11 +73,56 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Configure tools (xEdit, BodySlide, Synthesis, or anything else).
+    #[command(subcommand)]
+    Tool(ToolCmd),
+    /// Run a tool and capture its output into a generated mod; --apply to do it.
+    Run {
+        id: String,
+        /// Placeholder value, e.g. --var plugin=Update.esm (repeatable).
+        #[arg(long = "var", value_parser = parse_var)]
+        vars: Vec<(String, String)>,
+        #[arg(long)]
+        apply: bool,
+        /// Stop the tool after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
     Undo,
     Redo,
     History,
     /// Serve the Model Context Protocol on stdio for AI clients.
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum ToolCmd {
+    /// Configured tools and the available presets.
+    List,
+    /// Add or replace a tool. An id naming a preset (xedit, xedit-qac, bodyslide, synthesis) uses it.
+    Add {
+        id: String,
+        #[arg(long)]
+        exe: PathBuf,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        /// Default placeholder value, e.g. --var groups=CBBE (repeatable).
+        #[arg(long = "var", value_parser = parse_var)]
+        vars: Vec<(String, String)>,
+        /// Data-relative glob of files the tool rewrites in place (repeatable).
+        #[arg(long = "rewrites")]
+        rewrites: Vec<String>,
+        /// Name of the generated mod.
+        #[arg(long)]
+        output_mod: Option<String>,
+        /// Arguments after --, replacing the preset's. Placeholders: {data} {game} {plugins} {ini}
+        /// {ini_dir} {output} {state} and any --var.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Remove { id: String },
 }
 
 fn main() -> Result<()> {
@@ -128,6 +173,24 @@ fn main() -> Result<()> {
         Cmd::Check => print(&health::check(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
+        Cmd::Tool(ToolCmd::List) => print(&serde_json::json!({ "tools": tools::list(&open()?)?, "presets": tools::PRESETS })),
+        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, args }) => {
+            let spec = tools::ToolSpec {
+                exe,
+                preset,
+                name,
+                args: (!args.is_empty()).then_some(args),
+                vars: vars.into_iter().collect(),
+                rewrites: (!rewrites.is_empty()).then_some(rewrites),
+                output_mod,
+            };
+            print(&tools::add(&open()?, &id, spec)?)
+        }
+        Cmd::Tool(ToolCmd::Remove { id }) => done(tools::remove(&open()?, &id)),
+        Cmd::Run { id, vars, apply, timeout } => {
+            let vars = vars.into_iter().collect();
+            print(&tools::run(&open()?, &id, &vars, !apply, timeout.map(std::time::Duration::from_secs))?)
+        }
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
         Cmd::History => print(&open()?.history()?),
@@ -153,6 +216,10 @@ fn parse_choices(arg: &str) -> Result<rmm_core::fomod::Choices> {
         None => arg.to_owned(),
     };
     serde_json::from_str(&text).context("--choices is not valid FOMOD choices JSON")
+}
+
+fn parse_var(s: &str) -> Result<(String, String), String> {
+    s.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())).ok_or_else(|| format!("expected name=value, got '{s}'"))
 }
 
 fn done(r: Result<()>) -> Result<()> {

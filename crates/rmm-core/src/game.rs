@@ -51,6 +51,13 @@ impl Game {
             Game::Fallout4 => "Fallout4.exe",
         }
     }
+    /// The main INI in the My Games folder.
+    pub fn ini_name(self) -> &'static str {
+        match self {
+            Game::SkyrimSe => "Skyrim.ini",
+            Game::Fallout4 => "Fallout4.ini",
+        }
+    }
     pub fn loader(self) -> &'static str {
         match self {
             Game::SkyrimSe => "skse64_loader.exe",

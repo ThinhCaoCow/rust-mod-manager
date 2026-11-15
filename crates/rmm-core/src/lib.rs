@@ -8,6 +8,7 @@ pub mod install;
 pub mod instance;
 pub mod ops;
 pub mod plugins;
+pub mod tools;
 
 pub use game::Game;
 pub use instance::{Instance, ModEntry, PluginEntry, Profile};

@@ -8,7 +8,9 @@ use rmcp::{
     transport::stdio,
 };
 use rmm_core::fomod::Choices;
-use rmm_core::{Instance, conflicts, deploy, health, install, ops, plugins};
+use rmm_core::tools::ToolSpec;
+use rmm_core::{Instance, conflicts, deploy, health, install, ops, plugins, tools};
+use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -22,6 +24,7 @@ set_mod_enabled, move_mod, set_mod_order, set_plugin_order...) -> deploy with dr
 preview, then dry_run=false to apply. Nothing reaches the game folder until deploy is applied.
 FOMOD installers: fomod_options shows the steps, options and the resolved choices; edit those \
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
+Tools: add_tool registers a program (presets: xedit, xedit-qac, bodyslide, synthesis); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
 re-run health_check after changes.";
 
@@ -92,6 +95,26 @@ struct PluginOrderArgs {
 struct DryRun {
     /// Preview only (default true). Set false to change the game folder.
     dry_run: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AddToolArgs {
+    /// Tool id: letters, digits, '-' and '_'. An id naming a preset uses that preset.
+    id: String,
+    #[serde(flatten)]
+    spec: ToolSpec,
+}
+#[derive(Deserialize, JsonSchema)]
+struct RunToolArgs {
+    /// Tool id from list_tools.
+    id: String,
+    /// Placeholder values for this run, e.g. {"plugin": "Update.esm"}.
+    #[serde(default)]
+    vars: BTreeMap<String, String>,
+    /// Preview only (default true). Set false to deploy, run the tool and capture its output.
+    dry_run: Option<bool>,
+    /// Stop the tool after this many seconds.
+    timeout_secs: Option<u64>,
 }
 
 fn out<T: Serialize>(r: anyhow::Result<T>) -> Result<String, String> {
@@ -184,6 +207,22 @@ impl Rmm {
     #[tool(description = "Remove all deployed files and restore originals. dry_run defaults to true.")]
     async fn purge(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
         out(self.inst().and_then(|i| deploy::purge(&i, a.dry_run.unwrap_or(true))))
+    }
+
+    #[tool(description = "Configured tools (exe, argument template, vars, rewrites) and the available presets.")]
+    async fn list_tools(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| Ok(serde_json::json!({ "tools": tools::list(&i)?, "presets": tools::PRESETS }))))
+    }
+
+    #[tool(description = "Register or replace a tool. Give the exe path; a preset fills in the arguments, which args, vars and rewrites override.")]
+    async fn add_tool(&self, Parameters(a): Parameters<AddToolArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| tools::add(&i, &a.id, a.spec)))
+    }
+
+    #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). dry_run defaults to true and returns the command and plan. Blocks until the tool exits.")]
+    async fn run_tool(&self, Parameters(a): Parameters<RunToolArgs>) -> Result<String, String> {
+        let timeout = a.timeout_secs.map(std::time::Duration::from_secs);
+        out(self.inst().and_then(|i| tools::run(&i, &a.id, &a.vars, a.dry_run.unwrap_or(true), timeout)))
     }
 
     #[tool(description = "Undo the last change to the profile. Returns its label, or null if nothing to undo.")]

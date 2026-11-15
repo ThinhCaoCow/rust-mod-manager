@@ -277,13 +277,13 @@ fn find_layout(mut dir: PathBuf) -> Result<Layout> {
     }
 }
 
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let s: String = name.chars().filter(|c| !r#"<>:"/\|?*"#.contains(*c) && !c.is_control()).collect();
     let s = s.trim().trim_end_matches('.').to_string();
     if s.is_empty() { "mod".into() } else { s }
 }
 
-fn unique_id(inst: &Instance, base: &str) -> String {
+pub(crate) fn unique_id(inst: &Instance, base: &str) -> String {
     let taken = |id: &str| inst.mod_dir(id).exists() || inst.root.join("trash").join(id).exists();
     if !taken(base) {
         return base.into();

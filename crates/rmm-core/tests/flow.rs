@@ -417,3 +417,85 @@ fn fomod_installers() {
     assert_eq!(read(&inst.mod_dir(&r.id).join("textures/sub/r.dds")), "r");
     assert!(!inst.root.join(".staging/preview").exists());
 }
+
+/// A fake tool (a .bat) exercising every capture path: directed output, a new Data file, an
+/// in-place edit of a swapped link, a rewrite of a vanilla file kept for restore, and an
+/// in-place write through a link that isn't in the tool's rewrites.
+#[cfg(windows)]
+#[test]
+fn tool_runs_capture_output_into_a_generated_mod() {
+    use rmm_core::tools::{self, ToolSpec};
+    use std::collections::BTreeMap;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&game.join("Data/vanilla.ini"), "vanilla");
+    write(&src.join("BodySlide/CalienteTools/BodySlide/Config.xml"), "orig-config");
+    write(&src.join("BodySlide/CalienteTools/BodySlide/Other.xml"), "other");
+    write(&src.join("Plain/meshes/a.nif"), "a-mesh");
+    write(
+        &src.join("tool.bat"),
+        [
+            r"@echo off",
+            r#"mkdir "%~1\meshes""#,
+            r#"echo built> "%~1\meshes\body.nif""#,
+            r#"echo setting>> "%~2\CalienteTools\BodySlide\Config.xml""#,
+            r#"echo new> "%~2\newfile.txt""#,
+            r#"echo cleaned> "%~2\vanilla.ini""#,
+            r#"echo oops>> "%~2\meshes\a.nif""#,
+            r"echo done",
+        ]
+        .join("\r\n"),
+    );
+
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
+    install::install(&inst, &src.join("BodySlide"), None, true, None).unwrap();
+    install::install(&inst, &src.join("Plain"), None, true, None).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    let spec = ToolSpec {
+        exe: src.join("tool.bat"),
+        args: Some(vec!["{output}".into(), "{data}".into()]),
+        rewrites: Some(vec!["vanilla.ini".into(), "CalienteTools/BodySlide/*.xml".into()]),
+        ..Default::default()
+    };
+    tools::add(&inst, "gen", spec).unwrap();
+
+    let plan = tools::run(&inst, "gen", &BTreeMap::new(), true, None).unwrap();
+    assert_eq!(plan.swapped.len(), 2, "{plan:?}");
+    assert!(!game.join("Data/newfile.txt").exists(), "a dry run changes nothing");
+
+    let r = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!(r.mod_id.as_deref(), Some("gen Output"), "{r:?}");
+    assert_eq!(r.exit_code, Some(0));
+    assert!(r.log_tail.contains("done"), "{r:?}");
+    let out = root.join("mods/gen Output");
+    assert!(read(&out.join("meshes/body.nif")).contains("built"));
+    assert!(read(&out.join("newfile.txt")).contains("new"));
+    assert!(read(&out.join("vanilla.ini")).contains("cleaned"));
+    assert!(read(&out.join("CalienteTools/BodySlide/Config.xml")).contains("setting"));
+    assert!(read(&out.join("meshes/a.nif")).contains("oops"));
+    // The swapped link kept the mod store clean; the unlisted one wrote through and is reported.
+    assert_eq!(read(&root.join("mods/BodySlide/CalienteTools/BodySlide/Config.xml")), "orig-config");
+    assert_eq!(r.modified_in_place, vec!["Plain: meshes/a.nif".to_string()]);
+    // Untouched swapped copies are links again; the vanilla original went to backup/.
+    assert!(same_file::is_same_file(game.join("Data/CalienteTools/BodySlide/Other.xml"), root.join("mods/BodySlide/CalienteTools/BodySlide/Other.xml")).unwrap());
+    assert!(same_file::is_same_file(game.join("Data/newfile.txt"), out.join("newfile.txt")).unwrap());
+    assert_eq!(read(&root.join("backup/Data/vanilla.ini")), "vanilla");
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+    // A second run replaces the output; undo brings the first one back.
+    let r2 = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!(r2.previous.as_deref(), Some("gen Output"));
+    assert_eq!(r2.mod_id.as_deref(), Some("gen Output (2)"));
+    let ids: Vec<String> = inst.profile().unwrap().mods.into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, ["BodySlide", "Plain", "gen Output (2)"]);
+    assert!(root.join("trash/gen Output").is_dir());
+    inst.undo().unwrap();
+    assert!(inst.profile().unwrap().mods.iter().any(|m| m.id == "gen Output"));
+    assert!(out.is_dir());
+
+    deploy::purge(&inst, false).unwrap();
+    assert_eq!(read(&game.join("Data/vanilla.ini")), "vanilla");
+    assert!(!game.join("Data/newfile.txt").exists() && !game.join("Data/meshes/body.nif").exists());
+}
