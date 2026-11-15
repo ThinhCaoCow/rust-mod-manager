@@ -52,6 +52,20 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         }
     }
 
+    let (loaded, unloaded) = crate::conflicts::mod_archives(inst, &profile, &map)?;
+    for (mod_id, name) in unloaded {
+        // Base-game archive names are loaded from the INIs, not by a plugin.
+        let n = name.to_lowercase();
+        if !n.starts_with("skyrim - ") && !n.starts_with("fallout4 - ") {
+            add("warning", "archive_not_loaded", &name, format!("{mod_id}: no enabled plugin loads this archive; the game only loads archives named after an active plugin"));
+        }
+    }
+    for a in loaded {
+        if let Err(e) = crate::archives::list(&inst.mod_dir(&a.mod_id).join(&a.name)) {
+            add("warning", "archive_unreadable", &a.name, format!("{}: {e:#}", a.mod_id));
+        }
+    }
+
     let game = inst.config.game;
     let se_dir = format!("data/{}/plugins/", if game == crate::Game::SkyrimSe { "skse" } else { "f4se" });
     let has_se_plugins = map.files.values().any(|(rel, _)| crate::path_key(&format!("Data/{rel}")).starts_with(&se_dir) && rel.to_lowercase().ends_with(".dll"));

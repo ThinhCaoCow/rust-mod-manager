@@ -2,7 +2,7 @@
 
 A mod manager for Skyrim SE/AE and Fallout 4 that an AI can drive over MCP. The design is in [SPEC.md](SPEC.md). The research behind it is in [reports/](reports/).
 
-**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting and tool runs work. Conflicts inside BSA/BA2 and Proton launching finish milestone 2; the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
+**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting, archive conflicts and tool runs work. Proton launching finishes milestone 2; the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
 
 ## Build
 
@@ -49,7 +49,7 @@ The server exposes 24 tools covering inspection, install (including FOMOD instal
 ## Layout
 
 ```
-crates/rmm-core   game detection, instances, install, fomod, conflicts, deploy, plugins, loot, health, tools, ops
+crates/rmm-core   game detection, instances, install, fomod, conflicts, archives, deploy, plugins, loot, health, tools, ops
 crates/rmm        CLI + MCP server (one binary)
 ```
 

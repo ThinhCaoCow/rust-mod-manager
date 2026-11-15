@@ -144,7 +144,7 @@ impl Rmm {
         out(self.inst().and_then(|i| ops::mod_details(&i, &a.id, a.max_files.unwrap_or(200))))
     }
 
-    #[tool(description = "Loose-file conflicts between enabled mods: who overwrites whom, and mods that are fully overridden.")]
+    #[tool(description = "Conflicts between enabled mods: loose files (higher priority wins) and files inside loaded BSA/BA2 archives (the archive whose plugin loads later wins; any loose file beats every archive). Who overwrites whom, and mods that are fully overridden.")]
     async fn list_conflicts(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| conflicts::conflicts(&i, &i.profile()?)))
     }
@@ -154,7 +154,7 @@ impl Rmm {
         out(self.inst().and_then(|i| plugins::list(&i, &i.profile()?)))
     }
 
-    #[tool(description = "Problems to fix: missing masters, plugin limits, missing script extender, fully overridden mods, undeployed or externally changed files, LOOT warnings and dirty plugins.")]
+    #[tool(description = "Problems to fix: missing masters, plugin limits, missing script extender, fully overridden mods, archives no plugin loads, undeployed or externally changed files, LOOT warnings and dirty plugins.")]
     async fn health_check(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| health::check(&i)))
     }

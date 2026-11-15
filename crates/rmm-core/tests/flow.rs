@@ -418,6 +418,77 @@ fn fomod_installers() {
     assert!(!inst.root.join(".staging/preview").exists());
 }
 
+/// Minimal Skyrim SE (v105) BSA with names and no file data: enough for listing.
+fn bsa_bytes(files: &[&str]) -> Vec<u8> {
+    let mut dirs: Vec<(&str, Vec<&str>)> = Vec::new();
+    for f in files {
+        let (dir, name) = f.rsplit_once('/').unwrap();
+        match dirs.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, names)) => names.push(name),
+            None => dirs.push((dir, vec![name])),
+        }
+    }
+    let mut b = b"BSA\0".to_vec();
+    let dir_names: usize = dirs.iter().map(|(d, _)| d.len() + 1).sum();
+    let file_names: usize = files.iter().map(|f| f.rsplit_once('/').unwrap().1.len() + 1).sum();
+    for v in [105, 36, 3, dirs.len(), files.len(), dir_names, file_names, 0] {
+        b.extend((v as u32).to_le_bytes());
+    }
+    for (_, names) in &dirs {
+        b.extend([0u8; 8]);
+        b.extend((names.len() as u32).to_le_bytes());
+        b.extend([0u8; 12]);
+    }
+    for (dir, names) in &dirs {
+        b.push(dir.len() as u8 + 1);
+        b.extend(dir.replace('/', "\\").as_bytes());
+        b.push(0);
+        b.extend(vec![0u8; 16 * names.len()]);
+    }
+    for (_, names) in &dirs {
+        for n in names {
+            b.extend(n.as_bytes());
+            b.push(0);
+        }
+    }
+    b
+}
+
+/// Archive conflicts follow plugin load order, and loose files beat every archive.
+#[test]
+fn archive_conflicts() {
+    use rmm_core::ops;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&src.join("C/meshes/m.nif"), "loose");
+    write(&src.join("A/A.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("A/A.bsa"), bsa_bytes(&["textures/x.dds", "textures/a.dds", "meshes/m.nif"]));
+    write(&src.join("B/B.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("B/B - Textures.bsa"), bsa_bytes(&["textures/x.dds"]));
+    write(&src.join("D/D.bsa"), bsa_bytes(&["textures/d.dds"]));
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
+    for name in ["C", "A", "B", "D"] {
+        install::install(&inst, &src.join(name), None, true, None).unwrap();
+    }
+    let get = |inst: &Instance, id: &str| conflicts::conflicts(inst, &inst.profile().unwrap()).unwrap().into_iter().find(|c| c.id == id).unwrap();
+
+    let a = get(&inst, "A");
+    assert_eq!((a.archived_files, a.archived_losing), (3, 2), "{a:?}");
+    assert_eq!(a.archive_overwritten_by, ["C", "B"], "C's loose file beats A's archive despite its lower priority");
+    assert_eq!(get(&inst, "B").archive_overwrites, ["A"]);
+    assert_eq!(get(&inst, "C").archive_overwrites, ["A"]);
+    let issues = health::check(&inst).unwrap();
+    assert!(issues.iter().any(|i| i.kind == "archive_not_loaded" && i.subject == "D.bsa"), "{issues:?}");
+    assert!(!issues.iter().any(|i| i.kind == "archive_not_loaded" && i.subject != "D.bsa"), "{issues:?}");
+
+    ops::set_plugin_order(&inst, &["B.esp".into(), "A.esp".into()]).unwrap();
+    let a = get(&inst, "A");
+    assert_eq!((a.archived_losing, a.archive_overwritten_by.as_slice()), (1, ["C".to_string()].as_slice()));
+    assert_eq!(a.archive_overwrites, ["B"]);
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for b in bytes {
