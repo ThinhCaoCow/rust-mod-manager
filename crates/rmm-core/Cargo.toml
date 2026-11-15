@@ -16,6 +16,9 @@ libloadorder = "18"
 esplugin = "6"
 fd-lock = "4"
 schemars = "1"
+# Both already come in through libloadorder/walkdir.
+same-file = "1"
+dirs = "6"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

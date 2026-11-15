@@ -60,12 +60,58 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         add("error", "script_extender_missing", game.loader(), "script extender plugins are installed but the loader is not".into());
     }
 
-    let plan = crate::deploy::deploy(inst, true)?;
-    if !plan.is_noop() {
-        add("warning", "not_deployed", "deploy", format!("{} files to link and {} to remove since the last deploy", plan.link.len(), plan.remove.len()));
+    match crate::deploy::deploy(inst, true) {
+        Err(e) => add("error", "deploy_blocked", "deploy", e.to_string()),
+        Ok(plan) => {
+            if !plan.is_noop() {
+                add("warning", "not_deployed", "deploy", format!("{} files to link and {} to remove since the last deploy", plan.link.len(), plan.remove.len()));
+            }
+            for f in plan.external_changes {
+                add("warning", "external_change", &f, "changed outside rmm; deploy copies it to overwrite/, which then wins over every mod".into());
+            }
+        }
     }
-    for f in plan.external_changes {
-        add("warning", "external_change", &f, "changed outside rmm; it will be copied to overwrite/ on next deploy".into());
-    }
+    issues.extend(fallout4_ini(inst)?);
     Ok(issues)
+}
+
+/// Fallout 4 INI settings that quietly undo a deploy. Skipped until the game has written its INIs.
+pub fn fallout4_ini(inst: &Instance) -> Result<Vec<Issue>> {
+    let mut out = Vec::new();
+    let dir = inst.ini_dir().filter(|_| inst.config.game == crate::Game::Fallout4);
+    let Some(base) = dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("Fallout4.ini")).ok()) else {
+        return Ok(out);
+    };
+    let custom = std::fs::read_to_string(dir.unwrap().join("Fallout4Custom.ini")).unwrap_or_default();
+    let get = |section: &str, key: &str| ini_get(&custom, section, key).or_else(|| ini_get(&base, section, key));
+    let mut add = |severity, kind, subject: &str, message: &str| {
+        out.push(Issue { severity, kind, subject: subject.into(), message: message.into() })
+    };
+    if (1..=10).any(|i| get("General", &format!("sTestFile{i}")).is_some_and(|v| !v.is_empty())) {
+        add("error", "ini_test_file", "Fallout4.ini", "sTestFile entries under [General] make the game ignore plugins.txt; remove them");
+    }
+    let map = crate::conflicts::file_map(inst, &inst.profile()?)?;
+    let loose = map.files.keys().any(|k| k.contains('/') && !k.starts_with("root/"));
+    let invalidates = get("Archive", "bInvalidateOlderFiles").as_deref() == Some("1")
+        && get("Archive", "sResourceDataDirsFinal").is_none_or(|v| v.is_empty());
+    if loose && !invalidates {
+        add("warning", "archive_invalidation", "Fallout4Custom.ini", "loose files can lose to BA2 archives; set bInvalidateOlderFiles=1 and an empty sResourceDataDirsFinal= under [Archive]");
+    }
+    Ok(out)
+}
+
+/// First `key=value` under `[section]`, matched case-insensitively.
+fn ini_get(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut inside = false;
+    for line in text.lines().map(|l| l.trim_start_matches('\u{feff}').trim()) {
+        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = s.trim().eq_ignore_ascii_case(section);
+        } else if inside
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim().eq_ignore_ascii_case(key)
+        {
+            return Some(v.trim().to_owned());
+        }
+    }
+    None
 }

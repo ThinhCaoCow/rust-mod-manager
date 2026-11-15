@@ -88,8 +88,7 @@ fn main() -> Result<()> {
                 .or_else(|| found.as_ref().map(|d| d.game_path.clone()))
                 .context("game not found; pass --game-path")?;
             let local_path = local_path
-                .or_else(|| found.and_then(|d| d.local_path))
-                .or_else(|| game::local_path(g, None))
+                .or_else(|| game::local_path(g, &game_path))
                 .context("cannot work out where plugins.txt lives; pass --local-path")?;
             let inst = Instance::create(&dir, g, &game_path, &local_path)?;
             print(&ops::instance_info(&inst)?)

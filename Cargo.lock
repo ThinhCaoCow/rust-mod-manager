@@ -1147,9 +1147,11 @@ name = "rmm-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "esplugin",
  "fd-lock",
  "libloadorder",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

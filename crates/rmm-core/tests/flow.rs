@@ -112,13 +112,14 @@ fn full_flow() {
     assert_eq!(plan.link, vec!["Data/textures/sky.dds"]);
     assert_eq!(read(&game.join("Data/textures/sky.dds")), "A");
 
-    // A tool replaces a deployed file (atomic save): captured to overwrite/, never lost.
+    // A tool replaces a deployed file (atomic save): captured to overwrite/, which wins from then on.
     fs::remove_file(game.join("Data/meshes/a.nif")).unwrap();
     write(&game.join("Data/meshes/a.nif"), "edited by tool");
     assert!(health::check(&inst).unwrap().iter().any(|i| i.kind == "external_change"));
     deploy::deploy(&inst, false).unwrap();
     assert_eq!(read(&root.join("overwrite/meshes/a.nif")), "edited by tool");
-    assert_eq!(read(&game.join("Data/meshes/a.nif")), "a-mesh");
+    assert_eq!(read(&game.join("Data/meshes/a.nif")), "edited by tool");
+    assert!(deploy::deploy(&inst, true).unwrap().is_noop());
 
     // Undo / redo the reorder.
     assert_eq!(inst.undo().unwrap().as_deref(), Some("move B up"));
@@ -152,6 +153,114 @@ fn full_flow() {
     assert!(!game.join("skse64_loader.exe").exists());
     assert!(game.join("Data/Skyrim.esm").exists());
     assert!(!game.join(".rmm-owner").exists());
+}
+
+/// Vanilla Skyrim folder plus one installed, deployed mod A (sky.dds over vanilla, a.nif new).
+fn deployed_setup(tmp: &Path) -> (Instance, std::path::PathBuf) {
+    let (game, root) = (tmp.join("game"), tmp.join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/textures/sky.dds"), "vanilla");
+    write(&tmp.join("A/textures/sky.dds"), "A");
+    write(&tmp.join("A/meshes/a.nif"), "a-mesh");
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.join("local")).unwrap();
+    install::install(&inst, &tmp.join("A"), None, true).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    (inst, game)
+}
+
+fn has_issue(inst: &Instance, kind: &str) -> bool {
+    health::check(inst).unwrap().iter().any(|i| i.kind == kind)
+}
+
+#[test]
+fn changes_are_detected_by_file_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    let sky = game.join("Data/textures/sky.dds");
+
+    // Replaced by a file with the same size and mtime: only identity can tell.
+    let mtime = fs::metadata(&sky).unwrap().modified().unwrap();
+    fs::remove_file(&sky).unwrap();
+    write(&sky, "Z");
+    fs::File::options().write(true).open(&sky).unwrap().set_modified(mtime).unwrap();
+    let plan = deploy::deploy(&inst, false).unwrap();
+    assert_eq!(plan.external_changes, vec!["Data/textures/sky.dds"]);
+    assert_eq!(read(&inst.root.join("overwrite/textures/sky.dds")), "Z");
+    assert_eq!(read(&sky), "Z");
+
+    // Edited in place through the hard link: the mod file changed with it, nothing to capture.
+    fs::write(game.join("Data/meshes/a.nif"), "edited in place").unwrap();
+    assert!(deploy::deploy(&inst, true).unwrap().is_noop());
+
+    // Files a tool drops into overwrite/ are deployed on top.
+    write(&inst.root.join("overwrite/meshes/new.nif"), "tool output");
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&game.join("Data/meshes/new.nif")), "tool output");
+}
+
+#[test]
+fn purge_without_manifest_finds_links_by_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    fs::remove_file(inst.root.join("deploy.json")).unwrap();
+
+    let err = deploy::deploy(&inst, true).unwrap_err().to_string();
+    assert!(err.contains("deploy.json"), "{err}");
+    assert!(has_issue(&inst, "deploy_blocked"));
+
+    let mut removed = deploy::purge(&inst, true).unwrap().remove;
+    removed.sort();
+    assert_eq!(removed, vec!["Data/meshes/a.nif", "Data/textures/sky.dds"]);
+    deploy::purge(&inst, false).unwrap();
+    assert_eq!(read(&game.join("Data/textures/sky.dds")), "vanilla");
+    assert!(!game.join("Data/meshes").exists());
+    assert!(!game.join(".rmm-owner").exists());
+    deploy::deploy(&inst, false).unwrap();
+}
+
+#[test]
+fn deploy_refuses_a_vortex_managed_game() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    write(&game.join("Data/vortex.deployment.json"), "{}");
+    assert!(deploy::deploy(&inst, true).unwrap_err().to_string().contains("Vortex"));
+    assert!(has_issue(&inst, "deploy_blocked"));
+}
+
+#[cfg(windows)]
+#[test]
+fn deploy_refuses_while_the_game_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    let exe = game.join("SkyrimSE.exe");
+    fs::copy(r"C:\Windows\System32\PING.EXE", &exe).unwrap();
+    let mut child = std::process::Command::new(&exe).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let blocked = deploy::deploy(&inst, false);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(blocked.unwrap_err().to_string().contains("running"));
+    deploy::deploy(&inst, false).unwrap();
+}
+
+/// Calls the INI check directly: the full health check lists plugins through libloadorder, which
+/// reads the real Documents\My Games\Fallout4 INIs on this machine.
+#[test]
+fn fallout4_ini_checks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, ini) = (tmp.path().join("game"), tmp.path().join("My Games/Fallout4"));
+    write(&game.join("Fallout4.exe"), "exe");
+    write(&tmp.path().join("M/textures/x.dds"), "x");
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::Fallout4, &game, &tmp.path().join("local")).unwrap();
+    inst.config.ini_path = Some(ini.clone());
+    install::install(&inst, &tmp.path().join("M"), None, true).unwrap();
+    let kinds = |inst: &Instance| health::fallout4_ini(inst).unwrap().into_iter().map(|i| i.kind).collect::<Vec<_>>();
+
+    assert!(kinds(&inst).is_empty(), "no INIs yet: the game has never run");
+    write(&ini.join("Fallout4.ini"), "[General]\nsTestFile1=Foo.esp\n[Archive]\nsResourceDataDirsFinal=STRINGS\\\n");
+    assert_eq!(kinds(&inst), vec!["ini_test_file", "archive_invalidation"]);
+
+    write(&ini.join("Fallout4Custom.ini"), "\u{feff}[General]\nsTestFile1=\n[Archive]\nbInvalidateOlderFiles=1\nsResourceDataDirsFinal=\n");
+    assert!(kinds(&inst).is_empty());
 }
 
 #[test]

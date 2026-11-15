@@ -27,6 +27,11 @@ rmm purge --apply                                  # restore the vanilla game fo
 
 Keep the instance on the same drive as the game so deploys use hard links rather than copies.
 
+How deploys behave:
+- **Overwrite.** Files a tool or the game replaces in the game folder are copied to the instance's `overwrite/` folder, which is deployed above every mod, so they are never lost.
+- **When rmm refuses.** It won't deploy while the game is running, or into a game folder that Vortex still manages.
+- **Lost manifest.** If `deploy.json` is lost, `rmm purge --apply` still finds rmm's hard links by file identity.
+
 ## AI (MCP)
 
 ```

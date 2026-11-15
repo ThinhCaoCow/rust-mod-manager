@@ -10,6 +10,9 @@ const MOD_INDEX: &str = ".rmm-index";
 // ponytail: fixed undo depth; make it a setting if anyone hits it.
 const HISTORY_LIMIT: usize = 200;
 
+/// Pseudo mod id for `overwrite/`, deployed above every mod. `<>` never appears in real ids.
+pub const OVERWRITE: &str = "<overwrite>";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InstanceConfig {
     pub game: Game,
@@ -17,6 +20,9 @@ pub struct InstanceConfig {
     /// Folder holding plugins.txt.
     pub local_path: PathBuf,
     pub profile: String,
+    /// Folder holding the game's INI files; worked out from `local_path` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ini_path: Option<PathBuf>,
 }
 
 /// Everything a setup is, minus the (immutable) mod files. Small, so it is snapshotted for undo.
@@ -72,6 +78,7 @@ impl Instance {
                 game_path: game_path.into(),
                 local_path: local_path.into(),
                 profile: "default".into(),
+                ini_path: None,
             },
         };
         fs::write(root.join(CONFIG), toml::to_string_pretty(&inst.config)?)?;
@@ -89,10 +96,13 @@ impl Instance {
         self.root.join("mods")
     }
     pub fn mod_dir(&self, id: &str) -> PathBuf {
-        self.mods_dir().join(id)
+        if id == OVERWRITE { self.root.join("overwrite") } else { self.mods_dir().join(id) }
     }
     pub fn data_dir(&self) -> PathBuf {
         self.config.game_path.join("Data")
+    }
+    pub fn ini_dir(&self) -> Option<PathBuf> {
+        self.config.ini_path.clone().or_else(|| crate::game::my_games_dir(&self.config.local_path))
     }
     fn profile_dir(&self) -> PathBuf {
         self.root.join("profiles").join(&self.config.profile)
@@ -121,6 +131,10 @@ impl Instance {
     /// (`root/...` for game-root files). Cached in `.rmm-index` because mods are immutable.
     pub fn mod_files(&self, id: &str) -> Result<Vec<String>> {
         let dir = self.mod_dir(id);
+        if id == OVERWRITE {
+            // Not cached: tools and captures keep adding files here.
+            return if dir.is_dir() { index_dir(&dir) } else { Ok(vec![]) };
+        }
         if let Ok(text) = fs::read_to_string(dir.join(MOD_INDEX)) {
             return Ok(text.lines().map(str::to_owned).collect());
         }

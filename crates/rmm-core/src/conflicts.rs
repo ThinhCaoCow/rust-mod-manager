@@ -11,8 +11,10 @@ pub struct FileMap {
     pub files: BTreeMap<String, (String, Vec<usize>)>,
 }
 
+/// Enabled mods in profile order, then `overwrite/` on top (MO2's model).
 pub fn file_map(inst: &Instance, profile: &Profile) -> Result<FileMap> {
-    let mods: Vec<String> = profile.mods.iter().filter(|m| m.enabled).map(|m| m.id.clone()).collect();
+    let mut mods: Vec<String> = profile.mods.iter().filter(|m| m.enabled).map(|m| m.id.clone()).collect();
+    mods.push(crate::instance::OVERWRITE.into());
     let mut files: BTreeMap<String, (String, Vec<usize>)> = BTreeMap::new();
     for (i, id) in mods.iter().enumerate() {
         for rel in inst.mod_files(id)? {

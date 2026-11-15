@@ -2,6 +2,7 @@
 //! Only files that differ from the last deploy are touched, unmanaged files are backed up
 //! before being replaced, and files changed outside rmm are copied to overwrite/ first.
 use crate::conflicts::file_map;
+use crate::instance::OVERWRITE;
 use crate::{Instance, path_key};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -69,9 +70,38 @@ fn target_of(rel: &str) -> String {
 pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
     inst.locked(|| {
         check_owner(inst)?;
-        let profile = inst.profile()?;
+        check_foreign(inst)?;
         let game = &inst.config.game_path;
-        let desired: BTreeMap<String, Want> = file_map(inst, &profile)?
+        if !inst.root.join(MANIFEST).exists() && game.join(OWNER).exists() {
+            bail!("deploy.json is missing but the game folder still has rmm's files; run purge (it finds them by file identity), then deploy");
+        }
+        if !dry_run {
+            check_not_running(inst)?;
+        }
+        let profile = inst.profile()?;
+        let mut man = load_manifest(inst)?;
+        let mut plan = DeployPlan::default();
+
+        // Files changed outside rmm go to overwrite/ first, so they win the layering below.
+        let mut changed: HashSet<String> = HashSet::new();
+        let mut ok: HashSet<String> = HashSet::new();
+        for (key, e) in &man.files {
+            let path = game.join(&e.target);
+            if !path.exists() {
+                continue;
+            }
+            if is_ours(inst, e, &path) {
+                ok.insert(key.clone());
+            } else {
+                plan.external_changes.push(e.target.clone());
+                changed.insert(key.clone());
+                if !dry_run {
+                    capture(inst, &e.target, &path)?;
+                }
+            }
+        }
+
+        let mut desired: BTreeMap<String, Want> = file_map(inst, &profile)?
             .winners()
             .into_values()
             .map(|(mod_id, src)| {
@@ -79,31 +109,26 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
                 (path_key(&target), Want { target, mod_id, src })
             })
             .collect();
-        let mut man = load_manifest(inst)?;
-        let old_keys: HashSet<String> = man.files.keys().cloned().collect();
-        let mut plan = DeployPlan::default();
-        let mut to_link: Vec<(String, bool)> = Vec::new();
+        for key in &changed {
+            // Already true after a real capture; a dry run has to pretend.
+            let target = man.files[key].target.clone();
+            desired.insert(key.clone(), Want { src: overwrite_rel(&target), mod_id: OVERWRITE.into(), target });
+        }
 
+        let old_keys: HashSet<String> = man.files.keys().cloned().collect();
+        let mut to_link: Vec<(String, bool)> = Vec::new();
         for key in &old_keys {
             let e = man.files[key].clone();
             let path = game.join(&e.target);
-            let cur = state(&path);
-            let ours = cur == Some((e.size, e.mtime)) || still_linked(inst, &e, cur);
             let want = desired.get(key);
-            let same_src = want.is_some_and(|w| w.mod_id == e.mod_id && w.src == e.src);
-            if ours && same_src {
+            if ok.contains(key) && want.is_some_and(|w| w.mod_id == e.mod_id && w.src == e.src) {
                 plan.unchanged += 1;
-                if !dry_run {
+                if !dry_run && let Some(s) = state(&path) {
+                    // In-place edits through a hard link change size/mtime on both sides.
                     let ent = man.files.get_mut(key).unwrap();
-                    (ent.size, ent.mtime) = cur.unwrap();
+                    (ent.size, ent.mtime) = s;
                 }
                 continue;
-            }
-            if !ours && path.exists() {
-                plan.external_changes.push(e.target.clone());
-                if !dry_run {
-                    capture(inst, &e.target, &path)?;
-                }
             }
             if want.is_none() {
                 plan.remove.push(e.target.clone());
@@ -160,14 +185,19 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
 /// Remove everything rmm deployed and restore backed-up files.
 pub fn purge(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
     inst.locked(|| {
+        if !dry_run {
+            check_not_running(inst)?;
+        }
+        if !inst.root.join(MANIFEST).exists() {
+            return purge_by_identity(inst, dry_run);
+        }
         let game = &inst.config.game_path;
         let man = load_manifest(inst)?;
         let mut plan = DeployPlan::default();
         for e in man.files.values() {
             let path = game.join(&e.target);
             plan.remove.push(e.target.clone());
-            let cur = state(&path);
-            if cur.is_some_and(|s| s != (e.size, e.mtime)) && !still_linked(inst, e, cur) {
+            if path.exists() && !is_ours(inst, e, &path) {
                 plan.external_changes.push(e.target.clone());
                 if !dry_run {
                     capture(inst, &e.target, &path)?;
@@ -193,6 +223,51 @@ pub fn purge(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
     })
 }
 
+/// Purge without deploy.json: remove every game file that is a hard link to a file in mods/,
+/// trash/ or overwrite/, then put backed-up files back where nothing replaced them.
+// ponytail: copies made across drives can't be told from vanilla files without the manifest; they stay.
+fn purge_by_identity(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
+    let game = &inst.config.game_path;
+    let mut plan = DeployPlan::default();
+    let mut sources: Vec<PathBuf> = vec![inst.root.join("overwrite")];
+    for parent in ["mods", "trash"] {
+        if let Ok(rd) = fs::read_dir(inst.root.join(parent)) {
+            sources.extend(rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_dir()));
+        }
+    }
+    let data = inst.data_dir();
+    for dir in sources.iter().filter(|d| d.is_dir()) {
+        for rel in crate::instance::index_dir(dir)? {
+            let target = target_of(&rel);
+            let path = game.join(&target);
+            if !same_file::is_same_file(&path, dir.join(&rel)).unwrap_or(false) {
+                continue;
+            }
+            plan.remove.push(target);
+            if !dry_run {
+                fs::remove_file(&path)?;
+                for d in path.ancestors().skip(1).take_while(|d| d.starts_with(game) && *d != game.as_path() && *d != data.as_path()) {
+                    if fs::remove_dir(d).is_err() {
+                        break; // not empty: someone else's folder
+                    }
+                }
+            }
+        }
+    }
+    let backup = inst.root.join("backup");
+    if !dry_run && backup.is_dir() {
+        for rel in crate::instance::index_dir(&backup)? {
+            let path = game.join(&rel);
+            if !path.exists() {
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::rename(backup.join(&rel), &path)?;
+            }
+        }
+        remove_file_if_exists(&game.join(OWNER))?;
+    }
+    Ok(plan)
+}
+
 /// Path keys (game-relative, e.g. `data/foo.esp`) of every deployed file.
 pub fn managed_keys(inst: &Instance) -> Result<HashSet<String>> {
     Ok(load_manifest(inst)?.files.into_keys().collect())
@@ -207,6 +282,50 @@ fn check_owner(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// Vortex leaves `vortex.deployment*.json` in every folder it deploys to. Two managers linking
+/// into one game folder wreck each other's records, so rmm waits until Vortex has purged.
+pub fn vortex_manifest(inst: &Instance) -> Option<PathBuf> {
+    [inst.config.game_path.clone(), inst.data_dir()].into_iter().find_map(|dir| {
+        fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            n.starts_with("vortex.deployment") && n.ends_with(".json")
+        })
+    })
+}
+
+fn check_foreign(inst: &Instance) -> Result<()> {
+    if let Some(p) = vortex_manifest(inst) {
+        bail!("Vortex has mods deployed here ({}); purge them in Vortex first", p.display());
+    }
+    Ok(())
+}
+
+fn check_not_running(inst: &Instance) -> Result<()> {
+    let exe = inst.config.game.exe();
+    if game_running(&inst.config.game_path, exe) {
+        bail!("{exe} is running; close the game before changing its files");
+    }
+    Ok(())
+}
+
+/// A running .exe can't be opened for writing on Windows (ERROR_SHARING_VIOLATION).
+#[cfg(windows)]
+fn game_running(game: &Path, exe: &str) -> bool {
+    matches!(fs::OpenOptions::new().write(true).open(game.join(exe)), Err(e) if e.raw_os_error() == Some(32))
+}
+
+/// Under Proton the game is a Wine process whose command line names the .exe.
+#[cfg(not(windows))]
+fn game_running(_game: &Path, exe: &str) -> bool {
+    let exe = exe.to_lowercase();
+    let Ok(rd) = fs::read_dir("/proc") else { return false };
+    rd.filter_map(|e| e.ok()).any(|e| {
+        fs::read(e.path().join("cmdline")).is_ok_and(|c| {
+            String::from_utf8_lossy(&c).to_lowercase().split('\0').any(|a| a.rsplit(['/', '\\']).next() == Some(exe.as_str()))
+        })
+    })
+}
+
 fn load_manifest(inst: &Instance) -> Result<Manifest> {
     match fs::read_to_string(inst.root.join(MANIFEST)) {
         Ok(t) => Ok(serde_json::from_str(&t)?),
@@ -219,10 +338,21 @@ fn save_manifest(inst: &Instance, man: &Manifest) -> Result<()> {
     crate::instance::write_atomic(&inst.root.join(MANIFEST), &serde_json::to_string(man)?)
 }
 
-/// A hard link shares metadata with its mod file, so if both changed together the
-/// change lives in the mod already (edited in place). Nothing to capture.
-fn still_linked(inst: &Instance, e: &Deployed, cur: Option<(u64, u64)>) -> bool {
-    !e.copied && cur.is_some() && cur == state(&inst.mod_dir(&e.mod_id).join(&e.src))
+/// Is the file at `path` still what rmm put there? Links are compared by file identity (NTFS file
+/// id or inode): an in-place edit through the link is ours (the mod file changed with it), a
+/// replaced file is not, even with the same size and mtime. Copies, and links whose source is gone
+/// (mod uninstalled), fall back to the size and mtime recorded at deploy.
+fn is_ours(inst: &Instance, e: &Deployed, path: &Path) -> bool {
+    let src = inst.mod_dir(&e.mod_id).join(&e.src);
+    if !e.copied && src.exists() {
+        return same_file::is_same_file(path, src).unwrap_or(false);
+    }
+    state(path) == Some((e.size, e.mtime))
+}
+
+/// Where a captured target lives inside overwrite/.
+fn overwrite_rel(target: &str) -> String {
+    target.strip_prefix("Data/").map(str::to_owned).unwrap_or_else(|| format!("root/{target}"))
 }
 
 fn state(path: &Path) -> Option<(u64, u64)> {
@@ -233,8 +363,7 @@ fn state(path: &Path) -> Option<(u64, u64)> {
 
 /// Copy a file that changed outside rmm into overwrite/ (Data-relative, root files under root/).
 fn capture(inst: &Instance, target: &str, path: &Path) -> Result<()> {
-    let rel = target.strip_prefix("Data/").map(str::to_owned).unwrap_or_else(|| format!("root/{target}"));
-    let dest = inst.root.join("overwrite").join(rel);
+    let dest = inst.root.join("overwrite").join(overwrite_rel(target));
     fs::create_dir_all(dest.parent().unwrap())?;
     fs::copy(path, dest)?;
     Ok(())

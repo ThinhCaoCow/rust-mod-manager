@@ -31,6 +31,20 @@ impl Game {
             Game::Fallout4 => "Fallout4",
         }
     }
+    /// Local and My Games folder name for this install: the store adds a suffix, recognised by a
+    /// file only that store installs. Mirrors libloadorder's `appdata_folder_name`, which is
+    /// private and only reachable through a constructor that also reads the game INIs.
+    pub fn local_folder(self, game_path: &Path) -> String {
+        let has = |f: &str| game_path.join(f).exists();
+        let suffix = match self {
+            Game::SkyrimSe if has("Galaxy64.dll") => " GOG",
+            Game::Fallout4 if has("appxmanifest.xml") => " MS",
+            _ if has("EOSSDK-Win64-Shipping.dll") => " EPIC",
+            Game::SkyrimSe if has("appxmanifest.xml") => " MS",
+            _ => "",
+        };
+        format!("{}{suffix}", self.local_dir())
+    }
     pub fn exe(self) -> &'static str {
         match self {
             Game::SkyrimSe => "SkyrimSE.exe",
@@ -80,31 +94,39 @@ pub struct Detected {
 pub fn detect(game: Game) -> Option<Detected> {
     #[cfg(windows)]
     if let Some(p) = registry_install_path(game).filter(|p| p.join(game.exe()).is_file()) {
-        return Some(Detected { game, game_path: p, local_path: local_path(game, None), source: "registry" });
+        return Some(Detected { game, local_path: local_path(game, &p), game_path: p, source: "registry" });
     }
     steam_libraries().into_iter().find_map(|lib| {
         let p = lib.join("steamapps").join("common").join(game.steam_dir());
-        p.join(game.exe()).is_file().then(|| Detected {
-            game,
-            local_path: local_path(game, Some(&lib)),
-            game_path: p,
-            source: "steam",
-        })
+        p.join(game.exe()).is_file().then(|| Detected { game, local_path: local_path(game, &p), game_path: p, source: "steam" })
     })
 }
 
-/// Windows: `%LOCALAPPDATA%\<game>`. Linux/Proton: inside the game's compatdata prefix.
-pub fn local_path(game: Game, steam_lib: Option<&Path>) -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(game.local_dir()))
+/// Folder holding plugins.txt, named by [`Game::local_folder`].
+/// - Windows: under `%LOCALAPPDATA%`.
+/// - Linux: under the Proton prefix of the Steam library holding the game.
+pub fn local_path(game: Game, game_path: &Path) -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        dirs::data_local_dir()?
     } else {
-        steam_lib.map(|l| {
-            l.join("steamapps/compatdata")
-                .join(game.steam_app_id().to_string())
-                .join("pfx/drive_c/users/steamuser/AppData/Local")
-                .join(game.local_dir())
-        })
-    }
+        // <lib>/steamapps/common/<game>
+        let steamapps = game_path.parent()?.parent().filter(|p| p.file_name() == Some("steamapps".as_ref()))?;
+        steamapps.join("compatdata").join(game.steam_app_id().to_string()).join("pfx/drive_c/users/steamuser/AppData/Local")
+    };
+    Some(base.join(game.local_folder(game_path)))
+}
+
+/// `Documents/My Games/<folder>`, where the game keeps its INIs. The folder name matches the
+/// local folder's, store suffix included (libloadorder's `my_games_folder_name`).
+pub fn my_games_dir(local_path: &Path) -> Option<PathBuf> {
+    let name = local_path.file_name()?;
+    let docs = if cfg!(windows) {
+        dirs::document_dir()?
+    } else {
+        // .../users/steamuser/AppData/Local/<folder> -> .../users/steamuser/Documents
+        local_path.ancestors().nth(3)?.join("Documents")
+    };
+    Some(docs.join("My Games").join(name))
 }
 
 #[cfg(windows)]
@@ -154,6 +176,32 @@ pub fn parse_library_paths(vdf: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn local_path_follows_the_store() {
+        let tmp = std::env::temp_dir().join(format!("rmm-store-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let steam = local_path(Game::SkyrimSe, &tmp).unwrap();
+        std::fs::write(tmp.join("Galaxy64.dll"), "").unwrap();
+        let gog = local_path(Game::SkyrimSe, &tmp).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        assert!(steam.ends_with("Skyrim Special Edition"), "{steam:?}");
+        assert!(gog.ends_with("Skyrim Special Edition GOG"), "{gog:?}");
+        assert!(my_games_dir(&gog).unwrap().ends_with(r"My Games\Skyrim Special Edition GOG"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proton_paths_come_from_the_library() {
+        let local = local_path(Game::Fallout4, Path::new("/lib/steamapps/common/Fallout 4")).unwrap();
+        assert_eq!(local, Path::new("/lib/steamapps/compatdata/377160/pfx/drive_c/users/steamuser/AppData/Local/Fallout4"));
+        assert_eq!(
+            my_games_dir(&local).unwrap(),
+            Path::new("/lib/steamapps/compatdata/377160/pfx/drive_c/users/steamuser/Documents/My Games/Fallout4")
+        );
+        assert!(local_path(Game::Fallout4, Path::new("/opt/fallout4")).is_none());
+    }
 
     #[test]
     fn parses_library_folders() {
