@@ -2,12 +2,19 @@
 
 A mod manager for Skyrim SE/AE and Fallout 4 that an AI can drive over MCP. The design is in [SPEC.md](SPEC.md). The research behind it is in [reports/](reports/).
 
-**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting, archive conflicts, tool runs and launching through the script extender work on Windows. Proton launching and tool runs finish milestone 2; the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
+**Status: milestone 2 of 6 in progress.** The core library, CLI, MCP server, FOMOD installers, LOOT sorting and rules, archive conflicts, tool runs and launching through the script extender work, with Proton on Linux (compile-checked, not yet run there). That covers the milestone 2 list; the UI, the Nexus integration, add-ons and the in-game test harness come next (see SPEC.md "Milestones").
 
 ## Build
 
 ```
 cargo build --release
+```
+
+Compile-check the Linux code from Windows (Zstandard zips need a C compiler for the target, so they are left out; LLVM's clang assembles one file of `psm`):
+
+```
+rustup target add x86_64-unknown-linux-gnu
+CC_x86_64_unknown_linux_gnu=clang CFLAGS_x86_64_unknown_linux_gnu=--target=x86_64-unknown-linux-gnu AR_x86_64_unknown_linux_gnu=llvm-ar cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu --no-default-features
 ```
 
 ## Use
@@ -27,6 +34,7 @@ rmm deploy --apply                                 # hard-link mods in, write pl
 rmm tool add xedit-qac --exe "D:\Tools\SSEEdit\SSEEdit.exe"   # presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod
 rmm run xedit-qac --var plugin=Update.esm --apply  # deploy, run, capture output as the mod "Cleaned Update.esm"
 rmm launch --apply                                 # deploy, check the SKSE/F4SE build matches the game, start it
+rmm rule MyPatch.esp --after "Some Mod.esp"       # LOOT user rule; `rmm rule` lists them
 rmm undo                                           # every change is undoable
 rmm purge --apply                                  # restore the vanilla game folder
 ```
@@ -45,12 +53,12 @@ How deploys behave:
 claude mcp add rmm -- D:\Games\Rust_Mod_Manager\target\release\rmm.exe -i D:\Mods\skyrim mcp
 ```
 
-The server exposes 25 tools covering inspection, install (including FOMOD installers), ordering, LOOT sorting, plugins, health checks, tool runs, deploy, launch, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change lands in undo history, so anything the AI does can be reversed.
+The server exposes 28 tools covering inspection, install (including FOMOD installers), ordering, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, purge and undo/redo. Writes to the game folder default to `dry_run: true`. Every change lands in undo history, so anything the AI does can be reversed.
 
 ## Layout
 
 ```
-crates/rmm-core   game detection, instances, install, fomod, conflicts, archives, deploy, plugins, loot, health, tools, launch, ops
+crates/rmm-core   game detection, instances, install, fomod, conflicts, archives, deploy, plugins, loot, health, tools, launch, proton, ops
 crates/rmm        CLI + MCP server (one binary)
 ```
 

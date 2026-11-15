@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 const INSTRUCTIONS: &str = "\
 rmm manages one Skyrim SE or Fallout 4 instance.
@@ -24,7 +25,7 @@ set_mod_enabled, move_mod, set_mod_order, sort_plugins, set_plugin_order...) -> 
 preview, then dry_run=false to apply. Nothing reaches the game folder until deploy is applied.
 FOMOD installers: fomod_options shows the steps, options and the resolved choices; edit those \
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
-Tools: add_tool registers a program (presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first.
+Tools: add_tool registers a program (presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first. Long runs (DynDOLOD, grass) can go in the background (run_tool background=true, then poll tool_job).
 launch_game deploys and starts the game through its script extender after checking the versions match.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
 re-run health_check after changes.";
@@ -32,7 +33,22 @@ re-run health_check after changes.";
 #[derive(Clone)]
 pub struct Rmm {
     root: PathBuf,
+    /// Background tool runs by tool id. In memory only; a finished run's report is also in
+    /// tools/<id>/last-run.json.
+    jobs: Arc<Mutex<BTreeMap<String, Job>>>,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Job {
+    Running { started: u64 },
+    Done { report: serde_json::Value },
+    Failed { error: String },
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -116,6 +132,14 @@ struct RunToolArgs {
     dry_run: Option<bool>,
     /// Stop the tool after this many seconds.
     timeout_secs: Option<u64>,
+    /// Return at once and run in the background (default false); poll tool_job for the report.
+    /// Changes to the setup are refused until it finishes.
+    background: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ToolJobArgs {
+    /// Tool id; omit for every background run this server started.
+    id: Option<String>,
 }
 
 fn out<T: Serialize>(r: anyhow::Result<T>) -> Result<String, String> {
@@ -128,6 +152,19 @@ fn out<T: Serialize>(r: anyhow::Result<T>) -> Result<String, String> {
 impl Rmm {
     fn inst(&self) -> anyhow::Result<Instance> {
         Instance::open(&self.root)
+    }
+
+    /// The instance for a change: refused while a background tool run owns the game folder.
+    fn inst_mut(&self) -> anyhow::Result<Instance> {
+        let jobs = self.jobs.lock().unwrap();
+        if let Some((id, _)) = jobs.iter().find(|(_, j)| matches!(j, Job::Running { .. })) {
+            anyhow::bail!("tool '{id}' is running in the background; wait for it (tool_job) before changing the setup");
+        }
+        self.inst()
+    }
+
+    fn inst_for(&self, dry_run: bool) -> anyhow::Result<Instance> {
+        if dry_run { self.inst() } else { self.inst_mut() }
     }
 
     #[tool(description = "Game, paths, profile and mod counts for this instance.")]
@@ -162,7 +199,7 @@ impl Rmm {
 
     #[tool(description = "Install a mod from a local folder, .zip or .7z. Detects the Data root and game-root files. Mods with a FOMOD installer need choices (see fomod_options).")]
     async fn install_mod(&self, Parameters(a): Parameters<InstallArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| install::install(&i, a.path.as_ref(), a.name.as_deref(), a.enable.unwrap_or(true), a.choices.as_ref())))
+        out(self.inst_mut().and_then(|i| install::install(&i, a.path.as_ref(), a.name.as_deref(), a.enable.unwrap_or(true), a.choices.as_ref())))
     }
 
     #[tool(description = "Show a mod's FOMOD installer as it plays out with the given choices: visible steps, groups, options (type, description, selected), the full resolved choices, and the file count. Conditions are checked against the current setup.")]
@@ -172,32 +209,42 @@ impl Rmm {
 
     #[tool(description = "Uninstall a mod. Its files go to trash and come back on undo.")]
     async fn uninstall_mod(&self, Parameters(a): Parameters<ModId>) -> Result<String, String> {
-        out(self.inst().and_then(|i| install::uninstall(&i, &a.id)))
+        out(self.inst_mut().and_then(|i| install::uninstall(&i, &a.id)))
     }
 
     #[tool(description = "Enable or disable a mod (its plugins follow).")]
     async fn set_mod_enabled(&self, Parameters(a): Parameters<EnableArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| ops::set_mod_enabled(&i, &a.id, a.enabled)))
+        out(self.inst_mut().and_then(|i| ops::set_mod_enabled(&i, &a.id, a.enabled)))
     }
 
     #[tool(description = "Move one mod to a new priority.")]
     async fn move_mod(&self, Parameters(a): Parameters<MoveArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| ops::move_mod(&i, &a.id, a.priority)))
+        out(self.inst_mut().and_then(|i| ops::move_mod(&i, &a.id, a.priority)))
     }
 
     #[tool(description = "Set the complete mod order in one step.")]
     async fn set_mod_order(&self, Parameters(a): Parameters<OrderArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| ops::set_mod_order(&i, &a.ids)))
+        out(self.inst_mut().and_then(|i| ops::set_mod_order(&i, &a.ids)))
     }
 
     #[tool(description = "Enable or disable a single plugin.")]
     async fn set_plugin_enabled(&self, Parameters(a): Parameters<PluginEnableArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| ops::set_plugin_enabled(&i, &a.name, a.enabled)))
+        out(self.inst_mut().and_then(|i| ops::set_plugin_enabled(&i, &a.name, a.enabled)))
     }
 
     #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move; otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy.")]
     async fn sort_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst().and_then(|i| loot::sort(&i, a.dry_run.unwrap_or(true))))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| loot::sort(&i, a.dry_run.unwrap_or(true))))
+    }
+
+    #[tool(description = "The user's LOOT rules (loot/userlist.yaml) for the profile's plugins: load-after lists and groups.")]
+    async fn loot_rules(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::rules(&i)))
+    }
+
+    #[tool(description = "Replace one plugin's LOOT user rule: the plugins it loads after and its group (from the masterlist). An empty rule removes it. Saved to loot/userlist.yaml in LOOT's format and used by the next sort_plugins. Not in undo history: returns the previous rule, so set that to revert.")]
+    async fn set_loot_rule(&self, Parameters(a): Parameters<loot::Rule>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| Ok(serde_json::json!({ "previous": loot::set_rule(&i, &a)? }))))
     }
 
     #[tool(description = "Download the latest LOOT masterlist and prelude now. Returns warnings, if any.")]
@@ -207,22 +254,22 @@ impl Rmm {
 
     #[tool(description = "Reorder plugins. Masters still load before non-masters regardless.")]
     async fn set_plugin_order(&self, Parameters(a): Parameters<PluginOrderArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| ops::set_plugin_order(&i, &a.names)))
+        out(self.inst_mut().and_then(|i| ops::set_plugin_order(&i, &a.names)))
     }
 
     #[tool(description = "Apply the profile to the game folder (hard links, incremental) and write plugins.txt. dry_run defaults to true and returns the plan.")]
     async fn deploy(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst().and_then(|i| deploy::deploy(&i, a.dry_run.unwrap_or(true))))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| deploy::deploy(&i, a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one). Windows only for now. dry_run defaults to true and returns the deploy plan, game version and checks.")]
     async fn launch_game(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::launch::launch(&i, a.dry_run.unwrap_or(true))))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::launch::launch(&i, a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Remove all deployed files and restore originals. dry_run defaults to true.")]
     async fn purge(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst().and_then(|i| deploy::purge(&i, a.dry_run.unwrap_or(true))))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| deploy::purge(&i, a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Configured tools (exe, argument template, vars, rewrites) and the available presets.")]
@@ -232,23 +279,50 @@ impl Rmm {
 
     #[tool(description = "Register or replace a tool. Give the exe path; a preset fills in the arguments, which args, vars and rewrites override.")]
     async fn add_tool(&self, Parameters(a): Parameters<AddToolArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| tools::add(&i, &a.id, a.spec)))
+        out(self.inst_mut().and_then(|i| tools::add(&i, &a.id, a.spec)))
     }
 
-    #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). dry_run defaults to true and returns the command and plan. Blocks until the tool exits.")]
+    #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). dry_run defaults to true and returns the command and plan. Blocks until the tool exits, unless background is true: then it returns at once and tool_job reports progress and the result.")]
     async fn run_tool(&self, Parameters(a): Parameters<RunToolArgs>) -> Result<String, String> {
         let timeout = a.timeout_secs.map(std::time::Duration::from_secs);
-        out(self.inst().and_then(|i| tools::run(&i, &a.id, &a.vars, a.dry_run.unwrap_or(true), timeout)))
+        let dry_run = a.dry_run.unwrap_or(true);
+        if dry_run || !a.background.unwrap_or(false) {
+            return out(self.inst_for(dry_run).and_then(|i| tools::run(&i, &a.id, &a.vars, dry_run, timeout)));
+        }
+        let inst = self.inst_mut().map_err(|e| format!("{e:#}"))?;
+        self.jobs.lock().unwrap().insert(a.id.clone(), Job::Running { started: now() });
+        let jobs = self.jobs.clone();
+        std::thread::spawn(move || {
+            let job = match tools::run(&inst, &a.id, &a.vars, false, timeout) {
+                Ok(r) => Job::Done { report: serde_json::to_value(r).unwrap_or_default() },
+                Err(e) => Job::Failed { error: format!("{e:#}") },
+            };
+            jobs.lock().unwrap().insert(a.id, job);
+        });
+        out(Ok(serde_json::json!({ "state": "running", "next": "poll tool_job" })))
+    }
+
+    #[tool(description = "State of background tool runs: running (with its start time), done (with the run report) or failed. With an id and no run started by this server, the last finished run's report from disk.")]
+    async fn tool_job(&self, Parameters(a): Parameters<ToolJobArgs>) -> Result<String, String> {
+        let jobs = self.jobs.lock().unwrap().clone();
+        let Some(id) = a.id else { return out(Ok(jobs)) };
+        if let Some(j) = jobs.get(&id) {
+            return out(Ok(j.clone()));
+        }
+        out(self.inst().and_then(|i| {
+            let text = std::fs::read_to_string(i.root.join("tools").join(&id).join("last-run.json")).map_err(|_| anyhow::anyhow!("tool '{id}' has no run on record"))?;
+            Ok(Job::Done { report: serde_json::from_str(&text)? })
+        }))
     }
 
     #[tool(description = "Undo the last change to the profile. Returns its label, or null if nothing to undo.")]
     async fn undo(&self) -> Result<String, String> {
-        out(self.inst().and_then(|i| i.undo()))
+        out(self.inst_mut().and_then(|i| i.undo()))
     }
 
     #[tool(description = "Redo the last undone change.")]
     async fn redo(&self) -> Result<String, String> {
-        out(self.inst().and_then(|i| i.redo()))
+        out(self.inst_mut().and_then(|i| i.redo()))
     }
 
     #[tool(description = "Undoable changes, newest first.")]
@@ -267,7 +341,7 @@ impl ServerHandler for Rmm {
 }
 
 pub async fn serve(root: PathBuf) -> anyhow::Result<()> {
-    let server = Rmm { root, tool_router: Rmm::tool_router() };
+    let server = Rmm { root, jobs: Default::default(), tool_router: Rmm::tool_router() };
     server.serve(stdio()).await?.waiting().await?;
     Ok(())
 }

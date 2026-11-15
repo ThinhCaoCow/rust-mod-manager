@@ -9,7 +9,7 @@
 use crate::deploy::{self, Deployed, DeployPlan};
 use crate::instance::{ModMeta, index_dir, write_atomic};
 use crate::install::{is_plugin, sanitize, unique_id};
-use crate::{Game, Instance, ModEntry, PluginEntry, ops, path_key};
+use crate::{Game, Instance, ModEntry, PluginEntry, ops, path_key, proton};
 use anyhow::{Context, Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,10 @@ pub struct Tool {
     /// A JSON settings file edited before each run, for tools that take paths only from there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    /// A program, relative to the game folder, that the run also waits for: what a launcher
+    /// starts before exiting, e.g. SkyrimSE.exe behind skse64_loader.exe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for: Option<String>,
 }
 
 /// Keys rmm sets in a tool's JSON settings file before each run. Everything else in it stays.
@@ -95,6 +99,10 @@ pub struct ToolSpec {
     /// JSON settings keys set before each run.
     #[serde(default)]
     pub settings: Option<Settings>,
+    /// A program, relative to the game folder, the run also waits for, because a launcher
+    /// starts it and exits (SkyrimSE.exe behind skse64_loader.exe, CreationKit.exe behind ckpe_loader.exe).
+    #[serde(default)]
+    pub wait_for: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -172,6 +180,9 @@ pub fn add(inst: &Instance, id: &str, spec: ToolSpec) -> Result<Tool> {
     }
     if spec.settings.is_some() {
         tool.settings = spec.settings;
+    }
+    if spec.wait_for.is_some() {
+        tool.wait_for = spec.wait_for;
     }
     inst.locked(|| {
         let mut tools = list(inst)?;
@@ -266,9 +277,6 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     if !tool.exe.is_file() {
         bail!("{} not found", tool.exe.display());
     }
-    if cfg!(not(windows)) && tool.exe.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
-        bail!("running Windows tools through Proton isn't supported yet");
-    }
     let source = format!("tool:{id}");
     let previous = inst.profile()?.mods.into_iter().find(|m| {
         let meta = inst.mod_meta(&m.id);
@@ -302,7 +310,6 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     deploy::deploy(inst, false)?;
 
     let game = &inst.config.game_path;
-    let data = inst.data_dir();
     let stash = state.join("stash");
     let _ = fs::remove_dir_all(&stash);
     let _ = fs::remove_dir_all(&staging);
@@ -324,16 +331,24 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     }
     r.swapped = swapped.iter().map(|e| e.target.clone()).collect();
     let swapped: HashSet<String> = swapped.iter().map(|e| path_key(&e.target)).collect();
-    let before = snapshot(&data)?;
+    let before = snapshot(game)?;
+    let rewritten = |key: &str| key.strip_prefix("data/").is_some_and(|k| rewrites.iter().any(|g| glob(g, k)));
     for (key, (rel, ..)) in &before {
-        if !man.contains_key(&format!("data/{key}")) && rewrites.iter().any(|g| glob(g, key)) {
-            copy_file(&data.join(rel), &stash.join(rel))?;
+        if !man.contains_key(key) && rewritten(key) {
+            copy_file(&game.join(rel), &stash.join(rel))?;
         }
     }
 
     let log = state.join("last-run.log");
-    match launch(tool, &args, &log, timeout) {
-        Ok((code, timed_out)) => (r.exit_code, r.timed_out) = (code, timed_out),
+    match launch(inst, tool, &args, &log, timeout) {
+        Ok((code, timed_out)) => {
+            (r.exit_code, r.timed_out) = (code, timed_out);
+            if let Some(exe) = tool.wait_for.as_deref().filter(|_| !timed_out)
+                && !wait_for(game, exe)
+            {
+                r.warnings.push(format!("{exe} never started, so the run didn't wait for it"));
+            }
+        }
         Err(e) => {
             // Nothing ran: drop the copies and put the previous output back.
             for t in &r.swapped {
@@ -349,41 +364,42 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     r.log_tail = tail(&log);
     r.log = Some(log);
 
-    let after = snapshot(&data)?;
+    let after = snapshot(game)?;
     let mut added_plugins = false;
     let new_id = unique_id(inst, &sanitize(&output_mod));
     let dest = inst.mod_dir(&new_id);
     fs::rename(&staging, &dest)?;
+    // Keys and paths are game-relative; Data files go to the mod's top level, others to root/.
     for (key, (rel, size, mtime)) in &after {
-        let path = data.join(rel);
-        let mkey = format!("data/{key}");
+        let path = game.join(rel);
+        let to = dest.join(deploy::mod_rel(rel));
         match before.get(key) {
             Some((_, s, m)) if (s, m) == (size, mtime) => {
-                if swapped.contains(&mkey) {
+                if swapped.contains(key) {
                     fs::remove_file(&path)?; // untouched copy: the final deploy relinks it
                 }
             }
             Some(_) => {
                 r.changed.push(rel.clone());
-                match man.get(&mkey) {
+                match man.get(key) {
                     Some(e) if !e.copied && same_file::is_same_file(&path, inst.mod_dir(&e.mod_id).join(&e.src)).unwrap_or(false) => {
                         r.modified_in_place.push(format!("{}: {}", e.mod_id, e.src));
-                        copy_file(&path, &dest.join(rel))?;
+                        copy_file(&path, &to)?;
                     }
-                    Some(_) => move_file(&path, &dest.join(rel), &data)?,
+                    Some(_) => move_file(&path, &to, game)?,
                     None if stash.join(rel).is_file() => {
-                        move_file(&path, &dest.join(rel), &data)?;
-                        move_file(&stash.join(rel), &path, &data)?;
+                        move_file(&path, &to, game)?;
+                        move_file(&stash.join(rel), &path, game)?;
                     }
                     None => {
-                        copy_file(&path, &dest.join(rel))?;
+                        copy_file(&path, &to)?;
                         r.warnings.push(format!("{rel} changed but isn't in the tool's rewrites, so its original wasn't kept; purge leaves the tool's version"));
                     }
                 }
             }
             None => {
                 r.new.push(rel.clone());
-                move_file(&path, &dest.join(rel), &data)?;
+                move_file(&path, &to, game)?;
             }
         }
     }
@@ -392,11 +408,11 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
             continue;
         }
         r.deleted.push(rel.clone());
-        if man.contains_key(&format!("data/{key}")) {
+        if man.contains_key(key) {
             continue; // the final deploy relinks it
         }
         if stash.join(rel).is_file() {
-            move_file(&stash.join(rel), &data.join(rel), &data)?;
+            move_file(&stash.join(rel), &game.join(rel), game)?;
         } else {
             r.warnings.push(format!("{rel} was deleted and isn't rmm's to restore"));
         }
@@ -413,7 +429,7 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     r.files = files.len();
     if files.iter().all(|f| kept(f)) {
         fs::remove_dir_all(&dest)?;
-        r.warnings.push("the tool wrote nothing to Data or {output}".into());
+        r.warnings.push("the tool wrote nothing to the game folder or {output}".into());
         if let Some(p) = &disable_previous {
             ops::set_mod_enabled(inst, p, true)?;
         }
@@ -462,12 +478,20 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
             v.push(format!("... and {more} more"));
         }
     }
+    // For tool_job, and for anyone checking on a run after the fact.
+    write_atomic(&state.join("last-run.json"), &serde_json::to_string_pretty(&r)?)?;
     Ok(r)
 }
 
 fn vars(inst: &Instance, tool: &Tool, state: &Path, staging: &Path, given: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    // Windows tools don't all accept '/', which paths typed into the CLI often contain.
-    let p = |x: &Path| if cfg!(windows) { x.display().to_string().replace('/', "\\") } else { x.display().to_string() };
+    // Windows tools don't all accept '/', which paths typed into the CLI often contain. Under
+    // Proton they see Linux paths through drive Z:.
+    let wine = proton::needed(&tool.exe);
+    let p = |x: &Path| match () {
+        _ if wine => proton::windows_path(x),
+        _ if cfg!(windows) => x.display().to_string().replace('/', "\\"),
+        _ => x.display().to_string(),
+    };
     let mut v = BTreeMap::from([
         ("game".to_string(), p(&inst.config.game_path)),
         ("data".into(), p(&inst.data_dir())),
@@ -565,37 +589,32 @@ fn swap_for_copy(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Data-relative key -> (path, size, mtime). Metadata comes from opening each file: the
-/// directory listing's cached size and time can be stale for hard links.
-// ponytail: Data only; files tools write to the game root (ENB, grass trigger) aren't captured yet.
-fn snapshot(data: &Path) -> Result<BTreeMap<String, (String, u64, u64)>> {
+/// Game-relative key -> (path, size, mtime) for the whole game folder. Metadata comes from
+/// opening each file: the directory listing's cached size and time can be stale for hard links.
+fn snapshot(game: &Path) -> Result<BTreeMap<String, (String, u64, u64)>> {
     let mut snap = BTreeMap::new();
-    if !data.is_dir() {
-        return Ok(snap);
-    }
-    for e in walkdir::WalkDir::new(data).min_depth(1) {
+    for e in walkdir::WalkDir::new(game).min_depth(1) {
         let e = e?;
         if !e.file_type().is_file() {
             continue;
         }
-        let rel = e.path().strip_prefix(data)?.to_string_lossy().replace('\\', "/");
+        let rel = e.path().strip_prefix(game)?.to_string_lossy().replace('\\', "/");
         let (size, mtime) = deploy::state(e.path()).with_context(|| format!("cannot read {}", e.path().display()))?;
         snap.insert(path_key(&rel), (rel, size, mtime));
     }
     Ok(snap)
 }
 
-fn launch(tool: &Tool, args: &[String], log: &Path, timeout: Option<Duration>) -> Result<(Option<i32>, bool)> {
+fn launch(inst: &Instance, tool: &Tool, args: &[String], log: &Path, timeout: Option<Duration>) -> Result<(Option<i32>, bool)> {
     fs::create_dir_all(log.parent().unwrap())?;
     let out = fs::File::create(log)?;
-    let mut cmd = Command::new(&tool.exe);
+    let mut cmd = if proton::needed(&tool.exe) { proton::command(inst.config.game, &inst.config.game_path, &tool.exe)? } else { Command::new(&tool.exe) };
     cmd.args(args).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
     if let Some(dir) = tool.cwd.as_deref().or(tool.exe.parent()) {
         cmd.current_dir(dir);
     }
     let mut child = cmd.spawn().with_context(|| format!("cannot start {}", tool.exe.display()))?;
-    // ponytail: waits for the direct child only. Launchers that start the real program and exit
-    // (skse64_loader, ckpe_loader) need a job object or a process search.
+    // Waits for the direct child; launchers that exit early are covered by `wait_for`.
     let Some(limit) = timeout else { return Ok((child.wait()?.code(), false)) };
     let start = Instant::now();
     loop {
@@ -609,6 +628,22 @@ fn launch(tool: &Tool, args: &[String], log: &Path, timeout: Option<Duration>) -
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Wait for a program a launcher started. It shows up shortly after the launcher exits; returns
+/// false if it never did. No timeout: the game can run for hours (grass precaching).
+fn wait_for(game: &Path, exe: &str) -> bool {
+    let start = Instant::now();
+    while !deploy::game_running(game, exe) {
+        if start.elapsed() > Duration::from_secs(15) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    while deploy::game_running(game, exe) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    true
 }
 
 fn tail(log: &Path) -> String {

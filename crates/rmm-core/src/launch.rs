@@ -1,7 +1,8 @@
 //! Starting the game (SPEC.md "Launch"): deploy, check that the script extender was built for
-//! this game version, then start its loader (or the game) from the game folder.
+//! this game version, then start its loader (or the game) from the game folder, through Proton
+//! on Linux.
 use crate::deploy::{self, DeployPlan};
-use crate::{Game, Instance};
+use crate::{Game, Instance, proton};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::fs;
@@ -24,9 +25,6 @@ pub struct LaunchReport {
 
 /// Deploy and start the game. With `dry_run`, only the plan and the checks.
 pub fn launch(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
-    if cfg!(not(windows)) {
-        bail!("launching through Proton isn't supported yet; deploy, then start the game from Steam");
-    }
     let deploy = deploy::deploy(inst, dry_run)?; // refuses while the game runs
     let (root, game) = (&inst.config.game_path, inst.config.game);
     let game_exe = root.join(game.exe());
@@ -62,9 +60,10 @@ pub fn launch(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
         r.warnings.push(format!("script extender plugins are deployed but {} isn't; they won't load", game.loader()));
     }
     if !dry_run {
-        // ponytail: fire and forget. Waiting for the game to exit (to capture files it wrote) needs
-        // the real game process, not the loader, which exits right after starting it.
-        let child = Command::new(&r.exe)
+        // Fire and forget: files the game writes into Data are captured by the next deploy.
+        deploy::remember_unmanaged(inst)?;
+        let mut cmd = if proton::needed(&r.exe) { proton::command(game, root, &r.exe)? } else { Command::new(&r.exe) };
+        let child = cmd
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

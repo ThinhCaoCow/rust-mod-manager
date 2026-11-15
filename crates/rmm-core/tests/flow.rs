@@ -546,6 +546,19 @@ fn loot_sorts_and_reports() {
     let issues = health::check(&inst).unwrap();
     assert!(issues.iter().any(|i| i.kind == "loot_message" && i.subject == "First.esp" && i.message.contains("patch")), "{issues:?}");
     assert!(issues.iter().any(|i| i.kind == "dirty_plugin" && i.subject == "Dirty.esp" && i.message.starts_with("3 ITMs")), "{issues:?}");
+
+    // User rules go to the userlist and steer the next sort; an empty rule removes one.
+    let rule = loot::Rule { plugin: "Second.esp".into(), after: vec!["Dirty.esp".into()], group: None };
+    assert_eq!(loot::set_rule(&inst, &rule).unwrap(), None);
+    assert_eq!(loot::rules(&inst).unwrap(), [rule]);
+    assert!(read(&root.join("loot/userlist.yaml")).contains("Dirty.esp"));
+    let plan = loot::sort(&inst, true).unwrap();
+    assert!(pos(&plan.order, "Dirty.esp") < pos(&plan.order, "Second.esp"), "{plan:?}");
+    let bad = loot::Rule { plugin: "First.esp".into(), group: Some("Nope".into()), ..Default::default() };
+    assert!(loot::set_rule(&inst, &bad).unwrap_err().to_string().contains("no group"));
+    let previous = loot::set_rule(&inst, &loot::Rule { plugin: "Second.esp".into(), ..Default::default() }).unwrap();
+    assert_eq!(previous.unwrap().after, ["Dirty.esp"]);
+    assert!(loot::rules(&inst).unwrap().is_empty());
 }
 
 /// A fake tool (a .bat) exercising every capture path: directed output, a new Data file, an
@@ -574,6 +587,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
             r#"echo new> "%~2\newfile.txt""#,
             r#"echo cleaned> "%~2\vanilla.ini""#,
             r#"echo oops>> "%~2\meshes\a.nif""#,
+            r#"echo enb> "%~3\enblocal.ini""#,
             r"echo done",
         ]
         .join("\r\n"),
@@ -585,7 +599,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     deploy::deploy(&inst, false).unwrap();
     let spec = ToolSpec {
         exe: src.join("tool.bat"),
-        args: Some(vec!["{output}".into(), "{data}".into()]),
+        args: Some(vec!["{output}".into(), "{data}".into(), "{game}".into()]),
         rewrites: Some(vec!["vanilla.ini".into(), "CalienteTools/BodySlide/*.xml".into()]),
         ..Default::default()
     };
@@ -605,6 +619,9 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert!(read(&out.join("vanilla.ini")).contains("cleaned"));
     assert!(read(&out.join("CalienteTools/BodySlide/Config.xml")).contains("setting"));
     assert!(read(&out.join("meshes/a.nif")).contains("oops"));
+    // Files written to the game root go to the mod's root/ and are deployed back there.
+    assert!(read(&out.join("root/enblocal.ini")).contains("enb"));
+    assert!(same_file::is_same_file(game.join("enblocal.ini"), out.join("root/enblocal.ini")).unwrap());
     // The swapped link kept the mod store clean; the unlisted one wrote through and is reported.
     assert_eq!(read(&root.join("mods/BodySlide/CalienteTools/BodySlide/Config.xml")), "orig-config");
     assert_eq!(r.modified_in_place, vec!["Plain: meshes/a.nif".to_string()]);
@@ -628,6 +645,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     deploy::purge(&inst, false).unwrap();
     assert_eq!(read(&game.join("Data/vanilla.ini")), "vanilla");
     assert!(!game.join("Data/newfile.txt").exists() && !game.join("Data/meshes/body.nif").exists());
+    assert!(!game.join("enblocal.ini").exists());
 }
 
 /// A JSON settings file is merged before the run (other keys and a BOM survive), kept files carry
@@ -699,4 +717,246 @@ fn launch_checks_the_script_extender() {
     let r = launch::launch(&inst, false).unwrap();
     assert_eq!(r.script_extender.as_deref(), Some(dll.as_str()));
     assert!(r.exe.ends_with("skse64_loader.exe") && r.pid.is_some(), "{r:?}");
+}
+
+/// Wait until the stand-in game (a PING.EXE copy) has exited.
+#[cfg(windows)]
+fn wait_until_closed(exe: &Path) {
+    for _ in 0..100 {
+        if fs::OpenOptions::new().write(true).open(exe).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("{} still running", exe.display());
+}
+
+/// `wait_for`: the tool is a launcher that starts the "game" and exits at once; the run waits
+/// for the game and captures what it leaves behind only after it closed.
+#[cfg(windows)]
+#[test]
+fn tool_runs_wait_for_what_a_launcher_starts() {
+    use rmm_core::tools::{self, ToolSpec};
+    use std::collections::BTreeMap;
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    fs::copy(r"C:\Windows\System32\PING.EXE", game.join("SkyrimSE.exe")).unwrap();
+    write(
+        &tmp.path().join("loader.bat"),
+        [r"@echo off", r#"start "" /b "%~1\SkyrimSE.exe" -n 3 127.0.0.1"#, r#"echo grass> "%~1\Data\grass.cgid""#].join("\r\n"),
+    );
+    let spec = ToolSpec { exe: tmp.path().join("loader.bat"), args: Some(vec!["{game}".into()]), wait_for: Some("SkyrimSE.exe".into()), ..Default::default() };
+    tools::add(&inst, "precache", spec).unwrap();
+    let start = std::time::Instant::now();
+    let r = tools::run(&inst, "precache", &BTreeMap::new(), false, None).unwrap();
+    assert!(start.elapsed() >= std::time::Duration::from_millis(1500), "returned before the game closed: {r:?}");
+    assert!(r.warnings.is_empty(), "{r:?}");
+    assert_eq!(r.new, ["Data/grass.cgid"]);
+}
+
+/// After `launch_game`, the next deploy moves files that appeared in Data into overwrite/.
+/// Script-extender plugin configs are deployed as copies: a plugin's rewrite on launch becomes an
+/// external change in overwrite/, the mod's file stays as installed, and a newer mod file is
+/// copied again.
+#[cfg(windows)]
+#[test]
+fn launch_captures_what_the_game_writes() {
+    use rmm_core::launch;
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    let root = tmp.path().join("inst");
+    write(&tmp.path().join("Logger/SKSE/Plugins/CrashLogger.ini"), "installed");
+    install::install(&inst, &tmp.path().join("Logger"), None, true, None).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    let (ini, src) = (game.join("Data/SKSE/Plugins/CrashLogger.ini"), root.join("mods/Logger/SKSE/Plugins/CrashLogger.ini"));
+    assert!(!same_file::is_same_file(&ini, &src).unwrap(), "configs are copies");
+    write(&src, "updated by the user");
+    assert!(deploy::deploy(&inst, false).unwrap().link.iter().any(|l| l.ends_with("CrashLogger.ini")));
+    assert_eq!(read(&ini), "updated by the user");
+
+    write(&game.join("Data/old.txt"), "there before");
+    fs::copy(r"C:\Windows\System32\PING.EXE", game.join("SkyrimSE.exe")).unwrap();
+    launch::launch(&inst, false).unwrap();
+    wait_until_closed(&game.join("SkyrimSE.exe"));
+    // What the game and its plugins do during play.
+    write(&game.join("Data/MCM/Settings/mod.ini"), "user setting");
+    write(&ini, "rewritten on launch");
+
+    let plan = deploy::deploy(&inst, true).unwrap();
+    assert_eq!(plan.played, ["Data/MCM/Settings/mod.ini"]);
+    assert_eq!(plan.external_changes, ["Data/SKSE/Plugins/CrashLogger.ini"]);
+    deploy::deploy(&inst, false).unwrap();
+    assert!(same_file::is_same_file(game.join("Data/MCM/Settings/mod.ini"), root.join("overwrite/MCM/Settings/mod.ini")).unwrap());
+    assert_eq!(read(&root.join("overwrite/SKSE/Plugins/CrashLogger.ini")), "rewritten on launch");
+    assert_eq!(read(&src), "updated by the user");
+    assert!(deploy::deploy(&inst, true).unwrap().is_noop());
+
+    deploy::purge(&inst, false).unwrap();
+    assert!(!game.join("Data/MCM").exists() && !ini.exists());
+    assert_eq!(read(&game.join("Data/old.txt")), "there before");
+}
+
+/// One case for `vortex_planner_rows`: mods V1 (`meshes/sky.nif` = "v1"), V2 ("v2") and Same
+/// ("v1" again), with only V1 enabled, and nothing deployed yet.
+fn planner_case(base: &Path) -> (Instance, std::path::PathBuf, std::path::PathBuf) {
+    let (game, root) = (base.join("game"), base.join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    fs::create_dir_all(game.join("Data")).unwrap();
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &base.join("local")).unwrap();
+    for (id, content, on) in [("V1", "v1", true), ("V2", "v2", false), ("Same", "v1", false)] {
+        write(&base.join("src").join(id).join("meshes/sky.nif"), content);
+        install::install(&inst, &base.join("src").join(id), None, on, None).unwrap();
+    }
+    (inst, game, root)
+}
+
+/// Vortex's next deploy planner (`packages/mod-pipeline/src/plan.ts`, `OPERATIONS_BY_STATE`, GPL-3.0)
+/// decides per destination from (disk, previous deploy, current profile), with one JSON fixture
+/// per row in `fixtures/planner/`. Each block sets up one row, named by Vortex's state code (disk,
+/// previous, current: x = none, A/B/C = contents), and checks rmm's answer. rmm differs on
+/// purpose in two ways: a file changed outside rmm goes to overwrite/ and keeps winning (MO2's
+/// model) where Vortex backs it up and replaces it, and backups are restored on purge. The
+/// "unhashed" and symlink rows don't apply: rmm compares file identity, not hashes.
+#[test]
+fn vortex_planner_rows() {
+    use rmm_core::ops::set_mod_enabled;
+    let tmp = tempfile::tempdir().unwrap();
+    let t = "Data/meshes/sky.nif";
+    let case = |name: &str| planner_case(&tmp.path().join(name));
+    let on = |inst: &Instance, id: &str, e: bool| {
+        set_mod_enabled(inst, id, e).unwrap();
+    };
+    let linked = |game: &Path, root: &Path, m: &str| same_file::is_same_file(game.join(t), root.join("mods").join(m).join("meshes/sky.nif")).unwrap();
+    let replace = |game: &Path, s: &str| {
+        fs::remove_file(game.join(t)).unwrap();
+        write(&game.join(t), s);
+    };
+    let dry = |inst: &Instance| deploy::deploy(inst, true).unwrap();
+    let apply = |inst: &Instance| deploy::deploy(inst, false).unwrap();
+
+    // xxA new file: linked.
+    let (inst, game, root) = case("new");
+    assert_eq!(apply(&inst).link, [t]);
+    assert!(linked(&game, &root, "V1"));
+
+    // AxA, BxA: a file rmm didn't deploy is backed up, even with the same content, then linked.
+    // Removing the mod restores it, and so does purge (Vortex keeps backups forever).
+    for (name, there) in [("new-over-identical", "v1"), ("new-over-other", "user")] {
+        let (inst, game, root) = case(name);
+        write(&game.join(t), there);
+        let plan = apply(&inst);
+        assert!(plan.backup == [t] && plan.link == [t], "{name}: {plan:?}");
+        assert!(linked(&game, &root, "V1") && read(&root.join("backup").join(t)) == there);
+        on(&inst, "V1", false);
+        apply(&inst);
+        assert_eq!(read(&game.join(t)), there, "{name}: removing the mod restores the original");
+        on(&inst, "V1", true);
+        apply(&inst);
+        deploy::purge(&inst, false).unwrap();
+        assert_eq!(read(&game.join(t)), there, "{name}: purge restores the original");
+    }
+
+    // AAA unchanged, plus disk-only-file: files neither deploy knows are left alone.
+    let (inst, game, _) = case("unchanged");
+    apply(&inst);
+    write(&game.join("Data/user-notes.txt"), "mine");
+    assert!(dry(&inst).is_noop());
+    deploy::purge(&inst, false).unwrap();
+    assert_eq!(read(&game.join("Data/user-notes.txt")), "mine");
+
+    // xAA deployed but missing: linked again.
+    let (inst, game, root) = case("deployed-missing");
+    apply(&inst);
+    fs::remove_file(game.join(t)).unwrap();
+    assert_eq!(apply(&inst).link, [t]);
+    assert!(linked(&game, &root, "V1"));
+
+    // BAA edited outside rmm: captured to overwrite/ and kept (Vortex: back up, relink).
+    let (inst, game, root) = case("deployed-edited");
+    apply(&inst);
+    replace(&game, "edited");
+    assert_eq!(dry(&inst).external_changes, [t]);
+    apply(&inst);
+    assert_eq!(read(&game.join(t)), "edited");
+    assert_eq!(read(&root.join("overwrite/meshes/sky.nif")), "edited");
+    assert_eq!(read(&root.join("mods/V1/meshes/sky.nif")), "v1");
+
+    // xBA, BBA updated (another mod now wins), missing or still ours: linked to the new winner.
+    // same-content-other-mod: the same bytes from another mod are relinked too.
+    for (name, from, to, missing) in [("updated-missing", "V1", "V2", true), ("updated", "V1", "V2", false), ("same-content-other-mod", "V1", "Same", false)] {
+        let (inst, game, root) = case(name);
+        apply(&inst);
+        if missing {
+            fs::remove_file(game.join(t)).unwrap();
+        }
+        on(&inst, from, false);
+        on(&inst, to, true);
+        let plan = apply(&inst);
+        assert!(plan.link == [t] && plan.external_changes.is_empty() && plan.backup.is_empty(), "{name}: {plan:?}");
+        assert!(linked(&game, &root, to), "{name}");
+    }
+
+    // ABA, CBA: the old file was replaced outside rmm (with the update's bytes, or an edit) and
+    // the profile now wants the update. The outside file goes to overwrite/ and wins.
+    for (name, outside) in [("updated-over-identical", "v2"), ("updated-over-edited", "edited")] {
+        let (inst, game, root) = case(name);
+        apply(&inst);
+        replace(&game, outside);
+        on(&inst, "V2", true);
+        assert_eq!(apply(&inst).external_changes, [t], "{name}");
+        assert_eq!(read(&game.join(t)), outside, "{name}");
+        assert_eq!(read(&root.join("mods/V2/meshes/sky.nif")), "v2", "{name}");
+    }
+
+    // xAx removed and already gone, AAx removed: nothing left behind.
+    for (name, missing) in [("removed-gone", true), ("removed", false)] {
+        let (inst, game, _) = case(name);
+        apply(&inst);
+        if missing {
+            fs::remove_file(game.join(t)).unwrap();
+        }
+        on(&inst, "V1", false);
+        apply(&inst);
+        assert!(!game.join(t).exists() && dry(&inst).is_noop(), "{name}");
+    }
+
+    // BAx removed after an outside edit: the edit is kept in overwrite/ (Vortex: back up).
+    let (inst, game, root) = case("removed-edited");
+    apply(&inst);
+    replace(&game, "edited");
+    on(&inst, "V1", false);
+    apply(&inst);
+    assert_eq!(read(&game.join(t)), "edited");
+    assert_eq!(read(&root.join("overwrite/meshes/sky.nif")), "edited");
+
+    // deployed-file-other-case: the disk spells the folder differently; still the same file.
+    #[cfg(windows)]
+    {
+        let (inst, game, _) = case("other-case");
+        apply(&inst);
+        fs::rename(game.join("Data/meshes"), game.join("Data/Meshes")).unwrap();
+        assert!(dry(&inst).is_noop());
+    }
+
+    // file-replaces-folder, folder-replaces-file: the old entries are unlinked before the new
+    // ones are linked, and purge leaves neither behind.
+    let base = tmp.path().join("file-folder");
+    let (inst, game, _) = planner_case(&base);
+    write(&base.join("src/Dir/SkyUI/config.txt"), "config");
+    write(&base.join("src/Dir/interface/dir.swf"), "swf"); // two top-level folders: not unwrapped
+    write(&base.join("src/File/SkyUI"), "file");
+    install::install(&inst, &base.join("src/Dir"), None, true, None).unwrap();
+    install::install(&inst, &base.join("src/File"), None, false, None).unwrap();
+    apply(&inst);
+    on(&inst, "Dir", false);
+    on(&inst, "File", true);
+    let plan = apply(&inst);
+    assert!(plan.backup.is_empty(), "rmm's own folder isn't someone else's file: {plan:?}");
+    assert_eq!(read(&game.join("Data/SkyUI")), "file");
+    on(&inst, "File", false);
+    on(&inst, "Dir", true);
+    apply(&inst);
+    assert_eq!(read(&game.join("Data/SkyUI/config.txt")), "config");
+    deploy::purge(&inst, false).unwrap();
+    assert!(!game.join("Data/SkyUI").exists());
 }

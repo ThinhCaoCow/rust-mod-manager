@@ -13,3 +13,7 @@ clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 schemars = "1"
+
+[features]
+default = ["zstd"]
+zstd = ["rmm-core/zstd"]

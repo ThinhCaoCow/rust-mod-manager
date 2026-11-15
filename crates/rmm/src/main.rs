@@ -68,6 +68,17 @@ enum Cmd {
     },
     /// Download the latest LOOT masterlist now (sort refreshes it daily by itself).
     Masterlist,
+    /// LOOT user rules for the profile's plugins; with a plugin, replace its rule (no --after or
+    /// --group removes it). Kept in loot/userlist.yaml, LOOT's own format.
+    Rule {
+        plugin: Option<String>,
+        /// Plugin this one loads after (repeatable).
+        #[arg(long)]
+        after: Vec<String>,
+        /// LOOT group from the masterlist.
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// Health check.
     Check,
     /// Deploy, check the script extender matches the game, and start it (Windows); --apply to do it.
@@ -108,6 +119,7 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process
 enum ToolCmd {
     /// Configured tools and the available presets.
     List,
@@ -132,6 +144,9 @@ enum ToolCmd {
         /// Glob of files from the previous output copied into {output} before a run (repeatable).
         #[arg(long)]
         keep: Vec<String>,
+        /// Program (relative to the game folder) a launcher starts; the run waits for it too.
+        #[arg(long)]
+        wait_for: Option<String>,
         /// Arguments after --, replacing the preset's. Placeholders: {data} {game} {plugins} {ini}
         /// {ini_dir} {output} {state} and any --var.
         #[arg(last = true)]
@@ -187,12 +202,14 @@ fn main() -> Result<()> {
         }
         Cmd::Sort { apply } => print(&loot::sort(&open()?, !apply)?),
         Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
+        Cmd::Rule { plugin: None, .. } => print(&loot::rules(&open()?)?),
+        Cmd::Rule { plugin: Some(plugin), after, group } => print(&serde_json::json!({ "previous": loot::set_rule(&open()?, &loot::Rule { plugin, after, group })? })),
         Cmd::Check => print(&health::check(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
         Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
         Cmd::Tool(ToolCmd::List) => print(&serde_json::json!({ "tools": tools::list(&open()?)?, "presets": tools::PRESETS })),
-        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, args }) => {
+        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, wait_for, args }) => {
             let spec = tools::ToolSpec {
                 exe,
                 preset,
@@ -203,6 +220,7 @@ fn main() -> Result<()> {
                 output_mod,
                 keep: (!keep.is_empty()).then_some(keep),
                 settings: None, // JSON settings: presets, MCP, or tools.toml
+                wait_for,
             };
             print(&tools::add(&open()?, &id, spec)?)
         }

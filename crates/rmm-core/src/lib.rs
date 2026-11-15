@@ -11,6 +11,7 @@ pub mod launch;
 pub mod loot;
 pub mod ops;
 pub mod plugins;
+pub mod proton;
 pub mod tools;
 
 pub use game::Game;

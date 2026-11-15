@@ -1,14 +1,15 @@
 //! LOOT sorting and messages through libloot (SPEC.md "LOOT"). The masterlist and prelude are
 //! cached in `<instance>/loot/` and refreshed from LOOT's GitHub repositories at most once a day;
-//! `loot/userlist.yaml`, if present, adds the user's own rules.
+//! `loot/userlist.yaml`, if present, adds the user's own rules; `set_rule` edits it.
 use crate::health::Issue;
 use crate::instance::OVERWRITE;
 use crate::plugins::PluginInfo;
 use crate::{Game, Instance, PluginEntry, Profile, plugins};
 use anyhow::{Context, Result, bail};
-use libloot::metadata::{MessageType, select_message_content};
-use libloot::{EvalMode, GameType, MergeMode};
-use serde::Serialize;
+use libloot::metadata::{File, MessageType, PluginMetadata, select_message_content};
+use libloot::{EvalMode, GameType, MergeMode, MetadataWriteOptions};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -228,4 +229,71 @@ pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
         }
     }
     Ok(issues)
+}
+
+/// A user rule for one plugin, kept in `loot/userlist.yaml` in LOOT's own format, so LOOT itself
+/// reads the same rules.
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Rule {
+    pub plugin: String,
+    /// Plugins this one must load after.
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// A LOOT group from the masterlist, e.g. "Late Loaders".
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+fn rule_of(m: &PluginMetadata) -> Rule {
+    Rule { plugin: m.name().to_owned(), after: m.load_after_files().iter().map(|f| f.name().as_str().to_owned()).collect(), group: m.group().map(str::to_owned) }
+}
+
+/// The user rules for the profile's plugins.
+pub fn rules(inst: &Instance) -> Result<Vec<Rule>> {
+    let profile = inst.profile()?;
+    let (game, _) = handle(inst, &profile)?;
+    let db = game.database();
+    let db = db.read().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
+    let mut out = Vec::new();
+    for p in plugins::list(inst, &profile)? {
+        if let Some(m) = db.plugin_user_metadata(&p.name, EvalMode::DoNotEvaluate)? {
+            out.push(rule_of(&m));
+        }
+    }
+    Ok(out)
+}
+
+/// Replace a plugin's load-after list and group in the userlist; an empty rule removes them.
+/// Other user metadata for the plugin (messages, tags) stays. Returns the previous rule, which
+/// is how to undo this: the userlist isn't part of the profile history.
+pub fn set_rule(inst: &Instance, rule: &Rule) -> Result<Option<Rule>> {
+    let profile = inst.profile()?;
+    let (game, _) = handle(inst, &profile)?;
+    let db = game.database();
+    let mut db = db.write().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
+    if let Some(g) = &rule.group
+        && dir(inst).join("masterlist.yaml").is_file()
+        && !db.groups(MergeMode::WithUserMetadata).iter().any(|x| x.name() == g)
+    {
+        bail!("LOOT has no group '{g}'; groups come from the masterlist");
+    }
+    let old = db.plugin_user_metadata(&rule.plugin, EvalMode::DoNotEvaluate)?;
+    let mut m = match &old {
+        Some(m) => m.clone(),
+        None => PluginMetadata::new(&rule.plugin)?,
+    };
+    m.set_load_after_files(rule.after.iter().map(|a| File::new(a.clone())).collect());
+    match &rule.group {
+        Some(g) => m.set_group(g.clone()),
+        None => m.unset_group(),
+    }
+    db.discard_plugin_user_metadata(&rule.plugin);
+    if !m.has_name_only() {
+        db.set_plugin_user_metadata(m);
+    }
+    fs::create_dir_all(dir(inst))?;
+    let mut opts = MetadataWriteOptions::new();
+    opts.set_truncate(true);
+    db.write_user_metadata(&dir(inst).join("userlist.yaml"), &opts)?;
+    Ok(old.as_ref().map(rule_of))
 }
