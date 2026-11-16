@@ -31,18 +31,39 @@ pub struct InstallReport {
 }
 
 /// `choices` is required when the mod has a FOMOD installer (`Choices::default()` takes its defaults).
+/// The mod goes at the end, before generated tool output, or where mod rules place it.
 pub fn install(inst: &Instance, source: &Path, name: Option<&str>, enable: bool, choices: Option<&Choices>) -> Result<InstallReport> {
+    install_at(inst, source, name, enable, choices, None)
+}
+
+/// `install` at a given priority (0 = lowest) instead of the default place.
+pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bool, choices: Option<&Choices>, priority: Option<usize>) -> Result<InstallReport> {
     let name = name
         .map(str::to_owned)
-        .or_else(|| source.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        // A folder keeps its whole name ("Address Library (1.7.104.0)"); an archive loses its extension.
+        .or_else(|| if source.is_dir() { source.file_name() } else { source.file_stem() }.map(|s| s.to_string_lossy().into_owned()))
         .context("cannot derive a mod name from the source path")?;
     let id = unique_id(inst, &sanitize(&name));
-    let staging = inst.root.join(".staging").join(&id);
+    install_with_id(inst, source, &id, &name, enable, choices, priority)
+}
+
+/// Install under an exact id (a lockfile's), which must be free and valid.
+pub fn install_as(inst: &Instance, source: &Path, id: &str, name: &str, enable: bool, choices: Option<&Choices>) -> Result<InstallReport> {
+    if sanitize(id) != id || id.contains(':') || unique_id(inst, id) != id {
+        bail!("'{id}' is taken or isn't a valid mod id");
+    }
+    install_with_id(inst, source, id, name, enable, choices, None)
+}
+
+fn install_with_id(inst: &Instance, source: &Path, id: &str, name: &str, enable: bool, choices: Option<&Choices>, priority: Option<usize>) -> Result<InstallReport> {
+    let staging = inst.root.join(".staging").join(id);
     let _ = fs::remove_dir_all(&staging);
-    let result = install_inner(inst, source, &staging, &id, &name, enable, choices);
+    let mut result = install_inner(inst, source, &staging, id, name, enable, choices, priority);
     let _ = fs::remove_dir_all(&staging);
-    if result.is_ok() {
+    if let Ok(r) = &mut result {
         let _ = fs::remove_dir_all(preview_dir(inst));
+        let done = crate::addons::hook(inst, "after_install", &serde_json::json!({ "id": r.id, "name": r.name }));
+        r.warnings.extend(crate::addons::warnings(&done));
     }
     result
 }
@@ -61,7 +82,124 @@ pub fn fomod_options(inst: &Instance, source: &Path, choices: Option<&Choices>) 
     Ok(walk)
 }
 
-fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name: &str, enable: bool, choices: Option<&Choices>) -> Result<InstallReport> {
+/// Whether the mod at `source` has a FOMOD installer. An archive is unpacked into the preview
+/// cache, so fomod_options and the install that follow don't extract it again.
+pub fn has_fomod(inst: &Instance, source: &Path) -> Result<bool> {
+    let raw = if source.is_dir() { source.to_path_buf() } else { unpack(inst, source)? };
+    Ok(matches!(find_layout(raw)?, Layout::Fomod(_)))
+}
+
+/// The file an option's `image` names (FOMOD paths ignore case and may use `\`), inside the
+/// installer: `..` and absolute paths match nothing.
+pub fn fomod_image(inst: &Instance, source: &Path, image: &str) -> Result<PathBuf> {
+    let raw = if source.is_dir() { source.to_path_buf() } else { unpack(inst, source)? };
+    let Layout::Fomod(root) = find_layout(raw)? else {
+        bail!("{} has no FOMOD installer", source.display());
+    };
+    image
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .try_fold(root, |dir, part| child_ci(&dir, part))
+        .filter(|p| p.is_file())
+        .with_context(|| format!("the installer has no image '{image}'"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name: &str, enable: bool, choices: Option<&Choices>, priority: Option<usize>) -> Result<InstallReport> {
+    let dest = inst.mod_dir(id);
+    let (files, fomod, warnings) = build(inst, source, staging, &dest, choices)?;
+    // An archive's hash lets a lockfile find the same download elsewhere.
+    let sha256 = if source.is_file() { Some(crate::lockfile::sha256_file(source)?) } else { None };
+    inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone(), sha256, ..Default::default() })?;
+    let plugins = top_plugins(&files);
+    inst.edit(&format!("install {id}"), |p| {
+        let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
+        let at = match priority {
+            Some(n) => n.min(ids.len()),
+            None => crate::rules::place(inst, &ids, id)?,
+        };
+        p.mods.insert(at, ModEntry { id: id.into(), enabled: enable });
+        add_plugins(p, &plugins, enable);
+        Ok(())
+    })?;
+    Ok(report(id, name, &files, plugins, warnings, fomod))
+}
+
+/// Install a mod again from the archive or folder it came from, with new FOMOD choices
+/// (`None` keeps the stored ones). It keeps its id, name, place and enabled state; plugins the
+/// new files add join the plugin list. The old files go to trash/; this isn't in the undo history.
+pub fn reinstall(inst: &Instance, id: &str, choices: Option<&Choices>) -> Result<InstallReport> {
+    if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE {
+        bail!("'{id}' is not an installed mod");
+    }
+    let meta = inst.mod_meta(id);
+    let Some(source) = meta.source.clone().filter(|s| !s.starts_with("tool:")) else {
+        bail!("{id} wasn't installed from an archive or folder rmm can read again; tool output is rebuilt by running its tool");
+    };
+    let source = PathBuf::from(source);
+    if !source.exists() {
+        bail!("{} is gone; install the new download instead", source.display());
+    }
+    let Some(enabled) = inst.profile()?.mods.iter().find(|m| m.id == id).map(|m| m.enabled) else {
+        bail!("mod '{id}' is not in the profile");
+    };
+    let staging = inst.root.join(".staging").join(id);
+    let _ = fs::remove_dir_all(&staging);
+    let choices = choices.or(meta.fomod.as_ref()).cloned().unwrap_or_default();
+    let result = (|| {
+        fs::create_dir_all(&staging)?;
+        let fresh = staging.join("mod");
+        let (files, fomod, warnings) = build(inst, &source, &staging, &fresh, Some(&choices))?;
+        inst.locked(|| {
+            inst.trash_mod(id)?;
+            if let Err(e) = fs::rename(&fresh, inst.mod_dir(id)) {
+                fs::rename(inst.root.join("trash").join(id), inst.mod_dir(id))?;
+                return Err(e.into());
+            }
+            inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ..meta.clone() })
+        })?;
+        let plugins = top_plugins(&files);
+        inst.edit(&format!("reinstall {id}"), |p| {
+            add_plugins(p, &plugins, enabled);
+            Ok(())
+        })?;
+        Ok(report(id, &meta.name, &files, plugins, warnings, fomod))
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    if result.is_ok() {
+        let _ = fs::remove_dir_all(preview_dir(inst));
+    }
+    result
+}
+
+fn top_plugins(files: &[String]) -> Vec<String> {
+    files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect()
+}
+
+fn add_plugins(p: &mut crate::Profile, plugins: &[String], enable: bool) {
+    for pl in plugins {
+        if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(pl)) {
+            p.plugins.push(PluginEntry { name: pl.clone(), enabled: enable });
+        }
+    }
+}
+
+fn report(id: &str, name: &str, files: &[String], plugins: Vec<String>, warnings: Vec<String>, fomod: Option<Choices>) -> InstallReport {
+    InstallReport {
+        id: id.into(),
+        name: name.into(),
+        root_files: files.iter().filter(|f| f.starts_with("root/")).count(),
+        files: files.len(),
+        plugins,
+        warnings,
+        fomod,
+    }
+}
+
+/// Unpack `source` (or run its FOMOD installer) into `dest`, which must not exist yet, and index
+/// it. Returns the files, the FOMOD choices used and any warnings.
+fn build(inst: &Instance, source: &Path, staging: &Path, dest: &Path, choices: Option<&Choices>) -> Result<(Vec<String>, Option<Choices>, Vec<String>)> {
+    crate::progress::report("installing", 0, 0);
     let archive = !source.is_dir();
     let raw = if archive {
         unpack(inst, source)?
@@ -74,7 +212,6 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
 
     let mut warnings = Vec::new();
     let mut fomod = None;
-    let dest = inst.mod_dir(id);
     let layout = find_layout(raw)?;
     if archive && !matches!(layout, Layout::Fomod(_)) {
         // The moves below take files out of the unpacked archive, so it can't be reused.
@@ -102,14 +239,14 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
             if guessed {
                 warnings.push("no Data folder markers found; installed the archive contents as Data files".into());
             }
-            fs::rename(d, &dest)?;
+            fs::rename(d, dest)?;
         }
         Layout::Root(r) => {
-            fs::create_dir_all(&dest)?;
+            fs::create_dir_all(dest)?;
             fs::rename(r, dest.join("root"))?;
         }
         Layout::DataWithRoot { root, data } => {
-            fs::rename(&data, &dest)?;
+            fs::rename(&data, dest)?;
             let root_dest = dest.join("root");
             for e in fs::read_dir(&root)? {
                 let e = e?;
@@ -119,30 +256,9 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
         }
     }
 
-    let files = index_dir(&dest)?;
+    let files = index_dir(dest)?;
     fs::write(dest.join(".rmm-index"), files.join("\n"))?;
-    inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone() })?;
-    let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect();
-
-    inst.edit(&format!("install {id}"), |p| {
-        p.mods.push(ModEntry { id: id.into(), enabled: enable });
-        for pl in &plugins {
-            if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(pl)) {
-                p.plugins.push(PluginEntry { name: pl.clone(), enabled: enable });
-            }
-        }
-        Ok(())
-    })?;
-
-    Ok(InstallReport {
-        id: id.into(),
-        name: name.into(),
-        root_files: files.iter().filter(|f| f.starts_with("root/")).count(),
-        files: files.len(),
-        plugins,
-        warnings,
-        fomod,
-    })
+    Ok((files, fomod, warnings))
 }
 
 /// Run a FOMOD installer found at `root` against the instance's current setup.
@@ -180,6 +296,7 @@ fn unpack(inst: &Instance, source: &Path) -> Result<PathBuf> {
     }
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&raw)?;
+    crate::progress::report("extracting", 0, 0);
     extract(source, &raw)?;
     fs::write(dir.join(".key"), key)?;
     Ok(raw)
@@ -190,15 +307,78 @@ fn child_ci(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 pub fn uninstall(inst: &Instance, id: &str) -> Result<()> {
-    inst.edit(&format!("uninstall {id}"), |p| {
-        let before = p.mods.len();
-        p.mods.retain(|m| m.id != id);
-        if p.mods.len() == before {
+    uninstall_mods(inst, &[id.to_string()])
+}
+
+/// Uninstall mods (their folders go to trash/, so undo brings them back) and remove
+/// separators, in one undo step.
+pub fn uninstall_mods(inst: &Instance, ids: &[String]) -> Result<()> {
+    let label = match ids {
+        [one] if crate::instance::is_separator(one) => format!("remove separator {}", &one[4..]),
+        [one] => format!("uninstall {one}"),
+        _ => format!("uninstall {} mods", ids.len()),
+    };
+    inst.edit(&label, |p| {
+        if let Some(id) = ids.iter().find(|id| !p.mods.iter().any(|m| m.id == **id)) {
             bail!("mod '{id}' is not in the profile");
         }
+        p.mods.retain(|m| !ids.contains(&m.id));
+        p.colors.retain(|k, _| !ids.contains(k));
         Ok(())
     })?;
-    inst.trash_mod(id)
+    for id in ids.iter().filter(|id| !crate::instance::is_separator(id)) {
+        inst.trash_mod(id)?;
+    }
+    Ok(())
+}
+
+/// Turn everything in overwrite/ into a new mod named `name`, enabled at the end of the list
+/// (undoable like an install). overwrite/ starts empty again.
+pub fn mod_from_overwrite(inst: &Instance, name: &str) -> Result<InstallReport> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("the new mod needs a name");
+    }
+    let over = inst.mod_dir(crate::instance::OVERWRITE);
+    let files = inst.mod_files(crate::instance::OVERWRITE)?;
+    if files.is_empty() {
+        bail!("overwrite/ is empty");
+    }
+    let id = unique_id(inst, &sanitize(name));
+    let dest = inst.mod_dir(&id);
+    inst.locked(|| {
+        fs::create_dir_all(inst.mods_dir())?;
+        fs::rename(&over, &dest)?;
+        fs::create_dir_all(&over)?;
+        fs::write(dest.join(".rmm-index"), files.join("\n"))?;
+        inst.write_mod_meta(&id, &ModMeta { name: name.into(), ..Default::default() })
+    })?;
+    let plugins = top_plugins(&files);
+    inst.edit(&format!("create {id} from overwrite"), |p| {
+        let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
+        p.mods.insert(crate::rules::place(inst, &ids, &id)?, ModEntry { id: id.clone(), enabled: true });
+        add_plugins(p, &plugins, true);
+        Ok(())
+    })?;
+    Ok(report(&id, name, &files, plugins, vec![], None))
+}
+
+/// Move everything in overwrite/ to trash/overwrite (replacing what an earlier clear put there).
+/// Returns how many files went. Not in the undo history.
+pub fn clear_overwrite(inst: &Instance) -> Result<usize> {
+    let over = inst.mod_dir(crate::instance::OVERWRITE);
+    let n = inst.mod_files(crate::instance::OVERWRITE)?.len();
+    if n == 0 {
+        return Ok(0);
+    }
+    inst.locked(|| {
+        let bin = inst.root.join("trash").join("overwrite");
+        let _ = fs::remove_dir_all(&bin);
+        fs::create_dir_all(inst.root.join("trash"))?;
+        fs::rename(&over, &bin)?;
+        fs::create_dir_all(&over)?;
+        Ok(n)
+    })
 }
 
 pub fn is_plugin(name: &str) -> bool {

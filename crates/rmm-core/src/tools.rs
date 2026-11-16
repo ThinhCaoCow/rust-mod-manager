@@ -205,9 +205,11 @@ pub fn remove(inst: &Instance, id: &str) -> Result<()> {
 /// Built-in definitions, from reading each tool's source (docs/internals/tools/).
 pub fn preset(game: Game, name: &str) -> Option<Tool> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    let (switch, xedit) = match game {
-        Game::SkyrimSe => ("-SSE", "SSEEdit"),
-        Game::Fallout4 => ("-FO4", "FO4Edit"),
+    let (switch, xedit) = match (game.lo_id(), game.base()) {
+        (loadorder::GameId::SkyrimVR, _) => ("-TES5VR", "TES5VREdit"),
+        (loadorder::GameId::Fallout4VR, _) => ("-FO4VR", "FO4VREdit"),
+        (_, Game::Fallout4) => ("-FO4", "FO4Edit"),
+        _ => ("-SSE", "SSEEdit"),
     };
     // xEdit only finds Steam installs by itself, and keeps backups and its cache inside Data.
     // -C: gets no trailing separator from xEdit, so it is written here.
@@ -216,7 +218,7 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
     let lod_args = [switch, r"-o:{output}\", r"-d:{data}\", "-p:{plugins}", r"-m:{ini_dir}\"];
     let tool = |name: &str, args: Vec<String>| Tool { name: name.into(), args, ..Default::default() };
     let settings = |file: &str, set: &[(&str, Value)]| Some(Settings { file: file.into(), set: set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() });
-    let skyrim = game == Game::SkyrimSe;
+    let skyrim = game.base() == Game::SkyrimSe;
     Some(match name {
         // Saves by writing a new file and renaming it over the plugin, so links are safe.
         "xedit" => tool(xedit, s(&xedit_args)),
@@ -266,6 +268,15 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
 /// Run a tool. With `dry_run` nothing happens: the report shows the command, the generated mod
 /// it would replace, the links it would swap and the deploy that runs first.
 pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {
+    let mut r = run_inner(inst, id, given, dry_run, timeout)?;
+    if !dry_run {
+        let done = crate::addons::hook(inst, "after_tool_run", &serde_json::json!({ "tool": id, "mod": r.mod_id }));
+        r.warnings.extend(crate::addons::warnings(&done));
+    }
+    Ok(r)
+}
+
+fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {
     let tools = list(inst)?;
     let tool = tools.get(id).with_context(|| format!("no tool '{id}'; add one first (presets: {})", PRESETS.join(", ")))?;
     let state = inst.root.join("tools").join(id);
@@ -450,7 +461,7 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
             ops::set_mod_enabled(inst, p, true)?;
         }
     } else {
-        inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), fomod: None })?;
+        inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), ..Default::default() })?;
         let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect();
         let known = inst.profile()?.plugins;
         added_plugins = plugins.iter().any(|pl| !known.iter().any(|e| e.name.eq_ignore_ascii_case(pl)));
@@ -516,8 +527,8 @@ fn vars(inst: &Instance, tool: &Tool, state: &Path, staging: &Path, given: &BTre
         ("output".into(), p(staging)),
         ("state".into(), p(state)),
     ]);
-    if let Some(d) = inst.ini_dir() {
-        v.insert("ini".into(), p(&d.join(inst.config.game.ini_name())));
+    if let (Some(d), Some(ini)) = (inst.ini_dir(), inst.ini_file(inst.config.game.ini_name())) {
+        v.insert("ini".into(), p(&ini));
         v.insert("ini_dir".into(), p(&d));
     }
     v.extend(tool.vars.clone());

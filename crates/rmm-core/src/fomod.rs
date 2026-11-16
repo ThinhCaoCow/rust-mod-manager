@@ -569,7 +569,7 @@ fn ordered<T>(mut v: Vec<T>, list: Node, name: fn(&T) -> &String) -> Result<Vec<
 /// FOMOD files come as UTF-16 (often without a BOM), UTF-8, or a legacy code page.
 fn decode(b: &[u8]) -> String {
     let utf16 = |b: &[u8], be: bool| {
-        let units: Vec<u16> = b.chunks_exact(2).map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();
+        let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| if be { u16::from_be_bytes(c) } else { u16::from_le_bytes(c) }).collect();
         String::from_utf16_lossy(&units)
     };
     let utf8 = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap_or_else(|_| b.iter().map(|&c| c as char).collect());

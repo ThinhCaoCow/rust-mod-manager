@@ -25,6 +25,12 @@ pub struct LaunchReport {
 
 /// Deploy and start the game. With `dry_run`, only the plan and the checks.
 pub fn launch(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
+    launch_with(inst, dry_run, &[])
+}
+
+/// `launch` with extra environment variables, which the script extender's loader passes on to
+/// the game (the test harness reads its port and token from them).
+pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Result<LaunchReport> {
     let deploy = deploy::deploy(inst, dry_run)?; // refuses while the game runs
     let (root, game) = (&inst.config.game_path, inst.config.game);
     let game_exe = root.join(game.exe());
@@ -64,6 +70,7 @@ pub fn launch(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
         deploy::remember_unmanaged(inst)?;
         let mut cmd = if proton::needed(&r.exe) { proton::command(game, root, &r.exe)? } else { Command::new(&r.exe) };
         let child = cmd
+            .envs(env.iter().map(|(k, v)| (*k, v)))
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -104,7 +111,7 @@ fn runtimes(root: &Path, game: Game) -> Result<Vec<(String, [u32; 3])>> {
 }
 
 fn has_se_plugins(inst: &Instance, game: Game) -> bool {
-    let dir = inst.data_dir().join(if game == Game::SkyrimSe { "SKSE" } else { "F4SE" }).join("Plugins");
+    let dir = inst.data_dir().join(if game.base() == Game::SkyrimSe { "SKSE" } else { "F4SE" }).join("Plugins");
     fs::read_dir(dir).is_ok_and(|rd| rd.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().to_lowercase().ends_with(".dll")))
 }
 

@@ -51,6 +51,9 @@ pub struct DeployPlan {
     pub unchanged: usize,
     /// Files copied because hard links were impossible (different drives).
     pub copied: usize,
+    /// Add-on hooks that failed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl DeployPlan {
@@ -74,7 +77,29 @@ fn target_of(rel: &str) -> String {
 }
 
 pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
+    if dry_run {
+        return deploy_with(inst, true, true);
+    }
+    // Add-on hooks run outside the lock, so they can call back into rmm.
+    let before = crate::addons::hook(inst, "before_deploy", &serde_json::json!({}));
+    if let Some((addon, why)) = before.iter().find_map(|(a, r)| Some((a, r.as_ref().ok()?["abort"].as_str()?))) {
+        bail!("add-on {addon} stopped the deploy: {why}");
+    }
+    let mut plan = deploy_with(inst, false, true)?;
+    let after = crate::addons::hook(inst, "after_deploy", &serde_json::json!({ "linked": plan.link.len(), "removed": plan.remove.len() }));
+    plan.warnings.extend(crate::addons::warnings(&before));
+    plan.warnings.extend(crate::addons::warnings(&after));
+    Ok(plan)
+}
+
+/// `data: false` deploys only the game-root files (and takes linked Data files back out), for
+/// the Linux VFS mode, which shows Data through a mount instead.
+pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployPlan> {
     inst.locked(|| {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = crate::vfs::mounted_by(inst) {
+            bail!("Data is mounted by `rmm vfs` (process {pid}); stop it (Ctrl+C) before deploying");
+        }
         check_owner(inst)?;
         check_foreign(inst)?;
         let game = &inst.config.game_path;
@@ -85,6 +110,10 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             check_not_running(inst)?;
         }
         let profile = inst.profile()?;
+        // plugins.txt is written last; refuse up front rather than leave a half-done deploy.
+        if let Some(why) = crate::plugins::over_limit(&crate::plugins::list(inst, &profile)?) {
+            bail!("{why}. Nothing was deployed");
+        }
         let mut man = load_manifest(inst)?;
         let mut plan = DeployPlan::default();
         capture_played(inst, &man, &mut plan, dry_run)?;
@@ -92,18 +121,24 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
         // Files changed outside rmm go to overwrite/ first, so they win the layering below.
         let mut changed: HashSet<String> = HashSet::new();
         let mut ok: HashSet<String> = HashSet::new();
-        for (key, e) in &man.files {
+        let checks = man.files.len();
+        for (i, (key, e)) in man.files.iter().enumerate() {
+            crate::progress::report("checking deployed files", i, checks);
             let path = game.join(&e.target);
             if !path.exists() {
                 continue;
             }
-            if is_ours(inst, e, &path) {
-                ok.insert(key.clone());
-            } else {
-                plan.external_changes.push(e.target.clone());
-                changed.insert(key.clone());
-                if !dry_run {
-                    capture(inst, &e.target, &path)?;
+            match ours(inst, e, &path) {
+                Some(true) => {
+                    ok.insert(key.clone());
+                }
+                Some(false) => {} // a reinstalled mod's old file: relinked below
+                None => {
+                    plan.external_changes.push(e.target.clone());
+                    changed.insert(key.clone());
+                    if !dry_run {
+                        capture(inst, &e.target, &path)?;
+                    }
                 }
             }
         }
@@ -120,6 +155,9 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             // Already true after a real capture; a dry run has to pretend.
             let target = man.files[key].target.clone();
             desired.insert(key.clone(), Want { src: mod_rel(&target), mod_id: OVERWRITE.into(), target });
+        }
+        if !data {
+            desired.retain(|_, w| !w.target.starts_with("Data/"));
         }
 
         let old_keys: HashSet<String> = man.files.keys().cloned().collect();
@@ -161,18 +199,22 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
         to_link.extend(desired.keys().filter(|k| !old_keys.contains(*k)).map(|k| (k.clone(), false)));
         to_link.sort();
 
-        for (key, mut backed_up) in to_link {
+        let links = to_link.len();
+        let mut spelling = Spelling::default();
+        for (i, (key, mut backed_up)) in to_link.into_iter().enumerate() {
+            crate::progress::report(if dry_run { "planning" } else { "linking files" }, i, links);
             let w = &desired[&key];
-            let path = game.join(&w.target);
-            plan.link.push(w.target.clone());
+            let target = spelling.on_disk(game, &w.target);
+            let path = game.join(&target);
+            plan.link.push(target.clone());
             // A folder rmm made, emptied by the removals above, where a mod now puts a file.
             if path.is_dir() && man.dirs.iter().any(|d| path_key(d) == key) && (dry_run || fs::remove_dir(&path).is_ok()) {
                 man.dirs.retain(|d| path_key(d) != key);
             } else if !old_keys.contains(&key) && path.exists() {
-                plan.backup.push(w.target.clone());
+                plan.backup.push(target.clone());
                 backed_up = true;
                 if !dry_run {
-                    let b = inst.root.join("backup").join(&w.target);
+                    let b = inst.root.join("backup").join(&target);
                     fs::create_dir_all(b.parent().unwrap())?;
                     fs::rename(&path, b)?;
                 }
@@ -192,7 +234,7 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             let (size, mtime) = state(&path).expect("just deployed");
             man.files.insert(
                 key,
-                Deployed { target: w.target.clone(), mod_id: w.mod_id.clone(), src: w.src.clone(), size, mtime, backed_up, copied },
+                Deployed { target, mod_id: w.mod_id.clone(), src: w.src.clone(), size, mtime, backed_up, copied },
             );
         }
 
@@ -200,6 +242,7 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             save_manifest(inst, &man)?;
             fs::write(game.join(OWNER), inst.root.display().to_string())?;
             crate::plugins::write_plugins_txt(inst, &profile)?;
+            crate::profile_ini::apply(inst, &profile)?;
         }
         Ok(plan)
     })
@@ -208,8 +251,13 @@ pub fn deploy(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
 /// Remove everything rmm deployed and restore backed-up files.
 pub fn purge(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
     inst.locked(|| {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = crate::vfs::mounted_by(inst) {
+            bail!("Data is mounted by `rmm vfs` (process {pid}); stop it (Ctrl+C) first");
+        }
         if !dry_run {
             check_not_running(inst)?;
+            crate::profile_ini::release(inst)?;
         }
         if !inst.root.join(MANIFEST).exists() {
             return purge_by_identity(inst, dry_run);
@@ -371,13 +419,23 @@ fn save_manifest(inst: &Instance, man: &Manifest) -> Result<()> {
 /// Is the file at `path` still what rmm put there? Links are compared by file identity (NTFS file
 /// id or inode): an in-place edit through the link is ours (the mod file changed with it), a
 /// replaced file is not, even with the same size and mtime. Copies, and links whose source is gone
-/// (mod uninstalled), fall back to the size and mtime recorded at deploy.
-fn is_ours(inst: &Instance, e: &Deployed, path: &Path) -> bool {
+/// (mod uninstalled), fall back to the size and mtime recorded at deploy. A reinstalled mod's old
+/// files are in trash/, and a link to one of those is still ours, but stale: `Some(false)`.
+fn ours(inst: &Instance, e: &Deployed, path: &Path) -> Option<bool> {
     let src = inst.mod_dir(&e.mod_id).join(&e.src);
     if !e.copied && src.exists() {
-        return same_file::is_same_file(path, src).unwrap_or(false);
+        let same = |p: &Path| same_file::is_same_file(path, p).unwrap_or(false);
+        return if same(&src) {
+            Some(true)
+        } else {
+            same(&inst.root.join("trash").join(&e.mod_id).join(&e.src)).then_some(false)
+        };
     }
-    state(path) == Some((e.size, e.mtime))
+    (state(path) == Some((e.size, e.mtime))).then_some(true)
+}
+
+fn is_ours(inst: &Instance, e: &Deployed, path: &Path) -> bool {
+    ours(inst, e, path).is_some()
 }
 
 /// Where a game-relative target lives inside a mod or overwrite/: Data files at the top, the
@@ -459,6 +517,37 @@ fn capture(inst: &Instance, target: &str, path: &Path) -> Result<()> {
     fs::create_dir_all(dest.parent().unwrap())?;
     fs::copy(path, dest)?;
     Ok(())
+}
+
+/// Where a target goes on disk. Windows matches names without case; on Linux each part of the
+/// path takes the spelling already on disk (or given to an earlier target), as Wine sees it, so
+/// a mod's `Textures/` lands in vanilla's `textures/` instead of beside it.
+#[derive(Default)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Spelling(std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>);
+
+impl Spelling {
+    #[cfg(not(unix))]
+    fn on_disk(&mut self, _game: &Path, target: &str) -> String {
+        target.to_string()
+    }
+
+    #[cfg(unix)]
+    fn on_disk(&mut self, game: &Path, target: &str) -> String {
+        let mut dir = game.to_path_buf();
+        let mut out = Vec::new();
+        for part in target.split('/') {
+            let names = self.0.entry(dir.clone()).or_insert_with(|| {
+                fs::read_dir(&dir)
+                    .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).map(|n| (n.to_lowercase(), n)).collect())
+                    .unwrap_or_default()
+            });
+            let actual = names.entry(part.to_lowercase()).or_insert_with(|| part.to_string()).clone();
+            dir.push(&actual);
+            out.push(actual);
+        }
+        out.join("/")
+    }
 }
 
 fn create_parents(game: &Path, path: &Path, created: &mut Vec<String>) -> Result<()> {

@@ -29,7 +29,14 @@ pub struct PluginInfo {
 
 fn settings(inst: &Instance) -> Result<GameSettings> {
     let c = &inst.config;
-    Ok(GameSettings::with_local_path(c.game.lo_id(), &c.game_path, &c.local_path)?)
+    GameSettings::with_local_path(c.game.lo_id(), &c.game_path, &c.local_path).map_err(|e| match &e {
+        // ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING: the game can't read it either.
+        loadorder::Error::IoError(path, io) if io.raw_os_error() == Some(362) => anyhow::anyhow!(
+            "{} is online-only in OneDrive, and OneDrive isn't running: start OneDrive, or make the My Games folder available offline",
+            path.display()
+        ),
+        _ => e.into(),
+    })
 }
 
 /// Plugins in the order the game will load them: implicit first, then masters, then the rest,
@@ -99,10 +106,34 @@ pub fn list(inst: &Instance, profile: &Profile) -> Result<Vec<PluginInfo>> {
 
 /// Write plugins.txt (and loadorder.txt where the game uses one) from the profile.
 /// Must run after deploy so every plugin exists in Data.
+/// The game loads at most this many full plugins, plus this many light ones.
+pub const MAX_FULL_PLUGINS: usize = 254;
+pub const MAX_LIGHT_PLUGINS: usize = 4096;
+
+/// Why plugins.txt can't hold the enabled plugins, if it can't.
+pub fn over_limit(infos: &[PluginInfo]) -> Option<String> {
+    let full = infos.iter().filter(|p| p.enabled && !p.light).count();
+    let light = infos.iter().filter(|p| p.enabled && p.light).count();
+    if full > MAX_FULL_PLUGINS {
+        Some(format!("{full} full plugins are enabled and the game loads {MAX_FULL_PLUGINS}: disable some, or flag small ones light (health_check lists candidates)"))
+    } else if light > MAX_LIGHT_PLUGINS {
+        Some(format!("{light} light plugins are enabled and the game loads {MAX_LIGHT_PLUGINS}"))
+    } else {
+        None
+    }
+}
+
+/// Where the game reads its load order from.
+pub fn plugins_txt(inst: &Instance) -> Result<std::path::PathBuf> {
+    Ok(settings(inst)?.active_plugins_file().clone())
+}
+
 pub fn write_plugins_txt(inst: &Instance, profile: &Profile) -> Result<()> {
     std::fs::create_dir_all(&inst.config.local_path)?;
     let infos = list(inst, profile)?;
-    let mut lo = settings(inst)?.into_load_order();
+    let settings = settings(inst)?;
+    crate::profile_ini::keep_plugins_txt(inst, settings.active_plugins_file())?;
+    let mut lo = settings.into_load_order();
     lo.load()?;
     let names: Vec<&str> = infos.iter().map(|p| p.name.as_str()).collect();
     lo.set_load_order(&names)?;

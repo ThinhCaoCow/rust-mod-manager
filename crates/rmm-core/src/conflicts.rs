@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 pub struct FileMap {
     /// Enabled mod ids in priority order (index = priority).
     pub mods: Vec<String>,
-    /// path key -> (relative path as first seen, owning mods by priority, last = winner)
+    /// path key -> (relative path as the winner spells it, owning mods by priority, last = winner)
     pub files: BTreeMap<String, (String, Vec<usize>)>,
 }
 
@@ -19,7 +19,10 @@ pub fn file_map(inst: &Instance, profile: &Profile) -> Result<FileMap> {
     let mut files: BTreeMap<String, (String, Vec<usize>)> = BTreeMap::new();
     for (i, id) in mods.iter().enumerate() {
         for rel in inst.mod_files(id)? {
-            files.entry(path_key(&rel)).or_insert_with(|| (rel, Vec::new())).1.push(i);
+            let e = files.entry(path_key(&rel)).or_default();
+            // The winner's spelling: on a case-sensitive file system it is the file to open.
+            e.0 = rel;
+            e.1.push(i);
         }
     }
     Ok(FileMap { mods, files })
@@ -126,21 +129,10 @@ pub fn conflicts(inst: &Instance, profile: &Profile) -> Result<Vec<ModConflicts>
         }
     }
 
-    // ponytail: archives are re-read on every call (about 20 ms per 10k files); cache the lists
-    // per mod (mods are immutable) if large setups make this slow.
-    let mut archived: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for a in mod_archives(inst, profile, &map)?.0 {
-        let Some(m) = map.mods.iter().position(|id| *id == a.mod_id) else { continue };
-        let Ok(files) = archives::list(&inst.mod_dir(&a.mod_id).join(&a.name)) else { continue }; // health reports it
-        for f in files {
-            let owners = archived.entry(path_key(&f)).or_default();
-            owners.retain(|&o| o != m);
-            owners.push(m);
-        }
-    }
-    for (key, owners) in &archived {
+    for (key, owners) in &archived(inst, profile, &map)? {
+        let owners: Vec<usize> = owners.iter().map(|(m, _)| *m).collect();
         let winner = map.files.get(key).map_or(*owners.last().unwrap(), |(_, loose)| *loose.last().unwrap());
-        for &m in owners {
+        for &m in &owners {
             out[m].archived_files += 1;
             if m != winner {
                 out[m].archived_losing += 1;
@@ -154,6 +146,67 @@ pub fn conflicts(inst: &Instance, profile: &Profile) -> Result<Vec<ModConflicts>
         c.fully_overridden = c.total_files > 0 && c.losing_files == c.total_files && c.archived_losing == c.archived_files;
     }
     out.retain(|c| c.winning_files + c.losing_files + c.archived_losing > 0 || !c.archive_overwrites.is_empty());
+    Ok(out)
+}
+
+/// Files inside loaded archives: path key -> (mod index, archive name), in load order.
+// ponytail: archives are re-read on every call (about 20 ms per 10k files); cache the lists
+// per mod (mods are immutable) if large setups make this slow.
+fn archived(inst: &Instance, profile: &Profile, map: &FileMap) -> Result<BTreeMap<String, Vec<(usize, String)>>> {
+    let mut out: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+    for a in mod_archives(inst, profile, map)?.0 {
+        let Some(m) = map.mods.iter().position(|id| *id == a.mod_id) else { continue };
+        let Ok(files) = archives::list(&inst.mod_dir(&a.mod_id).join(&a.name)) else { continue }; // health reports it
+        for f in files {
+            let owners = out.entry(path_key(&f)).or_default();
+            owners.retain(|(o, _)| *o != m);
+            owners.push((m, a.name.clone()));
+        }
+    }
+    Ok(out)
+}
+
+/// One conflicting file of a mod: who provides it, lowest priority first, and who wins.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct FileConflict {
+    pub file: String,
+    /// Mod ids providing the file, in the order they load (the last loose one wins).
+    pub mods: Vec<String>,
+    pub winner: String,
+    /// For a file inside archives: the archive of each mod in `mods`; empty for loose files.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub archives: Vec<String>,
+}
+
+/// Every file of `id` that another enabled mod also provides, loose or in a loaded archive.
+pub fn file_conflicts(inst: &Instance, profile: &Profile, id: &str) -> Result<Vec<FileConflict>> {
+    let map = file_map(inst, profile)?;
+    let Some(m) = map.mods.iter().position(|x| x == id) else { return Ok(vec![]) };
+    let arch = archived(inst, profile, &map)?;
+    let mut out = Vec::new();
+    for (key, (rel, owners)) in &map.files {
+        if owners.len() > 1 && owners.contains(&m) && !arch.contains_key(key) {
+            let mods: Vec<String> = owners.iter().map(|&o| map.mods[o].clone()).collect();
+            out.push(FileConflict { file: rel.clone(), winner: mods.last().unwrap().clone(), mods, archives: vec![] });
+        }
+    }
+    for (key, owners) in arch {
+        let loose = map.files.get(&key);
+        if !(owners.iter().any(|(o, _)| *o == m) || loose.is_some_and(|(_, l)| l.contains(&m))) || (owners.len() < 2 && loose.is_none()) {
+            continue;
+        }
+        let winner = loose.map_or(owners.last().unwrap().0, |(_, l)| *l.last().unwrap());
+        let mut mods: Vec<String> = owners.iter().map(|(o, _)| map.mods[*o].clone()).collect();
+        let mut names: Vec<String> = owners.iter().map(|(_, a)| a.clone()).collect();
+        if let Some((_, l)) = loose {
+            for &o in l {
+                mods.push(map.mods[o].clone());
+                names.push(String::new()); // loose
+            }
+        }
+        out.push(FileConflict { file: key, winner: map.mods[winner].clone(), mods, archives: names });
+    }
+    out.sort_by_key(|a| a.file.to_lowercase());
     Ok(out)
 }
 

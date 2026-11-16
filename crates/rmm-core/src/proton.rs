@@ -23,13 +23,14 @@ pub fn command(game: Game, game_path: &Path, exe: &Path) -> Result<Command> {
 }
 
 /// Proton writes `config_info` into the prefix's compatdata folder on every run: the prefix
-/// version, then `<proton>/files/share/fonts/` (`dist/` before Proton 5.13), the lib folders, and
-/// the Steam client folder. Returns the Proton folder and the Steam folder.
+/// version, then `<proton>/files/share/fonts/` (`dist/` before Proton 5.13), the lib folders (one
+/// since Proton 11, two before), and the Steam client folder. Returns the Proton folder and the
+/// Steam folder.
 fn parse_config_info(info: &str) -> Option<(PathBuf, Option<PathBuf>)> {
     let lines: Vec<&str> = info.lines().collect();
     let inside = |l: &str| ["/files/", "/dist/"].iter().find_map(|m| l.find(m)).map(|i| PathBuf::from(&l[..i]));
     let proton = inside(lines.get(1)?)?;
-    let steam = lines.get(4).filter(|l| l.starts_with('/') && inside(l).is_none()).map(|l| PathBuf::from(l.trim_end_matches('/')));
+    let steam = lines.iter().skip(2).find(|l| l.starts_with('/') && inside(l).is_none()).map(|l| PathBuf::from(l.trim_end_matches('/')));
     Some((proton, steam))
 }
 
@@ -53,6 +54,8 @@ mod tests {
         let (proton, steam) = parse_config_info(info).unwrap();
         assert_eq!(proton, Path::new("/home/u/.local/share/Steam/steamapps/common/Proton 9.0 (Beta)"));
         assert_eq!(steam.unwrap(), Path::new("/home/u/.local/share/Steam"));
+        let p11 = "11.0-100\n/s/steamapps/common/Proton - Experimental/files/share/fonts/\n/s/steamapps/common/Proton - Experimental/files/lib/\n/s\n1794535548.0\n";
+        assert_eq!(parse_config_info(p11).unwrap(), (PathBuf::from("/s/steamapps/common/Proton - Experimental"), Some(PathBuf::from("/s"))));
         let old = "3\n/opt/GE-Proton5-9/dist/share/fonts/\n";
         assert_eq!(parse_config_info(old).unwrap(), (PathBuf::from("/opt/GE-Proton5-9"), None));
         assert!(parse_config_info("9.0-201\n").is_none());

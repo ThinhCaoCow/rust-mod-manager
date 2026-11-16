@@ -2,26 +2,143 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Game {
     SkyrimSe,
     Fallout4,
+    /// A game an add-on defines (`[[games]]` in addon.toml), following a built-in game's rules.
+    Addon(&'static GameDef),
+}
+
+/// A game an add-on adds: a relative of a built-in game (Skyrim VR, Fallout 4 VR, Enderal SE)
+/// that follows that game's rules for archives, plugins, the script extender and LOOT, with its
+/// own executable, folders and ids.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, schemars::JsonSchema)]
+pub struct GameDef {
+    /// The name instances use (`game = "skyrimvr"`); Vortex's id for the game where it has one,
+    /// so importing a Vortex setup finds it.
+    pub id: String,
+    pub name: String,
+    /// The built-in game whose rules it follows: skyrim-se or fallout4.
+    pub base: String,
+    /// The plugin and load order rules (libloadorder's game): the base's, or SkyrimVR for a
+    /// skyrim-se base, Fallout4VR for a fallout4 base.
+    #[serde(default)]
+    pub loadorder: Option<String>,
+    pub exe: String,
+    /// The script extender's loader.
+    pub loader: String,
+    pub steam_app_id: u32,
+    /// Folder under `steamapps/common`.
+    pub steam_dir: String,
+    /// Folder under `%LOCALAPPDATA%` and `My Games`, and the Bethesda registry key.
+    pub local_dir: String,
+    /// The main INI in My Games.
+    pub ini: String,
+    pub nexus_domain: String,
+}
+
+static ADDON_GAMES: std::sync::Mutex<Vec<&'static GameDef>> = std::sync::Mutex::new(Vec::new());
+
+/// Make an add-on's game known to this process (definitions live as long as it does). A
+/// definition already known by that id is kept.
+pub fn register(def: GameDef) -> Result<Game, String> {
+    if builtin(&def.id).is_some() || def.id.trim().is_empty() {
+        return Err(format!("an add-on game can't be called '{}'", def.id));
+    }
+    let base = builtin(&def.base).ok_or_else(|| format!("game '{}': base is skyrim-se or fallout4, not '{}'", def.id, def.base))?;
+    let allowed: &[&str] = if base == Game::SkyrimSe { &["SkyrimSE", "SkyrimVR"] } else { &["Fallout4", "Fallout4VR"] };
+    if let Some(lo) = def.loadorder.as_deref().filter(|lo| !allowed.contains(lo)) {
+        return Err(format!("game '{}': loadorder for a {} base is {}, not '{lo}'", def.id, def.base, allowed.join(" or ")));
+    }
+    let mut games = ADDON_GAMES.lock().unwrap();
+    if let Some(known) = games.iter().find(|g| g.id.eq_ignore_ascii_case(&def.id)) {
+        return Ok(Game::Addon(known));
+    }
+    let def: &'static GameDef = Box::leak(Box::new(def));
+    games.push(def);
+    Ok(Game::Addon(def))
+}
+
+fn builtin(s: &str) -> Option<Game> {
+    match s.to_lowercase().replace(['-', '_', ' '], "").as_str() {
+        "skyrimse" | "sse" | "skyrimspecialedition" | "skyrimae" => Some(Game::SkyrimSe),
+        "fallout4" | "fo4" => Some(Game::Fallout4),
+        _ => None,
+    }
+}
+
+impl Serialize for Game {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.id())
+    }
+}
+
+impl<'de> Deserialize<'de> for Game {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for Game {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Game".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "description": "skyrim-se, fallout4, or a game an installed add-on defines" })
+    }
 }
 
 impl Game {
     pub const ALL: [Game; 2] = [Game::SkyrimSe, Game::Fallout4];
 
+    /// The name instance.toml and the CLI use.
+    pub fn id(self) -> &'static str {
+        match self {
+            Game::SkyrimSe => "skyrim-se",
+            Game::Fallout4 => "fallout4",
+            Game::Addon(d) => &d.id,
+        }
+    }
+
+    /// The built-in game whose rules this one follows (itself for the built-in games).
+    pub fn base(self) -> Game {
+        match self {
+            Game::Addon(d) => builtin(&d.base).unwrap_or(Game::SkyrimSe),
+            g => g,
+        }
+    }
+
+    /// The game's id in Vortex.
+    pub fn vortex_id(self) -> &'static str {
+        match self {
+            Game::SkyrimSe => "skyrimse",
+            Game::Fallout4 => "fallout4",
+            Game::Addon(d) => &d.id,
+        }
+    }
+
+    /// The game's name in Nexus Mods URLs and API paths.
+    pub fn nexus_domain(self) -> &'static str {
+        match self {
+            Game::SkyrimSe => "skyrimspecialedition",
+            Game::Fallout4 => "fallout4",
+            Game::Addon(d) => &d.nexus_domain,
+        }
+    }
+
     pub fn steam_app_id(self) -> u32 {
         match self {
             Game::SkyrimSe => 489830,
             Game::Fallout4 => 377160,
+            Game::Addon(d) => d.steam_app_id,
         }
     }
     pub fn steam_dir(self) -> &'static str {
         match self {
             Game::SkyrimSe => "Skyrim Special Edition",
             Game::Fallout4 => "Fallout 4",
+            Game::Addon(d) => &d.steam_dir,
         }
     }
     /// Registry key under `Bethesda Softworks`, also the `%LOCALAPPDATA%` folder name.
@@ -29,12 +146,16 @@ impl Game {
         match self {
             Game::SkyrimSe => "Skyrim Special Edition",
             Game::Fallout4 => "Fallout4",
+            Game::Addon(d) => &d.local_dir,
         }
     }
     /// Local and My Games folder name for this install: the store adds a suffix, recognised by a
     /// file only that store installs. Mirrors libloadorder's `appdata_folder_name`, which is
     /// private and only reachable through a constructor that also reads the game INIs.
     pub fn local_folder(self, game_path: &Path) -> String {
+        if let Game::Addon(d) = self {
+            return d.local_dir.clone();
+        }
         let has = |f: &str| game_path.join(f).exists();
         let suffix = match self {
             Game::SkyrimSe if has("Galaxy64.dll") => " GOG",
@@ -49,6 +170,7 @@ impl Game {
         match self {
             Game::SkyrimSe => "SkyrimSE.exe",
             Game::Fallout4 => "Fallout4.exe",
+            Game::Addon(d) => &d.exe,
         }
     }
     /// The main INI in the My Games folder.
@@ -56,24 +178,32 @@ impl Game {
         match self {
             Game::SkyrimSe => "Skyrim.ini",
             Game::Fallout4 => "Fallout4.ini",
+            Game::Addon(d) => &d.ini,
         }
     }
     pub fn loader(self) -> &'static str {
         match self {
             Game::SkyrimSe => "skse64_loader.exe",
             Game::Fallout4 => "f4se_loader.exe",
+            Game::Addon(d) => &d.loader,
         }
     }
     pub fn lo_id(self) -> loadorder::GameId {
         match self {
             Game::SkyrimSe => loadorder::GameId::SkyrimSE,
             Game::Fallout4 => loadorder::GameId::Fallout4,
+            Game::Addon(d) => match d.loadorder.as_deref() {
+                Some("SkyrimVR") => loadorder::GameId::SkyrimVR,
+                Some("Fallout4VR") => loadorder::GameId::Fallout4VR,
+                _ => self.base().lo_id(),
+            },
         }
     }
+    /// The plugin format; the VR games use their base's.
     pub fn esp_id(self) -> esplugin::GameId {
-        match self {
-            Game::SkyrimSe => esplugin::GameId::SkyrimSE,
+        match self.base() {
             Game::Fallout4 => esplugin::GameId::Fallout4,
+            _ => esplugin::GameId::SkyrimSE,
         }
     }
 }
@@ -81,11 +211,9 @@ impl Game {
 impl FromStr for Game {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        match s.to_lowercase().replace(['-', '_', ' '], "").as_str() {
-            "skyrimse" | "sse" | "skyrimspecialedition" | "skyrimae" => Ok(Game::SkyrimSe),
-            "fallout4" | "fo4" => Ok(Game::Fallout4),
-            _ => Err(format!("unknown game '{s}' (use skyrim-se or fallout4)")),
-        }
+        builtin(s)
+            .or_else(|| ADDON_GAMES.lock().unwrap().iter().find(|d| d.id.eq_ignore_ascii_case(s)).map(|d| Game::Addon(d)))
+            .ok_or_else(|| format!("unknown game '{s}' (use skyrim-se or fallout4, or an add-on that defines it)"))
     }
 }
 

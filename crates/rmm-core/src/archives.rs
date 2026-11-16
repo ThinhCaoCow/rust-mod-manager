@@ -26,9 +26,10 @@ fn read(r: &mut (impl Read + Seek)) -> Result<Vec<String>> {
 pub fn loaded_by(game: Game, plugin: &str, archive: &str) -> bool {
     let stem = Path::new(plugin).file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
     let a = archive.to_lowercase();
-    match game {
-        Game::SkyrimSe => a == format!("{stem}.bsa") || a == format!("{stem} - textures.bsa"),
-        Game::Fallout4 => a.ends_with(".ba2") && a.starts_with(&format!("{stem} - ")),
+    if game.base() == Game::Fallout4 {
+        a.ends_with(".ba2") && a.starts_with(&format!("{stem} - "))
+    } else {
+        a == format!("{stem}.bsa") || a == format!("{stem} - textures.bsa")
     }
 }
 

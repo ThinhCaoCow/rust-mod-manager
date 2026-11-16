@@ -3,6 +3,7 @@ name = "rmm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 rmm-core.workspace = true
@@ -11,9 +12,9 @@ serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync"] }
 schemars = "1"
+getrandom = "0.3"
 
-[features]
-default = ["zstd"]
-zstd = ["rmm-core/zstd"]
+[dev-dependencies]
+tempfile = "3"

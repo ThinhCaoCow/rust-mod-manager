@@ -8,6 +8,7 @@
 </head>
 <body>
 <div id="busy" hidden><div></div></div>
+<div id="progress" hidden></div>
 
 <section id="welcome" hidden>
   <div class="welcome">
@@ -40,46 +41,82 @@
     <button data-tab="mods">Mods <span class="count" id="n-mods"></span></button>
     <button data-tab="plugins">Plugins <span class="count" id="n-plugins"></span></button>
     <button data-tab="problems">Problems <span class="count" id="n-problems"></span></button>
+    <button data-tab="tools">Tools <span class="count" id="n-tools"></span></button>
     <button data-tab="history">History</button>
     <div class="spacer"></div>
-    <input id="filter" type="search" placeholder="Filter" spellcheck="false">
-    <button id="install">＋ Install mod…</button>
+    <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags" spellcheck="false">
+    <button id="install" title="Installs after the selected mod, or at the end of the selected separator’s group. You can also drop archives on a row.">＋ Install mod…</button>
+    <button id="nxm" title="Download and install a file from Nexus Mods by its nxm:// link">From Nexus…</button>
   </nav>
 
   <main>
     <section class="pane" id="pane-mods">
+      <div class="toolbar wrap">
+        <div class="fchips" id="fchips" role="group" aria-label="Show only">
+          <button data-f="enabled">Enabled</button>
+          <button data-f="disabled">Disabled</button>
+          <button data-f="conflicted">Conflicted</button>
+          <button data-f="overridden">Overridden</button>
+          <button data-f="rule">Broken rule</button>
+          <button data-f="masters">Missing masters</button>
+          <button data-f="plugins">Has plugins</button>
+          <button data-f="recent" title="Installed in the last 7 days">Recent</button>
+          <button data-f="problems" title="Mods the health check or the list flags">Problems</button>
+        </div>
+        <span id="match" class="match" hidden></span>
+        <button id="clear-filter" class="link" hidden>Clear</button>
+        <div class="spacer"></div>
+        <button id="enable-matching" hidden>Enable matching</button>
+        <button id="disable-matching" hidden>Disable matching</button>
+        <button id="updates" title="Check Nexus Mods for newer files">Check for updates</button>
+        <button id="split" title="Show the plugins beside the mods" hidden>Plugins beside</button>
+        <button id="add-sep" title="Add a separator above the selected rows">＋ Separator</button>
+      </div>
       <div class="notice" id="rules-notice" hidden></div>
       <div class="scroll">
         <table class="list" id="mods">
-          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Mod</th><th>Conflicts</th><th class="num">Files</th><th class="num" title="Priority: higher wins file conflicts">#</th></tr></thead>
+          <thead title="Right-click to choose columns"><tr></tr></thead>
           <tbody></tbody>
         </table>
         <p class="empty" id="mods-empty" hidden>No mods yet. Drop a .zip or .7z here, or use Install mod.</p>
       </div>
+      <div class="ticks" id="ticks" aria-hidden="true"></div>
+      <div class="notice plain" id="overwrite-bar" hidden></div>
     </section>
     <section class="pane" id="pane-plugins" hidden>
-      <div class="toolbar"><span class="muted small">Masters always load before other plugins. Drag to reorder.</span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
+      <div class="toolbar"><span class="muted small" id="plugins-note"></span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
       <div class="scroll">
         <table class="list" id="plugins">
-          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th>Type</th><th>From</th><th>Issues</th><th class="num">#</th></tr></thead>
+          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num">#</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
     </section>
     <section class="pane" id="pane-problems" hidden>
-      <div class="toolbar"><span class="muted small" id="problems-note"></span><div class="spacer"></div><button id="recheck">Check again</button></div>
+      <div class="toolbar"><span class="muted small" id="problems-note"></span><div class="spacer"></div><button id="show-ignored" class="link" hidden></button><button id="test-run" title="Start the game, go through a save or cells, and check it holds up">Test run…</button><button id="crash-log" title="Read the newest crash log and the mods it points at">Crash log…</button><button id="papyrus-log" title="Summarise the Papyrus script log">Papyrus log…</button><button id="recheck">Check again</button></div>
       <div class="scroll"><ul class="issues" id="issues"></ul></div>
     </section>
+    <section class="pane" id="pane-tools" hidden>
+      <div class="toolbar"><span class="muted small">Programs rmm runs against the deployed setup. What a tool writes is captured into its own mod.</span><div class="spacer"></div><button id="addons" title="Sandboxed WebAssembly plugins: what they may do, their tools and panels">Add-ons…</button><button id="ai-access" title="Let AI clients use rmm's tools over HTTP while the window is open">AI access…</button><button id="add-tool">＋ Add tool…</button></div>
+      <div class="scroll">
+        <table class="list tall" id="tools">
+          <thead><tr><th>Tool</th><th class="from-col">Output mod</th><th class="from-col">Last run</th><th class="run-col"></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="tools-empty" hidden>No tools yet. Add xEdit, BodySlide, Synthesis, DynDOLOD or any other program.</p>
+      </div>
+    </section>
     <section class="pane" id="pane-history" hidden>
-      <div class="toolbar"><span class="muted small">Every change to this profile, newest first. Undo steps back through them.</span></div>
+      <div class="toolbar"><span class="muted small">Every change to this profile, newest first. Undo steps back one; Restore goes back to before any of them, and Redo steps forward again.</span></div>
       <div class="scroll"><ol class="history" id="history"></ol></div>
     </section>
     <aside id="details" hidden></aside>
   </main>
 </div>
 
-<div id="dropzone" hidden><div>Drop to install</div></div>
+<div id="dropzone" hidden><div id="drop-text">Drop to install</div></div>
 <dialog id="dlg"></dialog>
+<datalist id="mod-names"></datalist>
 <div id="toasts"></div>
 <script src="app.js"></script>
 </body>

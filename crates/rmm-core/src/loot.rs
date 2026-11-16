@@ -42,9 +42,11 @@ fn dir(inst: &Instance) -> PathBuf {
 /// Download the masterlist and prelude if the cached copies are missing, older than a day, or
 /// `force` is set. A failed download keeps the cached copy and returns a warning.
 pub fn update_masterlist(inst: &Instance, force: bool) -> Result<Vec<String>> {
-    let repo = match inst.config.game {
-        Game::SkyrimSe => "skyrimse",
-        Game::Fallout4 => "fallout4",
+    let repo = match (inst.config.game.lo_id(), inst.config.game.base()) {
+        (loadorder::GameId::SkyrimVR, _) => "skyrimvr",
+        (loadorder::GameId::Fallout4VR, _) => "fallout4vr",
+        (_, Game::Fallout4) => "fallout4",
+        _ => "skyrimse",
     };
     let files = [
         (format!("https://raw.githubusercontent.com/loot/{repo}/{BRANCH}/masterlist.yaml"), "masterlist.yaml"),
@@ -92,9 +94,11 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 /// Active-plugin conditions still come from plugins.txt, which deploy writes.
 fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<String>)> {
     let c = &inst.config;
-    let game_type = match c.game {
-        Game::SkyrimSe => GameType::SkyrimSE,
-        Game::Fallout4 => GameType::Fallout4,
+    let game_type = match (c.game.lo_id(), c.game.base()) {
+        (loadorder::GameId::SkyrimVR, _) => GameType::SkyrimVR,
+        (loadorder::GameId::Fallout4VR, _) => GameType::Fallout4VR,
+        (_, Game::Fallout4) => GameType::Fallout4,
+        _ => GameType::SkyrimSE,
     };
     let mut game = libloot::Game::with_local_path(game_type, &c.game_path, &c.local_path)?;
     let mut dirs = vec![inst.mod_dir(OVERWRITE)];
@@ -137,6 +141,7 @@ fn load<'a>(game: &mut libloot::Game, infos: &'a [PluginInfo], warnings: &mut Ve
 /// Sort plugins with LOOT. A dry run returns the new order and what moves; otherwise the order
 /// is saved to the profile (undoable) and reaches plugins.txt on the next deploy.
 pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
+    crate::progress::report("sorting plugins with LOOT", 0, 0);
     let mut warnings = update_masterlist(inst, false).unwrap_or_else(|e| vec![format!("{e:#}")]);
     let profile = inst.profile()?;
     let infos = plugins::list(inst, &profile)?;
@@ -261,6 +266,18 @@ pub fn rules(inst: &Instance) -> Result<Vec<Rule>> {
         }
     }
     Ok(out)
+}
+
+/// LOOT's group names (masterlist and userlist), for picking a plugin's group. Empty until a
+/// masterlist is cached.
+pub fn groups(inst: &Instance) -> Result<Vec<String>> {
+    if !dir(inst).join("masterlist.yaml").is_file() {
+        return Ok(vec![]);
+    }
+    let (game, _) = handle(inst, &inst.profile()?)?;
+    let db = game.database();
+    let db = db.read().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
+    Ok(db.groups(MergeMode::WithUserMetadata).iter().map(|g| g.name().to_owned()).collect())
 }
 
 /// Replace a plugin's load-after list and group in the userlist; an empty rule removes them.

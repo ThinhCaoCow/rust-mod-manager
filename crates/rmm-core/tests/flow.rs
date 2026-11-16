@@ -1,6 +1,6 @@
 //! End-to-end check on a synthetic Skyrim SE folder: install -> conflicts -> deploy -> reorder
 //! -> external change -> undo/redo -> uninstall/undo -> purge.
-use rmm_core::{Game, Instance, conflicts, deploy, health, install, plugins};
+use rmm_core::{Game, Instance, conflicts, deploy, health, install, ops, plugins};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -196,6 +196,39 @@ fn changes_are_detected_by_file_identity() {
     write(&inst.root.join("overwrite/meshes/new.nif"), "tool output");
     deploy::deploy(&inst, false).unwrap();
     assert_eq!(read(&game.join("Data/meshes/new.nif")), "tool output");
+
+    // overwrite/ becomes a mod of its own; the deployed files are already its files.
+    let r = install::mod_from_overwrite(&inst, "Captured").unwrap();
+    assert_eq!(r.files, 2);
+    assert!(inst.mod_files(rmm_core::instance::OVERWRITE).unwrap().is_empty());
+    assert_eq!(inst.profile().unwrap().mods.last().unwrap().id, r.id);
+    let plan = deploy::deploy(&inst, false).unwrap();
+    assert!(plan.external_changes.is_empty() && plan.remove.is_empty(), "{plan:?}");
+    assert_eq!(read(&game.join("Data/textures/sky.dds")), "Z");
+    assert!(install::mod_from_overwrite(&inst, "Again").is_err());
+    inst.undo().unwrap();
+    // Clearing moves what's there to trash/overwrite; the next deploy removes it from Data.
+    write(&inst.root.join("overwrite/meshes/stray.nif"), "stray");
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(install::clear_overwrite(&inst).unwrap(), 1);
+    assert_eq!(install::clear_overwrite(&inst).unwrap(), 0);
+    let plan = deploy::deploy(&inst, false).unwrap();
+    assert!(plan.external_changes.is_empty(), "{plan:?}");
+    assert!(!game.join("Data/meshes/stray.nif").exists());
+    assert!(inst.root.join("trash/overwrite/meshes/stray.nif").is_file());
+}
+
+#[test]
+fn reinstall_relinks_without_external_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    write(&tmp.path().join("A/meshes/a.nif"), "a-mesh v2");
+    let id = &inst.profile().unwrap().mods[0].id.clone();
+    install::reinstall(&inst, id, None).unwrap();
+    let plan = deploy::deploy(&inst, false).unwrap();
+    assert!(plan.external_changes.is_empty(), "{plan:?}");
+    assert_eq!(read(&game.join("Data/meshes/a.nif")), "a-mesh v2");
+    assert!(inst.mod_files(rmm_core::instance::OVERWRITE).unwrap().is_empty());
 }
 
 #[test]
@@ -256,11 +289,93 @@ fn fallout4_ini_checks() {
     let kinds = |inst: &Instance| health::fallout4_ini(inst).unwrap().into_iter().map(|i| i.kind).collect::<Vec<_>>();
 
     assert!(kinds(&inst).is_empty(), "no INIs yet: the game has never run");
-    write(&ini.join("Fallout4.ini"), "[General]\nsTestFile1=Foo.esp\n[Archive]\nsResourceDataDirsFinal=STRINGS\\\n");
+    // In the case the game uses under Proton; found either way.
+    write(&ini.join("Fallout4.INI"), "[General]\nsTestFile1=Foo.esp\n[Archive]\nsResourceDataDirsFinal=STRINGS\\\n");
     assert_eq!(kinds(&inst), vec!["ini_test_file", "archive_invalidation"]);
 
     write(&ini.join("Fallout4Custom.ini"), "\u{feff}[General]\nsTestFile1=\n[Archive]\nbInvalidateOlderFiles=1\nsResourceDataDirsFinal=\n");
     assert!(kinds(&inst).is_empty());
+
+    // General BA2 archives over the old limit; texture archives don't count.
+    let ba2 = |inst: &Instance| health::check(inst).unwrap().into_iter().find(|i| i.kind == "ba2_limit").map(|i| (i.severity, i.message));
+    for i in 0..256 {
+        write(&game.join(format!("Data/CC{i:03} - Main.ba2")), "");
+        write(&game.join(format!("Data/CC{i:03} - Textures.ba2")), "");
+    }
+    assert_eq!(ba2(&inst), None);
+    write(&game.join("Data/One more - Main.ba2"), "");
+    let (severity, message) = ba2(&inst).unwrap();
+    assert_eq!(severity, "warning");
+    assert!(message.starts_with("257 general BA2 archives"), "{message}");
+}
+
+/// A full plugin whose new records fit a light plugin is an ESL candidate.
+#[test]
+fn profile_inis_and_saves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, ini) = (tmp.path().join("game"), tmp.path().join("My Games/Skyrim Special Edition"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    // The user's own load order, from another manager: a purge puts it back.
+    write(&tmp.path().join("local/Plugins.txt"), "*Theirs.esp\r\n");
+    let (mine, my_prefs, game_prefs) = ("[General]\r\nsLanguage=ENGLISH\r\n", "[Display]\r\niSize W=1920\r\n", "[Display]\r\niSize W=1280\r\n");
+    write(&ini.join("Skyrim.ini"), mine);
+    write(&ini.join("SkyrimPrefs.ini"), my_prefs);
+    let at = |inst: &mut Instance| inst.config.ini_path = Some(ini.clone());
+    at(&mut inst);
+    let (state, prof) = (inst.root.join("ini-state.json"), inst.root.join("profiles/default/ini"));
+
+    deploy::deploy(&inst, false).unwrap();
+    assert_ne!(read(&tmp.path().join("local/Plugins.txt")), "*Theirs.esp\r\n");
+
+    ops::set_profile_options(&inst, Some(true), Some(true)).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    // The profile starts from the user's INIs; its saves get their own folder.
+    assert_eq!(read(&prof.join("Skyrim.ini")), mine);
+    assert_eq!(read(&ini.join("Skyrim.ini")), "[General]\r\nsLocalSavePath=Saves\\default\\\r\nsLanguage=ENGLISH\r\n");
+    // What the game changes (or adds) goes back to the profile, without rmm's save path.
+    write(&ini.join("SkyrimPrefs.ini"), game_prefs);
+    write(&ini.join("SkyrimCustom.ini"), "[Papyrus]\r\nbEnableLogging=1\r\n");
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!((read(&prof.join("Skyrim.ini")), read(&prof.join("SkyrimPrefs.ini"))), (mine.into(), game_prefs.into()));
+    assert!(prof.join("SkyrimCustom.ini").exists());
+
+    // A profile without the options gets the user's own INIs back.
+    inst.create_profile("Plain", false).unwrap();
+    inst.switch_profile("Plain").unwrap();
+    at(&mut inst);
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!((read(&ini.join("Skyrim.ini")), read(&ini.join("SkyrimPrefs.ini"))), (mine.into(), my_prefs.into()));
+    assert!(!ini.join("SkyrimCustom.ini").exists());
+
+    // Back, renamed while deployed, then purged: the change lands in the renamed profile and
+    // My Games is the user's again.
+    inst.switch_profile("default").unwrap();
+    at(&mut inst);
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&ini.join("SkyrimPrefs.ini")), game_prefs);
+    inst.rename_profile("default", "Main").unwrap();
+    at(&mut inst);
+    write(&ini.join("SkyrimPrefs.ini"), "[Display]\r\niSize W=800\r\n");
+    deploy::purge(&inst, false).unwrap();
+    assert_eq!(read(&inst.root.join("profiles/Main/ini/SkyrimPrefs.ini")), "[Display]\r\niSize W=800\r\n");
+    assert_eq!((read(&ini.join("Skyrim.ini")), read(&ini.join("SkyrimPrefs.ini"))), (mine.into(), my_prefs.into()));
+    assert!(!ini.join("SkyrimCustom.ini").exists() && !state.exists());
+    assert_eq!(fs::read_dir(inst.root.join("ini-backup")).unwrap().count(), 0);
+    assert_eq!(read(&tmp.path().join("local/Plugins.txt")), "*Theirs.esp\r\n");
+}
+
+#[test]
+fn esl_candidates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, _) = deployed_setup(tmp.path());
+    write(&tmp.path().join("Small/Small.esp"), plugin_bytes(&[], false));
+    write(&tmp.path().join("Small/Master.esm"), plugin_bytes(&[], true));
+    install::install(&inst, &tmp.path().join("Small"), None, true, None).unwrap();
+    let esl = health::check(&inst).unwrap().into_iter().find(|i| i.kind == "esl_candidates").unwrap();
+    assert_eq!(esl.severity, "info");
+    assert!(esl.message.starts_with("1 full plugins could be flagged light (ESL), which frees full slots: Small.esp."), "{}", esl.message);
 }
 
 /// Steps are listed out of order (the schema sorts them by name). Picking Blue sets a flag that
@@ -296,6 +411,7 @@ const MODULE_CONFIG: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
           <plugins>
             <plugin name="Red">
               <description>Red textures</description>
+              <image path="fomod\Images\Red.PNG"/>
               <files><folder source="red" destination="textures"/></files>
               <conditionFlags><flag name="colour">red</flag></conditionFlags>
               <typeDescriptor><type name="Recommended"/></typeDescriptor>
@@ -340,6 +456,7 @@ const MODULE_CONFIG: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
 fn fomod_source(dir: &Path) {
     let xml: Vec<u8> = [0xFF, 0xFE].into_iter().chain(MODULE_CONFIG.encode_utf16().flat_map(u16::to_le_bytes)).collect();
     write(&dir.join("fomod/ModuleConfig.xml"), xml);
+    write(&dir.join("fomod/images/red.png"), "png");
     write(&dir.join("core/Core.esp"), plugin_bytes(&["Skyrim.esm"], false));
     write(&dir.join("docs/readme.txt"), "readme");
     write(&dir.join("base/tex.dds"), "base");
@@ -380,6 +497,14 @@ fn fomod_installers() {
     assert_eq!(opts[1].kind, Kind::NotUsable);
     assert_eq!(walk.files, 6, "{walk:#?}"); // Core.esp, readme, tex, sub/r, RedPatch.esp, vanilla.txt
 
+    // Images resolve inside the installer whatever their case; nothing outside it does.
+    assert!(install::has_fomod(&inst, &src).unwrap());
+    let image = opts[2].image.as_deref().unwrap();
+    assert_eq!(read(&install::fomod_image(&inst, &src, image).unwrap()), "png");
+    for bad in ["..\\F\\fomod\\images\\red.png", "fomod\\nope.png", "fomod\\images"] {
+        assert!(install::fomod_image(&inst, &src, bad).is_err(), "{bad}");
+    }
+
     let blue = choices(serde_json::json!({"options": [{"name": "1 Colour", "groups": [{"name": "Colour", "choices": [{"name": "Blue"}]}]}]}));
     let walk = install::fomod_options(&inst, &src, Some(&blue)).unwrap();
     assert_eq!(walk.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["1 Colour", "2 Extras"]);
@@ -416,6 +541,36 @@ fn fomod_installers() {
     assert_eq!(r.plugins, ["Core.esp", "RedPatch.esp"]);
     assert_eq!(read(&inst.mod_dir(&r.id).join("textures/sub/r.dds")), "r");
     assert!(!inst.root.join(".staging/preview").exists());
+
+    // Reinstall with other choices: same id, place and name; the old files go to trash/.
+    ops::set_mods_enabled(&inst, std::slice::from_ref(&r.id), false).unwrap();
+    assert_eq!(ops::rename_mod(&inst, &r.id, " Red armour ").unwrap(), "Red");
+    let order = inst.profile().unwrap().mods;
+    let again = install::reinstall(&inst, &r.id, Some(&picks)).unwrap();
+    assert_eq!((again.id.as_str(), again.name.as_str()), (r.id.as_str(), "Red armour"));
+    assert_eq!(inst.profile().unwrap().mods, order);
+    assert_eq!(inst.mod_files(&r.id).unwrap(), files);
+    assert_eq!(inst.mod_meta(&r.id).fomod.unwrap().options[1].groups[0].choices[0].name, "Glow");
+    assert!(inst.root.join("trash").join(&r.id).join("RedPatch.esp").is_file());
+    // Without choices it keeps the stored ones.
+    assert_eq!(install::reinstall(&inst, &r.id, None).unwrap().files, 5);
+    assert_eq!(ops::list_mods(&inst).unwrap().iter().find(|m| m.id == r.id).unwrap().name, "Red armour");
+    assert!(ops::rename_mod(&inst, &r.id, "  ").is_err());
+    // A plain archive and a folder reinstall too.
+    let plain = tmp.path().join("Plain.zip");
+    {
+        let mut z = zip::ZipWriter::new(fs::File::create(&plain).unwrap());
+        z.start_file("textures/plain.dds", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(b"plain").unwrap();
+        z.finish().unwrap();
+    }
+    let pr = install::install(&inst, &plain, None, true, None).unwrap();
+    assert_eq!(install::reinstall(&inst, &pr.id, None).unwrap().files, 1);
+    let fr = install::install(&inst, &tmp.path().join("F wrapper/F/base"), Some("Folder"), true, None).unwrap();
+    assert_eq!(install::reinstall(&inst, &fr.id, None).unwrap().files, fr.files);
+    fs::remove_file(&zip_path).unwrap();
+    assert!(install::reinstall(&inst, &r.id, None).unwrap_err().to_string().contains("is gone"));
+    assert!(inst.mod_dir(&r.id).join("Core.esp").is_file());
 }
 
 /// Minimal Skyrim SE (v105) BSA with names and no file data: enough for listing.
@@ -457,7 +612,6 @@ fn bsa_bytes(files: &[&str]) -> Vec<u8> {
 /// Archive conflicts follow plugin load order, and loose files beat every archive.
 #[test]
 fn archive_conflicts() {
-    use rmm_core::ops;
     let tmp = tempfile::tempdir().unwrap();
     let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
     write(&game.join("SkyrimSE.exe"), "exe");
@@ -482,6 +636,11 @@ fn archive_conflicts() {
     let issues = health::check(&inst).unwrap();
     assert!(issues.iter().any(|i| i.kind == "archive_not_loaded" && i.subject == "D.bsa"), "{issues:?}");
     assert!(!issues.iter().any(|i| i.kind == "archive_not_loaded" && i.subject != "D.bsa"), "{issues:?}");
+
+    // Per file: who provides it, in load order, and who wins.
+    let files = conflicts::file_conflicts(&inst, &inst.profile().unwrap(), "A").unwrap();
+    let row = |f: &conflicts::FileConflict| format!("{} {} {} {}", f.file, f.mods.join(" "), f.winner, f.archives.join("|"));
+    assert_eq!(files.iter().map(row).collect::<Vec<_>>(), ["meshes/m.nif A C C A.bsa|", "textures/x.dds A B B A.bsa|B - Textures.bsa"]);
 
     ops::set_plugin_order(&inst, &["B.esp".into(), "A.esp".into()]).unwrap();
     let a = get(&inst, "A");
@@ -633,7 +792,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
 
     // A second run replaces the output; undo brings the first one back. Mod rules follow the new id.
     use rmm_core::rules::{self, ModRule};
-    rules::set_rule(&inst, &ModRule { id: "gen Output".into(), after: vec!["Plain".into()] }).unwrap();
+    rules::set_rule(&inst, &ModRule { id: "gen Output".into(), after: vec!["Plain".into()], ..Default::default() }).unwrap();
     let r2 = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
     assert_eq!(r2.previous.as_deref(), Some("gen Output"));
     assert_eq!(r2.mod_id.as_deref(), Some("gen Output (2)"));
@@ -724,6 +883,64 @@ fn launch_checks_the_script_extender() {
     let r = launch::launch(&inst, false).unwrap();
     assert_eq!(r.script_extender.as_deref(), Some(dll.as_str()));
     assert!(r.exe.ends_with("skse64_loader.exe") && r.pid.is_some(), "{r:?}");
+}
+
+/// test_run without the harness plugin, and the crash and Papyrus logs it reads back to mods.
+#[cfg(windows)]
+#[test]
+fn test_run_reads_logs_back_to_mods() {
+    use rmm_core::{harness, logs};
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut inst, game) = deployed_setup(tmp.path());
+    let my = tmp.path().join("My Games");
+    inst.config.ini_path = Some(my.clone());
+    write(&tmp.path().join("Smp/SKSE/Plugins/hdtSMP64.dll"), "dll");
+    write(&tmp.path().join("Smp/scripts/MyScript.pex"), "pex");
+    install::install(&inst, &tmp.path().join("Smp"), None, true, None).unwrap();
+    assert!(logs::read_crash_log(&inst, None).unwrap_err().to_string().contains("no crash logs"));
+
+    // The stand-in game exits at once; a crash log written during the run fails it.
+    fs::copy(r"C:\Windows\System32\PING.EXE", game.join("SkyrimSE.exe")).unwrap();
+    let log = my.join("SKSE/crash-2026-11-16-22-00-00.log");
+    let writer = {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            write(&log, "Skyrim SSE v1.6.1170
+CrashLoggerSSE v1-19-0-0
+
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x1
+
+CALL STACK ([P]robable / [S]tack scan):
+	[ 0] 0x1 hdtSMP64.dll+0001
+
+REGISTERS:
+	RCX File: \"Skyrim.esm\" Model: \"meshes\\a.nif\"
+");
+        })
+    };
+    let r = harness::test_run(&inst, &harness::Scenario { timeout: Some(3), ..Default::default() }).unwrap();
+    writer.join().unwrap();
+    assert_eq!(r.mode, "process");
+    assert!(!r.passed);
+    assert_eq!(r.summary, "the game crashed; suspects: Smp, A");
+    let crash = r.crash.unwrap();
+    assert_eq!(crash.path, log);
+    assert_eq!(crash.suspects.iter().map(|s| (s.name.as_str(), s.mod_id.as_deref())).collect::<Vec<_>>(), [("hdtSMP64.dll", Some("Smp")), ("meshes\\a.nif", Some("A"))]);
+
+    write(&my.join("Skyrim.ini"), "[Papyrus]
+bEnableLogging=1
+");
+    write(&my.join("Logs/Script/Papyrus.0.log"), "[11/16/2026 - 10:00:00PM] error: Cannot call Foo() on a None object, aborting function call
+stack:
+	[alias X on quest Y (0A001234)].MyScript.OnUpdate() - \"MyScript.psc\" Line 42
+[11/16/2026 - 10:00:01PM] warning: Assigning None to a non-object property
+");
+    let p = logs::read_papyrus_log(&inst, 10).unwrap();
+    assert!(p.logging_enabled);
+    assert_eq!((p.errors, p.warnings, p.tail.len()), (1, 1, 4));
+    assert_eq!(p.messages, [("Cannot call Foo() on a None object, aborting function call".to_string(), 1)]);
+    assert_eq!(p.scripts, [logs::ScriptHits { script: "MyScript".into(), mod_id: Some("Smp".into()), count: 1 }]);
 }
 
 /// Wait until the stand-in game (a PING.EXE copy) has exited.
@@ -1146,7 +1363,7 @@ fn mod_rules() {
         write(&src.join(id).join("textures/sky.dds"), id);
         install::install(&inst, &src.join(id), None, true, None).unwrap();
     }
-    let rule = |id: &str, after: &[&str]| ModRule { id: id.into(), after: after.iter().map(|s| s.to_string()).collect() };
+    let rule = |id: &str, after: &[&str]| ModRule { id: id.into(), after: after.iter().map(|s| s.to_string()).collect(), ..Default::default() };
     let ids = |inst: &Instance| inst.profile().unwrap().mods.into_iter().map(|m| m.id).collect::<Vec<_>>().join(" ");
     let broken = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "mod_rule_broken").map(|i| format!("{}: {}", i.subject, i.message)).collect::<Vec<_>>();
 
@@ -1178,4 +1395,738 @@ fn mod_rules() {
     // An empty rule removes it and returns it.
     assert_eq!(rules::set_rule(&inst, &rule("C", &[])).unwrap(), Some(rule("C", &["A"])));
     assert_eq!(rules::rules(&inst).unwrap(), [rule("A", &["C"])]);
+
+    // Requires and incompatible: reported for enabled mods only, never blocking.
+    let kinds = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "mod_requires" || i.kind == "mod_incompatible").map(|i| format!("{} {}", i.kind, i.subject)).collect::<Vec<_>>();
+    let b = ModRule { id: "B".into(), requires: vec!["C".into()], incompatible: vec!["A".into()], ..Default::default() };
+    rules::set_rule(&inst, &b).unwrap();
+    assert_eq!(kinds(&inst), ["mod_incompatible B"]);
+    set_mod_enabled(&inst, "C", false).unwrap();
+    set_mod_enabled(&inst, "A", false).unwrap();
+    assert_eq!(kinds(&inst), ["mod_requires B"]);
+    set_mod_enabled(&inst, "B", false).unwrap();
+    assert!(kinds(&inst).is_empty());
+    let both = ModRule { id: "B".into(), requires: vec!["C".into()], incompatible: vec!["C".into()], ..Default::default() };
+    assert!(rules::set_rule(&inst, &both).is_err());
+    assert_eq!(rules::rules(&inst).unwrap()[1], b);
+
+    // A new mod goes before generated tool output, and before a mod that loads after it.
+    assert_eq!(ids(&inst), "B C A");
+    write(&src.join("D/textures/d.dds"), "D");
+    install::install(&inst, &src.join("D"), None, true, None).unwrap();
+    assert_eq!(ids(&inst), "B C A D");
+    let mut meta = inst.mod_meta("D");
+    meta.source = Some("tool:gen".into());
+    inst.write_mod_meta("D", &meta).unwrap();
+    write(&src.join("E/textures/e.dds"), "E");
+    install::install(&inst, &src.join("E"), None, true, None).unwrap();
+    assert_eq!(ids(&inst), "B C A E D");
+    fs::create_dir_all(inst.mod_dir("F")).unwrap(); // a rule can name a mod installed later
+    rules::set_rule(&inst, &rule("C", &["F"])).unwrap();
+    fs::remove_dir(inst.mod_dir("F")).unwrap();
+    write(&src.join("F/textures/f.dds"), "F");
+    assert_eq!(install::install(&inst, &src.join("F"), None, true, None).unwrap().id, "F");
+    assert_eq!(ids(&inst), "B F C A E D");
+    // An explicit priority wins.
+    write(&src.join("G/textures/g.dds"), "G");
+    install::install_at(&inst, &src.join("G"), None, true, None, Some(0)).unwrap();
+    assert_eq!(ids(&inst), "G B F C A E D");
+}
+
+/// Separators head groups of mods; bulk enable, move and uninstall are one undo step each.
+#[test]
+fn separators_and_bulk_ops() {
+    use rmm_core::ops::{self, add_separator, edit_separator, move_mods, set_mods_enabled};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    fs::create_dir_all(game.join("Data")).unwrap();
+    let mut inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    for id in ["A", "B", "C"] {
+        write(&src.join(id).join(format!("{id}.esp")), plugin_bytes(&[], false));
+        install::install(&inst, &src.join(id), None, true, None).unwrap();
+    }
+    let ids = |inst: &Instance| inst.profile().unwrap().mods.into_iter().map(|m| m.id).collect::<Vec<_>>().join(" | ");
+    let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    assert!(add_separator(&inst, "  ", None).is_err());
+    assert_eq!(add_separator(&inst, "Textures", Some(0)).unwrap(), "sep:Textures");
+    assert_eq!(add_separator(&inst, "Textures", None).unwrap(), "sep:Textures (2)");
+    assert_eq!(ids(&inst), "sep:Textures | A | B | C | sep:Textures (2)");
+    let rows = ops::list_mods(&inst).unwrap();
+    assert!(rows[0].separator && rows[0].name == "Textures" && rows[0].files == 0);
+    assert_eq!(ops::instance_info(&inst).unwrap()["mods"], 3);
+
+    // Bulk enable skips separators and takes the plugins along; a separator alone has no state.
+    assert!(ops::set_mod_enabled(&inst, "sep:Textures", true).is_err());
+    set_mods_enabled(&inst, &v(&["A", "sep:Textures", "B"]), false).unwrap();
+    assert_eq!(inst.history().unwrap()[0], "disable 2 mods");
+    let p = inst.profile().unwrap();
+    assert_eq!(p.mods.iter().filter(|m| m.enabled).map(|m| m.id.as_str()).collect::<Vec<_>>(), ["C"]);
+    assert_eq!(p.plugins.iter().filter(|e| e.enabled).map(|e| e.name.as_str()).collect::<Vec<_>>(), ["C.esp"]);
+
+    // A block moves in list order, whatever order the ids come in.
+    move_mods(&inst, &v(&["sep:Textures (2)", "C"]), 0).unwrap();
+    assert_eq!(ids(&inst), "C | sep:Textures (2) | sep:Textures | A | B");
+    assert!(move_mods(&inst, &v(&["Nope"]), 0).is_err());
+
+    // Rename carries the colour; colours are validated.
+    assert!(edit_separator(&inst, "A", Some("X"), None).is_err());
+    assert!(edit_separator(&inst, "sep:Textures", None, Some("red")).is_err());
+    assert!(edit_separator(&inst, "sep:Textures", Some("Textures (2)"), None).is_err());
+    edit_separator(&inst, "sep:Textures", None, Some("#AABBCC")).unwrap();
+    assert_eq!(edit_separator(&inst, "sep:Textures", Some("Gameplay"), None).unwrap(), "sep:Gameplay");
+    let rows = ops::list_mods(&inst).unwrap();
+    assert_eq!((rows[2].id.as_str(), rows[2].color.as_deref()), ("sep:Gameplay", Some("#aabbcc")));
+
+    // Separators survive a profile switch and never count as missing mods.
+    inst.create_profile("Other", true).unwrap();
+    inst.switch_profile("Other").unwrap();
+    assert_eq!(ids(&inst), "C | sep:Textures (2) | sep:Gameplay | A | B");
+    assert!(health::check(&inst).unwrap().iter().all(|i| !i.subject.starts_with("sep:")));
+    assert!(deploy::deploy(&inst, true).is_ok());
+
+    // Uninstalling a mod and a separator together is one step, and undo brings both back.
+    install::uninstall_mods(&inst, &v(&["sep:Gameplay", "B"])).unwrap();
+    assert_eq!(inst.history().unwrap()[0], "uninstall 2 mods");
+    assert_eq!(ids(&inst), "C | sep:Textures (2) | A");
+    assert!(!root.join("mods/B").exists() && inst.profile().unwrap().colors.is_empty());
+    inst.undo().unwrap();
+    assert_eq!(ids(&inst), "C | sep:Textures (2) | sep:Gameplay | A | B");
+    assert!(root.join("mods/B").is_dir());
+    assert_eq!(inst.profile().unwrap().colors["sep:Gameplay"], "#aabbcc");
+}
+
+#[test]
+fn notes_colours_locks_and_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    fs::create_dir_all(game.join("Data")).unwrap();
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    write(&src.join("A/textures/t.dds"), "A");
+    write(&src.join("A/scripts/s.pex"), "pex");
+    write(&src.join("B/textures/t.dds"), "B");
+    write(&src.join("B/textures/b.dds"), "B");
+    for id in ["A", "B", "C"] {
+        write(&src.join(id).join(format!("{id}.esp")), plugin_bytes(&[], false));
+        install::install(&inst, &src.join(id), None, true, None).unwrap();
+    }
+    let row = |id: &str| ops::list_mods(&inst).unwrap().into_iter().find(|m| m.id == id).unwrap();
+    let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let plugins = || inst.profile().unwrap().plugins.into_iter().map(|e| e.name).collect::<Vec<_>>().join(" ");
+
+    // Tags come from the files.
+    assert_eq!(row("A").tags, ["plugins", "scripts", "textures"]);
+
+    // Notes live with the mod; empty clears them.
+    assert_eq!(ops::set_mod_note(&inst, "A", "  needs B  ").unwrap(), None);
+    assert_eq!(row("A").notes.as_deref(), Some("needs B"));
+    assert_eq!(ops::set_mod_note(&inst, "A", "").unwrap().as_deref(), Some("needs B"));
+    assert_eq!(row("A").notes, None);
+    assert!(ops::set_mod_note(&inst, "Nope", "x").is_err());
+
+    // Any row can take a colour; undoable.
+    assert!(ops::set_color(&inst, "A", "red").is_err());
+    assert!(ops::set_color(&inst, "Nope", "#000000").is_err());
+    ops::set_color(&inst, "A", "#FF0000").unwrap();
+    assert_eq!(row("A").color.as_deref(), Some("#ff0000"));
+    inst.undo().unwrap();
+    assert_eq!(row("A").color, None);
+
+    // A locked plugin stays put whatever else moves.
+    ops::set_plugin_order(&inst, &v(&["C.esp", "A.esp", "B.esp"])).unwrap();
+    ops::lock_plugin(&inst, "c.esp", true).unwrap();
+    assert_eq!(inst.profile().unwrap().locks["C.esp"], 0);
+    ops::set_plugin_order(&inst, &v(&["B.esp", "A.esp", "C.esp"])).unwrap();
+    assert_eq!(plugins(), "C.esp B.esp A.esp");
+    ops::lock_plugin(&inst, "C.esp", false).unwrap();
+    ops::set_plugin_order(&inst, &v(&["A.esp", "B.esp", "C.esp"])).unwrap();
+    assert_eq!(plugins(), "A.esp B.esp C.esp");
+    assert!(ops::lock_plugin(&inst, "Nope.esp", true).is_err());
+
+    // Loose per-file conflicts.
+    let files = conflicts::file_conflicts(&inst, &inst.profile().unwrap(), "A").unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!((files[0].file.as_str(), files[0].mods.join(" "), files[0].winner.as_str()), ("textures/t.dds", "A B".into(), "B"));
+
+    // History says what each change did; restore goes back several steps at once and redo returns.
+    ops::set_mods_enabled(&inst, &v(&["B"]), false).unwrap();
+    ops::move_mods(&inst, &v(&["C"]), 0).unwrap();
+    let h = inst.history_details().unwrap();
+    assert_eq!(h[0].change.moved, ["C"]);
+    assert_eq!(h[1].change.disabled, ["B"]);
+    assert!(h[1].change.moved.is_empty() && h[1].change.plugins == 1, "{:?}", h[1]);
+    let preview = inst.restore_preview(1).unwrap();
+    assert_eq!((preview.enabled.as_slice(), preview.moved.as_slice()), (v(&["B"]).as_slice(), v(&["C"]).as_slice()));
+    assert_eq!(inst.restore(1).unwrap().len(), 2);
+    let p = inst.profile().unwrap();
+    assert_eq!(p.mods.iter().map(|m| format!("{}{}", m.id, if m.enabled { "" } else { "-" })).collect::<Vec<_>>().join(" "), "A B C");
+    assert!(inst.restore(99).is_err());
+    assert!(inst.redo().unwrap().is_some());
+    assert!(!inst.profile().unwrap().mods[1].enabled);
+}
+
+#[test]
+fn deploy_refuses_more_plugins_than_the_game_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src) = (tmp.path().join("game"), tmp.path().join("src"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    for i in 0..254 {
+        write(&src.join(format!("Many/P{i:03}.esp")), plugin_bytes(&["Skyrim.esm"], false));
+    }
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    install::install(&inst, &src.join("Many"), None, true, None).unwrap();
+    let e = deploy::deploy(&inst, true).unwrap_err().to_string();
+    assert!(e.contains("255 full plugins are enabled"), "{e}");
+    assert!(deploy::deploy(&inst, false).is_err());
+    assert!(!game.join("Data/P000.esp").exists(), "nothing deployed");
+    assert!(has_issue(&inst, "plugin_limit"));
+    ops::set_plugin_enabled(&inst, "P253.esp", false).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert!(game.join("Data/P000.esp").exists());
+}
+
+fn order(inst: &Instance) -> String {
+    inst.profile().unwrap().mods.iter().map(|m| format!("{}{}", m.id, if m.enabled { "+" } else { "" })).collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn imports_an_mo2_instance() {
+    use rmm_core::import;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, mo2) = (tmp.path().join("game"), tmp.path().join("mo2"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&mo2.join("ModOrganizer.ini"), "[General]\r\ngameName=Skyrim Special Edition\r\nselected_profile=@ByteArray(Main)\r\n");
+    write(&mo2.join("mods/A/A.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&mo2.join("mods/A/textures/a.dds"), "A");
+    write(&mo2.join("mods/A/meta.ini"), "[General]\r\nmodid=123\r\nversion=1.0\r\ninstallationFile=A-123-1-0.7z\r\ncomments=keep this\r\n[installedFiles]\r\n1\\modid=123\r\n1\\fileid=456\r\nsize=1\r\n");
+    write(&mo2.join("mods/B/B.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&mo2.join("mods/B/textures/a.dds"), "B");
+    write(&mo2.join("mods/B/Root/enbseries.ini"), "enb");
+    write(&mo2.join("mods/Visuals_separator/meta.ini"), "[General]\r\n");
+    write(&mo2.join("mods/C/meshes/c.nif"), "C");
+    write(&mo2.join("profiles/Main/modlist.txt"), "# This file was automatically generated by Mod Organizer.\r\n+B\r\n-Visuals_separator\r\n-A\r\n*DLC: Dawnguard\r\n");
+    write(&mo2.join("profiles/Main/plugins.txt"), "# This file was automatically generated by Mod Organizer.\r\n*B.esp\r\nA.esp\r\n");
+    write(&mo2.join("profiles/Main/loadorder.txt"), "Skyrim.esm\r\nB.esp\r\nA.esp\r\n");
+    write(&mo2.join("profiles/Main/lockedorder.txt"), "B.esp|1\r\n");
+    write(&mo2.join("overwrite/SKSE/Plugins/x.ini"), "x");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+
+    let dry = import::import_mo2(&inst, &mo2, None, true).unwrap();
+    assert_eq!((dry.mods.join(" "), dry.separators, dry.plugins), ("A B C".into(), 1, 3));
+    assert!(!inst.mod_dir("A").exists() && order(&inst).is_empty());
+
+    let r = import::import_mo2(&inst, &mo2, None, false).unwrap();
+    assert_eq!(r.linked + r.copied, 6, "{r:?}"); // 5 mod files and the overwrite file; meta.ini stays behind
+    assert_eq!(order(&inst), "A sep:Visuals B+ C");
+    assert_eq!(inst.mod_files("B").unwrap(), ["B.esp", "root/enbseries.ini", "textures/a.dds"]);
+    let meta = inst.mod_meta("A");
+    assert_eq!((meta.notes.as_deref(), meta.nexus.as_ref().map(|n| (n.mod_id, n.file_id, n.version.clone()))), (Some("keep this"), Some((123, Some(456), Some("1.0".into())))));
+    assert!(meta.source.unwrap().replace('\\', "/").ends_with("mo2/downloads/A-123-1-0.7z"));
+    let p = inst.profile().unwrap();
+    assert_eq!(p.plugins.iter().map(|e| format!("{}{}", e.name, if e.enabled { "+" } else { "" })).collect::<Vec<_>>().join(" "), "Skyrim.esm B.esp+ A.esp");
+    assert_eq!(p.locks["B.esp"], 1);
+    assert!(inst.root.join("overwrite/SKSE/Plugins/x.ini").is_file());
+    assert_eq!(inst.history().unwrap()[0], "import MO2 profile Main");
+
+    // Again: nothing new to bring in.
+    let again = import::import_mo2(&inst, &mo2, Some("Main"), false).unwrap();
+    assert_eq!((again.mods.len(), again.existing.join(" ")), (0, "A B C".into()));
+    assert!(import::import_mo2(&inst, &mo2, Some("Nope"), true).is_err());
+}
+
+#[test]
+fn imports_a_vortex_backup() {
+    use rmm_core::import;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, staging, local) = (tmp.path().join("game"), tmp.path().join("staging"), tmp.path().join("local"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&staging.join("Alpha-1-1-0/Alpha.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&staging.join("Alpha-1-1-0/textures/x.dds"), "alpha");
+    write(&staging.join("Beta-2/textures/x.dds"), "beta");
+    write(&staging.join("Gamma-3/d3d11.dll"), "enb");
+    write(&local.join("plugins.txt"), "# comment\n*Alpha.esp\n");
+    let state = serde_json::json!({
+        "persistent": {
+            "mods": { "skyrimse": {
+                "m1": { "state": "installed", "type": "", "installationPath": "Alpha-1-1-0",
+                    "attributes": { "name": "Alpha", "logicalFileName": "Alpha", "installTime": "2024-01-01T00:00:00Z", "modId": 11, "fileId": "22", "version": "1.0",
+                        "fileName": "Alpha-1-1-0.zip", "installerChoices": { "type": "fomod", "options": [{ "name": "Main", "groups": [{ "name": "G", "choices": [{ "name": "Opt", "idx": 0 }] }] }] } },
+                    "rules": [{ "type": "after", "reference": { "id": "m2" } }] },
+                "m2": { "state": "installed", "type": "", "installationPath": "Beta-2",
+                    "attributes": { "name": "Beta", "installTime": "2024-01-02T00:00:00Z" },
+                    "rules": [{ "type": "requires", "reference": { "logicalFileName": "Gamma" } }, { "type": "before", "reference": { "id": "m3" }, "ignored": true }] },
+                "m3": { "state": "installed", "type": "dinput", "installationPath": "Gamma-3", "attributes": { "logicalFileName": "Gamma", "installTime": "2024-01-03T00:00:00Z" } },
+                "m4": { "state": "downloaded", "attributes": { "name": "Not installed" } },
+                "c1": { "state": "installed", "type": "collection", "installationPath": "coll", "attributes": { "name": "A collection" } }
+            } },
+            "profiles": {
+                "p1": { "id": "p1", "gameId": "skyrimse", "name": "Default", "modState": { "m1": { "enabled": true }, "m2": { "enabled": true } } },
+                "p2": { "id": "p2", "gameId": "fallout4", "name": "Other" }
+            }
+        },
+        "settings": { "mods": { "installPath": { "skyrimse": staging.display().to_string() } }, "profiles": { "lastActiveProfile": { "skyrimse": "p1" } } }
+    });
+    let backup = tmp.path().join("startup.json");
+    write(&backup, state.to_string());
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &local).unwrap();
+
+    let dry = import::import_vortex(&inst, &backup, None, None, true).unwrap();
+    assert_eq!((dry.profile.as_str(), dry.mods.join(" "), dry.rules), ("Default", "Alpha Beta Gamma".into(), 2));
+
+    // The same state in Vortex's live LevelDB: one key per leaf, path parts joined by ###.
+    fn leaves(v: &serde_json::Value, path: &mut Vec<String>, out: &mut Vec<(String, String)>) {
+        match v.as_object() {
+            Some(m) => {
+                for (k, v) in m {
+                    path.push(k.clone());
+                    leaves(v, path, out);
+                    path.pop();
+                }
+            }
+            None => out.push((path.join("###"), v.to_string())),
+        }
+    }
+    let db_dir = tmp.path().join("state.v2");
+    {
+        let mut db = rusty_leveldb::DB::open(&db_dir, rusty_leveldb::Options { create_if_missing: true, ..Default::default() }).unwrap();
+        let mut kv = Vec::new();
+        leaves(&state, &mut Vec::new(), &mut kv);
+        for (k, v) in kv {
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let live = import::import_vortex(&inst, &db_dir, None, None, true).unwrap();
+    assert_eq!((live.profile, live.mods, live.rules), (dry.profile.clone(), dry.mods.clone(), dry.rules), "LevelDB reads like the backup");
+    assert!(!inst.root.join(".staging/vortex-state").exists(), "the copy is cleaned up");
+    let r = import::import_vortex(&inst, &backup, None, None, false).unwrap();
+    assert!(r.warnings.is_empty(), "{r:?}");
+    assert_eq!(order(&inst), "Beta+ Alpha+ Gamma", "Alpha loads after Beta by its rule");
+    assert_eq!(inst.mod_files("Gamma").unwrap(), ["root/d3d11.dll"]);
+    let meta = inst.mod_meta("Alpha");
+    assert_eq!(meta.nexus.map(|n| (n.mod_id, n.file_id)), Some((11, Some(22))));
+    assert_eq!(meta.fomod.unwrap().options[0].groups[0].choices[0].name, "Opt");
+    let rules = rmm_core::rules::rules(&inst).unwrap();
+    let rule = |id: &str| rules.iter().find(|r| r.id == id).unwrap().clone();
+    assert_eq!((rule("Alpha").after, rule("Beta").requires), (vec!["Beta".to_string()], vec!["Gamma".to_string()]));
+    assert_eq!(inst.profile().unwrap().plugins.iter().find(|e| e.name == "Alpha.esp").map(|e| e.enabled), Some(true));
+    assert!(import::import_vortex(&inst, &backup, None, Some("Other"), true).is_err(), "a Fallout 4 profile");
+}
+
+#[test]
+fn lockfile_round_trip_keeps_user_mods() {
+    use rmm_core::lockfile;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, dl) = (tmp.path().join("game"), tmp.path().join("downloads"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let zip = |name: &str, files: &[(&str, &[u8])]| {
+        fs::create_dir_all(&dl).unwrap();
+        let mut z = zip::ZipWriter::new(fs::File::create(dl.join(name)).unwrap());
+        for (f, b) in files {
+            z.start_file(*f, zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(b).unwrap();
+        }
+        z.finish().unwrap();
+    };
+    zip("A-1.zip", &[("A.esp", &plugin_bytes(&["Skyrim.esm"], false)), ("textures/a.dds", b"A")]);
+    zip("B-1.zip", &[("textures/a.dds", b"B")]);
+
+    let one = Instance::create(&tmp.path().join("one"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    install::install(&one, &dl.join("A-1.zip"), Some("Alpha"), true, None).unwrap();
+    ops::add_separator(&one, "Textures", None).unwrap();
+    install::install(&one, &dl.join("B-1.zip"), None, false, None).unwrap();
+    ops::set_color(&one, "Alpha", "#112233").unwrap();
+    assert!(one.mod_meta("Alpha").sha256.is_some_and(|h| h.len() == 64));
+    let mut lock = lockfile::export(&one).unwrap();
+    lock.mods.push(lockfile::LockedMod {
+        id: "Gone".into(),
+        enabled: true,
+        archive: Some("Gone-5-6.zip".into()),
+        nexus: Some(rmm_core::instance::NexusRef { mod_id: 5, file_id: Some(6), version: None }),
+        ..Default::default()
+    });
+    let path = tmp.path().join("modlist.lock.toml");
+    fs::write(&path, toml::to_string_pretty(&lock).unwrap()).unwrap();
+    let lock = lockfile::read(&path).unwrap();
+    assert_eq!(lock.mods.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["Alpha", "sep:Textures", "B-1", "Gone"]);
+    assert_eq!(lock.mods[0].archive.as_deref(), Some("A-1.zip"));
+
+    // Another machine, where the user has a mod of their own.
+    let two = Instance::create(&tmp.path().join("two"), Game::SkyrimSe, &game, &tmp.path().join("local2")).unwrap();
+    write(&tmp.path().join("Mine/textures/m.dds"), "mine");
+    install::install(&two, &tmp.path().join("Mine"), None, true, None).unwrap();
+    let dry = lockfile::apply(&two, &lock, std::slice::from_ref(&dl), true).unwrap();
+    assert_eq!((dry.install.join(" "), dry.kept.join(" ")), ("Alpha B-1".into(), "Mine".into()));
+    assert_eq!(dry.missing[0].url.as_deref(), Some("https://www.nexusmods.com/skyrimspecialedition/mods/5?tab=files&file_id=6"));
+    assert!(!two.mod_dir("Alpha").exists());
+
+    let r = lockfile::apply(&two, &lock, std::slice::from_ref(&dl), false).unwrap();
+    assert!(r.warnings.is_empty(), "{r:?}");
+    assert_eq!(order(&two), "Mine+ Alpha+ sep:Textures B-1");
+    assert_eq!(two.profile().unwrap().colors["Alpha"], "#112233");
+    let again = lockfile::apply(&two, &lock, &[dl], true).unwrap();
+    assert_eq!((again.ok, again.install.len(), again.differs.len()), (2, 0, 0), "same files as on the first machine");
+
+    // A curated list moves on: the user's mod stays after the mod it followed.
+    ops::move_mods(&two, &["Mine".to_string()], 1).unwrap();
+    let mut next = lock.clone();
+    next.mods.swap(0, 2); // B-1, sep:Textures, Alpha
+    lockfile::apply(&two, &next, &[], false).unwrap();
+    assert_eq!(order(&two), "B-1 sep:Textures Alpha+ Mine+");
+}
+
+type Hits = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>;
+
+/// A stand-in for the Nexus API on 127.0.0.1. `routes` gets the server's base URL and returns
+/// the answer for each path and query; /v1 requests without the test key get a 401.
+fn mock_nexus(routes: impl FnOnce(&str) -> std::collections::HashMap<String, Vec<u8>>) -> (String, Hits) {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let routes = routes(&base);
+    let hits: Hits = Default::default();
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+            let mut keyed = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                keyed |= line.to_lowercase().starts_with("apikey: test-key");
+            }
+            *counter.lock().unwrap().entry(path.clone()).or_insert(0) += 1;
+            let (status, body) = match routes.get(&path) {
+                _ if path.starts_with("/v1") && !keyed => ("401 Unauthorized", br#"{"message":"Please provide a valid API Key"}"#.to_vec()),
+                Some(b) => ("200 OK", b.clone()),
+                None => ("404 Not Found", b"{}".to_vec()),
+            };
+            let mut out = stream;
+            let _ = write!(out, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = out.write_all(&body);
+        }
+    });
+    (base, hits)
+}
+
+#[test]
+fn nexus_updates_and_downloads() {
+    use rmm_core::nexus;
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    fs::create_dir_all(game.join("Data")).unwrap();
+    let mut zip_bytes = Vec::new();
+    {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+        z.start_file("textures/a.dds", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(b"v2").unwrap();
+        z.finish().unwrap();
+    }
+    let d = "/v1/games/skyrimspecialedition/mods";
+    let json = |v: serde_json::Value| v.to_string().into_bytes();
+    let (base, hits) = mock_nexus(|base| {
+        std::collections::HashMap::from([
+            ("/v1/users/validate.json".to_string(), json(serde_json::json!({ "user_id": 1, "key": "test-key", "name": "tester", "is_premium": false, "email": "someone@example.com" }))),
+            (format!("{d}/updated.json?period=1m"), json(serde_json::json!([{ "mod_id": 9, "latest_file_update": 1 }]))),
+            (format!("{d}/9/files.json"), json(serde_json::json!({
+                "files": [{ "file_id": 1, "version": "1.0", "category_name": "OLD_VERSION", "file_name": "A-1.zip" }, { "file_id": 2, "version": "2.0", "category_name": "MAIN", "file_name": "A-2.zip" }],
+                "file_updates": [{ "old_file_id": 1, "new_file_id": 2 }]
+            }))),
+            (format!("{d}/9.json"), json(serde_json::json!({ "name": "Alpha Mod" }))),
+            (format!("{d}/9/files/2.json"), json(serde_json::json!({ "file_id": 2, "file_name": "A-2.zip", "version": "2.0" }))),
+            (format!("{d}/9/files/2/download_link.json?key=k&expires=5"), json(serde_json::json!([{ "name": "CDN", "URI": format!("{base}/cdn/A-2.zip") }]))),
+            ("/cdn/A-2.zip".to_string(), zip_bytes),
+        ])
+    });
+    let client = |key: &str| {
+        let mut c = nexus::Client::new(key).unwrap();
+        c.base = base.clone();
+        c
+    };
+
+    let who = client("test-key").validate().unwrap();
+    assert_eq!(who["name"], "tester");
+    assert!(who.get("key").is_none() && who.get("email").is_none(), "the key and email never leave validate: {who}");
+    assert!(format!("{:#}", client("wrong").validate().unwrap_err()).contains("refused the API key"));
+
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    write(&tmp.path().join("A/textures/a.dds"), "v1");
+    install::install(&inst, &tmp.path().join("A"), None, true, None).unwrap();
+    let mut meta = inst.mod_meta("A");
+    meta.nexus = Some(rmm_core::instance::NexusRef { mod_id: 9, file_id: Some(1), version: Some("1.0".into()) });
+    inst.write_mod_meta("A", &meta).unwrap();
+
+    let c = client("test-key");
+    let ups = nexus::check_updates(&inst, &c, None).unwrap();
+    assert_eq!(ups.iter().map(|u| (u.id.as_str(), u.file_id, u.latest.as_deref())).collect::<Vec<_>>(), [("A", 2, Some("2.0"))]);
+    nexus::check_updates(&inst, &c, None).unwrap();
+    assert_eq!(hits.lock().unwrap()[&format!("{d}/9/files.json")], 1, "the second check uses the cache");
+
+    let link = nexus::parse_nxm("nxm://skyrimspecialedition/mods/9/files/2?key=k&expires=5&user_id=1").unwrap();
+    let r = nexus::install(&inst, &c, &link, None).unwrap();
+    assert_eq!(r.name, "Alpha Mod");
+    assert!(inst.root.join("downloads/A-2.zip").is_file());
+    let meta = inst.mod_meta(&r.id);
+    let n = meta.nexus.unwrap();
+    assert_eq!((n.mod_id, n.file_id, n.version.as_deref()), (9, Some(2), Some("2.0")));
+    assert!(meta.sha256.is_some());
+    assert!(nexus::download(&inst, &c, &nexus::parse_nxm("nxm://fallout4/mods/1/files/2").unwrap()).is_err(), "another game");
+    let ids = nexus::link_or_ids(&inst, " 9 / 2 ").unwrap();
+    assert_eq!((ids.game.as_str(), ids.mod_id, ids.file_id, ids.key), ("skyrimspecialedition", 9, 2, None));
+    assert_eq!(nexus::link_or_ids(&inst, "nxm://skyrimspecialedition/mods/9/files/2").unwrap().file_id, 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn vfs_mount_layers_and_writes_to_overwrite() {
+    use rmm_core::vfs;
+    if !Path::new("/dev/fuse").exists() || std::process::Command::new("fusermount3").arg("-V").output().is_err() {
+        eprintln!("skipped: no FUSE here");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    let data = game.join("Data");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&data.join("Skyrim.esm"), plugin_bytes(&[], true));
+    write(&data.join("textures/v.dds"), "vanilla");
+    write(&data.join("textures/shared.dds"), "vanilla-shared");
+    fs::create_dir_all(tmp.path().join("local")).unwrap();
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    write(&tmp.path().join("A/textures/shared.dds"), "A");
+    write(&tmp.path().join("A/textures/a.dds"), "a");
+    write(&tmp.path().join("B/Textures/Shared.dds"), "B");
+    write(&tmp.path().join("B/meshes/b.nif"), "b");
+    write(&tmp.path().join("B/root/skse_loader.exe"), "loader");
+    install::install(&inst, &tmp.path().join("A"), None, true, None).unwrap();
+    install::install(&inst, &tmp.path().join("B"), None, true, None).unwrap();
+    write(&inst.root.join("overwrite/textures/o.dds"), "o");
+    deploy::deploy(&inst, false).unwrap(); // a hard-link deploy first: the mount takes Data back out
+    let read = |rel: &str| fs::read_to_string(data.join(rel)).unwrap();
+
+    let m = vfs::mount(&inst).unwrap();
+    assert_eq!(read("textures/shared.dds"), "B", "the later mod wins");
+    assert_eq!((read("textures/v.dds"), read("textures/a.dds"), read("textures/o.dds"), read("meshes/b.nif")), ("vanilla".into(), "a".into(), "o".into(), "b".into()));
+    assert_eq!(read("TEXTURES/A.DDS"), "a", "names match without case");
+    let mut names: Vec<String> = fs::read_dir(data.join("textures")).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_lowercase()).collect();
+    names.sort();
+    assert_eq!(names, ["a.dds", "o.dds", "shared.dds", "v.dds"]);
+    assert_eq!(read("../skse_loader.exe"), "loader", "root files still deploy");
+    assert!(deploy::deploy(&inst, true).unwrap_err().to_string().contains("rmm vfs"), "no deploy while mounted");
+
+    // Writes land in overwrite/; vanilla and mod files stay as they were.
+    write(&data.join("new/x.txt"), "new");
+    assert_eq!(fs::read_to_string(inst.root.join("overwrite/new/x.txt")).unwrap(), "new");
+    fs::OpenOptions::new().append(true).open(data.join("textures/v.dds")).unwrap().write_all(b"+").unwrap();
+    fs::write(data.join("textures/a.dds"), "a2").unwrap();
+    assert_eq!((read("textures/v.dds"), read("textures/a.dds")), ("vanilla+".into(), "a2".into()));
+    assert_eq!(fs::read_to_string(inst.root.join("overwrite/textures/v.dds")).unwrap(), "vanilla+");
+    assert_eq!(fs::read_to_string(inst.mod_dir("A").join("textures/a.dds")).unwrap(), "a", "the mod's file is untouched");
+    fs::rename(data.join("new/x.txt"), data.join("new/y.txt")).unwrap();
+    assert!(inst.root.join("overwrite/new/y.txt").is_file() && !inst.root.join("overwrite/new/x.txt").exists());
+    fs::remove_file(data.join("new/y.txt")).unwrap();
+    assert!(!inst.root.join("overwrite/new/y.txt").exists());
+    fs::remove_file(data.join("meshes/b.nif")).unwrap();
+    assert!(!data.join("meshes/b.nif").exists() && inst.mod_dir("B").join("meshes/b.nif").is_file(), "hidden, not deleted");
+
+    drop(m);
+    assert_eq!(read("textures/v.dds"), "vanilla", "vanilla Data is back, unchanged");
+    assert!(!data.join("textures/a.dds").exists() && vfs::mounted_by(&inst).is_none());
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read("textures/v.dds"), "vanilla+", "overwrite/ wins a normal deploy too");
+    let dirs: Vec<String> = fs::read_dir(&data).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.eq_ignore_ascii_case("textures")).collect();
+    assert_eq!(dirs, ["textures"], "B's Textures/ goes into vanilla's textures/, not beside it");
+    assert_eq!(read("textures/shared.dds"), "B");
+    assert!(inst.root.join("backup/Data/textures/shared.dds").is_file(), "vanilla's file is backed up");
+}
+
+/// A tiny Extism add-on in WebAssembly text. `call_host` hands its input to rmm's host function
+/// and returns the answer; each (name, json, via_host) is a function returning that JSON, or
+/// passing it to the host function and returning the answer.
+fn wat_addon(fixed: &[(&str, &str, bool)]) -> String {
+    let (mut data, mut funcs, mut at) = (String::new(), String::new(), 0);
+    for (name, json, via_host) in fixed {
+        let esc: String = json.bytes().map(|b| format!("\\{b:02x}")).collect();
+        data += &format!("(data (i32.const {at}) \"{esc}\")\n");
+        let len = json.len();
+        funcs += &if *via_host {
+            format!("(func (export \"{name}\") (result i32) (local $r i64) (local.set $r (call $rmm (call $copy (i32.const {at}) (i32.const {len})))) (call $output_set (local.get $r) (call $length (local.get $r))) (i32.const 0))\n")
+        } else {
+            format!("(func (export \"{name}\") (result i32) (call $output_set (call $copy (i32.const {at}) (i32.const {len})) (i64.const {len})) (i32.const 0))\n")
+        };
+        at += len;
+    }
+    format!(
+        r#"(module
+  (import "extism:host/env" "alloc" (func $alloc (param i64) (result i64)))
+  (import "extism:host/env" "store_u8" (func $store_u8 (param i64 i32)))
+  (import "extism:host/env" "length" (func $length (param i64) (result i64)))
+  (import "extism:host/env" "input_length" (func $input_length (result i64)))
+  (import "extism:host/env" "input_load_u8" (func $input_load_u8 (param i64) (result i32)))
+  (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
+  (import "extism:host/user" "rmm" (func $rmm (param i64) (result i64)))
+  (memory 1)
+  {data}
+  (func $copy (param $ptr i32) (param $len i32) (result i64)
+    (local $off i64) (local $i i32)
+    (local.set $off (call $alloc (i64.extend_i32_u (local.get $len))))
+    (block $done (loop $next
+      (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+      (call $store_u8 (i64.add (local.get $off) (i64.extend_i32_u (local.get $i))) (i32.load8_u (i32.add (local.get $ptr) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $next)))
+    (local.get $off))
+  (func $input (result i64)
+    (local $n i64) (local $off i64) (local $i i64)
+    (local.set $n (call $input_length))
+    (local.set $off (call $alloc (local.get $n)))
+    (block $done (loop $next
+      (br_if $done (i64.ge_u (local.get $i) (local.get $n)))
+      (call $store_u8 (i64.add (local.get $off) (local.get $i)) (call $input_load_u8 (local.get $i)))
+      (local.set $i (i64.add (local.get $i) (i64.const 1)))
+      (br $next)))
+    (local.get $off))
+  (func (export "call_host") (result i32)
+    (local $r i64)
+    (local.set $r (call $rmm (call $input)))
+    (call $output_set (local.get $r) (call $length (local.get $r)))
+    (i32.const 0))
+  {funcs})"#
+    )
+}
+
+#[test]
+fn addons_hooks_and_capabilities() {
+    use rmm_core::addons;
+    use serde_json::json;
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    fs::create_dir_all(tmp.path().join("local")).unwrap();
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+
+    let helper = tmp.path().join("helper");
+    write(&helper.join("addon.toml"), r#"
+name = "helper"
+version = "1.0"
+capabilities = ["read_instance", "mod_files"]
+hooks = ["after_install", "health_check"]
+tools = [{ name = "call_host", description = "Pass a request to rmm" }]
+panels = [{ title = "Status", function = "status" }]
+"#);
+    write(&helper.join("addon.wasm"), wat_addon(&[
+        ("after_install", r#"{"op":"write_overwrite","path":"hook/installed.txt","text":"yes"}"#, true),
+        ("health_check", r#"[{"severity":"error","subject":"Test","message":"from wasm"}]"#, false),
+        ("status", r#"{"text":"all good"}"#, false),
+    ]));
+    let preview = addons::install(&inst, &helper, true).unwrap();
+    assert_eq!(serde_json::to_value(&preview.toml.capabilities).unwrap(), json!(["read_instance", "mod_files"]));
+    assert!(addons::list(&inst).unwrap().is_empty(), "a dry run installs nothing");
+    addons::install(&inst, &helper, false).unwrap();
+
+    write(&tmp.path().join("A/textures/a.dds"), "a");
+    let r = install::install(&inst, &tmp.path().join("A"), None, true, None).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(fs::read_to_string(inst.root.join("overwrite/hook/installed.txt")).unwrap(), "yes", "after_install ran");
+
+    let host = |req: serde_json::Value| addons::call(&inst, "helper", "call_host", &req).unwrap();
+    assert_eq!(host(json!({ "op": "list_mods" }))["ok"][0]["id"], "A");
+    let denied = host(json!({ "op": "set_mods_enabled", "ids": ["A"], "enabled": false }));
+    assert!(denied["error"].as_str().unwrap().contains("modify_profile"), "{denied}");
+    assert!(ops::list_mods(&inst).unwrap()[0].enabled, "nothing changed");
+    for escape in [json!({ "op": "read_file", "id": "..", "path": "instance.toml" }), json!({ "op": "write_overwrite", "path": "../escape.txt", "text": "x" })] {
+        assert!(host(escape.clone())["error"].as_str().unwrap().contains(".."), "{escape}");
+    }
+    assert!(!inst.root.join("escape.txt").exists());
+    assert_eq!(host(json!({ "op": "read_file", "id": "A", "path": "textures/a.dds" }))["ok"], "YQ==");
+    assert_eq!(addons::call(&inst, "helper", "status", &json!({})).unwrap()["text"], "all good");
+    assert!(addons::call(&inst, "helper", "after_install", &json!({})).is_err(), "hooks aren't callable as tools");
+
+    let issues = health::check(&inst).unwrap();
+    assert!(issues.iter().any(|i| i.kind == "addon" && i.severity == "error" && i.message.contains("from wasm")), "{issues:?}");
+
+    let gate = tmp.path().join("gate");
+    write(&gate.join("addon.toml"), "name = \"gate\"\nversion = \"1\"\nhooks = [\"before_deploy\"]\n");
+    write(&gate.join("addon.wasm"), wat_addon(&[("before_deploy", r#"{"abort":"not today"}"#, false)]));
+    addons::install(&inst, &gate, false).unwrap();
+    assert!(deploy::deploy(&inst, true).is_ok(), "previews don't run hooks");
+    assert!(format!("{:#}", deploy::deploy(&inst, false).unwrap_err()).contains("not today"));
+    assert!(!game.join("Data/textures/a.dds").exists());
+    addons::remove(&inst, "gate").unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert!(game.join("Data/textures/a.dds").exists());
+
+    write(&tmp.path().join("bad/addon.toml"), "name = \"bad\"\nversion = \"1\"\nhosts = [\"example.com\"]\n");
+    write(&tmp.path().join("bad/addon.wasm"), "(module)");
+    assert!(addons::install(&inst, &tmp.path().join("bad"), true).unwrap_err().to_string().contains("network"));
+}
+
+#[test]
+fn a_folder_keeps_the_dots_in_its_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("game/SkyrimSE.exe"), "exe");
+    write(&tmp.path().join("Lib (1.7.104.0) v13/SKSE/Plugins/x.bin"), "x");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &tmp.path().join("game"), &tmp.path().join("local")).unwrap();
+    let r = install::install(&inst, &tmp.path().join("Lib (1.7.104.0) v13"), None, true, None).unwrap();
+    assert_eq!(r.name, "Lib (1.7.104.0) v13");
+}
+
+/// A game from an add-on: Skyrim VR on Skyrim SE's rules, with its own exe, folders and LOOT type.
+#[test]
+fn a_game_from_an_addon() {
+    use rmm_core::{addons, archives};
+    let tmp = tempfile::tempdir().unwrap();
+    let vr = tmp.path().join("vr-addon");
+    write(&vr.join("addon.toml"), r#"
+name = "skyrim-vr"
+version = "1.0"
+
+[[games]]
+id = "skyrimvr"
+name = "Skyrim VR"
+base = "skyrim-se"
+loadorder = "SkyrimVR"
+exe = "SkyrimVR.exe"
+loader = "sksevr_loader.exe"
+steam_app_id = 611670
+steam_dir = "SkyrimVR"
+local_dir = "Skyrim VR"
+ini = "SkyrimVR.ini"
+nexus_domain = "skyrimspecialedition"
+"#);
+    let games = addons::games_in(&vr).unwrap();
+    let g = games[0];
+    assert_eq!((g.id(), g.base(), g.exe(), g.loader(), g.steam_app_id()), ("skyrimvr", Game::SkyrimSe, "SkyrimVR.exe", "sksevr_loader.exe", 611670));
+    assert_eq!((g.lo_id(), g.local_folder(tmp.path())), (loadorder::GameId::SkyrimVR, "Skyrim VR".to_string()));
+    assert!(archives::loaded_by(g, "Foo.esp", "Foo - Textures.bsa"), "Skyrim SE's archive rules");
+    assert_eq!("SkyrimVR".parse::<Game>().unwrap(), g);
+
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimVR.exe"), "exe");
+    let inst = Instance::create(&tmp.path().join("inst"), g, &game, &tmp.path().join("local")).unwrap();
+    addons::install(&inst, &vr, false).unwrap();
+    assert!(fs::read_to_string(tmp.path().join("inst/instance.toml")).unwrap().contains(r#"game = "skyrimvr""#));
+    assert_eq!(Instance::open(&tmp.path().join("inst")).unwrap().config.game, g);
+    assert_eq!(addons::list(&inst).unwrap()[0].toml.games[0].name, "Skyrim VR");
+
+    let def = |id: &str, base: &str, lo: &str| rmm_core::game::GameDef {
+        id: id.into(), name: "x".into(), base: base.into(), loadorder: Some(lo.into()), exe: "x.exe".into(), loader: "l.exe".into(),
+        steam_app_id: 1, steam_dir: "x".into(), local_dir: "x".into(), ini: "x.ini".into(), nexus_domain: "x".into(),
+    };
+    assert!(rmm_core::game::register(def("oblivion-x", "oblivion", "SkyrimSE")).is_err());
+    assert!(rmm_core::game::register(def("vr-x", "skyrim-se", "Fallout4VR")).is_err());
+    assert!(rmm_core::game::register(def("skyrim-se", "skyrim-se", "SkyrimSE")).is_err());
 }

@@ -10,7 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 walkdir = "2"
-zip = { version = "9", default-features = false, features = ["aes-crypto", "bzip2", "deflate64", "deflate", "lzma", "ppmd", "time", "xz"] }
+zip = { version = "9", default-features = false, features = ["aes-crypto", "bzip2", "deflate64", "deflate", "lzma", "ppmd", "time", "xz", "zstd"] }
 sevenz-rust2 = "0.25"
 libloadorder = "18"
 esplugin = "6"
@@ -21,15 +21,24 @@ same-file = "1"
 dirs = "6"
 roxmltree = "0.21.2"
 libloot = "0.29.7"
+# Already in the build through libloot.
+regex = "1"
+sha2 = "0.10"
+rusty-leveldb = "4.0.2"
+extism = "1.41"
+base64 = "0.23"
+# Nexus single sign-on's websocket. All three already come in through extism (ureq) and rmm.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+getrandom = "0.3"
 
-[features]
-default = ["zstd"]
-# Zstandard zips. Its C library needs a compiler for the target, so cross-checks from Windows
-# (`cargo check --target x86_64-unknown-linux-gnu --no-default-features`) turn it off.
-zstd = ["zip/zstd"]
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18.0", default-features = false }
+libc = "0.2.191"
 
 [dev-dependencies]
 tempfile = "3"

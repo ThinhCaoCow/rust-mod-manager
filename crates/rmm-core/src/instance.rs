@@ -5,10 +5,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CONFIG: &str = "instance.toml";
-const MOD_META: &str = "rmm-mod.toml";
+pub(crate) const MOD_META: &str = "rmm-mod.toml";
 const MOD_INDEX: &str = ".rmm-index";
 // ponytail: fixed undo depth; make it a setting if anyone hits it.
 const HISTORY_LIMIT: usize = 200;
+
+type IndexCache = std::collections::HashMap<PathBuf, (Stamp, Vec<String>)>;
+static INDEX_CACHE: std::sync::LazyLock<std::sync::Mutex<IndexCache>> = std::sync::LazyLock::new(Default::default);
+
+/// What tells one `.rmm-index` from the next. The time alone doesn't: Linux moves file times on a
+/// clock that ticks every few milliseconds, so a reinstall can write its index within the same
+/// tick. The new index is a new file, though (the old one went to trash/ with its mod).
+type Stamp = (std::time::SystemTime, u64, u64);
+
+fn stamp(m: &fs::Metadata) -> Stamp {
+    #[cfg(unix)]
+    let file = std::os::unix::fs::MetadataExt::ino(m);
+    #[cfg(windows)]
+    let file = std::os::windows::fs::MetadataExt::creation_time(m);
+    (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), file)
+}
+
+/// Separators head a group of mods in the list, like MO2's `_separator` mods. Their ids start
+/// with `sep:`, which no mod id can (`:` is stripped from mod names), and they hold no files.
+pub fn is_separator(id: &str) -> bool {
+    id.starts_with("sep:")
+}
 
 /// Pseudo mod id for `overwrite/`, deployed above every mod. `<>` never appears in real ids.
 pub const OVERWRITE: &str = "<overwrite>";
@@ -34,6 +56,96 @@ pub struct Profile {
     /// Plugin load order. Plugins whose mod is disabled stay here so they keep their slot.
     #[serde(default)]
     pub plugins: Vec<PluginEntry>,
+    /// Row colours (`#rrggbb`) by separator or mod id.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub colors: std::collections::BTreeMap<String, String>,
+    /// Plugins locked to a position in `plugins` (MO2's index lock): every change puts them back.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub locks: std::collections::BTreeMap<String, usize>,
+    /// The profile keeps its own copies of the game's INIs (`profiles/<name>/ini/`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_inis: bool,
+    /// The profile's saves go to `Saves/<name>/`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_saves: bool,
+}
+
+impl Profile {
+    /// Put locked plugins back at their positions, lowest first.
+    pub fn apply_locks(&mut self) {
+        let mut locked: Vec<(usize, PluginEntry)> = Vec::new();
+        for (name, &at) in &self.locks {
+            if let Some(i) = self.plugins.iter().position(|e| e.name.eq_ignore_ascii_case(name)) {
+                locked.push((at, self.plugins.remove(i)));
+            }
+        }
+        locked.sort_by_key(|(at, _)| *at);
+        for (at, e) in locked {
+            self.plugins.insert(at.min(self.plugins.len()), e);
+        }
+    }
+}
+
+/// What a change did to a profile, or what restoring a history entry would do.
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct Diff {
+    pub enabled: Vec<String>,
+    pub disabled: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Mods whose place among the others changed.
+    pub moved: Vec<String>,
+    /// Plugins enabled, disabled, added, removed or moved.
+    pub plugins: usize,
+}
+
+/// The difference from `a` to `b`.
+pub fn diff(a: &Profile, b: &Profile) -> Diff {
+    use std::collections::HashMap;
+    let before: HashMap<&str, bool> = a.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
+    let after: HashMap<&str, bool> = b.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
+    let mut d = Diff::default();
+    for m in &b.mods {
+        match before.get(m.id.as_str()) {
+            None => d.added.push(m.id.clone()),
+            Some(&was) if was != m.enabled && !is_separator(&m.id) => (if m.enabled { &mut d.enabled } else { &mut d.disabled }).push(m.id.clone()),
+            _ => {}
+        }
+    }
+    d.removed = a.mods.iter().filter(|m| !after.contains_key(m.id.as_str())).map(|m| m.id.clone()).collect();
+    // Moved: the mods outside a longest run that kept its order.
+    let pos: HashMap<&str, usize> = a.mods.iter().enumerate().map(|(i, m)| (m.id.as_str(), i)).collect();
+    let common: Vec<(usize, &str)> = b.mods.iter().filter_map(|m| pos.get(m.id.as_str()).map(|&i| (i, m.id.as_str()))).collect();
+    let keep = longest_increasing(&common.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+    d.moved = common.iter().enumerate().filter(|(k, _)| !keep.contains(k)).map(|(_, (_, id))| id.to_string()).collect();
+    let plugin_state = |p: &Profile| p.plugins.iter().map(|e| (e.name.to_lowercase(), e.enabled)).collect::<Vec<_>>();
+    let (pa, pb) = (plugin_state(a), plugin_state(b));
+    d.plugins = pb.iter().enumerate().filter(|(i, e)| pa.get(*i) != Some(e)).count().max(pa.len().saturating_sub(pb.len()));
+    d
+}
+
+/// Indices (into `v`) of one longest strictly increasing subsequence. O(n log n).
+fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
+    let (mut tails, mut prev): (Vec<usize>, Vec<Option<usize>>) = (Vec::new(), vec![None; v.len()]);
+    for i in 0..v.len() {
+        let k = tails.partition_point(|&t| v[t] < v[i]);
+        prev[i] = k.checked_sub(1).map(|k| tails[k]);
+        if k == tails.len() { tails.push(i) } else { tails[k] = i }
+    }
+    let mut out = std::collections::HashSet::new();
+    let mut at = tails.last().copied();
+    while let Some(i) = at {
+        out.insert(i);
+        at = prev[i];
+    }
+    out
+}
+
+/// One undoable change: its label and what it did.
+#[derive(Serialize, Debug)]
+pub struct HistoryEntry {
+    pub label: String,
+    pub change: Diff,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -56,6 +168,25 @@ pub struct ModMeta {
     /// FOMOD choices the mod was installed with (Vortex's `installerChoices` format).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fomod: Option<crate::fomod::Choices>,
+    /// The user's notes on the mod.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Where the mod comes from on Nexus Mods, for update checks and download links.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nexus: Option<NexusRef>,
+    /// sha256 of the archive it was installed from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// A mod's page and file on Nexus Mods (the game comes from the instance).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+pub struct NexusRef {
+    pub mod_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 pub struct Instance {
@@ -92,6 +223,7 @@ impl Instance {
     pub fn open(root: &Path) -> Result<Self> {
         let text = fs::read_to_string(root.join(CONFIG))
             .with_context(|| format!("{} is not an rmm instance (no {CONFIG})", root.display()))?;
+        crate::addons::register_games(root);
         Ok(Instance { root: root.into(), config: toml::from_str(&text)? })
     }
 
@@ -106,6 +238,15 @@ impl Instance {
     }
     pub fn ini_dir(&self) -> Option<PathBuf> {
         self.config.ini_path.clone().or_else(|| crate::game::my_games_dir(&self.config.local_path))
+    }
+    /// `name` in the INI folder, in whatever letter case it has there (under Proton the game
+    /// writes `Skyrim.INI`); the plain path when there is no such file yet.
+    pub fn ini_file(&self, name: &str) -> Option<PathBuf> {
+        let dir = self.ini_dir()?;
+        let found = std::fs::read_dir(&dir).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name)))
+        });
+        Some(found.unwrap_or_else(|| dir.join(name)))
     }
     fn profile_dir(&self) -> PathBuf {
         self.root.join("profiles").join(&self.config.profile)
@@ -162,7 +303,7 @@ impl Instance {
         self.locked(|| {
             let before = next.profile()?;
             let mut p = before.clone();
-            p.mods.retain(|m| next.mod_dir(&m.id).is_dir());
+            p.mods.retain(|m| is_separator(&m.id) || next.mod_dir(&m.id).is_dir());
             let mut installed: Vec<String> = fs::read_dir(next.mods_dir())?
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().is_dir())
@@ -199,6 +340,7 @@ impl Instance {
             }
             let dir = self.root.join("profiles");
             fs::rename(dir.join(&from), dir.join(to))?;
+            crate::profile_ini::renamed(self, &from, to)?;
             if config.profile == from {
                 config.profile = to.into();
                 write_atomic(&self.root.join(CONFIG), &toml::to_string_pretty(&config)?)?;
@@ -244,8 +386,21 @@ impl Instance {
             // Not cached: tools and captures keep adding files here.
             return if dir.is_dir() { index_dir(&dir) } else { Ok(vec![]) };
         }
-        if let Ok(text) = fs::read_to_string(dir.join(MOD_INDEX)) {
-            return Ok(text.lines().map(str::to_owned).collect());
+        // Kept in memory too, keyed by the index file's stamp: a long-lived process (the app)
+        // would otherwise reread thousands of index files on every refresh.
+        let index = dir.join(MOD_INDEX);
+        if let Ok(meta) = fs::metadata(&index) {
+            let st = stamp(&meta);
+            if let Some((t, files)) = INDEX_CACHE.lock().unwrap().get(&index)
+                && *t == st
+            {
+                return Ok(files.clone());
+            }
+            if let Ok(text) = fs::read_to_string(&index) {
+                let files: Vec<String> = text.lines().map(str::to_owned).collect();
+                INDEX_CACHE.lock().unwrap().insert(index, (st, files.clone()));
+                return Ok(files);
+            }
         }
         if !dir.is_dir() {
             bail!("mod '{id}' is not installed");
@@ -273,6 +428,7 @@ impl Instance {
             let before = self.profile()?;
             let mut after = before.clone();
             let r = f(&mut after)?;
+            after.apply_locks();
             if after != before {
                 self.push("undo", label, &before)?;
                 let _ = fs::remove_dir_all(self.stack_dir("redo"));
@@ -295,6 +451,41 @@ impl Instance {
         let mut entries = self.stack("undo")?;
         entries.reverse();
         Ok(entries.into_iter().map(|(_, label)| label).collect())
+    }
+
+    /// Undoable changes, newest first, each with the mods it touched.
+    pub fn history_details(&self) -> Result<Vec<HistoryEntry>> {
+        let snaps = self.snapshots()?;
+        let mut after = self.profile()?;
+        let mut out = Vec::new();
+        for (label, before) in snaps.into_iter().rev() {
+            out.push(HistoryEntry { label, change: diff(&before, &after) });
+            after = before;
+        }
+        Ok(out)
+    }
+
+    /// What restoring the state before history entry `n` (0 = the newest) would change.
+    pub fn restore_preview(&self, n: usize) -> Result<Diff> {
+        let snaps = self.snapshots()?;
+        let (_, target) = snaps.len().checked_sub(n + 1).and_then(|i| snaps.into_iter().nth(i)).context("no such history entry")?;
+        Ok(diff(&self.profile()?, &target))
+    }
+
+    /// Go back to the state before history entry `n`: `n + 1` undos in one go, so redo can step
+    /// forward again. Returns the labels undone.
+    pub fn restore(&self, n: usize) -> Result<Vec<String>> {
+        self.locked(|| {
+            if n >= self.stack("undo")?.len() {
+                bail!("no such history entry");
+            }
+            (0..=n).map(|_| self.shift("undo", "redo").map(Option::unwrap_or_default)).collect()
+        })
+    }
+
+    /// (label, profile before the change) for every undo entry, oldest first.
+    fn snapshots(&self) -> Result<Vec<(String, Profile)>> {
+        self.stack("undo")?.into_iter().map(|(path, label)| Ok((label, toml::from_str(&fs::read_to_string(path)?)?))).collect()
     }
 
     /// Move a mod folder to trash/ so an undo can bring it back.
