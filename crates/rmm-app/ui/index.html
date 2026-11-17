@@ -48,7 +48,7 @@
     <button data-tab="tools">Tools <span class="count" id="n-tools"></span></button>
     <button data-tab="history">History</button>
     <button data-tab="ai" title="rmm's own AI, with your API key">AI</button>
-    <button data-tab="settings" title="AI providers, keys, and who does each mod team role">Settings</button>
+    <button data-tab="settings" title="AI providers and the mod team, how rmm deploys, sorts, tests and checks, and this window's look">Settings</button>
     <div class="spacer"></div>
     <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags and categories" spellcheck="false">
     <button id="install" title="Installs after the selected mod, or at the end of the selected separator’s group. You can also drop archives on a row.">＋ Install mod…</button>
@@ -237,6 +237,7 @@
         <h2>Mod team</h2>
         <p class="muted small">Who answers in the AI tab. A message with a role goes to that role's AI, and the Lead hands each step to the AI of its role. An AI app such as Claude can take a role over MCP (<button class="link small" id="set-access">AI access…</button> or <code>rmm mcp</code>): steps for it wait on the team board until you ask the app to do its rmm team tasks, and it can hand steps to the roles on a provider here.</p>
         <table class="set" id="set-team"></table>
+        <div id="set-more"></div>
       </div></div>
     </section>
     <aside id="details" hidden></aside>

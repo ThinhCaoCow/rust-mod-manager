@@ -22,6 +22,7 @@ pub mod profile_ini;
 pub mod proton;
 pub mod rules;
 pub mod saves;
+pub mod settings;
 pub mod tools;
 pub mod workspace;
 #[cfg(target_os = "linux")]

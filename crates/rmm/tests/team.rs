@@ -39,6 +39,7 @@ fn lead_hands_steps_to_each_roles_ai() {
     agent::set_seat("tester", "mcp", "").unwrap();
     assert!(agent::set_seat("cook", "deepseek", "").is_err());
     assert_eq!(agent::seat("lead").provider, "claude", "an unset role follows the provider in use");
+    rmm_core::settings::set_one("ai.role_instructions", r#"{"researcher": "Only ESL-flagged mods."}"#).unwrap();
 
     let mut lead = Agent::new(Conn::for_seat(&agent::seat("lead")).unwrap(), root.clone()).unwrap();
     let mut screen = Screen::default();
@@ -51,7 +52,7 @@ fn lead_hands_steps_to_each_roles_ai() {
         assert!(seen[0].2["messages"][0].to_string().contains("You lead rmm's mod team"), "the lead role by its name");
         assert_eq!((seen[1].0.as_str(), &seen[1].2["model"]), ("/chat/completions", &json!("deepseek-test")));
         let asked = seen[1].2["messages"][1]["content"].to_string();
-        assert!(asked.contains("You are the researcher") && asked.contains("find snow mods"), "{asked}");
+        assert!(asked.contains("You are the researcher") && asked.contains("find snow mods") && asked.contains("Only ESL-flagged mods."), "{asked}");
         let back = &seen[2].2["messages"][2]["content"][0];
         assert_eq!((&back["tool_use_id"], &back["content"][0]["text"]), (&json!("t1"), &json!("Snow Plus scores 90.")));
     }

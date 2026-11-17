@@ -24,6 +24,33 @@ const BA2_LIMIT: usize = 1024;
 /// Larger plugins are rarely light-plugin material and take long to read whole.
 const ESL_SCAN_MAX_BYTES: u64 = 16 << 20;
 
+/// Every kind of problem `check` reports, and what it means (for Settings).
+pub const KINDS: &[(&str, &str)] = &[
+    ("mod_missing", "A mod's folder is gone"),
+    ("mod_rule_broken", "A load-after rule is broken"),
+    ("mod_requires", "A mod's required mod isn't enabled"),
+    ("mod_incompatible", "Incompatible mods are both enabled"),
+    ("load_order_unreadable", "The load order can't be read"),
+    ("plugin_unreadable", "A plugin can't be read"),
+    ("missing_masters", "A plugin's masters are missing"),
+    ("plugin_limit", "Too many full plugins"),
+    ("light_plugin_limit", "Too many light plugins"),
+    ("esl_candidates", "Plugins that could be ESL-flagged"),
+    ("fully_overridden", "A mod whose every file is overridden"),
+    ("archive_not_loaded", "An archive no plugin loads"),
+    ("archive_unreadable", "An archive can't be read"),
+    ("ba2_limit", "Too many BA2 archives (Fallout 4)"),
+    ("script_extender_missing", "Script extender plugins without the loader"),
+    ("deploy_blocked", "Deploy can't run"),
+    ("not_deployed", "Changes not deployed yet"),
+    ("external_change", "Deployed files changed outside rmm"),
+    ("loot_message", "LOOT's messages"),
+    ("loot_failed", "LOOT couldn't run"),
+    ("ini_test_file", "sTestFile lines in Fallout4.ini"),
+    ("archive_invalidation", "Archive invalidation is off (Fallout 4)"),
+    ("addon", "Add-ons' checks"),
+];
+
 pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     let profile = inst.profile()?;
     let mut issues = Vec::new();
@@ -114,7 +141,12 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
             .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| general(n) && !managed.contains(&crate::path_key(n))).count())
             .unwrap_or(0);
         let n = loaded.iter().filter(|a| general(&a.name)).count() + unmanaged;
-        if n > BA2_LIMIT {
+        let limit = crate::settings::get().health.ba2_limit;
+        if limit != 0 {
+            if n > limit {
+                add("error", "ba2_limit", "archives", format!("{n} general BA2 archives load; your game handles {limit} (Settings). Merge or extract some, or use Buffout 4"));
+            }
+        } else if n > BA2_LIMIT {
             add("error", "ba2_limit", "archives", format!("{n} general BA2 archives load; Fallout 4 handles {BA2_LIMIT}. Merge or extract some, or use Buffout 4"));
         } else if n > BA2_OLD_LIMIT {
             add("warning", "ba2_limit", "archives", format!("{n} general BA2 archives load; Fallout 4 before the August 2025 update handles {BA2_OLD_LIMIT} (now {BA2_LIMIT}). Update the game or use Buffout 4"));
@@ -161,6 +193,9 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
             Err(e) => issues.push(Issue { severity: "warning", kind: "addon", subject: addon, message: format!("{e:#}") }),
         }
     }
+    // Kinds the user turned off (Settings).
+    let hidden = crate::settings::get().health.hidden;
+    issues.retain(|i| !hidden.iter().any(|h| h == i.kind));
     Ok(issues)
 }
 

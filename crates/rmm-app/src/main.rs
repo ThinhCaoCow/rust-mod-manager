@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use rmm_core::instance::OVERWRITE;
-use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, install, launch, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, workspace};
+use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, install, launch, lockfile, logs, loot, nexus, ops, plugins, rules, saves, settings, tools, workspace};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,8 +23,6 @@ struct Current(Mutex<Option<PathBuf>>);
 /// The MCP server the window hosts for AI clients, when switched on.
 struct Mcp(Mutex<Option<rmm::http::Http>>);
 
-/// A fixed port, so AI clients' settings keep working.
-const MCP_ADDR: &str = "127.0.0.1:47823";
 
 /// Switch the HTTP MCP server on (again, for the open instance) or off.
 #[tauri::command]
@@ -36,7 +34,7 @@ async fn mcp(current: tauri::State<'_, Current>, server: tauri::State<'_, Mcp>, 
         return Ok(json!({ "on": false }));
     }
     let root = root.ok_or("no instance is open")?;
-    let started = rmm::http::token().and_then(|token| Ok((rmm::http::start(root, MCP_ADDR, token.clone())?, token)));
+    let started = rmm::http::token().and_then(|token| Ok((rmm::http::start(root, &format!("127.0.0.1:{}", settings::get().mcp.port), token.clone())?, token)));
     let (http, token) = started.map_err(|e| format!("{e:#}"))?;
     let url = format!("http://{}/mcp", http.addr);
     *slot = Some(http);
@@ -232,6 +230,13 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let inst = Instance::create(Path::new(&s("path")?), g, &found.game_path, &local)?;
             return Ok((ops::instance_info(&inst)?, Some(inst.root)));
         }
+        // rmm's settings (no instance needed), with what the Settings tab needs to draw them.
+        "settings" => return Ok((json!({ "settings": settings::get(), "health_kinds": health::KINDS }), root)),
+        "set_settings" => {
+            settings::set(&serde_json::from_value(a["settings"].clone())?)?;
+            return Ok((json!(settings::get()), root));
+        }
+        "reset_settings" => return Ok((json!(settings::reset(None)?), root)),
         _ => {}
     }
     let root = root.context("no instance is open")?;
@@ -318,7 +323,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "install" => {
             let name = a["name"].as_str().map(str::trim).filter(|n| !n.is_empty());
             let at = a["priority"].as_u64().map(|n| n as usize);
-            let r = install::install_at(&inst, Path::new(&s("path")?), name, true, Some(&choices()?.unwrap_or_default()), at)?;
+            let r = install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at)?;
             if let Ok(n) = serde_json::from_value(a["nexus"].clone()) {
                 nexus::remember(&inst, &r.id, n)?;
             }
@@ -339,7 +344,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "remove_tool" => json!(tools::remove(&inst, &s("id")?)?),
         "run_tool" => {
             let vars = serde_json::from_value(a.get("vars").cloned().unwrap_or(json!({})))?;
-            json!(tools::run(&inst, &s("id")?, &vars, flag("dry_run"), None)?)
+            let limit = Some(Duration::from_secs(settings::get().tools.timeout_mins * 60)).filter(|d| !d.is_zero());
+            json!(tools::run(&inst, &s("id")?, &vars, flag("dry_run"), limit)?)
         }
         "loot_rules" => json!({ "rules": loot::rules(&inst)?, "groups": loot::groups(&inst)? }),
         "set_loot_rule" => json!(loot::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
@@ -402,6 +408,11 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "saves" => json!(saves::list(&inst)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
         "downloads" => json!(install::downloads(&inst)?),
+        "downloads_dir" => json!({ "path": inst.downloads_dir(), "custom": inst.config.downloads_path.is_some() }),
+        "set_downloads_dir" => {
+            inst.set_downloads_dir(a["path"].as_str().map(str::trim).filter(|p| !p.is_empty()).map(PathBuf::from))?;
+            json!({ "path": inst.downloads_dir(), "custom": inst.config.downloads_path.is_some() })
+        }
         "delete_download" => json!(install::delete_download(&inst, &s("name")?)?),
         "trash" => json!(install::trash(&inst)?),
         "empty_trash" => json!(install::empty_trash(&inst)?),

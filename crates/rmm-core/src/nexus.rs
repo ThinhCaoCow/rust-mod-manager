@@ -23,7 +23,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://api.nexusmods.com";
 const CACHE: &str = "nexus-cache.json";
-const RECHECK_SECS: u64 = 30 * 86400;
 /// rmm's application name for Nexus single sign-on. Only Nexus staff issue one, when they
 /// register the app; until then single sign-on is off unless `RMM_NEXUS_APP` sets a name.
 const SSO_APP: Option<&str> = None;
@@ -468,7 +467,7 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         let checked = cache.checked.get(&n.mod_id).copied();
         let stale = match checked {
             None => true,
-            Some(t) => recent.get(&n.mod_id).is_some_and(|&u| u >= t) || now().saturating_sub(t) > RECHECK_SECS,
+            Some(t) => recent.get(&n.mod_id).is_some_and(|&u| u >= t) || now().saturating_sub(t) > crate::settings::get().nexus.recheck_days * 86400,
         };
         if stale || !cache.files.contains_key(&n.mod_id) {
             let files = client.get(&format!("/v1/games/{domain}/mods/{}/files.json", n.mod_id))?;
@@ -558,7 +557,7 @@ fn download_info(inst: &Instance, client: &Client, link: &NxmLink) -> Result<(Pa
     let links = client.get(&format!("{base}/download_link.json{query}"))?;
     let uri = links.as_array().and_then(|l| l.first()).and_then(|l| l["URI"].as_str()).context("Nexus sent no download link")?;
     let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{}-{}", link.mod_id, link.file_id));
-    let dest = inst.root.join("downloads").join(&name);
+    let dest = inst.downloads_dir().join(&name);
     fs::create_dir_all(dest.parent().unwrap())?;
     crate::progress::report(&format!("downloading {name}"), 0, 0);
     fetch_url(uri, &dest)?;

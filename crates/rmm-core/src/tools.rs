@@ -488,7 +488,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
     r.deploy = Some(deploy::deploy(inst, false)?);
     // New plugins land at the end of the list. Sort them in if the user sorts with LOOT already;
     // the first sort, with its download, stays the user's call.
-    if added_plugins && inst.root.join("loot").join("masterlist.yaml").is_file() {
+    if added_plugins && crate::settings::get().loot.sort_after_tools && inst.root.join("loot").join("masterlist.yaml").is_file() {
         match crate::loot::sort(inst, false) {
             Ok(s) => {
                 if !s.moved.is_empty() {

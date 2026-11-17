@@ -470,7 +470,7 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
         }
     }
     let mut out = Vec::new();
-    for e in fs::read_dir(inst.root.join("downloads")).into_iter().flatten().flatten() {
+    for e in fs::read_dir(inst.downloads_dir()).into_iter().flatten().flatten() {
         let (name, m) = (e.file_name().to_string_lossy().into_owned(), e.metadata()?);
         if !m.is_file() || name.ends_with(".part") {
             continue;
@@ -485,7 +485,7 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
 /// Delete a file from the downloads folder. Mods installed from it stay; they can't be
 /// reinstalled from it any more.
 pub fn delete_download(inst: &Instance, name: &str) -> Result<()> {
-    let path = inst.root.join("downloads").join(name);
+    let path = inst.downloads_dir().join(name);
     if name.contains(['/', '\\']) || name.starts_with('.') || !path.is_file() {
         bail!("no download named {name}");
     }

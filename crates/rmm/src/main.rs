@@ -2,7 +2,7 @@ use rmm::{agent, http, mcp};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools};
+use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, settings, tools};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -115,7 +115,21 @@ enum Cmd {
         fix: Option<String>,
     },
     /// Archives in the instance's downloads folder and the mods installed from them.
-    Downloads,
+    Downloads {
+        /// Keep this instance's downloads in this folder from now on ("" for downloads/ in the
+        /// instance). Files already downloaded stay where they are.
+        #[arg(long)]
+        folder: Option<String>,
+    },
+    /// rmm's settings, shared by the window and the MCP server: all of them, one by its name
+    /// (deploy.method), or set one (`rmm settings loot.language de`; lists take commas or JSON).
+    Settings {
+        key: Option<String>,
+        value: Option<String>,
+        /// Put the named setting (or, without one, all of them) back to its default.
+        #[arg(long, conflicts_with = "value")]
+        reset: bool,
+    },
     /// How much uninstalled mods take in trash/ (undo restores them from there).
     Trash {
         /// Delete it all for good; undo can't bring those mods back afterwards.
@@ -668,7 +682,25 @@ fn run() -> Result<()> {
         }
         Cmd::Saves { fix: None } => print(&saves::list(&open()?)?),
         Cmd::Saves { fix: Some(file) } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
-        Cmd::Downloads => print(&install::downloads(&open()?)?),
+        Cmd::Downloads { folder: None } => print(&install::downloads(&open()?)?),
+        Cmd::Downloads { folder: Some(f) } => {
+            let mut inst = open()?;
+            inst.set_downloads_dir((!f.is_empty()).then(|| PathBuf::from(&f)))?;
+            print(&serde_json::json!({ "downloads": inst.downloads_dir() }))
+        }
+        Cmd::Settings { key, value, reset } => {
+            if reset {
+                print(&settings::reset(key.as_deref())?)
+            } else if let (Some(k), Some(v)) = (&key, &value) {
+                print(&settings::set_one(k, v)?)
+            } else {
+                let all = serde_json::to_value(settings::get())?;
+                match key {
+                    Some(k) => print(k.split('.').try_fold(&all, |v, p| v.get(p)).with_context(|| format!("no setting {k}"))?),
+                    None => print(&all),
+                }
+            }
+        }
         Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),
         Cmd::Trash { empty: true } => print(&install::empty_trash(&open()?)?),
         Cmd::Note { id, text } => print(&serde_json::json!({ "previous": ops::set_mod_note(&open()?, &id, &text)? })),

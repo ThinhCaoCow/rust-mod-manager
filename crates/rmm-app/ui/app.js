@@ -48,6 +48,17 @@ const savePrefs = () => { try { localStorage.setItem(PREFS, JSON.stringify(prefs
 prefs.cols ??= { conflicts: true, tags: false, notes: false, installed: false, files: true, priority: true };
 prefs.cols.category ??= true;
 prefs.widths ??= {};
+// This window's look and habits (Settings, "This window").
+const WIN = { theme: 'system', density: 'comfortable', zoom: 1, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true, tabSize: 4, spaces: false, wrap: false, enterSends: true };
+const W = prefs.win = { ...WIN, ...prefs.win };
+function applyWin() {
+  if (W.theme === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = W.theme;
+  document.body.classList.toggle('compact', W.density === 'compact');
+  T.webview.getCurrentWebview().setZoom(W.zoom).catch(() => {});
+  for (const el of [$('#ide-text'), $('#ide-gutter')]) el.style.tabSize = W.tabSize;
+  $('#ide-text').wrap = W.wrap ? 'soft' : 'off';
+  $('#ide-gutter').style.display = W.wrap ? 'none' : ''; // its numbers count unwrapped lines
+}
 // `w`: the default width in pixels, as style.css sets it for `cls`.
 const COLS = {
   conflicts: { title: 'Conflicts', cls: 'conf-col', w: 200 },
@@ -193,13 +204,15 @@ async function refreshPlan() {
 // Another process (the CLI, an AI over MCP) changed the instance: reload. One poll at a time: a
 // load slower than the interval would otherwise be overtaken, and dropped, by the next poll's.
 let polling = false;
+let polled = 0;
 setInterval(async () => {
-  if (busy || polling || !S || document.hidden) return;
+  if (busy || polling || !S || document.hidden || !W.poll || Date.now() - polled < W.poll * 1000) return;
   polling = true;
+  polled = Date.now();
   try {
     if ((await call('stamp')) !== stamp) await load();
   } catch {} finally { polling = false; }
-}, 1500);
+}, 500);
 
 const collapsedKey = () => 'rmm.collapsed:' + S.info.root;
 const ignoredKey = () => 'rmm.ignored:' + S.info.root;
@@ -227,11 +240,12 @@ function showApp() {
   $('#app').hidden = false;
   remember(S.info.root);
   showTab(tab);
-  nexusShow();
+  nexusShow().then(async () => { if ((await loadConf())?.nexus.check_on_start && nexus.user) checkUpdates(true); });
 }
 
 // The last tab, filter and state chips come back with the window.
-tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history'].includes(prefs.tab) ? prefs.tab : 'mods';
+const START = W.startTab === 'last' ? prefs.tab : W.startTab;
+tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'ai', 'settings'].includes(START) ? START : 'mods';
 $('#filter').value = prefs.filter ?? '';
 filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, problems: 1 }));
 
@@ -329,7 +343,6 @@ function render() {
   renderDetails();
 }
 
-const RECENT = 7 * 86400;
 const CRITERIA = {
   enabled: m => m.enabled,
   disabled: m => !m.enabled,
@@ -338,7 +351,7 @@ const CRITERIA = {
   rule: m => D.broken.has(m.id),
   masters: m => D.missing.has(m.id),
   plugins: m => m.plugins.length > 0,
-  recent: m => (m.installed ?? 0) >= Date.now() / 1000 - RECENT,
+  recent: m => (m.installed ?? 0) >= Date.now() / 1000 - W.recentDays * 86400,
   problems: m => D.broken.has(m.id) || D.missing.has(m.id) || !!D.C[m.id]?.fully_overridden || !!D.flagged?.has(m.id),
 };
 const filterText = () => $('#filter').value.trim().toLowerCase();
@@ -1090,7 +1103,7 @@ function showTab(t) {
   if (t === 'saves') loadSaves(); // the game writes them; read them each time
   if (t === 'downloads' && !downloadsData) loadDownloads();
   if (t === 'ai') ideInit();
-  if (t === 'settings') aiLoad();
+  if (t === 'settings') { aiLoad(); drawMore(); }
 }
 $$('.tabs [data-tab]').forEach(b => { b.onclick = () => showTab(b.dataset.tab); });
 $('#recheck').onclick = runHealth;
@@ -1122,17 +1135,20 @@ async function crashLog(path) {
 $('#crash-log').onclick = () => crashLog(null);
 
 $('#test-run').onclick = async () => {
+  const t = (await loadConf())?.test ?? { window: '960x540', dwell: 10, screenshots: true };
+  const sizes = [['960x540', 'Small, behind your other windows'], ['1280x720', '1280×720, behind your other windows'], ['fullscreen', 'The game’s own display settings']];
+  if (!sizes.some(([v]) => v === t.window)) sizes.unshift([t.window, `${t.window.replace('x', '×')}, behind your other windows`]);
   const body = `<p>Deploys, starts the game through the script extender and checks that it holds up. With rmm's harness plugin installed as a mod it waits for the main menu, loads the save or goes to each cell with <code>coc</code>, and measures FPS; without it, it only watches the game. A crash log written during the run fails it.</p>
     <label class="field">Save to load <input id="tr-save" type="text" placeholder="optional: the save's name without extension" spellcheck="false"></label>
     <label class="field">Cells to visit <input id="tr-cells" type="text" placeholder="Riverwood, WhiterunBreezehome" spellcheck="false"></label>
-    <label class="field">Seconds in each cell <input id="tr-dwell" type="number" min="1" value="10"></label>
-    <label class="field">Window <select id="tr-window"><option value="960x540">Small, behind your other windows</option><option value="1280x720">1280×720, behind your other windows</option><option value="fullscreen">The game’s own display settings</option></select></label>
-    <label class="row" style="margin-top:12px"><input id="tr-shots" type="checkbox" checked> A screenshot in each cell</label>`;
+    <label class="field">Seconds in each cell <input id="tr-dwell" type="number" min="1" value="${t.dwell}"></label>
+    <label class="field">Window <select id="tr-window">${sizes.map(([v, l]) => `<option value="${esc(v)}"${v === t.window ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+    <label class="row" style="margin-top:12px"><input id="tr-shots" type="checkbox" ${t.screenshots ? 'checked' : ''}> A screenshot in each cell</label>`;
   if (await dialog({ title: 'Test run', body, actions: [['cancel', 'Cancel'], ['run', 'Start the game', 'primary']] }) !== 'run') return;
   const scenario = {
     save: $('#tr-save').value.trim() || null,
     cells: $('#tr-cells').value.split(',').map(c => c.trim()).filter(Boolean),
-    dwell: Math.max(1, Number($('#tr-dwell').value) || 10),
+    dwell: Math.max(1, Number($('#tr-dwell').value) || t.dwell),
     window: $('#tr-window').value,
     screenshots: $('#tr-shots').checked,
   };
@@ -1578,7 +1594,7 @@ $('#deploy').onclick = async () => {
       + part('written by the game during play', plan.played ?? [], 'Moved to overwrite/ and linked back.')
       + `<p class="muted small" style="margin-top:10px">${plural(plan.unchanged, 'file')} already in place.</p>`
     : `<p>The game folder already matches this profile (${plural(plan.unchanged, 'file')}).</p>`;
-  const r = await dialog({ title: 'Deploy to the game folder', body, actions: [['purge', 'Purge…'], ...(n ? [['cancel', 'Cancel'], ['apply', 'Deploy', 'primary']] : [['cancel', 'Close']])] });
+  const r = n && !W.deployPreview ? 'apply' : await dialog({ title: 'Deploy to the game folder', body, actions: [['purge', 'Purge…'], ...(n ? [['cancel', 'Cancel'], ['apply', 'Deploy', 'primary']] : [['cancel', 'Close']])] });
   if (r === 'purge') return purge();
   if (r !== 'apply') return;
   const res = await act('Deploying', () => call('deploy'));
@@ -1732,17 +1748,20 @@ $('#nxm').onclick = async () => {
   if (f && f !== true) install([f.path], slotAfter(selIds().length === 1 ? selIds()[0] : null), f);
 };
 
-$('#updates').onclick = async () => {
-  if (!await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) return;
-  const r = await act('Checking for updates', () => call('check_updates'), { reload: false });
+$('#updates').onclick = () => checkUpdates(false);
+/** Ask Nexus for newer files; quietly (at start) only says so when there are some. */
+async function checkUpdates(quiet) {
+  if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) return;
+  const r = quiet ? await call('check_updates').catch(() => null) : await act('Checking for updates', () => call('check_updates'), { reload: false });
   if (!Array.isArray(r)) return;
   updates = new Map(r.map(u => [u.id, u]));
   paint(lists.mods);
+  if (quiet) return r.length && toast(`${plural(r.length, 'update')} on Nexus; Check for updates lists them.`);
   if (!r.length) return toast('Every mod with Nexus ids is up to date.');
   const rows = r.map(u => `<tr><td>${esc(nameOf(u.id))}</td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td><td><span class="small">${esc(u.url)}</span></td></tr>`).join('');
   dialog({ title: `${plural(r.length, 'update')} on Nexus`, body: `<table class="fc">${rows}</table><p class="muted small">Download a new file with its “Mod manager download” button (once nxm links open rmm), or use From Nexus…, or download it and drop it on the mod’s row.</p>`, actions: [['cancel', 'Close']] });
   $('#dlg').classList.add('wide');
-};
+}
 
 // ---- Add-ons ----------------------------------------------------------------------------------
 
@@ -2165,7 +2184,7 @@ async function install(paths, at = null, nx = null) {
   }
 }
 
-T.webview.getCurrentWebview().onDragDropEvent(e => {
+T.webview.getCurrentWebview().onDragDropEvent(async e => {
   const type = e.payload.type;
   if (tab === 'ai') return aiDrop(e.payload);
   if (type === 'enter' || type === 'over') {
@@ -2184,7 +2203,8 @@ T.webview.getCurrentWebview().onDragDropEvent(e => {
     $('#dropzone').hidden = true;
     dropAt = null;
     paint(lists.mods);
-    if (type === 'drop' && S && e.payload.paths?.length) install(e.payload.paths, at);
+    const paths = type === 'drop' && S ? e.payload.paths ?? [] : [];
+    if (paths.length && (!W.confirmDrop || await confirmBox('Install', `Install ${paths.map(basename).join(', ')}?`, 'Install', 'primary'))) install(paths, at);
   }
 });
 
@@ -2451,6 +2471,143 @@ for (const t of ['#set-providers', '#set-team']) {
   });
 }
 $('#set-access').onclick = () => $('#ai-access').click();
+
+// ---- Settings: rmm's (settings.json, shared with the CLI and AI apps) and this window's -------
+
+let conf = null, healthKinds = [], dlDir = null;
+async function loadConf() {
+  try { ({ settings: conf, health_kinds: healthKinds } = await call('settings')); } catch {}
+  return conf;
+}
+const LANGS = [['en', 'English'], ['de', 'Deutsch'], ['es', 'Español'], ['fr', 'Français'], ['it', 'Italiano'], ['ja', '日本語'], ['ko', '한국어'], ['pl', 'Polski'], ['pt_BR', 'Português (Brasil)'], ['ru', 'Русский'], ['sv', 'Svenska'], ['uk', 'Українська'], ['zh_CN', '中文']];
+const TABS = [['mods', 'Mods'], ['plugins', 'Plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['ai', 'AI']];
+// [key, label, kind, options or [min, max, step], help]. Keys with "win." are this window's.
+const SETTINGS = [
+  ['This window', 'Kept by this window on this computer.', [
+    ['win.theme', 'Theme', 'select', [['system', 'Follow Windows'], ['light', 'Light'], ['dark', 'Dark']]],
+    ['win.density', 'Rows', 'select', [['comfortable', 'Comfortable'], ['compact', 'Compact']]],
+    ['win.zoom', 'Size', 'select', [[0.8, '80%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.25, '125%'], [1.5, '150%']]],
+    ['win.startTab', 'Open on', 'select', [['last', 'The last tab'], ...TABS]],
+    ['win.poll', 'Look for changes made by the CLI or AI apps', 'select', [[1.5, 'Every 1.5 seconds'], [5, 'Every 5 seconds'], [15, 'Every 15 seconds'], [0, 'Never']]],
+    ['win.toast', 'Seconds a message stays', 'num', [2, 60], 'Errors stay three times as long. Click one to dismiss it.'],
+    ['win.recentDays', 'The Recent filter shows mods installed in the last', 'num', [1, 365], 'days'],
+    ['win.confirmDrop', 'Ask before installing files dropped on the window', 'bool'],
+    ['win.deployPreview', 'Show what a deploy changes before it runs', 'bool'],
+    ['win.tabSize', 'Editor tab width', 'num', [1, 16]],
+    ['win.spaces', 'The Tab key inserts spaces in the editor', 'bool'],
+    ['win.wrap', 'Wrap long lines in the editor', 'bool', null, 'Hides the line numbers.'],
+    ['win.enterSends', 'Enter sends an AI message', 'bool', null, 'Otherwise Ctrl+Enter sends. Shift+Enter is always a new line.'],
+  ]],
+  ['Deploy', 'How mod files reach the game folder.', [
+    ['deploy.method', 'Files in the game folder', 'select', [['link', 'Hard links (copies across drives)'], ['copy', 'Copies']], 'Copies take space, and nothing the game does to them reaches the mod. The next deploy redoes links as copies.'],
+    ['deploy.exclude', 'Never deploy', 'lines', null, 'One pattern a line, by the path inside Data: *.txt, readme*, fomod/*. A pattern without / matches file names.'],
+  ]],
+  ['Play', '', [
+    ['launch.script_extender', 'Start the game through its script extender when it’s installed', 'bool'],
+    ['launch.args', 'Arguments for the game', 'text', null, 'Quotes keep spaces in one argument.'],
+  ]],
+  ['Installs', '', [
+    ['install.enable', 'Mods installed here start enabled', 'bool'],
+    ['@downloads', 'Downloads folder', 'folder', null, 'For this instance. Files already downloaded stay where they are.'],
+    ['history.limit', 'Undo steps kept per profile', 'num', [1, 10000]],
+  ]],
+  ['LOOT', '', [
+    ['loot.language', 'Messages in', 'select', LANGS, 'Where the masterlist has them; English otherwise.'],
+    ['loot.show_info', 'Show LOOT’s notes too, not only its warnings and errors', 'bool'],
+    ['loot.sort_after_tools', 'Sort the plugins a tool run adds', 'bool'],
+    ['loot.refresh_hours', 'Download the masterlist again after', 'num', [1, 8760], 'hours'],
+  ]],
+  ['Problems', 'What the Problems tab and the AI’s health check report.', [
+    ['health.hidden', 'Report', 'kinds'],
+    ['health.ba2_limit', 'Fallout 4’s limit on BA2 archives', 'select', [[0, 'Work it out (1,024, a warning above 256)'], [256, '256 (before the August 2025 update)'], [1024, '1,024']]],
+  ]],
+  ['Test runs', 'Defaults for a test run; the Test run dialog and AI apps can change them for one run.', [
+    ['test.window', 'Game window', 'text', null, 'A size such as 960x540 (behind your other windows), or fullscreen.'],
+    ['test.dwell', 'Seconds in each cell', 'num', [1, 600]],
+    ['test.timeout', 'Seconds to wait for the menu or a cell to load', 'num', [30, 3600]],
+    ['test.screenshots', 'A screenshot in each cell', 'bool'],
+    ['test.keep_runs', 'Keep the screenshots of the last', 'num', [0, 100000], 'test runs; 0 keeps all.'],
+  ]],
+  ['Nexus Mods', '', [
+    ['nexus.check_on_start', 'Check for updates when the window opens (signed in)', 'bool'],
+    ['nexus.recheck_days', 'Ask Nexus again about a mod it hasn’t listed as updated after', 'num', [1, 365], 'days'],
+  ]],
+  ['Tools', '', [['tools.timeout_mins', 'Stop a tool run from the window after', 'num', [0, 1440], 'minutes; 0: never.']]],
+  ['rmm’s AI', '', [
+    ['ai.max_steps', 'Steps in one turn before it pauses', 'num', [1, 500]],
+    ['ai.budget', 'Stop a chat once it has cost', 'num', [0, 100000, 0.5], 'US dollars; 0: no limit. Claude and OpenRouter report costs.'],
+    ['ai.auto_allow', 'Tools it may run without asking', 'lines', null, 'One tool name a line (deploy, sort_plugins…), on top of reads and previews.'],
+    ['ai.role_instructions.lead', 'Your instructions for the Lead', 'area'],
+    ['ai.role_instructions.researcher', 'For the Researcher', 'area'],
+    ['ai.role_instructions.installer', 'For the Installer', 'area'],
+    ['ai.role_instructions.tester', 'For the Tester', 'area', null, 'Added to the role’s prompt, for rmm’s AI and for AI apps over MCP.'],
+  ]],
+  ['AI access (MCP)', '', [
+    ['mcp.port', 'Port on 127.0.0.1', 'num', [1024, 65535], 'AI apps’ settings name this port; change them too.'],
+    ['mcp.record_sessions', 'Keep each AI app’s session as a chat rmm’s AI can read', 'bool'],
+  ]],
+];
+const pathGet = (o, k) => k.split('.').reduce((v, p) => v?.[p], o);
+const pathSet = (o, k, v) => { const ps = k.split('.'), last = ps.pop(); const t = ps.reduce((x, p) => (x[p] ??= {}), o); if (v === '' && ps.at(-1) === 'role_instructions') delete t[last]; else t[last] = v; };
+
+async function drawMore() {
+  if (!conf) await loadConf();
+  if (!conf) return;
+  dlDir = await call('downloads_dir').catch(() => null);
+  const cur = k => k.startsWith('win.') ? W[k.slice(4)] : pathGet(conf, k);
+  const control = ([k, label, kind, opt]) => {
+    const v = cur(k), at = `data-key="${k}" data-kind="${kind}" aria-label="${esc(label)}"`;
+    if (kind === 'bool') return `<input type="checkbox" ${at} ${v ? 'checked' : ''}>`;
+    if (kind === 'num') return `<input type="number" ${at} min="${opt[0]}" max="${opt[1]}" step="${opt[2] ?? 1}" value="${esc(v)}">`;
+    if (kind === 'text') return `<input type="text" ${at} spellcheck="false" value="${esc(v)}">`;
+    if (kind === 'area') return `<textarea ${at} rows="2">${esc(v)}</textarea>`;
+    if (kind === 'lines') return `<textarea ${at} rows="3" spellcheck="false">${esc((v ?? []).join('\n'))}</textarea>`;
+    if (kind === 'select') return `<select ${at}>${opt.map(([o, l]) => `<option value="${esc(o)}"${String(o) === String(v) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
+    if (kind === 'kinds') return `<div class="kinds">${healthKinds.map(([id, what]) => `<label><input type="checkbox" data-key="${k}" data-kind="kind" value="${esc(id)}" ${(v ?? []).includes(id) ? '' : 'checked'}> ${esc(what)}</label>`).join('')}</div>`;
+    if (kind === 'folder') return dlDir ? `<div class="set-path"><code title="${esc(dlDir.path)}">${esc(dlDir.path)}</code><button class="small" data-act="dl-pick">Choose…</button>${dlDir.custom ? '<button class="small" data-act="dl-reset" title="downloads/ in the instance">Default</button>' : ''}</div>` : '';
+    return '';
+  };
+  $('#set-more').innerHTML = SETTINGS.map(([title, about, fields]) => `<h2>${esc(title)}</h2>${about ? `<p class="muted small">${esc(about)}</p>` : ''}
+    <table class="set">${fields.map(f => `<tr><td>${esc(f[1])}</td><td>${control(f)}${f[4] ? `<span class="muted small">${esc(f[4])}</span>` : ''}</td></tr>`).join('')}</table>`).join('')
+    + `<p class="set-reset"><button data-act="reset">Reset all settings…</button> <span class="muted small">rmm’s settings are in settings.json in your user folder, also changed with <code>rmm settings</code>.</span></p>`;
+}
+
+$('#set-more').onchange = async e => {
+  const el = e.target.closest('[data-key]');
+  if (!el) return;
+  const { key, kind } = el.dataset;
+  let v = kind === 'bool' ? el.checked
+    : kind === 'num' ? Number(el.value)
+    : kind === 'lines' ? el.value.split('\n').map(l => l.trim()).filter(Boolean)
+    : kind === 'kind' ? $$('input[data-kind="kind"]', $('#set-more')).filter(c => !c.checked).map(c => c.value)
+    : kind === 'area' ? el.value.trim() : el.value;
+  if (kind === 'select' && el.value !== '' && !isNaN(el.value)) v = Number(el.value);
+  if (key.startsWith('win.')) {
+    W[key.slice(4)] = v;
+    savePrefs();
+    return applyWin();
+  }
+  const next = structuredClone(conf);
+  pathSet(next, key, v);
+  try { conf = await call('set_settings', { settings: next }); } catch (err) { toast(String(err), 'error'); return drawMore(); }
+  if (key === 'mcp.port' && mcpOn) setMcp(true);
+};
+$('#set-more').onclick = async e => {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  if (b.dataset.act === 'reset') {
+    if (!await confirmBox('Reset all settings', 'Put every setting on this page back to its default? The AI providers, keys and mod team stay.', 'Reset')) return;
+    try { conf = await call('reset_settings'); } catch (err) { toast(String(err), 'error'); }
+    Object.assign(W, WIN);
+    savePrefs();
+    applyWin();
+  } else {
+    const path = b.dataset.act === 'dl-reset' ? '' : await T.dialog.open({ directory: true, title: 'Where downloads go for this instance' });
+    if (path === null) return;
+    try { await call('set_downloads_dir', { path }); } catch (err) { toast(String(err), 'error'); }
+  }
+  drawMore();
+};
 $('#ai-to-settings').onclick = () => showTab('settings');
 
 async function aiKey(id) {
@@ -2684,7 +2841,7 @@ $('#ide-text').oninput = () => {
 $('#ide-text').onscroll = () => { $('#ide-gutter').scrollTop = $('#ide-text').scrollTop; };
 $('#ide-text').onkeydown = e => {
   if (e.ctrlKey && e.key.toLowerCase() === 's') { e.preventDefault(); ideSave(); }
-  else if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.target.readOnly) { e.preventDefault(); document.execCommand('insertText', false, '\t'); }
+  else if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.target.readOnly) { e.preventDefault(); document.execCommand('insertText', false, W.spaces ? ' '.repeat(W.tabSize) : '\t'); }
   else if (e.key === 'Escape') e.target.blur(); // then Tab moves on
 };
 $('#ide-save').onclick = ideSave;
@@ -2887,7 +3044,7 @@ function aiDrop(p) {
   drawPics();
 }
 
-$('#ai-text').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#ai-form').requestSubmit(); } };
+$('#ai-text').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && (W.enterSends || e.ctrlKey)) { e.preventDefault(); $('#ai-form').requestSubmit(); } };
 $('#ai-form').onsubmit = async ev => {
   ev.preventDefault();
   const typed = $('#ai-text').value.trim(), role = $('#ai-role').value;
@@ -2957,7 +3114,8 @@ function toast(msg, kind = 'info') {
   el.title = 'Click to dismiss';
   el.onclick = () => el.remove();
   $('#toasts').append(el);
-  setTimeout(() => el.remove(), kind === 'error' ? 15000 : 5000);
+  setTimeout(() => el.remove(), W.toast * (kind === 'error' ? 3000 : 1000));
 }
 
+applyWin();
 start();

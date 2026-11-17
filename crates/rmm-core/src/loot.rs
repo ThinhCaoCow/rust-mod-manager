@@ -16,7 +16,10 @@ use std::time::{Duration, SystemTime};
 
 /// Masterlist branch matching libloot 0.29's metadata syntax.
 const BRANCH: &str = "v0.29";
-const REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
+/// How old the masterlist may get (Settings).
+fn refresh() -> Duration {
+    Duration::from_secs(crate::settings::get().loot.refresh_hours * 3600)
+}
 
 #[derive(Debug, Serialize)]
 pub struct SortReport {
@@ -56,7 +59,7 @@ pub fn update_masterlist(inst: &Instance, force: bool) -> Result<Vec<String>> {
     fs::create_dir_all(dir(inst))?;
     for (url, name) in files {
         let path = dir(inst).join(name);
-        let fresh = fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < REFRESH);
+        let fresh = fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < refresh());
         if fresh && !force {
             continue;
         }
@@ -200,10 +203,12 @@ pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
     let db = game.database();
     let db = db.read().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
     let mut issues = Vec::new();
-    let text = |m: &libloot::metadata::Message| select_message_content(m.content(), "en").map(|c| c.text().to_owned()).unwrap_or_default();
+    let cfg = crate::settings::get().loot;
+    let text = |m: &libloot::metadata::Message| select_message_content(m.content(), &cfg.language).map(|c| c.text().to_owned()).unwrap_or_default();
     let severity = |m: &libloot::metadata::Message| match m.message_type() {
         MessageType::Error => Some("error"),
         MessageType::Warn => Some("warning"),
+        MessageType::Say if cfg.show_info => Some("info"),
         _ => None,
     };
     for m in db.general_messages(MergeMode::WithUserMetadata, EvalMode::Evaluate)? {

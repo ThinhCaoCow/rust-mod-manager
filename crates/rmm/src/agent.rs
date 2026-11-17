@@ -48,7 +48,6 @@ const EFFORT: &[&str] = &["claude-opus-5", "claude-sonnet-5", "claude-haiku-5", 
 const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Claude models with server-side fallbacks: when one declines, another carries on in the same call.
 const FALLBACKS: &[&str] = &["claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"];
-const MAX_STEPS: usize = 60;
 /// Tool answers longer than this are cut before they reach the model.
 const MAX_RESULT: usize = 40_000;
 
@@ -1160,9 +1159,14 @@ impl Agent {
     }
 
     fn run(&mut self, ui: &mut dyn Ui) -> Result<()> {
-        for _ in 0..MAX_STEPS {
+        let cfg = rmm_core::settings::get().ai;
+        for _ in 0..cfg.max_steps {
             if ui.stopped() {
                 self.show(ui, notice("Stopped."));
+                return Ok(());
+            }
+            if let Some(cost) = self.chat.usage.cost.filter(|&c| cfg.budget > 0.0 && c >= cfg.budget) {
+                self.show(ui, notice(format!("Stopped: this chat has cost ${cost:.2}, your budget is ${:.2} (Settings).", cfg.budget)));
                 return Ok(());
             }
             let calls = match self.conn.provider.api {
@@ -1173,7 +1177,7 @@ impl Agent {
             let done: Vec<Done> = calls.iter().map(|c| self.run_call(c, ui)).collect();
             self.push_results(&calls, done);
         }
-        self.show(ui, notice(format!("Paused after {MAX_STEPS} steps; say \"go on\" to continue.")));
+        self.show(ui, notice(format!("Paused after {} steps; say \"go on\" to continue.", cfg.max_steps)));
         Ok(())
     }
 
@@ -1296,9 +1300,10 @@ impl Agent {
         Ok(None)
     }
 
-    /// Reads, dry runs and the steps of a live test the user already let start run without asking.
+    /// Reads, dry runs, the steps of a live test the user already let start, and the tools the user
+    /// allowed in Settings run without asking.
     fn needs_ok(&self, name: &str, args: &Value) -> bool {
-        if matches!(name, "view_image" | "test_session_step" | "test_session_stop") {
+        if matches!(name, "view_image" | "test_session_step" | "test_session_stop") || rmm_core::settings::get().ai.auto_allow.iter().any(|t| t == name) {
             return false;
         }
         let Some(t) = self.mcp.get(name) else { return false };

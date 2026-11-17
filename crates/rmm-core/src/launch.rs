@@ -47,8 +47,9 @@ pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Re
     if dry_run && !r.deploy.is_noop() {
         r.warnings.push("the checks below see the game folder before this deploy".into());
     }
+    let cfg = crate::settings::get().launch;
     let loader = root.join(game.loader());
-    if loader.is_file() {
+    if cfg.script_extender && loader.is_file() {
         // The loader shows an error box and quits on a mismatch; say it here instead.
         let runtimes = runtimes(root, game)?;
         match runtimes.iter().find(|(_, v)| v[..] == version[..3]) {
@@ -63,13 +64,18 @@ pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Re
         }
         r.exe = loader;
     } else if has_se_plugins(inst, game) {
-        r.warnings.push(format!("script extender plugins are deployed but {} isn't; they won't load", game.loader()));
+        r.warnings.push(if loader.is_file() {
+            "the game starts without its script extender (Settings), so its plugins won't load".into()
+        } else {
+            format!("script extender plugins are deployed but {} isn't; they won't load", game.loader())
+        });
     }
     if !dry_run {
         // Fire and forget: files the game writes into Data are captured by the next deploy.
         deploy::remember_unmanaged(inst)?;
         let mut cmd = if proton::needed(&r.exe) { proton::command(game, root, &r.exe)? } else { Command::new(&r.exe) };
         let child = cmd
+            .args(crate::settings::split_args(&cfg.args))
             .envs(env.iter().map(|(k, v)| (*k, v)))
             .current_dir(root)
             .stdin(Stdio::null())

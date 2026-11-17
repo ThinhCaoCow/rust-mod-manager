@@ -185,6 +185,13 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
                     (path_key(&target), Want { target, mod_id, src })
                 })
                 .collect();
+            // The user's choices (Settings): files left out, by their path inside Data, and copies
+            // instead of links.
+            let cfg = crate::settings::get().deploy;
+            if !cfg.exclude.is_empty() {
+                desired.retain(|_, w| !crate::settings::excluded(&cfg.exclude, w.target.strip_prefix("Data/").unwrap_or(&w.target)));
+            }
+            let copy_all = cfg.method == "copy";
             for key in &changed {
                 // Already true after a real capture; a dry run has to pretend.
                 let target = man.files[key].target.clone();
@@ -205,7 +212,8 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
                 let fresh = if e.copied {
                     state(&inst.mod_dir(&e.mod_id).join(&e.src)).is_none_or(|s| s == (e.size, e.mtime))
                 } else {
-                    !rewritten_in_play(key)
+                    // Links become copies when the user switches to copies; copies stay until a purge.
+                    !rewritten_in_play(key) && !copy_all
                 };
                 if ok.contains(key) && fresh && want.is_some_and(|w| w.mod_id == e.mod_id && w.src == e.src) {
                     plan.unchanged += 1;
@@ -266,7 +274,7 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
                 let e = man.files.get_mut(&key).unwrap();
                 create_parents(game, &path, &mut man.dirs)?;
                 let src = inst.mod_dir(&w.mod_id).join(&w.src);
-                e.copied = if rewritten_in_play(&key) {
+                e.copied = if copy_all || rewritten_in_play(&key) {
                     copy_keep_mtime(&src, &path)?;
                     true
                 } else {

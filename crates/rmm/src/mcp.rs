@@ -1127,32 +1127,35 @@ struct TestPromptArgs {
 
 #[prompt_router]
 impl Rmm {
-    fn role(&self, text: &str, fills: &[(&str, &str)]) -> Vec<PromptMessage> {
+    fn role(&self, who: &str, text: &str, fills: &[(&str, &str)]) -> Vec<PromptMessage> {
         let game = self.inst().map_or_else(|_| "the game".to_string(), |i| i.config.game.steam_dir().to_string());
-        let text = fills.iter().fold(text.replace("{game}", &game), |t, (k, v)| t.replace(&format!("{{{k}}}"), v));
+        let mut text = fills.iter().fold(text.replace("{game}", &game), |t, (k, v)| t.replace(&format!("{{{k}}}"), v));
+        if let Some(mine) = rmm_core::settings::get().ai.role_instructions.get(who).filter(|t| !t.trim().is_empty()) {
+            text.push_str(&format!("\n\nThe user's instructions for this role:\n{}", mine.trim()));
+        }
         vec![PromptMessage::new_text(Role::User, text)]
     }
 
     #[prompt(description = "Researcher: find Nexus mods that match what the user describes (in words or images), work with a mod they name, or fit their list, ranked by confidence.")]
     async fn find_mods(&self, Parameters(a): Parameters<WantArgs>) -> Vec<PromptMessage> {
-        self.role(RESEARCHER, &[("request", &a.request)])
+        self.role("researcher", RESEARCHER, &[("request", &a.request)])
     }
 
     #[prompt(description = "Installer: download a mod, check it isn't malicious (or reuse its saved review), review its code, place it in the mod and plugin order, and deploy.")]
     async fn install_safely(&self, Parameters(a): Parameters<InstallPromptArgs>) -> Vec<PromptMessage> {
-        self.role(INSTALLER, &[("what", &a.what)])
+        self.role("installer", INSTALLER, &[("what", &a.what)])
     }
 
     #[prompt(description = "Tester: play the game in a small background window through a live test session (teleports, fights, quests, items) and report crashes, script errors and FPS.")]
     async fn test_mods(&self, Parameters(a): Parameters<TestPromptArgs>) -> Vec<PromptMessage> {
         let focus = a.focus.unwrap_or_else(|| "the mods installed last".into());
         let save = a.save.unwrap_or_else(|| "a cell, from the main menu".into());
-        self.role(TESTER, &[("focus", &focus), ("save", &save)])
+        self.role("tester", TESTER, &[("focus", &focus), ("save", &save)])
     }
 
     #[prompt(description = "Lead: run the whole mod team for a request: research, the user's pick, install and review, then guide the tester through each mechanic.")]
     async fn mod_team(&self, Parameters(a): Parameters<WantArgs>) -> Vec<PromptMessage> {
-        self.role(LEAD, &[("request", &a.request)])
+        self.role("lead", LEAD, &[("request", &a.request)])
     }
 }
 
@@ -1197,6 +1200,11 @@ impl Rmm {
         self
     }
 
+    /// `recorded` unless the user turned keeping sessions off (Settings).
+    pub fn recorded_if_set(self) -> Rmm {
+        if rmm_core::settings::get().mcp.record_sessions { self.recorded() } else { self }
+    }
+
     /// Changes the session's chat (made on first use, in an instance only) and saves it; None when
     /// nothing is kept. Keeping it never fails a call.
     fn session_chat(&self, app: Option<String>, change: impl FnOnce(&mut agent::Chat)) -> Option<String> {
@@ -1218,6 +1226,6 @@ fn app_name(peer: &Peer<RoleServer>) -> Option<String> {
 }
 
 pub async fn serve(root: PathBuf) -> anyhow::Result<()> {
-    Rmm::new(root).recorded().serve(stdio()).await?.waiting().await?;
+    Rmm::new(root).recorded_if_set().serve(stdio()).await?.waiting().await?;
     Ok(())
 }

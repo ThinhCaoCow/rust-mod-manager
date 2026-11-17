@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 const CONFIG: &str = "instance.toml";
 pub(crate) const MOD_META: &str = "rmm-mod.toml";
 const MOD_INDEX: &str = ".rmm-index";
-// ponytail: fixed undo depth; make it a setting if anyone hits it.
-const HISTORY_LIMIT: usize = 200;
 
 type IndexCache = std::collections::HashMap<PathBuf, (Stamp, Vec<String>)>;
 static INDEX_CACHE: std::sync::LazyLock<std::sync::Mutex<IndexCache>> = std::sync::LazyLock::new(Default::default);
@@ -45,6 +43,9 @@ pub struct InstanceConfig {
     /// Folder holding the game's INI files; worked out from `local_path` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ini_path: Option<PathBuf>,
+    /// Where downloads go; `downloads/` in the instance when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloads_path: Option<PathBuf>,
 }
 
 /// Everything a setup is, minus the (immutable) mod files. Small, so it is snapshotted for undo.
@@ -224,6 +225,7 @@ impl Instance {
                 local_path: local_path.into(),
                 profile: "default".into(),
                 ini_path: None,
+                downloads_path: None,
             },
         };
         fs::write(root.join(CONFIG), toml::to_string_pretty(&inst.config)?)?;
@@ -247,6 +249,27 @@ impl Instance {
     pub fn data_dir(&self) -> PathBuf {
         self.config.game_path.join("Data")
     }
+    /// Where downloads are kept: the folder set for this instance, else `downloads/` in it.
+    pub fn downloads_dir(&self) -> PathBuf {
+        self.config.downloads_path.clone().unwrap_or_else(|| self.root.join("downloads"))
+    }
+
+    /// Keep downloads in `dir` (None: `downloads/` in the instance). Files already downloaded stay
+    /// where they are.
+    pub fn set_downloads_dir(&mut self, dir: Option<PathBuf>) -> Result<()> {
+        if let Some(d) = &dir {
+            if !d.is_absolute() {
+                bail!("the downloads folder must be a full path");
+            }
+            fs::create_dir_all(d).with_context(|| format!("cannot make {}", d.display()))?;
+        }
+        let mut config = Instance::open(&self.root)?.config;
+        config.downloads_path = dir;
+        self.locked(|| write_atomic(&self.root.join(CONFIG), &toml::to_string_pretty(&config)?))?;
+        self.config = config;
+        Ok(())
+    }
+
     pub fn ini_dir(&self) -> Option<PathBuf> {
         self.config.ini_path.clone().or_else(|| crate::game::my_games_dir(&self.config.local_path))
     }
@@ -589,7 +612,7 @@ impl Instance {
             .map_or(0, |n| n + 1);
         let body = format!("# {}\n{}", label.replace('\n', " "), toml::to_string_pretty(p)?);
         fs::write(dir.join(format!("{next:010}.toml")), body)?;
-        for (old, _) in existing.iter().take((existing.len() + 1).saturating_sub(HISTORY_LIMIT)) {
+        for (old, _) in existing.iter().take((existing.len() + 1).saturating_sub(crate::settings::get().history.limit)) {
             fs::remove_file(old)?;
         }
         Ok(())

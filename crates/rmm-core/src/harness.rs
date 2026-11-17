@@ -179,7 +179,7 @@ pub fn test_run(inst: &Instance, s: &Scenario) -> Result<TestRun> {
     if has_harness(inst)? {
         let wants_shots = s.screenshots || s.steps.iter().any(|x| matches!(x, Step::Screenshot(_)));
         let (server, shots) = run.launch_harness(inst, wants_shots)?;
-        match server.accept(Duration::from_secs(s.timeout.unwrap_or(180)), &alive) {
+        match server.accept(Duration::from_secs(s.timeout.unwrap_or_else(|| crate::settings::get().test.timeout)), &alive) {
             Ok((conn, runtime)) => {
                 run.r.runtime = runtime;
                 run.r.timings.insert("hello".into(), secs(run.t0));
@@ -236,6 +236,7 @@ impl Run {
         let shots = shots.then(|| std::path::absolute(inst.root.join("test-runs").join(self.started.to_string()))).transpose()?;
         if let Some(dir) = &shots {
             std::fs::create_dir_all(dir)?;
+            prune_runs(&inst.root.join("test-runs"), crate::settings::get().test.keep_runs);
         }
         self.r.launch = Some(launch::launch_with(inst, false, &env)?);
         self.r.mode = "harness".into();
@@ -292,7 +293,7 @@ impl Session {
         }
         let mut run = Run::begin(inst, &Scenario { keep_open: false, ..s.clone() })?;
         let alive = run.alive();
-        let timeout = Duration::from_secs(s.timeout.unwrap_or(180));
+        let timeout = Duration::from_secs(s.timeout.unwrap_or_else(|| crate::settings::get().test.timeout));
         let up = (|| -> Result<(Conn, std::path::PathBuf)> {
             let (server, shots) = run.launch_harness(inst, true)?;
             let (mut c, runtime) = server.accept(timeout, &alive)?;
@@ -380,8 +381,21 @@ impl Drop for Session {
 }
 
 /// The window size a scenario asks for, or None for the game's own display settings.
+/// Keep the newest `keep` test runs' screenshot folders (named by their start time); 0 keeps all.
+fn prune_runs(dir: &std::path::Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let mut runs: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path()))).collect();
+    runs.sort();
+    for (_, p) in runs.iter().take(runs.len().saturating_sub(keep)) {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 fn window_size(s: &Scenario) -> Result<Option<(u32, u32)>> {
-    let w = s.window.as_deref().unwrap_or("960x540");
+    let default = crate::settings::get().test.window;
+    let w = s.window.as_deref().unwrap_or(&default);
     if s.keep_open || w.eq_ignore_ascii_case("fullscreen") {
         return Ok(None);
     }
@@ -519,9 +533,9 @@ fn watch(s: &Scenario, t0: Instant, alive: &dyn Fn() -> bool, r: &mut TestRun) {
 
 /// Play the scenario over a connected harness. Failures end up in `r.summary`.
 fn drive(mut c: Conn, s: &Scenario, t0: Instant, shots: Option<&Path>, alive: &dyn Fn() -> bool, r: &mut TestRun) {
-    let dwell = Duration::from_secs(s.dwell.unwrap_or(10));
+    let dwell = Duration::from_secs(s.dwell.unwrap_or_else(|| crate::settings::get().test.dwell));
     let step = |c: &mut Conn, r: &mut TestRun| -> Result<()> {
-        let timeout = Duration::from_secs(s.timeout.unwrap_or(180));
+        let timeout = Duration::from_secs(s.timeout.unwrap_or_else(|| crate::settings::get().test.timeout));
         for ev in ["data_loaded", "main_menu"] {
             c.until(ev, timeout, alive)?;
             r.timings.insert(ev.into(), secs(t0));

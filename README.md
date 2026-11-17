@@ -71,6 +71,35 @@ How deploys behave:
 - **Tool runs.** `rmm run` deploys, runs the tool, then captures what it wrote into a generated mod: its `{output}` folder plus new or changed Data files. That mod replaces the tool's previous output. Files a tool rewrites in place (its `rewrites`) are swapped from hard links to copies first, so your installed mods aren't changed through the link. Pandora and PGPatcher get their paths written into their JSON settings, and keep their mod list or plugin between runs. New plugins are sorted with LOOT if you already sort with it.
 - **Lost manifest.** If `deploy.json` is lost, `rmm purge --apply` still finds rmm's hard links by file identity.
 
+## Settings
+
+Most of what rmm does can be changed, in the window's **Settings** tab or with `rmm settings`. They live in `settings.json` in rmm's config folder (`%APPDATA%\rmm`, or `RMM_CONFIG_DIR`), shared by the CLI, the window and the MCP server; a missing setting keeps its default.
+
+```
+rmm settings                         # all of them
+rmm settings deploy.exclude "*.txt, fomod/*"
+rmm settings deploy.method copy      # copies instead of hard links
+rmm settings --reset deploy.exclude  # back to the default (--reset alone: all of them)
+rmm downloads --folder E:\Downloads\Skyrim   # this instance's downloads folder ("" for downloads/)
+```
+
+| Setting | Default | What it does |
+|---|---|---|
+| `deploy.method` | `link` | `copy` deploys copies, so nothing the game does to a file reaches the mod |
+| `deploy.exclude` | none | Files never deployed: `*.txt`, `readme*`, `docs/*` (a pattern without `/` matches file names) |
+| `launch.script_extender`, `launch.args` | on, none | Start through SKSE/F4SE when it's there; arguments for the game |
+| `install.enable` | on | Mods installed in the window start enabled |
+| `history.limit` | 200 | Undo steps kept per profile |
+| `loot.refresh_hours`, `loot.language`, `loot.show_info`, `loot.sort_after_tools` | 24, `en`, off, on | Masterlist age, message language, LOOT's notes, sorting after tool runs |
+| `health.hidden`, `health.ba2_limit` | none, 0 | Kinds of problems not reported; Fallout 4's BA2 limit (0 works it out, 256, 1024) |
+| `test.window`, `test.dwell`, `test.timeout`, `test.screenshots`, `test.keep_runs` | 960x540, 10, 180, on, 0 | Test run defaults; screenshots of the last N runs kept (0: all) |
+| `nexus.recheck_days`, `nexus.check_on_start` | 30, off | When to ask Nexus about a mod again; check for updates when the window opens |
+| `tools.timeout_mins` | 0 | Stop a tool run from the window after this long (0: never) |
+| `ai.max_steps`, `ai.budget`, `ai.auto_allow`, `ai.role_instructions` | 60, 0, none, none | rmm's AI: steps per turn, the most a chat may cost (US$), tools it runs without asking, your instructions per role (also for AI apps over MCP) |
+| `mcp.port`, `mcp.record_sessions` | 47823, on | The window's AI access port; keep AI apps' sessions as chats |
+
+The window keeps its own look too: theme (follow Windows, light, dark), compact rows, size, the tab it opens on, how often it looks for outside changes, how long messages stay, the Recent filter's days, asking before installing dropped files, skipping the deploy preview, the editor's tab width, spaces and wrapping, and whether Enter or Ctrl+Enter sends an AI message.
+
 ## Desktop app
 
 ```
