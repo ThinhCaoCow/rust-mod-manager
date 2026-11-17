@@ -23,6 +23,13 @@ pub struct LaunchReport {
     pub deploy: DeployPlan,
 }
 
+/// Installed mods with the script extender's loader in root/ (the game folder).
+pub fn script_extender_mods(inst: &Instance) -> Result<Vec<String>> {
+    let loader = format!("root/{}", inst.config.game.loader()).to_lowercase();
+    let has = |id: &str| inst.mod_files(id).is_ok_and(|f| f.iter().any(|f| f.to_lowercase() == loader));
+    Ok(inst.profile()?.mods.into_iter().map(|m| m.id).filter(|id| !crate::instance::is_separator(id) && has(id)).collect())
+}
+
 /// Deploy and start the game. With `dry_run`, only the plan and the checks.
 pub fn launch(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
     launch_with(inst, dry_run, &[])
@@ -50,18 +57,7 @@ pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Re
     let cfg = crate::settings::get().launch;
     let loader = root.join(game.loader());
     if cfg.script_extender && loader.is_file() {
-        // The loader shows an error box and quits on a mismatch; say it here instead.
-        let runtimes = runtimes(root, game)?;
-        match runtimes.iter().find(|(_, v)| v[..] == version[..3]) {
-            Some((name, _)) => r.script_extender = Some(name.clone()),
-            None if runtimes.is_empty() => bail!("{} is installed without its runtime DLL; reinstall the script extender", game.loader()),
-            None => bail!(
-                "the script extender is built for game version {}, the game is {}; install the build for {}",
-                runtimes.iter().map(|(_, v)| v.map(|x| x.to_string()).join(".")).collect::<Vec<_>>().join(", "),
-                r.game_version,
-                r.game_version
-            ),
-        }
+        r.script_extender = Some(se_runtime(root, game, &version)?);
         r.exe = loader;
     } else if has_se_plugins(inst, game) {
         r.warnings.push(if loader.is_file() {
@@ -86,6 +82,39 @@ pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Re
         r.pid = Some(child.id());
     }
     Ok(r)
+}
+
+/// The installed script extender's runtime DLL for this game version. The loader shows an error box
+/// and quits on a mismatch; this says why, and what to do, before it gets that far.
+pub(crate) fn se_runtime(root: &Path, game: Game, version: &[u32; 4]) -> Result<String> {
+    let runtimes = runtimes(root, game)?;
+    let site = if game.base() == Game::SkyrimSe { "skse.silverlock.org" } else { "f4se.silverlock.org" };
+    let have = version.map(|x| x.to_string()).join(".");
+    match runtimes.iter().find(|(_, v)| v[..] == version[..3]) {
+        Some((name, _)) => Ok(name.clone()),
+        None if runtimes.is_empty() => bail!("{} is installed without its runtime DLL; reinstall the script extender from {site}", game.loader()),
+        None => bail!(
+            "the script extender is built for game version {}, the game is {have} (a game update?); install the build for {have} from {site}, or wait for one if it isn't out yet. Mods that need the script extender won't work until then",
+            runtimes.iter().map(|(_, v)| v.map(|x| x.to_string()).join(".")).collect::<Vec<_>>().join(", "),
+        ),
+    }
+}
+
+/// The game exe's version (cached by the exe's size and time: it takes reading the whole file).
+pub(crate) fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
+    type Seen = (PathBuf, u64, std::time::SystemTime, [u32; 4]);
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let exe = root.join(game.exe());
+    let m = fs::metadata(&exe)?;
+    let key = (exe.clone(), m.len(), m.modified()?);
+    if let Some((p, n, t, v)) = SEEN.lock().unwrap().clone()
+        && (p, n, t) == key
+    {
+        return Ok(v);
+    }
+    let v = exe_version(&exe)?;
+    *SEEN.lock().unwrap() = Some((key.0, key.1, key.2, v));
+    Ok(v)
 }
 
 /// The file version in an exe's VS_FIXEDFILEINFO: the signature 0xFEEF04BD, struct version 1.0,
@@ -140,5 +169,9 @@ mod tests {
         }
         assert_eq!(runtimes(dir.path(), Game::SkyrimSe).unwrap(), vec![("skse64_1_6_1170.dll".to_string(), [1, 6, 1170])]);
         assert_eq!(runtimes(dir.path(), Game::Fallout4).unwrap(), vec![("f4se_1_10_163.dll".to_string(), [1, 10, 163])]);
+        assert_eq!(game_version(dir.path(), Game::SkyrimSe).unwrap(), [1, 6, 1170, 0]);
+        assert_eq!(se_runtime(dir.path(), Game::SkyrimSe, &[1, 6, 1170, 0]).unwrap(), "skse64_1_6_1170.dll");
+        let e = se_runtime(dir.path(), Game::SkyrimSe, &[1, 6, 1179, 0]).unwrap_err().to_string();
+        assert!(e.contains("built for game version 1.6.1170, the game is 1.6.1179") && e.contains("skse.silverlock.org"), "{e}");
     }
 }

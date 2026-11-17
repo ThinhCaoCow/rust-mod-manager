@@ -53,6 +53,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+button.primary .muted { color: inherit; font-weight: 400; opacity: .75; }
 button.danger { color: var(--bad); }
 button.link { border: 0; background: none; padding: 0; color: var(--accent); }
 button.link:hover:not(:disabled) { background: none; text-decoration: underline; }

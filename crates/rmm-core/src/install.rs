@@ -401,22 +401,30 @@ pub fn mod_from_overwrite(inst: &Instance, name: &str) -> Result<InstallReport> 
     Ok(report(&id, name, &files, plugins, vec![], None))
 }
 
-/// Move everything in overwrite/ to trash/overwrite (replacing what an earlier clear put there).
-/// Returns how many files went. Not in the undo history.
+/// Empty overwrite/ in one undo step: its files become a mod, "Cleared overwrite", that goes
+/// straight to trash/. The step before lists that mod, so undo brings the files back as a mod at
+/// the end of the list. Returns how many files went.
 pub fn clear_overwrite(inst: &Instance) -> Result<usize> {
-    let over = inst.mod_dir(crate::instance::OVERWRITE);
-    let n = inst.mod_files(crate::instance::OVERWRITE)?.len();
-    if n == 0 {
+    let files = inst.mod_files(crate::instance::OVERWRITE)?;
+    if files.is_empty() {
         return Ok(0);
     }
+    let id = unique_id(inst, "Cleared overwrite");
     inst.locked(|| {
-        let bin = inst.root.join("trash").join("overwrite");
-        let _ = fs::remove_dir_all(&bin);
-        fs::create_dir_all(inst.root.join("trash"))?;
-        fs::rename(&over, &bin)?;
+        let (over, dest) = (inst.mod_dir(crate::instance::OVERWRITE), inst.mod_dir(&id));
+        fs::create_dir_all(inst.mods_dir())?;
+        fs::rename(&over, &dest)?;
         fs::create_dir_all(&over)?;
-        Ok(n)
-    })
+        fs::write(dest.join(".rmm-index"), files.join("\n"))?;
+        inst.write_mod_meta(&id, &ModMeta { name: id.clone(), ..Default::default() })?;
+        inst.list_quietly(&id)
+    })?;
+    inst.edit("clear overwrite", |p| {
+        p.mods.retain(|m| m.id != id);
+        Ok(())
+    })?;
+    inst.trash_mod(&id)?;
+    Ok(files.len())
 }
 
 /// What trash/ holds: uninstalled mods, replaced files of reinstalled mods and tool output, and

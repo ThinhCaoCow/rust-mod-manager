@@ -86,7 +86,8 @@ pub struct Loot {
     pub language: String,
     /// Show LOOT's notes too, not only its warnings and errors.
     pub show_info: bool,
-    /// Sort the plugins a tool run adds, once LOOT is in use.
+    /// Place the plugins a tool run adds where LOOT would (once LOOT is in use); the rest keep
+    /// their order.
     pub sort_after_tools: bool,
 }
 impl Default for Loot {

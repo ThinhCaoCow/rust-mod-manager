@@ -361,6 +361,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "sort_plugins" => json!(loot::sort(&inst, flag("dry_run"))?),
         "undo" => json!(inst.undo()?),
         "redo" => json!(inst.redo()?),
+        "script_extender_mods" => json!(launch::script_extender_mods(&inst)?),
         "create_profile" => json!(inst.create_profile(&s("name")?, flag("copy"))?),
         "switch_profile" => json!(inst.switch_profile(&s("name")?)?),
         "rename_profile" => json!(inst.rename_profile(&s("from")?, &s("to")?)?),
@@ -370,6 +371,11 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "papyrus_log" => json!(logs::read_papyrus_log(&inst, 60)?),
         "nexus_status" => {
             let mut st = nexus::status();
+            // Who opens nxm:// links, and whether it's this instance (`rmm -i "<root>" nxm`).
+            let cmd = nexus::handler_command();
+            let here = format!("-i \"{}\"", inst.root.display()).to_lowercase();
+            st["handler_here"] = json!(cmd.as_deref().is_some_and(|c| c.to_lowercase().contains(&here)));
+            st["handler"] = json!(cmd);
             // Signed in: fetch the game's category names once, so Nexus categories show.
             if st["user"].is_object() {
                 st["categories_read"] = json!(nexus::Client::from_env().and_then(|c| nexus::refresh_categories(&inst, &c)).unwrap_or(false));
@@ -396,6 +402,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "addon_remove" => json!(addons::remove(&inst, &s("name")?)?),
         "addon_call" => addons::call(&inst, &s("name")?, &s("function")?, &a["input"].clone())?,
         "import_sources" => json!(import::find_sources()),
+        "mo2_profiles" => json!(import::mo2_profiles(Path::new(&s("dir")?))?),
         "import_mo2" => json!(import::import_mo2(&inst, Path::new(&s("dir")?), a["profile"].as_str(), flag("dry_run"))?),
         "import_vortex" => json!(import::import_vortex(&inst, Path::new(&s("path")?), a["staging"].as_str().map(Path::new), a["profile"].as_str(), flag("dry_run"))?),
         "export_lockfile" => json!(lockfile::write(&inst, None)?),
@@ -406,6 +413,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "file_conflicts" => json!(conflicts::file_conflicts(&inst, &p, &s("id")?)?),
         "data" => json!(conflicts::data_view(&inst, &p, &serde_json::from_value(a.clone())?)?),
         "saves" => json!(saves::list(&inst)?),
+        "newest_save_using" => json!(saves::newest_using(&inst, &serde_json::from_value::<Vec<String>>(a["plugins"].clone())?)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
         "downloads" => json!(install::downloads(&inst)?),
         "downloads_dir" => json!({ "path": inst.downloads_dir(), "custom": inst.config.downloads_path.is_some() }),

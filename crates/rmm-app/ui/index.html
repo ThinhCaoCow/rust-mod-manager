@@ -35,7 +35,7 @@
     <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
     <button id="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
     <button id="deploy" title="Preview and apply the changes to the game folder"></button>
-    <button id="play" class="primary" title="Deploy, check the script extender and start the game">▶ Play</button>
+    <button id="play" class="primary" title="Deploy, check the script extender and start the game. Starting from Steam skips both.">▶ Play</button>
   </header>
 
   <nav class="tabs">
@@ -231,13 +231,14 @@
     </section>
     <section class="pane" id="pane-settings" hidden>
       <div class="scroll"><div class="settings">
+        <div id="set-more"></div>
         <h2>AI providers</h2>
         <p class="muted small">rmm's own AI runs on a provider you pay for, with your API key. Keys are kept in your user folder, never in the instance.</p>
         <table class="set" id="set-providers"></table>
         <h2>Mod team</h2>
         <p class="muted small">Who answers in the AI tab. A message with a role goes to that role's AI, and the Lead hands each step to the AI of its role. An AI app such as Claude can take a role over MCP (<button class="link small" id="set-access">AI access…</button> or <code>rmm mcp</code>): steps for it wait on the team board until you ask the app to do its rmm team tasks, and it can hand steps to the roles on a provider here.</p>
         <table class="set" id="set-team"></table>
-        <div id="set-more"></div>
+        <div id="set-more-ai"></div>
       </div></div>
     </section>
     <aside id="details" hidden></aside>

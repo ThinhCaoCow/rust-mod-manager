@@ -41,6 +41,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("archive_unreadable", "An archive can't be read"),
     ("ba2_limit", "Too many BA2 archives (Fallout 4)"),
     ("script_extender_missing", "Script extender plugins without the loader"),
+    ("script_extender_mismatch", "The script extender doesn't match the game version"),
     ("deploy_blocked", "Deploy can't run"),
     ("not_deployed", "Changes not deployed yet"),
     ("external_change", "Deployed files changed outside rmm"),
@@ -65,7 +66,7 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     }
 
     for (id, after) in crate::rules::broken(inst, &profile)? {
-        add("warning", "mod_rule_broken", &id, format!("should load after {after} (a mod rule); sort_mods fixes the order"));
+        add("warning", "mod_rule_broken", &id, format!("should load after {after} (a mod rule); Sort by rules fixes the order"));
     }
     for u in crate::rules::unmet(inst, &profile)? {
         if !u.missing.is_empty() {
@@ -160,12 +161,20 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     if has_se_plugins && !loader_present {
         add("error", "script_extender_missing", game.loader(), "script extender plugins are installed but the loader is not".into());
     }
+    let root = &inst.config.game_path;
+    if root.join(game.loader()).is_file()
+        && crate::settings::get().launch.script_extender
+        && let Ok(v) = crate::launch::game_version(root, game)
+        && let Err(e) = crate::launch::se_runtime(root, game, &v)
+    {
+        add("error", "script_extender_mismatch", game.loader(), format!("{e:#}. Play won't start the game until it matches"));
+    }
 
     match crate::deploy::deploy(inst, true) {
         Err(e) => add("error", "deploy_blocked", "deploy", e.to_string()),
         Ok(plan) => {
             if !plan.is_noop() {
-                add("warning", "not_deployed", "deploy", format!("{} files to link and {} to remove since the last deploy", plan.link.len(), plan.remove.len()));
+                add("info", "not_deployed", "deploy", format!("{} files to link and {} to remove since the last deploy", plan.link.len(), plan.remove.len()));
             }
             for f in plan.external_changes {
                 add("warning", "external_change", &f, "changed outside rmm; deploy copies it to overwrite/, which then wins over every mod".into());

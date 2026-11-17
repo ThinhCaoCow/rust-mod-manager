@@ -20,6 +20,7 @@ let D = null;               // lookups worked out once per load (see derive)
 let plan = null;            // deploy dry run, or { error }
 let issues = null;          // health check findings
 let issuesStale = true;
+let failures = [];          // failed installs, Plays and downloads in this window, until dismissed
 let details = null;         // mod_details of the selected mod
 let stamp = '';
 let selected = new Set();   // selected mod and separator ids
@@ -78,8 +79,9 @@ const isSep = id => !!byId.get(id)?.separator;
 // ---- Calls ----------------------------------------------------------------------------------
 
 /** Run one change: progress bar, errors as toasts, reload afterwards. Resolves to the call's
- *  result (true for calls that return nothing), or undefined when it failed. */
-async function act(label, fn, { reload = true } = {}) {
+ *  result (true for calls that return nothing), or undefined when it failed. With `problem`, a
+ *  failure is also listed in Problems until dismissed. */
+async function act(label, fn, { reload = true, problem = false } = {}) {
   if (busy) return busyNote();
   setBusy(true, label);
   try {
@@ -88,6 +90,10 @@ async function act(label, fn, { reload = true } = {}) {
     return r ?? true;
   } catch (e) {
     toast(`${label} failed.\n${e}`, 'error');
+    if (problem) {
+      failures = [{ severity: 'error', subject: `${label} failed`, message: String(e) }, ...failures].slice(0, 20);
+      renderProblems();
+    }
     if (reload) load().catch(() => {}); // undo what the window showed ahead of the call
   } finally {
     setBusy(false);
@@ -253,8 +259,10 @@ async function showWelcome() {
   $('#app').hidden = true;
   $('#welcome').hidden = false;
   const found = await call('detect').catch(() => []);
-  $('#create-games').innerHTML = found.map(d =>
-    `<button data-game="${esc(d.game)}">New instance for ${esc(GAMES[d.game] ?? d.game)}<br><span class="muted small">${esc(d.game_path)}</span></button>`).join('');
+  const first = !recall() && found.length; // nothing opened before: making an instance comes first
+  $('#open-instance').classList.toggle('primary', !first);
+  $('#create-games').innerHTML = found.map((d, i) =>
+    `<button data-game="${esc(d.game)}" data-path="${esc(d.game_path)}"${first && !i ? ' class="primary"' : ''}>New instance for ${esc(GAMES[d.game] ?? d.game)}<br><span class="muted small">${esc(d.game_path)}</span></button>`).join('');
 }
 
 async function enter(label, fn) {
@@ -267,10 +275,14 @@ $('#open-instance').onclick = async () => {
 };
 
 $('#create-games').onclick = async e => {
-  const game = e.target.closest('[data-game]')?.dataset.game;
-  if (!game) return;
+  const b = e.target.closest('[data-game]');
+  if (!b) return;
   const path = await T.dialog.open({ directory: true, title: 'Choose a folder for the new instance' });
-  if (path) enter('Creating the instance', () => call('create', { game, path }));
+  if (!path) return;
+  const [here, there] = [path, b.dataset.path].map(p => p.slice(0, 2).toUpperCase());
+  const drive = d => `drive ${d.replace(':', '')}`;
+  if (here !== there && !await confirmBox('Another drive', `The game is on ${drive(there)} and this folder on ${drive(here)}. Deploys would then copy mod files into the game folder instead of linking them, which takes as much space again. A folder on ${drive(there)} avoids that.`, 'Use this folder', 'primary')) return;
+  enter('Creating the instance', () => call('create', { game: b.dataset.game, path }));
 };
 
 // ---- Virtual lists: only the rows on screen are in the DOM -------------------------------------
@@ -866,7 +878,17 @@ async function removeSelected() {
   const title = ids.length > 1 ? `Remove ${[mods && plural(mods, 'mod'), seps && plural(seps, 'separator')].filter(Boolean).join(' and ')}?`
     : seps ? `Remove separator “${nameOf(ids[0])}”?` : `Uninstall ${nameOf(ids[0])}?`;
   const text = mods ? 'Mod files move to the instance’s trash folder. Undo brings them back.' : 'Its mods join the group above. Undo brings it back.';
-  if (await confirmBox(title, text, mods ? 'Uninstall' : 'Remove')) act('Uninstalling', () => call('uninstall', { ids }));
+  const plugins = ids.flatMap(id => byId.get(id)?.plugins ?? []);
+  const used = plugins.length ? await call('newest_save_using', { plugins }).catch(() => null) : null;
+  if (!used) {
+    if (await confirmBox(title, text, mods ? 'Uninstall' : 'Remove')) act('Uninstalling', () => call('uninstall', { ids }));
+    return;
+  }
+  const [save, its] = used;
+  const v = await dialog({ title, body: `<p>${esc(text)}</p><p>Your latest save, <b>${esc(save)}</b>, was made with ${esc(its.join(', '))}. Loading the save without ${its.length > 1 ? 'those plugins' : 'that plugin'} can break it. Disable instead if you may go back to that save.</p>`,
+    actions: [['cancel', 'Cancel'], ['off', 'Disable instead'], ['ok', 'Uninstall', 'danger']] });
+  if (v === 'off') act('Disabling', () => call('enable_mods', { ids: ids.filter(id => !isSep(id)), enabled: false }));
+  else if (v === 'ok') act('Uninstalling', () => call('uninstall', { ids }));
 }
 
 /** What a move takes: the ids in list order, each separator with its whole group. */
@@ -1023,7 +1045,7 @@ $('#overwrite-bar').onclick = async e => {
     const name = await ask('Create a mod from overwrite', 'Everything in overwrite becomes a new mod at the end of the list.', 'Overwrite output');
     if (name) act('Creating the mod', async () => { const r = await call('mod_from_overwrite', { name }); toast(`Created ${r.name} (${plural(r.files, 'file')}).`); });
   } else if (what === 'clear') {
-    if (await confirmBox('Clear overwrite?', `Moves ${plural(S.overwrite, 'file')} to the instance's trash/overwrite folder, replacing what an earlier clear put there. The next deploy removes them from the game folder. This isn't in the undo history.`, 'Clear')) {
+    if (await confirmBox('Clear overwrite?', `Moves ${plural(S.overwrite, 'file')} to the instance's trash; the next deploy removes them from the game folder. They are often settings the game saved (MCM menus, for example) or a tool's output: Create mod… keeps them instead. Undo brings them back as a mod named “Cleared overwrite”.`, 'Clear')) {
       act('Clearing overwrite', () => call('clear_overwrite'));
     }
   }
@@ -1055,7 +1077,7 @@ let showIgnored = false;
 
 function renderProblems() {
   const rank = { error: 0, warning: 1, info: 2 };
-  const all = [...issues].sort((a, b) => rank[a.severity] - rank[b.severity]);
+  const all = [...failures, ...[...(issues ?? [])].sort((a, b) => rank[a.severity] - rank[b.severity])];
   const hidden = all.filter(i => ignored.has(keyOf(i))).length;
   const list = showIgnored ? all : all.filter(i => !ignored.has(keyOf(i)));
   $('#issues').innerHTML = list.length
@@ -1063,19 +1085,19 @@ function renderProblems() {
       const k = keyOf(i), ign = ignored.has(k), to = i.kind && targetOf(i);
       return `<li class="${esc(i.severity)}${to ? ' link' : ''}${ign ? ' ignored' : ''}" data-key="${esc(k)}" ${to ? `data-mod="${esc(to.mod ?? '')}" data-plugin="${esc(to.plugin ?? '')}" title="Show it in the list"` : ''}>
         <span class="sev">${esc(i.severity)}</span><span class="subject">${esc(to?.mod ? nameOf(to.mod) : i.subject)}</span><span class="message">${esc(i.message)}</span>
-        ${i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : ''}</li>`;
+        ${i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : ''}${failures.includes(i) ? `<button class="link ign" data-dismiss="${failures.indexOf(i)}">Dismiss</button>` : ''}</li>`;
     }).join('')
     : `<li class="info"><span class="sev">ok</span><span class="subject">No problems found${hidden ? ' apart from ignored ones' : ''}.</span></li>`;
   $('#show-ignored').hidden = !hidden;
   $('#show-ignored').textContent = showIgnored ? 'Hide ignored' : `Show ${hidden} ignored`;
   // Mods with a finding, for the Problems filter.
-  D.flagged = new Set(issues.filter(i => !ignored.has(keyOf(i)) && i.severity !== 'info').map(i => targetOf(i)?.mod).filter(Boolean));
-  const shown = issues.filter(i => !ignored.has(keyOf(i)));
+  D.flagged = new Set(all.filter(i => !ignored.has(keyOf(i)) && i.severity !== 'info').map(i => targetOf(i)?.mod).filter(Boolean));
+  const shown = all.filter(i => !ignored.has(keyOf(i)));
   const serious = shown.filter(i => i.severity !== 'info').length;
   $('#n-problems').textContent = serious || '';
   $('#n-problems').classList.toggle('bad', shown.some(i => i.severity === 'error'));
   if (filters.has('problems')) renderMods();
-  $('#problems-note').textContent = `${plural(issues.length, 'finding')}. LOOT's messages are included once its masterlist is downloaded.`;
+  $('#problems-note').textContent = `${plural(all.length - failures.length, 'finding')}. LOOT's messages are included once its masterlist is downloaded.`;
 }
 
 // ---- Tabs, filters, keys --------------------------------------------------------------------
@@ -1182,7 +1204,8 @@ async function showTestRun(r) {
 $('#papyrus-log').onclick = async () => {
   const r = await act('Reading the Papyrus log', () => call('papyrus_log'), { reload: false });
   if (!r || r === true) return;
-  const off = r.logging_enabled ? '' : '<p>Papyrus logging is off, so the game writes no new log. Set <code>bEnableLogging=1</code> under <code>[Papyrus]</code> in the game’s Custom INI to turn it on.</p>';
+  const ini = { 'skyrim-se': 'SkyrimCustom.ini', fallout4: 'Fallout4Custom.ini' }[S.info.game] ?? 'the game’s Custom INI';
+  const off = r.logging_enabled ? '' : `<p>The game writes no Papyrus log while its logging is off. To turn it on, add these two lines to ${esc(ini)} in the game’s My Games folder, then play again:</p><pre>[Papyrus]\nbEnableLogging=1</pre>`;
   const body = off + (!r.modified ? '<p class="muted">There is no Papyrus log yet.</p>' : `
     <p class="muted small">${esc(basename(r.path))} · ${esc(when(r.modified))} · ${plural(r.errors, 'error')}, ${plural(r.warnings, 'warning')}</p>
     ${r.scripts.length ? `<p>Scripts in errors:</p><table class="fc">${r.scripts.slice(0, 30).map(s => `<tr><td>${esc(s.script)} <span class="muted">×${s.count}</span></td><td>${modLink(s.mod_id)}</td></tr>`).join('')}</table>` : ''}
@@ -1196,6 +1219,11 @@ $('#papyrus-log').onclick = async () => {
 };
 $('#show-ignored').onclick = () => { showIgnored = !showIgnored; renderProblems(); };
 $('#issues').onclick = e => {
+  const dismiss = e.target.closest('[data-dismiss]')?.dataset.dismiss;
+  if (dismiss) {
+    failures.splice(Number(dismiss), 1);
+    return renderProblems();
+  }
   const ign = e.target.closest('[data-ignore]')?.dataset.ignore;
   if (ign) {
     if (!ignored.delete(ign)) ignored.add(ign);
@@ -1616,10 +1644,15 @@ async function purge() {
 }
 
 $('#play').onclick = async () => {
-  const r = await act('Starting the game', () => call('launch'));
+  const r = await act('Starting the game', () => call('launch'), { problem: true });
   if (!r) return;
   const what = [`game ${r.game_version}`, r.script_extender].filter(Boolean).join(', ');
   toast(`Started ${basename(r.exe)} (${what}).${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
+  if (!prefs.playHint) {
+    prefs.playHint = true;
+    savePrefs();
+    toast('Start the game with Play from now on: starting it from Steam or a desktop shortcut skips the script extender and any changes not deployed yet.');
+  }
 };
 
 // ---- Profiles -------------------------------------------------------------------------------
@@ -1669,8 +1702,13 @@ $('#profile-pop').onclick = async e => {
   } else if (t.dataset.new) {
     const copy = t.dataset.new === 'copy';
     const name = await ask(copy ? 'Copy this profile' : 'New empty profile',
-      copy ? `A copy of “${cur}”: same mods, order and plugins.` : 'Every installed mod, disabled.', copy ? `${cur} copy` : '');
-    if (name && await act('Creating the profile', async () => { await call('create_profile', { name, copy }); await call('switch_profile', { name }); })) {
+      copy ? `A copy of “${cur}”: same mods, order and plugins.` : 'Every installed mod, disabled, except the script extender.', copy ? `${cur} copy` : '');
+    if (name && await act('Creating the profile', async () => {
+      await call('create_profile', { name, copy });
+      await call('switch_profile', { name });
+      const se = copy ? [] : await call('script_extender_mods');
+      if (se.length) await call('enable_mods', { ids: se, enabled: true });
+    })) {
       toast(`Switched to ${name}.`);
     }
   } else if (t.dataset.rename) {
@@ -1699,8 +1737,31 @@ async function nexusLogin(why, sso) {
     ? await act('Waiting for you to approve rmm on nexusmods.com', () => call('nexus_sso'), { reload: false })
     : await act('Checking the key', () => call('nexus_set_key', { key }), { reload: false });
   if (who && who !== true) toast(`Signed in to Nexus as ${who.name}${who.is_premium ? ' (Premium)' : ''}.`);
-  if (who) nexusShow();
+  if (who) nexusShow().then(offerHandler);
   return !!who;
+}
+
+/** Who opens nxm:// links (“Mod manager download”) now, in a sentence. */
+function handlerNow() {
+  if (nexus.handler_here) return 'Nexus links open with rmm, into this instance.';
+  if (!nexus.handler) return 'No program opens Nexus links now.';
+  const exe = basename(nexus.handler.match(/^"?([^"]+)/)?.[1] ?? nexus.handler);
+  const app = { 'nxmhandler.exe': 'Mod Organizer 2', 'vortex.exe': 'Vortex', 'rmm.exe': 'rmm, for another instance' }[exe.toLowerCase()] ?? exe;
+  return `Nexus links open with ${app} now.`;
+}
+
+/** After signing in: offer to take the website's “Mod manager download” links. */
+async function offerHandler() {
+  if (nexus.handler_here || !nexus.user) return;
+  const free = nexus.user.is_premium ? '' : ' That’s how free accounts download.';
+  const v = await dialog({ title: 'Open Nexus links with rmm?', body: `<p>The “Mod manager download” buttons on nexusmods.com would then install into this instance.${free}</p><p class="muted small">${esc(handlerNow())} The Nexus button can change this later.</p>`,
+    actions: [['cancel', 'Not now'], ['ok', 'Open them with rmm', 'primary']] });
+  if (v === 'ok') setHandler();
+}
+
+async function setHandler() {
+  if (await act('Setting rmm to open Nexus links', () => call('nexus_handler'), { reload: false })) toast(`“Mod manager download” buttons on nexusmods.com now install into ${S.info.root}.`);
+  nexusShow();
 }
 
 /** True once a Nexus API key is saved, asking for one if needed. */
@@ -1730,21 +1791,22 @@ $('#nexus-btn').onclick = async () => {
     : 'Free accounts download through the website: click “Mod manager download” on a file. Let rmm open those links and it installs the file here. Premium accounts can also download straight from a mod page link.';
   const v = await dialog({
     title: 'Nexus Mods',
-    body: `<p>Signed in as <b>${esc(u.name)}</b>${u.is_premium ? ' (Premium)' : ''}.</p><p class="muted small">${esc(how)}</p>`,
-    actions: [['cancel', 'Close'], ['out', 'Sign out'], ['handler', 'Open Nexus links with rmm', 'primary']],
+    body: `<p>Signed in as <b>${esc(u.name)}</b>${u.is_premium ? ' (Premium)' : ''}.</p><p class="muted small">${esc(how)}</p><p class="muted small">${esc(handlerNow())}</p>`,
+    actions: [['cancel', 'Close'], ['out', 'Sign out'], ...(nexus.handler_here ? [] : [['handler', 'Open Nexus links with rmm', 'primary']])],
   });
   if (v === 'out') {
     if (await act('Signing out of Nexus', () => call('nexus_forget_key'), { reload: false })) toast('Signed out of Nexus. The key is deleted from this computer.');
     nexusShow();
-  } else if (v === 'handler') {
-    if (await act('Setting rmm to open Nexus links', () => call('nexus_handler'), { reload: false })) toast(`“Mod manager download” buttons on nexusmods.com now install into ${S.info.root}.`);
-  }
+  } else if (v === 'handler') setHandler();
 };
 
 $('#nxm').onclick = async () => {
-  const link = await ask('Install from Nexus Mods', 'Paste a mod page link or a mod id (Premium: downloads its newest main file), or the nxm:// link of a file’s “Mod manager download” button (any account).', '');
+  const free = nexus.user && !nexus.user.is_premium;
+  const link = await ask('Install from Nexus Mods', free
+    ? 'Free accounts download from the website: on the mod’s Files tab, click “Mod manager download” (with rmm opening Nexus links, the file installs here). Or paste that button’s nxm:// link.'
+    : 'Paste a mod page link or a mod id (Premium: downloads its newest main file), or the nxm:// link of a file’s “Mod manager download” button.', '');
   if (!link || !await nexusReady('Downloads from Nexus Mods need your API key.')) return;
-  const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link }), { reload: false });
+  const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link }), { reload: false, problem: true });
   if (f && f !== true) install([f.path], slotAfter(selIds().length === 1 ? selIds()[0] : null), f);
 };
 
@@ -1878,6 +1940,12 @@ async function importExport(what) {
       : await T.dialog.open({ title: 'A Vortex state backup', filters: [{ name: 'Vortex backup', extensions: ['json'] }], defaultPath: src.vortex.find(p => p.endsWith('.json')) });
     if (!path) return;
     const args = what === 'mo2' ? { dir: path } : { path };
+    const profiles = what === 'mo2' ? await call('mo2_profiles', { dir: path }).catch(() => []) : [];
+    if (profiles.length > 1) {
+      const body = `<p>Which MO2 profile? Its mods come in with their order, and its plugin order.</p><select id="mo2-profile" aria-label="MO2 profile">${profiles.map((p, i) => `<option value="${esc(p)}">${esc(p)}${i ? '' : ' (selected in MO2)'}</option>`).join('')}</select>`;
+      if (await dialog({ title: 'Import from MO2', body, actions: [['cancel', 'Cancel'], ['ok', 'Next', 'primary']] }) !== 'ok') return;
+      args.profile = $('#mo2-profile').value;
+    }
     const run = dry_run => call(what === 'mo2' ? 'import_mo2' : 'import_vortex', { ...args, dry_run });
     const r = await act('Reading the setup', () => run(true), { reload: false });
     if (!r || r === true) return;
@@ -2168,7 +2236,7 @@ function slotAfter(id) {
 async function install(paths, at = null, nx = null) {
   for (const path of paths) {
     // Unpacks the archive once; the install below reuses it.
-    const walk = await act(`Reading ${basename(path)}`, () => call('fomod', { path }), { reload: false });
+    const walk = await act(`Reading ${basename(path)}`, () => call('fomod', { path }), { reload: false, problem: true });
     if (!walk) continue;
     let choices, name = nx?.name ?? undefined;
     if (walk !== true) { // it has a FOMOD installer, which names the mod better than most file names
@@ -2176,7 +2244,7 @@ async function install(paths, at = null, nx = null) {
       if (!choices) continue;
       name = walk.module;
     }
-    const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus }));
+    const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus }), { problem: true });
     if (!r) continue;
     if (at !== null) at++;
     const notes = [r.plugins.length ? `Plugins: ${r.plugins.join(', ')}` : '', ...r.warnings].filter(Boolean);
@@ -2489,7 +2557,7 @@ const SETTINGS = [
     ['win.zoom', 'Size', 'select', [[0.8, '80%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.25, '125%'], [1.5, '150%']]],
     ['win.startTab', 'Open on', 'select', [['last', 'The last tab'], ...TABS]],
     ['win.poll', 'Look for changes made by the CLI or AI apps', 'select', [[1.5, 'Every 1.5 seconds'], [5, 'Every 5 seconds'], [15, 'Every 15 seconds'], [0, 'Never']]],
-    ['win.toast', 'Seconds a message stays', 'num', [2, 60], 'Errors stay three times as long. Click one to dismiss it.'],
+    ['win.toast', 'Seconds a message stays', 'num', [2, 60], 'Errors stay until you click them.'],
     ['win.recentDays', 'The Recent filter shows mods installed in the last', 'num', [1, 365], 'days'],
     ['win.confirmDrop', 'Ask before installing files dropped on the window', 'bool'],
     ['win.deployPreview', 'Show what a deploy changes before it runs', 'bool'],
@@ -2514,7 +2582,7 @@ const SETTINGS = [
   ['LOOT', '', [
     ['loot.language', 'Messages in', 'select', LANGS, 'Where the masterlist has them; English otherwise.'],
     ['loot.show_info', 'Show LOOT’s notes too, not only its warnings and errors', 'bool'],
-    ['loot.sort_after_tools', 'Sort the plugins a tool run adds', 'bool'],
+    ['loot.sort_after_tools', 'Place the plugins a tool run adds where LOOT would', 'bool', null, 'Every other plugin keeps its place.'],
     ['loot.refresh_hours', 'Download the masterlist again after', 'num', [1, 8760], 'hours'],
   ]],
   ['Problems', 'What the Problems tab and the AI’s health check report.', [
@@ -2567,12 +2635,15 @@ async function drawMore() {
     if (kind === 'folder') return dlDir ? `<div class="set-path"><code title="${esc(dlDir.path)}">${esc(dlDir.path)}</code><button class="small" data-act="dl-pick">Choose…</button>${dlDir.custom ? '<button class="small" data-act="dl-reset" title="downloads/ in the instance">Default</button>' : ''}</div>` : '';
     return '';
   };
-  $('#set-more').innerHTML = SETTINGS.map(([title, about, fields]) => `<h2>${esc(title)}</h2>${about ? `<p class="muted small">${esc(about)}</p>` : ''}
-    <table class="set">${fields.map(f => `<tr><td>${esc(f[1])}</td><td>${control(f)}${f[4] ? `<span class="muted small">${esc(f[4])}</span>` : ''}</td></tr>`).join('')}</table>`).join('')
+  const section = ([title, about, fields]) => `<h2>${esc(title)}</h2>${about ? `<p class="muted small">${esc(about)}</p>` : ''}
+    <table class="set">${fields.map(f => `<tr><td>${esc(f[1])}</td><td>${control(f)}${f[4] ? `<span class="muted small">${esc(f[4])}</span>` : ''}</td></tr>`).join('')}</table>`;
+  const ai = s => s[0] === 'rmm’s AI' || s[0] === 'AI access (MCP)';
+  $('#set-more').innerHTML = SETTINGS.filter(s => !ai(s)).map(section).join('');
+  $('#set-more-ai').innerHTML = SETTINGS.filter(ai).map(section).join('')
     + `<p class="set-reset"><button data-act="reset">Reset all settings…</button> <span class="muted small">rmm’s settings are in settings.json in your user folder, also changed with <code>rmm settings</code>.</span></p>`;
 }
 
-$('#set-more').onchange = async e => {
+$('#set-more').onchange = $('#set-more-ai').onchange = async e => {
   const el = e.target.closest('[data-key]');
   if (!el) return;
   const { key, kind } = el.dataset;
@@ -2592,7 +2663,7 @@ $('#set-more').onchange = async e => {
   try { conf = await call('set_settings', { settings: next }); } catch (err) { toast(String(err), 'error'); return drawMore(); }
   if (key === 'mcp.port' && mcpOn) setMcp(true);
 };
-$('#set-more').onclick = async e => {
+$('#set-more').onclick = $('#set-more-ai').onclick = async e => {
   const b = e.target.closest('button[data-act]');
   if (!b) return;
   if (b.dataset.act === 'reset') {
@@ -3114,7 +3185,9 @@ function toast(msg, kind = 'info') {
   el.title = 'Click to dismiss';
   el.onclick = () => el.remove();
   $('#toasts').append(el);
-  setTimeout(() => el.remove(), W.toast * (kind === 'error' ? 3000 : 1000));
+  // Errors stay until clicked (the newest five), so a refusal can be read twice.
+  if (kind === 'error') $$('#toasts .toast.error').slice(0, -5).forEach(t => t.remove());
+  else setTimeout(() => el.remove(), W.toast * 1000);
 }
 
 applyWin();

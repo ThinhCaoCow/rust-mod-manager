@@ -91,6 +91,23 @@ pub fn list(inst: &Instance) -> Result<SaveList> {
     Ok(SaveList { dir: Some(dir), saves })
 }
 
+/// The newest save, with those of `plugins` it was made with; None when it uses none of them.
+pub fn newest_using(inst: &Instance, plugins: &[String]) -> Result<Option<(String, Vec<String>)>> {
+    let Some(dir) = crate::profile_ini::save_dir(inst, &inst.profile()?) else { return Ok(None) };
+    let ext = ext(inst.config.game);
+    let newest = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e)))
+        .max_by_key(|(t, _)| *t);
+    let Some((_, e)) = newest else { return Ok(None) };
+    let Ok(h) = read(&e.path()) else { return Ok(None) };
+    let used: Vec<String> = h.plugins.into_iter().filter(|n| plugins.iter().any(|p| p.eq_ignore_ascii_case(n))).collect();
+    Ok((!used.is_empty()).then(|| (e.file_name().to_string_lossy().into_owned(), used)))
+}
+
 /// Enable the installed mods and plugins a save needs, as one change. Returns the plugins enabled.
 pub fn enable_missing(inst: &Instance, file: &str) -> Result<Vec<String>> {
     if file.contains(['/', '\\']) {
@@ -365,6 +382,8 @@ mod tests {
         assert!(inst.profile().unwrap().mods.iter().any(|m| m.id == a && m.enabled));
         assert_eq!(missing(list(&inst).unwrap()), ["Gone.esp None", "Small.esl None"]);
         assert!(enable_missing(&inst, "../x.ess").is_err());
+        assert_eq!(newest_using(&inst, &["a.ESP".into(), "Other.esp".into()]).unwrap(), Some(("x.ess".into(), vec!["A.esp".to_string()])));
+        assert_eq!(newest_using(&inst, &["Other.esp".into()]).unwrap(), None);
 
         // With its own saves, the profile has a folder of its own.
         crate::ops::set_profile_options(&inst, None, Some(true)).unwrap();

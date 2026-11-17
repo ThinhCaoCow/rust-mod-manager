@@ -68,7 +68,7 @@ Keep the instance on the same drive as the game so deploys use hard links rather
 How deploys behave:
 - **Overwrite.** Files a tool or the game replaces in the game folder are copied to the instance's `overwrite/` folder, which is deployed above every mod, so they are never lost.
 - **When rmm refuses.** It won't deploy while the game is running, or into a game folder that Vortex still manages.
-- **Tool runs.** `rmm run` deploys, runs the tool, then captures what it wrote into a generated mod: its `{output}` folder plus new or changed Data files. That mod replaces the tool's previous output. Files a tool rewrites in place (its `rewrites`) are swapped from hard links to copies first, so your installed mods aren't changed through the link. Pandora and PGPatcher get their paths written into their JSON settings, and keep their mod list or plugin between runs. New plugins are sorted with LOOT if you already sort with it.
+- **Tool runs.** `rmm run` deploys, runs the tool, then captures what it wrote into a generated mod: its `{output}` folder plus new or changed Data files. That mod replaces the tool's previous output. Files a tool rewrites in place (its `rewrites`) are swapped from hard links to copies first, so your installed mods aren't changed through the link. Pandora and PGPatcher get their paths written into their JSON settings, and keep their mod list or plugin between runs. If you already sort with LOOT, new plugins are placed where LOOT would put them; every other plugin keeps its place.
 - **Lost manifest.** If `deploy.json` is lost, `rmm purge --apply` still finds rmm's hard links by file identity.
 
 ## Settings
@@ -90,7 +90,7 @@ rmm downloads --folder E:\Downloads\Skyrim   # this instance's downloads folder 
 | `launch.script_extender`, `launch.args` | on, none | Start through SKSE/F4SE when it's there; arguments for the game |
 | `install.enable` | on | Mods installed in the window start enabled |
 | `history.limit` | 200 | Undo steps kept per profile |
-| `loot.refresh_hours`, `loot.language`, `loot.show_info`, `loot.sort_after_tools` | 24, `en`, off, on | Masterlist age, message language, LOOT's notes, sorting after tool runs |
+| `loot.refresh_hours`, `loot.language`, `loot.show_info`, `loot.sort_after_tools` | 24, `en`, off, on | Masterlist age, message language, LOOT's notes, placing a tool's new plugins |
 | `health.hidden`, `health.ba2_limit` | none, 0 | Kinds of problems not reported; Fallout 4's BA2 limit (0 works it out, 256, 1024) |
 | `test.window`, `test.dwell`, `test.timeout`, `test.screenshots`, `test.keep_runs` | 960x540, 10, 180, on, 0 | Test run defaults; screenshots of the last N runs kept (0: all) |
 | `nexus.recheck_days`, `nexus.check_on_start` | 30, off | When to ask Nexus about a mod again; check for updates when the window opens |
@@ -110,7 +110,7 @@ The mod list with drag and drop and conflict markers (select a mod to see who it
 
 It also renames and reinstalls mods, keeps notes, categories and row colours, locks plugins, edits LOOT rules, runs tools, reads crash and Papyrus logs, restores history, purges, imports from MO2 and Vortex, writes and applies lockfiles, installs from Nexus and checks for updates, manages add-ons, and can let AI clients in over HTTP ("AI access").
 
-Built for long lists: only the rows on screen are drawn, separators group mods and collapse, and filters (enabled, conflicted, overridden, broken rule, missing masters, recently installed and more) show "x of y mods". Select several rows with Shift or Ctrl, then use Space (enable or disable), Delete, Ctrl+Up/Down, F2 (rename a separator), Ctrl+A, Ctrl+F, or "Move to" (top, bottom, a group, after a mod, past every conflict). The window reloads when the CLI or an AI changes the instance. It is plain HTML and JavaScript in `crates/rmm-app/ui/`, with no build step; every action is one call into rmm-core (`crates/rmm-app/src/main.rs`).
+Built for long lists: only the rows on screen are drawn, separators group mods and collapse, and filters (enabled, conflicted, overridden, broken rule, missing masters, recently installed and more) show "x of y mods". Select several rows with Shift or Ctrl, then use Space (enable or disable), Delete, Ctrl+Up/Down, F2 (rename), Ctrl+A, Ctrl+F, or "Move to" (top, bottom, a group, after a mod, past every conflict). The window reloads when the CLI or an AI changes the instance. It is plain HTML and JavaScript in `crates/rmm-app/ui/`, with no build step; every action is one call into rmm-core (`crates/rmm-app/src/main.rs`).
 
 ## AI (MCP)
 

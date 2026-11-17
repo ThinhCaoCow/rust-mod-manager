@@ -11,6 +11,7 @@ pub type Seen = Arc<Mutex<Vec<(String, HashMap<String, String>, Value)>>>;
 
 /// Answers each POST with the next reply, and keeps what was sent.
 pub fn fake_provider(replies: Vec<Value>) -> (String, Seen) {
+    isolate();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen: Seen = Default::default();
@@ -60,6 +61,7 @@ impl Ui for Screen {
 
 /// A Skyrim SE instance with one mod, Snow.
 pub fn instance(tmp: &std::path::Path) -> std::path::PathBuf {
+    isolate();
     let game = tmp.join("game");
     std::fs::create_dir_all(game.join("Data")).unwrap();
     std::fs::write(game.join("SkyrimSE.exe"), "exe").unwrap();
@@ -68,4 +70,17 @@ pub fn instance(tmp: &std::path::Path) -> std::path::PathBuf {
     let inst = Instance::create(&tmp.join("inst"), Game::SkyrimSe, &game, &tmp.join("local")).unwrap();
     rmm_core::install::install(&inst, &tmp.join("src/Snow"), None, true, None).unwrap();
     inst.root
+}
+
+/// Settings and keys from an empty folder, never the user's: their Settings tab changes what rmm
+/// reports (hidden problem kinds, LOOT's notes, deploy method).
+pub fn isolate() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // Before any test reads the environment: each one calls this first. A test that sets its own
+    // folder keeps it.
+    ONCE.call_once(|| {
+        if std::env::var_os("RMM_CONFIG_DIR").is_none() {
+            unsafe { std::env::set_var("RMM_CONFIG_DIR", std::env::temp_dir().join(format!("rmm-test-config-{}", std::process::id()))) };
+        }
+    });
 }

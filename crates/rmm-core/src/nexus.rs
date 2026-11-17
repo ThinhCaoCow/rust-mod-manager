@@ -544,7 +544,7 @@ fn download_info(inst: &Instance, client: &Client, link: &NxmLink) -> Result<(Pa
     }
     if link.key.is_none() && client.validate()?["is_premium"] != true {
         bail!(
-            "only Premium accounts can download without the website: open https://www.nexusmods.com/{domain}/mods/{}?tab=files and click \"Mod manager download\" on the file (with rmm set to open Nexus links), or paste that button's nxm:// link",
+            "free Nexus accounts download through the website: on the mod's Files tab (https://www.nexusmods.com/{domain}/mods/{}?tab=files), click \"Mod manager download\" on the file you want. With rmm set to open Nexus links it installs here; you can also paste that button's nxm:// link",
             link.mod_id
         );
     }
@@ -688,6 +688,20 @@ pub fn register_handler(rmm_exe: &Path, instance: &Path) -> Result<String> {
             bail!("wrote {}, but xdg-mime couldn't make it the nxm handler", apps.join("rmm-nxm.desktop").display());
         }
         Ok(format!("x-scheme-handler/nxm -> rmm-nxm.desktop ({exec})"))
+    }
+}
+
+/// The command Windows runs for nxm:// links, when a program has them (read only; Windows only).
+pub fn handler_command() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use winreg::RegKey;
+        use winreg::enums::HKEY_CLASSES_ROOT;
+        RegKey::predef(HKEY_CLASSES_ROOT).open_subkey(r"nxm\shell\open\command").ok()?.get_value("").ok()
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 

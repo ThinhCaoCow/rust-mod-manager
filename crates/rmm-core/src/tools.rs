@@ -392,7 +392,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
     r.log = Some(log);
 
     let after = snapshot(game)?;
-    let mut added_plugins = false;
+    let mut added_plugins: Vec<String> = vec![];
     let new_id = unique_id(inst, &sanitize(&output_mod));
     let dest = inst.mod_dir(&new_id);
     fs::rename(&staging, &dest)?;
@@ -464,7 +464,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), ..Default::default() })?;
         let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect();
         let known = inst.profile()?.plugins;
-        added_plugins = plugins.iter().any(|pl| !known.iter().any(|e| e.name.eq_ignore_ascii_case(pl)));
+        added_plugins = plugins.iter().filter(|pl| !known.iter().any(|e| e.name.eq_ignore_ascii_case(pl))).cloned().collect();
         inst.edit(&format!("run {id}"), |p| {
             let entry = ModEntry { id: new_id.clone(), enabled: true };
             match previous.as_ref().and_then(|old| p.mods.iter().position(|m| m.id == old.id)) {
@@ -486,17 +486,18 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         r.mod_id = Some(new_id);
     }
     r.deploy = Some(deploy::deploy(inst, false)?);
-    // New plugins land at the end of the list. Sort them in if the user sorts with LOOT already;
-    // the first sort, with its download, stays the user's call.
-    if added_plugins && crate::settings::get().loot.sort_after_tools && inst.root.join("loot").join("masterlist.yaml").is_file() {
-        match crate::loot::sort(inst, false) {
+    // New plugins land at the end of the list. Place them where LOOT would if the user sorts with
+    // LOOT already, leaving every other plugin alone; the first sort, with its download, stays the
+    // user's call.
+    if !added_plugins.is_empty() && crate::settings::get().loot.sort_after_tools && inst.root.join("loot").join("masterlist.yaml").is_file() {
+        match crate::loot::place(inst, &added_plugins) {
             Ok(s) => {
                 if !s.moved.is_empty() {
                     crate::plugins::write_plugins_txt(inst, &inst.profile()?)?;
                 }
                 r.sort = Some(s);
             }
-            Err(e) => r.warnings.push(format!("LOOT couldn't sort the new plugins: {e:#}")),
+            Err(e) => r.warnings.push(format!("LOOT couldn't place the new plugins: {e:#}")),
         }
     }
     for v in [&mut r.new, &mut r.changed, &mut r.deleted] {

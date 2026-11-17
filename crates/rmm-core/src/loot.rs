@@ -141,6 +141,37 @@ fn load<'a>(game: &mut libloot::Game, infos: &'a [PluginInfo], warnings: &mut Ve
     Ok(usable)
 }
 
+/// Put only the `new` plugins where LOOT's sort would, each right after the nearest plugin LOOT puts
+/// before it; every other plugin keeps the user's order. Saved to the profile (undoable).
+pub fn place(inst: &Instance, new: &[String]) -> Result<SortReport> {
+    let mut r = sort(inst, true)?;
+    let mut moved = vec![];
+    inst.edit("place new plugins (LOOT)", |p| {
+        let before = p.plugins.clone();
+        p.plugins = placed(&before, &r.order, new);
+        let at = |list: &[PluginEntry], n: &str| list.iter().position(|e| e.name.eq_ignore_ascii_case(n));
+        moved = new.iter().filter_map(|n| Some(Moved { name: n.clone(), from: at(&before, n)?, to: at(&p.plugins, n)? })).filter(|m| m.from != m.to).collect();
+        Ok(())
+    })?;
+    r.order = inst.profile()?.plugins.into_iter().map(|e| e.name).collect();
+    (r.dry_run, r.moved) = (false, moved);
+    Ok(r)
+}
+
+fn placed(plugins: &[PluginEntry], loot: &[String], new: &[String]) -> Vec<PluginEntry> {
+    let is_new = |n: &str| new.iter().any(|x| x.eq_ignore_ascii_case(n));
+    let mut out: Vec<PluginEntry> = plugins.iter().filter(|e| !is_new(&e.name)).cloned().collect();
+    for (i, name) in loot.iter().enumerate().filter(|(_, n)| is_new(n)) {
+        let Some(e) = plugins.iter().find(|e| e.name.eq_ignore_ascii_case(name)) else { continue };
+        let at = loot[..i].iter().rev().find_map(|b| out.iter().position(|x| x.name.eq_ignore_ascii_case(b))).map_or(0, |j| j + 1);
+        out.insert(at, e.clone());
+    }
+    // New plugins LOOT didn't see stay where they were, at the end.
+    let unseen: Vec<PluginEntry> = plugins.iter().filter(|e| is_new(&e.name) && !loot.iter().any(|n| n.eq_ignore_ascii_case(&e.name))).cloned().collect();
+    out.extend(unseen);
+    out
+}
+
 /// Sort plugins with LOOT. A dry run returns the new order and what moves; otherwise the order
 /// is saved to the profile (undoable) and reaches plugins.txt on the next deploy.
 pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
@@ -318,4 +349,23 @@ pub fn set_rule(inst: &Instance, rule: &Rule) -> Result<Option<Rule>> {
     opts.set_truncate(true);
     db.write_user_metadata(&dir(inst).join("userlist.yaml"), &opts)?;
     Ok(old.as_ref().map(rule_of))
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::*;
+
+    #[test]
+    fn only_new_plugins_move() {
+        let e = |n: &str| PluginEntry { name: n.into(), enabled: true };
+        let names = |v: Vec<PluginEntry>| v.into_iter().map(|e| e.name).collect::<Vec<_>>();
+        // The user keeps C before A on purpose; LOOT would swap them and puts New after A.
+        let mine = vec![e("C.esp"), e("A.esp"), e("B.esp"), e("New.esp")];
+        let loot: Vec<String> = ["A.esp", "New.esp", "B.esp", "C.esp"].map(String::from).to_vec();
+        assert_eq!(names(placed(&mine, &loot, &["new.esp".into()])), ["C.esp", "A.esp", "New.esp", "B.esp"]);
+        // First in LOOT's order: to the top. Unseen by LOOT: left at the end.
+        let loot: Vec<String> = ["New.esp", "A.esp", "B.esp", "C.esp"].map(String::from).to_vec();
+        assert_eq!(names(placed(&mine, &loot, &["New.esp".into()])), ["New.esp", "C.esp", "A.esp", "B.esp"]);
+        assert_eq!(names(placed(&mine, &loot[1..], &["New.esp".into()])), ["C.esp", "A.esp", "B.esp", "New.esp"]);
+    }
 }

@@ -225,7 +225,7 @@ static SCRIPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\]\.([A-Za-z0-9_:
 
 /// Summarise `Logs/Script/Papyrus.0.log`: errors grouped by message, scripts by mod, and the tail.
 pub fn read_papyrus_log(inst: &Instance, tail: usize) -> Result<PapyrusReport> {
-    let dir = inst.ini_dir().context("can't tell where the game's My Games folder is; set ini_path in instance.toml")?;
+    let dir = inst.ini_dir().context("can't find your Documents folder, where the game keeps its logs")?;
     let get = |key: &str| {
         let read = |name: &str| inst.ini_file(name).and_then(|p| fs::read_to_string(p).ok()).unwrap_or_default();
         let (custom, base) = (read(&inst.config.game.ini_name().replace(".ini", "Custom.ini")), read(inst.config.game.ini_name()));

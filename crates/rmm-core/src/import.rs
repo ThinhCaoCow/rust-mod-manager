@@ -39,6 +39,7 @@ struct Incoming {
     id: String,
     enabled: bool,
     from: Option<(PathBuf, ModMeta, bool)>, // folder, metadata, everything belongs in root/
+    color: Option<String>,
 }
 
 /// MO2 instances and Vortex state backups found in their usual places.
@@ -78,7 +79,7 @@ pub fn find_sources() -> Sources {
 
 /// Import an MO2 instance's profile (default: the one MO2 has selected) into the active profile.
 pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: bool) -> Result<ImportReport> {
-    let ini = qt_ini(&fs::read_to_string(dir.join("ModOrganizer.ini")).with_context(|| format!("{} has no ModOrganizer.ini; pass the MO2 instance folder", dir.display()))?);
+    let ini = mo2_ini(dir)?;
     let get = |s: &str, k: &str| ini.get(s).and_then(|m| m.get(k)).filter(|v| !v.is_empty()).cloned();
     let game = match get("General", "gameName").as_deref() {
         Some("Skyrim Special Edition") => Game::SkyrimSe,
@@ -88,10 +89,7 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
     if game != inst.config.game {
         bail!("this MO2 instance is for {game:?}, the rmm instance for {:?}", inst.config.game);
     }
-    let base = get("Settings", "base_directory").map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf());
-    let sub = |key: &str, default: &str| {
-        get("Settings", key).map(|v| PathBuf::from(v.replace("%BASE_DIR%", &base.to_string_lossy()))).unwrap_or_else(|| base.join(default))
-    };
+    let sub = |key: &str, default: &str| mo2_dir(&ini, dir, key, default);
     let (mods_dir, overwrite_dir, downloads) = (sub("mod_directory", "mods"), sub("overwrite_directory", "overwrite"), sub("download_directory", "downloads"));
     let name = profile.map(str::to_owned).or_else(|| get("General", "selected_profile")).context("no profile given, and ModOrganizer.ini has none selected")?;
     let pdir = sub("profiles_directory", "profiles").join(&name);
@@ -136,7 +134,8 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
     let mut incoming = Vec::new();
     for (n, enabled) in listed {
         if let Some(sep) = n.strip_suffix("_separator") {
-            incoming.push(Incoming { id: format!("sep:{}", sanitize(sep)), enabled: false, from: None });
+            let color = mo2_color(&fs::read_to_string(mods_dir.join(&n).join("meta.ini")).unwrap_or_default());
+            incoming.push(Incoming { id: format!("sep:{}", sanitize(sep)), enabled: false, from: None, color });
             continue;
         }
         if n.trim_end_matches(|c: char| c.is_ascii_digit()).to_lowercase().ends_with("backup") {
@@ -147,8 +146,8 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
             r.warnings.push(format!("{n}: listed in modlist.txt, but its folder is missing"));
             continue;
         }
-        let meta = mo2_meta(&folder, &n, &downloads, &categories);
-        incoming.push(Incoming { id: sanitize(&n), enabled, from: Some((folder, meta, false)) });
+        let (meta, color) = mo2_meta(&folder, &n, &downloads, &categories);
+        incoming.push(Incoming { id: sanitize(&n), enabled, from: Some((folder, meta, false)), color });
     }
 
     let plugins = plugin_lists(&pdir.join("plugins.txt"), &pdir.join("loadorder.txt"));
@@ -170,17 +169,46 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
     Ok(r)
 }
 
-fn mo2_meta(folder: &Path, name: &str, downloads: &Path, categories: &HashMap<i64, String>) -> ModMeta {
-    let ini = qt_ini(&fs::read_to_string(folder.join("meta.ini")).unwrap_or_default());
+fn mo2_ini(dir: &Path) -> Result<HashMap<String, HashMap<String, String>>> {
+    Ok(qt_ini(&fs::read_to_string(dir.join("ModOrganizer.ini")).with_context(|| format!("{} has no ModOrganizer.ini; pass the MO2 instance folder", dir.display()))?))
+}
+
+/// A folder ModOrganizer.ini sets (`%BASE_DIR%` filled in), or its default in the base folder.
+fn mo2_dir(ini: &HashMap<String, HashMap<String, String>>, dir: &Path, key: &str, default: &str) -> PathBuf {
+    let get = |k: &str| ini.get("Settings").and_then(|m| m.get(k)).filter(|v| !v.is_empty());
+    let base = get("base_directory").map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf());
+    get(key).map(|v| PathBuf::from(v.replace("%BASE_DIR%", &base.to_string_lossy()))).unwrap_or_else(|| base.join(default))
+}
+
+/// The MO2 instance's profiles (folders with a modlist.txt), the selected one first.
+pub fn mo2_profiles(dir: &Path) -> Result<Vec<String>> {
+    let ini = mo2_ini(dir)?;
+    let selected = ini.get("General").and_then(|m| m.get("selected_profile")).cloned().unwrap_or_default();
+    let mut names: Vec<String> = fs::read_dir(mo2_dir(&ini, dir, "profiles_directory", "profiles"))?
+        .flatten()
+        .filter(|e| e.path().join("modlist.txt").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort_by_key(|n| (*n != selected, n.to_lowercase()));
+    Ok(names)
+}
+
+/// A mod's metadata and colour from its meta.ini.
+fn mo2_meta(folder: &Path, name: &str, downloads: &Path, categories: &HashMap<i64, String>) -> (ModMeta, Option<String>) {
+    let text = fs::read_to_string(folder.join("meta.ini")).unwrap_or_default();
+    let ini = qt_ini(&text);
     let general = ini.get("General");
     let get = |k: &str| general.and_then(|m| m.get(k)).filter(|v| !v.is_empty()).cloned();
     let file_id = ini.get("installedFiles").and_then(|m| m.iter().find(|(k, _)| k.ends_with("fileid")).and_then(|(_, v)| v.parse().ok()));
     // `category="3,12,"`: MO2 category ids, -1 or 0 for none.
     let cats: Vec<String> = get("category").unwrap_or_default().split(',').filter_map(|c| categories.get(&c.trim().parse().ok()?).cloned()).collect();
-    ModMeta {
+    // MO2 has a one-line comment and notes (HTML from its editor); rmm keeps both as the note.
+    let notes = raw_value(&text, "notes").map(|v| html_text(&qt_unescape(v).into_iter().filter_map(char::from_u32).collect::<String>()));
+    let notes: Vec<String> = [get("comments"), notes].into_iter().flatten().filter(|n| !n.is_empty()).collect();
+    let meta = ModMeta {
         name: name.into(),
         source: get("installationFile").map(|f| if Path::new(&f).is_absolute() { f } else { downloads.join(f).display().to_string() }),
-        notes: get("comments"),
+        notes: (!notes.is_empty()).then(|| notes.join("\n\n")),
         categories: (!cats.is_empty()).then_some(cats),
         nexus: get("modid").and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0).map(|mod_id| NexusRef {
             mod_id,
@@ -189,7 +217,77 @@ fn mo2_meta(folder: &Path, name: &str, downloads: &Path, categories: &HashMap<i6
             category: get("nexusCategory").and_then(|c| c.parse().ok()).filter(|&c: &u64| c > 0),
         }),
         ..Default::default()
+    };
+    (meta, mo2_color(&text))
+}
+
+/// A key's value as a Qt INI has it (still escaped), without its quotes.
+fn raw_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let v = text.lines().find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))?.trim();
+    Some(v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v))
+}
+
+/// Undo Qt's INI escaping (`\0`, `\x43`, `\n`, `\"`) into character codes.
+fn qt_unescape(s: &str) -> Vec<u32> {
+    let c: Vec<char> = s.chars().collect();
+    let (mut out, mut i) = (Vec::new(), 0);
+    while i < c.len() {
+        let ch = c[i];
+        i += 1;
+        if ch != '\\' || i == c.len() {
+            out.push(ch as u32);
+            continue;
+        }
+        let radix = match c[i] {
+            'x' => 16,
+            '0'..='7' => 8,
+            e => {
+                i += 1;
+                out.push(match e { 'a' => 7, 'b' => 8, 'f' => 12, 'n' => 10, 'r' => 13, 't' => 9, 'v' => 11, e => e as u32 });
+                continue;
+            }
+        };
+        i += usize::from(radix == 16);
+        let mut v = 0u32;
+        while let Some(d) = c.get(i).and_then(|ch| ch.to_digit(radix)) {
+            v = v.saturating_mul(radix).saturating_add(d);
+            i += 1;
+        }
+        out.push(v);
     }
+    out
+}
+
+/// MO2's `color=@Variant(…)`: a QColor as Qt streams it (type 0x43, then spec, alpha, red, green
+/// and blue as big-endian u16), INI-escaped. `#rrggbb` for an RGB colour (spec 1); MO2 writes
+/// spec 0 for none.
+fn mo2_color(meta_ini: &str) -> Option<String> {
+    let b = qt_unescape(raw_value(meta_ini, "color")?.strip_prefix("@Variant(")?.strip_suffix(')')?);
+    (b.len() >= 13 && b[..5] == [0, 0, 0, 0x43, 1]).then(|| format!("#{:02x}{:02x}{:02x}", b[7] & 0xff, b[9] & 0xff, b[11] & 0xff))
+}
+
+/// The text of QTextEdit's HTML (MO2's notes): paragraphs and line breaks as new lines.
+fn html_text(s: &str) -> String {
+    let Some(body) = s.find("<body").and_then(|i| s[i..].find('>').map(|j| &s[i + j + 1..])) else { return s.trim().to_string() };
+    let body = body.split("</body>").next().unwrap_or(body);
+    let (mut out, mut tag) = (String::new(), None::<String>);
+    for ch in body.chars() {
+        match (&mut tag, ch) {
+            (None, '<') => tag = Some(String::new()),
+            (None, '\n') => {} // markup, not text
+            (None, c) => out.push(c),
+            (Some(t), '>') => {
+                let t = t.to_lowercase();
+                if t.starts_with("br") || t == "/p" {
+                    out.push('\n');
+                }
+                tag = None;
+            }
+            (Some(t), c) => t.push(c),
+        }
+    }
+    let out = out.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ").replace("&amp;", "&");
+    out.trim().to_string()
 }
 
 /// A Qt `QSettings` INI: section -> key -> value. `@ByteArray(…)` is unwrapped and `\\` in
@@ -335,7 +433,7 @@ pub fn import_vortex(inst: &Instance, backup: &Path, staging: Option<&Path>, pro
         let root = matches!(m["type"].as_str(), Some("dinput" | "enb"));
         let enabled = prof["modState"][vid.as_str()]["enabled"].as_bool().unwrap_or(false);
         ids.insert(vid.as_str(), id.clone());
-        incoming.push(Incoming { id, enabled, from: Some((folder, meta, root)) });
+        incoming.push(Incoming { id, enabled, from: Some((folder, meta, root)), color: None });
     }
 
     // Rules point at a mod by id, or by archive hash or logical file name.
@@ -463,6 +561,7 @@ fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<Pl
         let others: Vec<PluginEntry> = p.plugins.iter().filter(|e| !listed.contains(&e.name.to_lowercase())).cloned().collect();
         p.plugins = plugins.into_iter().chain(others).collect();
         p.locks.extend(locks);
+        p.colors.extend(incoming.iter().filter_map(|m| Some((m.id.clone(), m.color.clone()?))));
         Ok(())
     })
 }
@@ -500,4 +599,21 @@ fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> 
         }
     }
     Ok((linked, copied))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_mo2_colours_and_notes() {
+        let c = |v: &str| mo2_color(&format!("[General]\r\nmodid=1\r\ncolor={v}\r\n"));
+        assert_eq!(c(r"@Variant(\0\0\0\x43\x1\xff\xff\xff\xff\x80\x80\0\0\0\0)").as_deref(), Some("#ff8000"));
+        assert_eq!(c(r"@Variant(\0\0\0\x43\0\xff\xff\0\0\0\0\0\0\0\0)"), None, "MO2's no colour");
+        assert_eq!(c(r#""@Variant(\0\0\0\x43\x1\xff\xff==\x1\x1;;\0\0)""#).as_deref(), Some("#3d013b"), "quoted, with plain characters");
+        let html = "<html><head><style>p { a: b; }</style></head><body style=\"x\">\n<p>One &amp; <b>two</b><br />three</p>\n<p>four</p></body></html>";
+        assert_eq!(html_text(html), "One & two\nthree\nfour");
+        assert_eq!(html_text(" plain\ntext "), "plain\ntext");
+        assert_eq!(qt_unescape(r#"a\n\"b\\"#), "a\n\"b\\".chars().map(|c| c as u32).collect::<Vec<_>>());
+    }
 }

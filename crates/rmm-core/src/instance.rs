@@ -541,6 +541,14 @@ impl Instance {
             .collect()
     }
 
+    /// Add a mod to the end of the list without an undo step of its own (for a step that takes it
+    /// off again at once, so undoing that brings it back).
+    pub(crate) fn list_quietly(&self, id: &str) -> Result<()> {
+        let mut p = self.profile()?;
+        p.mods.push(ModEntry { id: id.into(), enabled: true });
+        write_atomic(&self.profile_file(), &toml::to_string_pretty(&p)?)
+    }
+
     /// Move a mod folder to trash/ so an undo can bring it back.
     pub fn trash_mod(&self, id: &str) -> Result<()> {
         let dest = self.root.join("trash").join(id);
