@@ -1,15 +1,22 @@
 //! MCP server: the same operations as the CLI, as tools an AI can call.
 //! Every mutation lands in undo history; game-folder writes default to dry runs.
+use crate::agent::{self, Event};
 use rmcp::{
-    ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerConfig},
+    ErrorData, Peer, RoleServer, ServerHandler, ServiceExt,
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        tool::ToolCallContext,
+        wrapper::Parameters,
+    },
+    model::{CallToolRequestParams, CallToolResponse, Implementation, PromptMessage, Role, ServerCapabilities, ServerConfig},
+    prompt, prompt_handler, prompt_router,
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
 use rmm_core::fomod::Choices;
 use rmm_core::tools::ToolSpec;
-use rmm_core::{Instance, addons, conflicts, deploy, harness, health, import, install, lockfile, logs, loot, nexus, ops, plugins, rules, tools};
+use rmm_core::{Instance, addons, conflicts, deploy, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, workspace};
 use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -32,8 +39,20 @@ Separators (add_separator) are headings in the mod list with ids starting \"sep:
 move_mods moves a separator and the mods under it when you list them all.
 Mod rules (set_mod_rule: a mod loads after, requires, or is incompatible with other mods) are suggestions: health_check reports broken ones and sort_mods reorders the list to satisfy the load-after rules. set_mod_rule replaces the whole rule, so pass every list.
 Profiles: each has its own enabled mods, mod order, plugin order and undo history. switch_profile changes the active one and previews the deploy that applies it; deploy to apply.
+Files: list_files, read_file and edit_file work on mod files, overwrite/ and the game's INIs by workspace path \
+(mods/<mod id>/..., overwrite/..., ini/<file>); every edit keeps the old file (file_edits, revert_edit).
+Chats: list_chats and read_chat show the saved chats, rmm's own AI's and those of AI apps connected over MCP. \
+An app connected over MCP (not rmm's own AI) has its tool calls kept as a chat, but not the conversation: \
+call save_chat_note when a task ends with what the user asked for, what you did and decided, and what's left.
 Every change can be reverted with undo; history lists them. Prefer small reversible steps and \
-re-run health_check after changes.";
+re-run health_check after changes.
+Mod team (prompts find_mods, install_safely, test_mods and mod_team): search_nexus and nexus_mod_info find mods; \
+scan_mod, read_mod_file and save_review check a mod once (mod_reviews has the saved reviews, current while the files \
+are unchanged); plugin_records gives the ids the console takes; test_session_start, test_session_step and \
+test_session_stop play the game step by step in a small window behind the user's.
+The team: the user gives each role (lead, researcher, installer, tester) to one of rmm's AI providers or to you, \
+the AI app connected over MCP, in rmm's Settings. team_tasks shows who does what and the steps handed over: \
+ask_teammate gives a step to a role on a provider, and a task waiting for you is yours to do and finish_team_task.";
 
 #[derive(Clone)]
 pub struct Rmm {
@@ -41,7 +60,12 @@ pub struct Rmm {
     /// Background tool runs by tool id. In memory only; a finished run's report is also in
     /// tools/<id>/last-run.json.
     jobs: Arc<Mutex<BTreeMap<String, Job>>>,
+    /// The live test (test_session_*); dropping it closes the game.
+    session: Arc<Mutex<Option<harness::Session>>>,
+    /// Some when the client's calls are kept as a chat (an AI app's session; see `recorded`).
+    log: Option<Arc<Mutex<Option<agent::Chat>>>>,
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 #[derive(Clone, Serialize)]
@@ -88,7 +112,7 @@ struct DetailsArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct InstallArgs {
-    /// Path to a mod folder, .zip or .7z on this machine.
+    /// Path to a mod folder, .zip, .7z or .rar on this machine.
     path: String,
     /// Display name (defaults to the file name).
     name: Option<String>,
@@ -103,7 +127,7 @@ struct InstallArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct FomodArgs {
-    /// Path to a mod folder, .zip or .7z on this machine.
+    /// Path to a mod folder, .zip, .7z or .rar on this machine.
     path: String,
     /// Choices to preview; steps and groups left out take their defaults.
     choices: Option<Choices>,
@@ -183,8 +207,9 @@ struct UpdatesArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct NexusInstallArgs {
-    /// An nxm:// link from the website's "Mod manager download" button. Or give mod_id and
-    /// file_id, which only Premium accounts can download.
+    /// An nxm:// link from the website's "Mod manager download" button, or a mod page link
+    /// (nexusmods.com/<game>/mods/<id>). Or give mod_id, and file_id unless the newest main file
+    /// will do. All but nxm links download only with Premium.
     link: Option<String>,
     mod_id: Option<u64>,
     file_id: Option<u64>,
@@ -234,10 +259,143 @@ struct ConflictArgs {
     id: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct SaveArgs {
+    /// The save's file name, as list_saves gives it.
+    file: String,
+}
+#[derive(Deserialize, JsonSchema)]
 struct NoteArgs {
     id: String,
     /// The notes; "" clears them.
     note: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct NexusModArgs {
+    /// The mod's id on Nexus (search_nexus's mod_id, the number in its page's address).
+    mod_id: u64,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ReviewArgs {
+    /// Mod id.
+    id: String,
+    /// "clean", "suspicious" or "malicious".
+    verdict: String,
+    /// What the mod does and how, what you checked (scan, DLLs, scripts), and what it costs.
+    notes: String,
+    /// Where it belongs in the order and why: what it loads after or before, patches it needs.
+    load_order: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ReviewsArgs {
+    /// A mod id; omit for every reviewed mod.
+    id: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct RecordsArgs {
+    /// Plugin file name, such as "Frostfall.esp".
+    plugin: String,
+    /// Record types (four letters: QUST, NPC_, WEAP, ARMO, SPEL, CELL, GLOB...); default: the
+    /// ones tests reach through the console.
+    kinds: Option<Vec<String>>,
+    /// At most this many records (default 300).
+    max: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct SessionStartArgs {
+    /// Default true: show the launch plan instead of starting the game.
+    dry_run: Option<bool>,
+    #[serde(flatten)]
+    scenario: harness::Scenario,
+}
+#[derive(Deserialize, JsonSchema)]
+struct SessionStepArgs {
+    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}.
+    steps: Vec<harness::Step>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ScanArgs {
+    /// A mod id: scan it with Windows Defender too. Leave out to triage every mod (no Defender).
+    id: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ReadFileArgs {
+    /// Mod id.
+    id: String,
+    /// The file's path inside the mod, as mod_details lists it (scripts/foo.pex).
+    path: String,
+    /// First line to return (0-based) for text and scripts. Default 0.
+    offset: Option<usize>,
+    /// Lines to return. Default 400.
+    limit: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ListFilesArgs {
+    /// A folder's workspace path: mods, mods/<mod id>/<folder>, overwrite/<folder>, or ini. Empty lists the roots.
+    #[serde(default)]
+    path: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct WorkspaceReadArgs {
+    /// mods/<mod id>/<path in the mod>, overwrite/<path>, or ini/<file>.
+    path: String,
+    /// First line to return (0-based). Default 0.
+    offset: Option<usize>,
+    /// Lines to return. Default 400.
+    limit: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct EditFileArgs {
+    /// mods/<mod id>/<path in the mod>, overwrite/<path>, or ini/<file>.
+    path: String,
+    /// Text to replace: exact, with enough lines around it to be found once. Leave out to write the whole file.
+    old: Option<String>,
+    /// The replacement for `old`, or the whole file.
+    new: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct TeammateArgs {
+    /// researcher, installer or tester.
+    role: String,
+    /// What to do, with everything the teammate needs to know.
+    task: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct FinishTaskArgs {
+    /// The task's number, from team_tasks.
+    n: usize,
+    /// Your report: what you did and found.
+    answer: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ChatNoteArgs {
+    /// A few lines: what the user asked for, what you did and decided, and what's left.
+    text: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ChatIdArgs {
+    /// The chat's id, from list_chats.
+    id: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct RevertEditArgs {
+    /// The edit's number, from file_edits.
+    n: usize,
+}
+#[derive(Deserialize, JsonSchema)]
+struct PluginConflictArgs {
+    /// Only the pairs with this plugin.
+    plugin: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CategoryArgs {
+    /// Mod ids.
+    ids: Vec<String>,
+    /// Categories to add (any text; list_mods shows the ones in use).
+    #[serde(default)]
+    add: Vec<String>,
+    /// Categories to remove (case doesn't matter). To replace a mod's categories, remove its current ones.
+    #[serde(default)]
+    remove: Vec<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct ColorArgs {
@@ -344,22 +502,22 @@ impl Rmm {
         if dry_run { self.inst() } else { self.inst_mut() }
     }
 
-    #[tool(description = "Game, paths, profile and mod counts for this instance.")]
+    #[tool(description = "Game, paths, profile and mod counts for this instance.", annotations(read_only_hint = true))]
     async fn instance_info(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| ops::instance_info(&i)))
     }
 
-    #[tool(description = "All mods in priority order (later wins conflicts) with enabled state, file and plugin counts.")]
+    #[tool(description = "All mods in priority order (later wins conflicts) with enabled state, file and plugin counts.", annotations(read_only_hint = true))]
     async fn list_mods(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| ops::list_mods(&i)))
     }
 
-    #[tool(description = "One mod: metadata, files and its conflicts.")]
+    #[tool(description = "One mod: metadata, files and its conflicts.", annotations(read_only_hint = true))]
     async fn mod_details(&self, Parameters(a): Parameters<DetailsArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| ops::mod_details(&i, &a.id, a.max_files.unwrap_or(200))))
     }
 
-    #[tool(description = "Conflicts between enabled mods: loose files (higher priority wins) and files inside loaded BSA/BA2 archives (the archive whose plugin loads later wins; any loose file beats every archive). Who overwrites whom, and mods that are fully overridden. With a mod id: each file it shares, every mod providing it in load order (with the archive for archived files) and the winner.")]
+    #[tool(description = "Conflicts between enabled mods: loose files (higher priority wins) and files inside loaded BSA/BA2 archives (the archive whose plugin loads later wins; any loose file beats every archive). Who overwrites whom, and mods that are fully overridden. With a mod id: each file it shares, every mod providing it in load order (with the archive for archived files) and the winner.", annotations(read_only_hint = true))]
     async fn list_conflicts(&self, Parameters(a): Parameters<ConflictArgs>) -> Result<String, String> {
         match a.id {
             Some(id) => out(self.inst().and_then(|i| conflicts::file_conflicts(&i, &i.profile()?, &id))),
@@ -367,22 +525,161 @@ impl Rmm {
         }
     }
 
-    #[tool(description = "Plugins in load order with master/light flags, masters and missing masters.")]
+    #[tool(description = "One folder of the Data folder as the game sees it after a deploy: its subfolders (with file counts), then each file with the mods providing it in load order (the last wins; none means the game's own file). `find` searches every folder instead (first 1000 paths); `conflicts_only` keeps files more than one mod provides; `archives` adds files inside loaded BSA/BA2 archives.", annotations(read_only_hint = true))]
+    async fn list_data(&self, Parameters(q): Parameters<conflicts::DataQuery>) -> Result<String, String> {
+        out(self.inst().and_then(|i| conflicts::data_view(&i, &i.profile()?, &q)))
+    }
+
+    #[tool(description = "The profile's saves, newest first: character, level, location, and the plugins each save was made with that the profile doesn't load now, with the installed mod that has each one. Loading such a save loses what those plugins added.", annotations(read_only_hint = true))]
+    async fn list_saves(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| saves::list(&i)))
+    }
+
+    #[tool(description = "Enable the installed mods and plugins a save needs (those list_saves names with a mod), as one undoable change. Returns the plugins enabled. Deploy afterwards.")]
+    async fn enable_save_plugins(&self, Parameters(a): Parameters<SaveArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| saves::enable_missing(&i, &a.file)))
+    }
+
+    #[tool(description = "Archives in the instance's downloads folder (where Nexus downloads go), newest first, with the mods installed from each.", annotations(read_only_hint = true))]
+    async fn list_downloads(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| install::downloads(&i)))
+    }
+
+    #[tool(description = "Safety check of a mod's files. With an id, Windows Defender scans the mod's folder (nothing is quarantined). Every DLL and EXE is read for what its imports let it do (network, starting programs, registry writes, writing into other programs), packers, and strings such as URLs, addresses and shell commands; files that are programs posing as another type, scripts that run outside the game, and archives inside the mod are flagged too. Verdict: threat, review or clean. These are leads, not proof: read flagged files with read_mod_file, and a clean result isn't a guarantee. Without an id, every mod is triaged without Defender and only mods with native code or findings are listed.", annotations(read_only_hint = true))]
+    async fn scan_mod(&self, Parameters(a): Parameters<ScanArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| inspect::scan(&i, a.id.as_deref())))
+    }
+
+    #[tool(description = "Read a file inside a mod. Text (Papyrus sources .psc, INI, JSON, XML, FOMOD config, readmes) comes as text. Compiled Papyrus scripts (.pex, Skyrim and Fallout 4) come disassembled: the script and what it extends, variables, properties, states, and each function's instructions (calls, property reads and writes, jumps), which shows what a script does and what it costs (OnUpdate loops, short RegisterForUpdate intervals, many calls per update, polling instead of events). DLLs and EXEs come as their imports, exports, sections and notable strings. Text and scripts are paged by line (offset, limit). mod_details lists a mod's files.", annotations(read_only_hint = true))]
+    async fn read_mod_file(&self, Parameters(a): Parameters<ReadFileArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| inspect::read_file(&i, &a.id, &a.path, a.offset.unwrap_or(0), a.limit.unwrap_or(400))))
+    }
+
+    #[tool(description = "The folders and files the IDE and edit_file work on: mods/<mod id>/... (each installed mod's folder), overwrite/... (what tools and the game wrote) and ini (the INI files the game reads, in My Games). Give a folder's path; empty lists those three.", annotations(read_only_hint = true))]
+    async fn list_files(&self, Parameters(a): Parameters<ListFilesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| workspace::list(&i, &a.path)))
+    }
+
+    #[tool(description = "Read a file by its workspace path (see list_files), some lines at a time. Compiled Papyrus scripts come disassembled and DLLs as a summary; those are read-only. Read a file before edit_file changes it.", annotations(read_only_hint = true))]
+    async fn read_file(&self, Parameters(a): Parameters<WorkspaceReadArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| workspace::read(&i, &a.path)).map(|d| {
+            let lines: Vec<&str> = d.text.lines().collect();
+            let first = a.offset.unwrap_or(0).min(lines.len());
+            let text = lines.iter().skip(first).take(a.limit.unwrap_or(400)).copied().collect::<Vec<_>>().join("\n");
+            serde_json::json!({ "path": d.path, "editable": d.editable, "note": d.note, "total_lines": lines.len(), "first_line": first, "text": text })
+        }))
+    }
+
+    #[tool(description = "Change a text file: replace `old` (exact, found once in the file) with `new`, or without `old` write the whole file (making it if it's new, in a mod or overwrite/). The file's old content is kept: file_edits lists edits and revert_edit puts one back. A mod's file changes in place, so a deployed mod's change reaches the game at once; INIs apply the next time the game starts. Only text: for a compiled script, edit its .psc source. The user sees the change as a diff and approves it.")]
+    async fn edit_file(&self, Parameters(a): Parameters<EditFileArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| match &a.old {
+            Some(old) => workspace::replace(&i, &a.path, old, &a.new, "AI"),
+            None => workspace::write(&i, &a.path, &a.new, None, "AI"),
+        }))
+    }
+
+    #[tool(description = "Edits made to files (by the user in the IDE, an AI, or a revert), newest first: number, path, when, by whom, lines before and after.", annotations(read_only_hint = true))]
+    async fn file_edits(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| workspace::edits(&i)))
+    }
+
+    #[tool(description = "Put a file back as it was before edit n (from file_edits). A file the edit made is removed. The revert is an edit too, so it can be reverted.")]
+    async fn revert_edit(&self, Parameters(a): Parameters<RevertEditArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| workspace::revert(&i, a.n)))
+    }
+
+    #[tool(description = "rmm's mod team: who does each role (one of rmm's AI providers with the user's key, or \"mcp\": the AI app connected over MCP; the user picks in rmm's Settings), and the team board: steps handed to a teammate, newest first, with their answers. A task waiting for you (an AI app over MCP) is yours: do it with its role's prompt, then finish_team_task.", annotations(read_only_hint = true))]
+    async fn team_tasks(&self) -> Result<String, String> {
+        out(agent::tasks(&self.root).map(|mut t| {
+            t.reverse();
+            serde_json::json!({ "team": agent::team(), "tasks": t })
+        }))
+    }
+
+    #[tool(description = "Hand a step to a teammate the user gave to one of rmm's AI providers (team_tasks shows who): the researcher, installer or tester works on it in the background with its role's prompt, and its answer comes in team_tasks. It can read and preview but not change anything, so it reports changes for you to make. Give it all it needs: the request, the mod picked, what to test.")]
+    async fn ask_teammate(&self, peer: Peer<RoleServer>, Parameters(a): Parameters<TeammateArgs>) -> Result<String, String> {
+        let from = app_name(&peer).unwrap_or_else(|| "an AI app".into());
+        agent::start_teammate(self.root.clone(), &a.role, &a.task, &from).map_err(|e| format!("{e:#}"))
+    }
+
+    #[tool(description = "Finish a team task that waited for you (team_tasks): your report goes on the board for the lead.")]
+    async fn finish_team_task(&self, Parameters(a): Parameters<FinishTaskArgs>) -> Result<String, String> {
+        agent::finish_task(&self.root, a.n, &a.answer).map(|()| format!("Team task {} is done.", a.n)).map_err(|e| format!("{e:#}"))
+    }
+
+    #[tool(description = "Saved chats in this instance, newest first: rmm's own AI chats and the sessions of AI apps connected over MCP (provider \"mcp\", model: the app). read_chat shows one.", annotations(read_only_hint = true))]
+    async fn list_chats(&self) -> Result<String, String> {
+        out(agent::chats(&self.root))
+    }
+
+    #[tool(description = "A saved chat as text: the user's and the AI's words (for an MCP app, the notes it saved), each tool call and the start of its answer. A long chat keeps its end. Read an earlier session before carrying on from it.", annotations(read_only_hint = true))]
+    async fn read_chat(&self, Parameters(a): Parameters<ChatIdArgs>) -> Result<String, String> {
+        agent::load_chat(&self.root, &a.id).map(|c| c.transcript(40_000)).map_err(|e| format!("{e:#}"))
+    }
+
+    #[tool(description = "For AI apps connected over MCP: rmm keeps your tool calls as a chat in the instance, but not the conversation. When a task ends, save a short note to it: what the user asked for, what you did and decided, and what's left. rmm's own AI and later sessions read it with read_chat.")]
+    async fn save_chat_note(&self, peer: Peer<RoleServer>, Parameters(a): Parameters<ChatNoteArgs>) -> Result<String, String> {
+        let text = a.text.trim().to_string();
+        if text.is_empty() {
+            return Err("the note is empty".into());
+        }
+        self.session_chat(app_name(&peer), |c| {
+            // The first note names the session in the chat list.
+            if !c.log.iter().any(|e| matches!(e, Event::Text { .. })) {
+                c.title = text.lines().next().unwrap_or_default().chars().take(70).collect();
+            }
+            c.log.push(Event::Text { text });
+        })
+        .map(|id| format!("Saved to chat {id}."))
+        .ok_or_else(|| "nothing to save to: rmm's own AI keeps its chats itself, and outside an instance there are none".into())
+    }
+
+    #[tool(description = "Record conflicts between enabled plugins (what xEdit shows): each pair of plugins that change the same records, how many, which one's version the game uses (the later in load order, `wins`), and whether the later one is a patch for the earlier (has it as a master, so the override is intended). The base game, DLC and Creation Club are left out, since every mod overrides them. With plugin: only its pairs. Where a plugin should go: compare with sort_plugins (dry run, LOOT's order) and the masters in list_plugins; loose-file and archive conflicts between mods are in list_conflicts.", annotations(read_only_hint = true))]
+    async fn plugin_conflicts(&self, Parameters(a): Parameters<PluginConflictArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| plugins::record_overlaps(&i, &i.profile()?, a.plugin.as_deref())))
+    }
+
+    #[tool(description = "Search the game's mods on Nexus by words in their names and descriptions; no API key needed. Filter by Nexus category, sort (relevance, endorsements, downloads, updated, created), page with count and offset. Each result has its Nexus id, summary, category, author, endorsements, downloads, last update, page and picture, and the installed mod with that id, if any. Adult-only mods are left out unless adult is true. Search several times with different words; nexus_mod_info reads one mod's page.", annotations(read_only_hint = true))]
+    async fn search_nexus(&self, Parameters(a): Parameters<nexus::Search>) -> Result<String, String> {
+        out(self.inst().and_then(|i| nexus::search(&i, &nexus::Client::any(), &a)))
+    }
+
+    #[tool(description = "One Nexus mod's page: its description as text (compatibility notes, the patches it links), tags, version, the mods and DLC it requires (each with the installed mod, if any), and the mods that require it, which are its patches and add-ons (the first 100, and the total). No API key needed.", annotations(read_only_hint = true))]
+    async fn nexus_mod_info(&self, Parameters(a): Parameters<NexusModArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| nexus::mod_info(&i, &nexus::Client::any(), a.mod_id)))
+    }
+
+    #[tool(description = "Save a review of a mod's code with the mod: verdict (clean, suspicious or malicious), notes on what it does, what was checked and what it costs, and where it belongs in the order. Replaces its last review. scan_mod and mod_reviews show it, with current=false once the mod's files change (reinstall, update), so a mod is checked again only when it changed. Not in undo history.")]
+    async fn save_review(&self, Parameters(a): Parameters<ReviewArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| inspect::save_review(&i, &a.id, &a.verdict, &a.notes, a.load_order.as_deref().unwrap_or_default())))
+    }
+
+    #[tool(description = "Saved mod reviews: one mod's, or every reviewed mod's in the profile, each with current (its files are still the ones reviewed). Read these before reviewing a mod again.", annotations(read_only_hint = true))]
+    async fn mod_reviews(&self, Parameters(a): Parameters<ReviewsArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| inspect::reviews(&i, a.id.as_deref())))
+    }
+
+    #[tool(description = "The records a plugin adds (not its changes to other plugins' records): by default quests, NPCs, leveled NPC lists, weapons, armour, ammo, spells, shouts, perks, books, misc items, potions, ingredients, scrolls, keys, containers, furniture, activators, cells, worldspaces and globals. Each has its editor id (what coc, startquest, setstage, movetoqt and set take), its name, and its form id in the current load order (what player.placeatme, player.additem and player.addspell take; none while the plugin is disabled). counts has how many of each type. What a test reaches through the console.", annotations(read_only_hint = true))]
+    async fn plugin_records(&self, Parameters(a): Parameters<RecordsArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| plugins::new_records(&i, &i.profile()?, &a.plugin, &a.kinds.unwrap_or_default(), a.max.unwrap_or(300))))
+    }
+
+    #[tool(description = "Plugins in load order with master/light flags, masters and missing masters.", annotations(read_only_hint = true))]
     async fn list_plugins(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| plugins::list(&i, &i.profile()?)))
     }
 
-    #[tool(description = "Problems to fix: missing masters, plugin limits, missing script extender, fully overridden mods, archives no plugin loads, undeployed or externally changed files, LOOT warnings and dirty plugins.")]
+    #[tool(description = "Problems to fix: missing masters, plugin limits, missing script extender, fully overridden mods, archives no plugin loads, undeployed or externally changed files, LOOT warnings and dirty plugins.", annotations(read_only_hint = true))]
     async fn health_check(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| health::check(&i)))
     }
 
-    #[tool(description = "Install a mod from a local folder, .zip or .7z. Detects the Data root and game-root files. Mods with a FOMOD installer need choices (see fomod_options).")]
+    #[tool(description = "Install a mod from a local folder, .zip, .7z or .rar. Detects the Data root and game-root files. Mods with a FOMOD installer need choices (see fomod_options).")]
     async fn install_mod(&self, Parameters(a): Parameters<InstallArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| install::install_at(&i, a.path.as_ref(), a.name.as_deref(), a.enable.unwrap_or(true), a.choices.as_ref(), a.priority)))
     }
 
-    #[tool(description = "Show a mod's FOMOD installer as it plays out with the given choices: visible steps, groups, options (type, description, selected), the full resolved choices, and the file count. Conditions are checked against the current setup.")]
+    #[tool(description = "Show a mod's FOMOD installer as it plays out with the given choices: visible steps, groups, options (type, description, selected), the full resolved choices, and the file count. Conditions are checked against the current setup.", annotations(read_only_hint = true))]
     async fn fomod_options(&self, Parameters(a): Parameters<FomodArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| install::fomod_options(&i, a.path.as_ref(), a.choices.as_ref())))
     }
@@ -427,6 +724,11 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| ops::set_mod_note(&i, &a.id, &a.note)))
     }
 
+    #[tool(description = "Add or remove category labels (like MO2's categories) on mods. A mod without its own shows its Nexus category, which the first change keeps. Not in undo history. list_mods shows each mod's categories.")]
+    async fn set_mod_categories(&self, Parameters(a): Parameters<CategoryArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| ops::edit_categories(&i, &a.ids, &a.add, &a.remove)))
+    }
+
     #[tool(description = "Colour a mod or separator row (#rrggbb, \"\" removes it). Undoable.")]
     async fn set_color(&self, Parameters(a): Parameters<ColorArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| ops::set_color(&i, &a.id, &a.color)))
@@ -452,7 +754,7 @@ impl Rmm {
         out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| loot::sort(&i, a.dry_run.unwrap_or(true))))
     }
 
-    #[tool(description = "The user's LOOT rules (loot/userlist.yaml) for the profile's plugins: load-after lists and groups.")]
+    #[tool(description = "The user's LOOT rules (loot/userlist.yaml) for the profile's plugins: load-after lists and groups.", annotations(read_only_hint = true))]
     async fn loot_rules(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| loot::rules(&i)))
     }
@@ -467,7 +769,7 @@ impl Rmm {
         out(self.inst().and_then(|i| loot::update_masterlist(&i, true)))
     }
 
-    #[tool(description = "Mod rules (rules.toml, shared by all profiles): each mod and the mods it loads after, i.e. wins file conflicts against.")]
+    #[tool(description = "Mod rules (rules.toml, shared by all profiles): each mod and the mods it loads after, i.e. wins file conflicts against.", annotations(read_only_hint = true))]
     async fn mod_rules(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| rules::rules(&i)))
     }
@@ -502,7 +804,7 @@ impl Rmm {
         out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| deploy::purge(&i, a.dry_run.unwrap_or(true))))
     }
 
-    #[tool(description = "Configured tools (exe, argument template, vars, rewrites) and the available presets.")]
+    #[tool(description = "Configured tools (exe, argument template, vars, rewrites) and the available presets.", annotations(read_only_hint = true))]
     async fn list_tools(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| Ok(serde_json::json!({ "tools": tools::list(&i)?, "presets": tools::PRESETS }))))
     }
@@ -532,7 +834,7 @@ impl Rmm {
         out(Ok(serde_json::json!({ "state": "running", "next": "poll tool_job" })))
     }
 
-    #[tool(description = "State of background tool runs: running (with its start time), done (with the run report) or failed. With an id and no run started by this server, the last finished run's report from disk.")]
+    #[tool(description = "State of background tool runs: running (with its start time), done (with the run report) or failed. With an id and no run started by this server, the last finished run's report from disk.", annotations(read_only_hint = true))]
     async fn tool_job(&self, Parameters(a): Parameters<ToolJobArgs>) -> Result<String, String> {
         let jobs = self.jobs.lock().unwrap().clone();
         let Some(id) = a.id else { return out(Ok(jobs)) };
@@ -545,7 +847,7 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Profiles and the active one. Each profile has its own enabled mods, mod order, plugin order and undo history; installed mods, overwrite/, tools and LOOT rules are shared.")]
+    #[tool(description = "Profiles and the active one. Each profile has its own enabled mods, mod order, plugin order and undo history; installed mods, overwrite/, tools and LOOT rules are shared.", annotations(read_only_hint = true))]
     async fn profiles(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| Ok(serde_json::json!({ "active": i.config.profile, "profiles": i.profiles()? }))))
     }
@@ -582,12 +884,12 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| i.delete_profile(&a.name)))
     }
 
-    #[tool(description = "Read a crash log (Crash Logger SSE, Buffout 4, Trainwreck, NetScriptFramework; default: the newest) and rank the DLLs, plugins and files it names, with the mod providing each. The call stack counts most. Lists the other crash logs too.")]
+    #[tool(description = "Read a crash log (Crash Logger SSE, Buffout 4, Trainwreck, NetScriptFramework; default: the newest) and rank the DLLs, plugins and files it names, with the mod providing each. The call stack counts most. Lists the other crash logs too.", annotations(read_only_hint = true))]
     async fn read_crash_log(&self, Parameters(a): Parameters<CrashLogArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| logs::read_crash_log(&i, a.path.as_deref().map(std::path::Path::new))))
     }
 
-    #[tool(description = "Summarise the Papyrus log (Logs/Script/Papyrus.0.log): whether logging is on, errors grouped by message, scripts in error stacks with the mod providing each, and the last lines.")]
+    #[tool(description = "Summarise the Papyrus log (Logs/Script/Papyrus.0.log): whether logging is on, errors grouped by message, scripts in error stacks with the mod providing each, and the last lines.", annotations(read_only_hint = true))]
     async fn read_papyrus_log(&self, Parameters(a): Parameters<PapyrusArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| logs::read_papyrus_log(&i, a.tail.unwrap_or(40))))
     }
@@ -613,26 +915,67 @@ impl Rmm {
         out(Ok(serde_json::json!({ "state": "running", "next": "poll tool_job with id test_run" })))
     }
 
-    #[tool(description = "Whether the user has saved a Nexus API key, and the account's name and Premium status. The user saves the key themselves (`rmm nexus login` or the window); it never passes through MCP.")]
+    #[tool(description = "Start the game for a live test you drive step by step: deploy, start it through the script extender in a small window behind the user's windows (window \"960x540\" unless set; \"fullscreen\" keeps the game's own settings), wait for the main menu, then load the save, visit the cells and run the steps. Needs rmm's harness plugin deployed. Then send test_session_step batches, looking at each result (cell, FPS, screenshot PNG) before the next, and end with test_session_stop. One live test at a time. dry_run defaults to true: shows the launch plan. Ask the user first: the game uses their Steam account.")]
+    async fn test_session_start(&self, Parameters(a): Parameters<SessionStartArgs>) -> Result<String, String> {
+        if a.dry_run.unwrap_or(true) {
+            return out(self.inst().and_then(|i| harness::preview(&i)));
+        }
+        let mut slot = self.session.lock().unwrap();
+        if slot.is_some() {
+            return Err("a live test is running; end it with test_session_stop first".into());
+        }
+        out(self.inst_mut().and_then(|i| {
+            let session = harness::Session::start(&i, &a.scenario)?;
+            let report = serde_json::to_value(session.progress())?;
+            *slot = Some(session);
+            Ok(report)
+        }))
+    }
+
+    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; its text output isn't read back), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window; open it to see the game), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell and the screenshot's path. If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
+    async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<String, String> {
+        let mut slot = self.session.lock().unwrap();
+        let Some(session) = slot.as_mut() else {
+            return Err("no live test is running; start one with test_session_start".into());
+        };
+        let steps = session.steps(&a.steps);
+        if session.alive() {
+            return out(Ok(serde_json::json!({ "steps": steps })));
+        }
+        let session = slot.take().expect("checked above");
+        out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": "the game closed", "run": session.stop(&i)? }))))
+    }
+
+    #[tool(description = "End the live test: quit the game and report the whole session: every step, timings, FPS, screenshots, a crash log read back to mods, and the Papyrus log's errors with their mods. The INIs changed for the small window are put back.")]
+    async fn test_session_stop(&self) -> Result<String, String> {
+        let Some(session) = self.session.lock().unwrap().take() else {
+            return Err("no live test is running".into());
+        };
+        out(self.inst().and_then(|i| session.stop(&i)))
+    }
+
+    #[tool(description = "Whether the user has saved a Nexus API key, and the account's name and Premium status. The user saves the key themselves (`rmm nexus login` or the window); it never passes through MCP.", annotations(read_only_hint = true))]
     async fn nexus_status(&self) -> Result<String, String> {
         out(Ok(nexus::status()))
     }
 
-    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. Needs the user's API key.")]
+    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. Needs the user's API key.", annotations(read_only_hint = true))]
     async fn check_mod_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
     }
 
-    #[tool(description = "Download a file from Nexus into the instance's downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording its Nexus ids. Without Premium, Nexus only allows downloads through an nxm:// link from the website's button. dry_run defaults to true: shows the file.")]
+    #[tool(description = "Download a file from Nexus with the user's account into the instance's downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording its Nexus ids. Give an nxm:// link, a mod page link, or a mod id (the newest main file unless file_id names one). Without Premium, Nexus only allows downloads through an nxm:// link from the website's button. Needs the user signed in (nexus_status). dry_run defaults to true: shows the file.")]
     async fn install_from_nexus(&self, Parameters(a): Parameters<NexusInstallArgs>) -> Result<String, String> {
         let inst = self.inst_mut().map_err(|e| format!("{e:#}"))?;
-        let link = match (&a.link, a.mod_id, a.file_id) {
-            (Some(l), _, _) => nexus::parse_nxm(l),
-            (None, Some(m), Some(f)) => Ok(nexus::premium_link(&inst, m, f)),
-            _ => Err(anyhow::anyhow!("give an nxm link, or mod_id and file_id")),
+        let what = match (&a.link, a.mod_id, a.file_id) {
+            (Some(l), _, _) => Ok(l.clone()),
+            (None, Some(m), Some(f)) => Ok(format!("{m}/{f}")),
+            (None, Some(m), None) => Ok(m.to_string()),
+            _ => Err(anyhow::anyhow!("give a link or a mod_id")),
         };
-        out(link.and_then(|link| {
+        out(what.and_then(|what| {
             let client = nexus::Client::from_env()?;
+            let link = nexus::resolve(&inst, &client, &what)?;
             if a.dry_run.unwrap_or(true) {
                 return client.get(&format!("/v1/games/{}/mods/{}/files/{}.json", inst.config.game.nexus_domain(), link.mod_id, link.file_id));
             }
@@ -640,7 +983,7 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Installed add-ons (sandboxed WebAssembly plugins): their capabilities, the hooks they run at (after_install, before_deploy, after_deploy, after_tool_run, health_check), and the tools and panels they offer, with input schemas. The user installs add-ons themselves.")]
+    #[tool(description = "Installed add-ons (sandboxed WebAssembly plugins): their capabilities, the hooks they run at (after_install, before_deploy, after_deploy, after_tool_run, health_check), and the tools and panels they offer, with input schemas. The user installs add-ons themselves.", annotations(read_only_hint = true))]
     async fn list_addons(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| addons::list(&i)))
     }
@@ -650,7 +993,7 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| addons::call(&i, &a.addon, &a.function, &a.input.unwrap_or_else(|| serde_json::json!({})))))
     }
 
-    #[tool(description = "MO2 instances (folders with ModOrganizer.ini under %LOCALAPPDATA%/ModOrganizer) and Vortex state backups (%APPDATA%/Vortex/temp/state_backups_full, newest first) found on this machine. A portable MO2 lives wherever the user put it.")]
+    #[tool(description = "MO2 instances (folders with ModOrganizer.ini under %LOCALAPPDATA%/ModOrganizer) and Vortex state backups (%APPDATA%/Vortex/temp/state_backups_full, newest first) found on this machine. A portable MO2 lives wherever the user put it.", annotations(read_only_hint = true))]
     async fn find_import_sources(&self) -> Result<String, String> {
         out(Ok(import::find_sources()))
     }
@@ -688,7 +1031,7 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| i.redo()))
     }
 
-    #[tool(description = "Undoable changes, newest first, each with what it did: mods enabled, disabled, added, removed or moved, and how many plugins changed.")]
+    #[tool(description = "Undoable changes, newest first, each with what it did: mods enabled, disabled, added, removed or moved, and how many plugins changed.", annotations(read_only_hint = true))]
     async fn history(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| i.history_details()))
     }
@@ -702,10 +1045,141 @@ impl Rmm {
     }
 }
 
+
+// The mod team's roles, as MCP prompts. The user's AI client plays them (one agent each where it
+// can start sub-agents); rmm provides the tools.
+
+const RESEARCHER: &str = "\
+You are the researcher in rmm's mod team for this {game} setup. The user wants: {request}
+
+1. Understand the request. If the user attached images or video frames, describe what they show (armour style, weather, interface, animation...) and turn that into search words. You can't watch a video: ask for a few screenshots or a description instead.
+2. Know the setup: instance_info, then list_mods (names, categories, Nexus ids). When the request names a mod (\"compatible with X\", \"a patch for X\"), find it: installed (list_mods) or on Nexus (search_nexus).
+3. Search with search_nexus several times with different words (synonyms, the kind of mod, a category), by relevance and by endorsements. For \"works with X\", nexus_mod_info on X: its required_by lists the mods that need X, which are its patches and add-ons.
+4. Check each candidate with nexus_mod_info: what it does, its compatibility notes and known incompatibilities, its requirements (installed or not), DLC, last update, endorsements. Compare with the user's mods: two mods doing the same job (two weather or combat overhauls), mods its page says it conflicts with, patches it needs for mods the user has.
+5. Score each candidate 0-100 for how well it matches what the user asked for, and say separately how it fits the list (fits / needs patch X / conflicts with Y). Leave out anything under 60 unless nothing scores higher, and say so.
+6. Report a ranked short list (at most 8): name, Nexus page, confidence and why, what else it needs, how it fits the current list, risks. Install nothing: the user picks, and the installer (the install_safely prompt) takes the pick.";
+
+const INSTALLER: &str = "\
+You are the installer in rmm's mod team for this {game} setup. Install {what} safely and give it its place.
+
+1. Before downloading: nexus_mod_info (search_nexus first if you were given a name). Install its missing requirements first, the same way. install_from_nexus with dry_run=true shows the file, then dry_run=false installs it. Without Premium, Nexus only allows downloads through the website's \"Mod manager download\" button: ask the user to click it (rmm takes nxm links if they set that up), or to download the archive and give you its path for install_mod.
+2. Right after installing, disable the mod (set_mods_enabled) until it is reviewed. Nothing reaches the game folder before a deploy.
+3. Review it, unless mod_reviews has a review with current=true (same files): then use that one and go to step 4.
+   - scan_mod with its id: Windows Defender plus the DLL and EXE checks. Verdict \"threat\": stop, tell the user, uninstall it (uninstall_mods).
+   - read_mod_file on what the scan flagged, on every DLL (what its imports let it do: network, starting programs, registry writes) and on its scripts: what they do and what they cost (OnUpdate loops, RegisterForUpdate intervals of a few seconds, polling instead of events, many calls per update). Compiled code can't be changed here, so name the settings (its MCM, INI or JSON) that lower the cost.
+   - save_review: verdict clean, suspicious or malicious; notes on what it does, what you checked and its cost; load_order. The next reviewer reads this instead of checking again.
+   Malicious: uninstall it and stop. Suspicious: ask the user before enabling it.
+4. Enable it and place it:
+   - Files: list_conflicts with its id shows who it overwrites and who overwrites it. move_mods so the right mod wins (patches after what they patch), and set_mod_rule to record why, so sort_mods keeps it.
+   - Plugins: plugin_conflicts with its plugin shows the records it shares and which plugin wins. sort_plugins with dry_run=true is LOOT's order; apply it if it agrees, and set_loot_rule for a rule LOOT lacks.
+   - health_check: missing masters and requirements.
+   Put the order you chose, and why, in the review's load_order (save_review again).
+5. deploy with dry_run=true, then deploy. Hand over to the tester (the test_mods prompt) with what to test: the mod's features from its page and scripts, and its plugin_records (quests, NPCs, items, cells and their ids).
+Every change is in history and can be undone.";
+
+const TESTER: &str = "\
+You are the tester in rmm's mod team for this {game} setup. Test: {focus}. Start from: {save}.
+The lead (the user, or the lead agent) says what to test; follow its plan and report back to it.
+
+The game runs in a small window behind the user's windows, so you see it only through screenshots. Ask the user before starting the game: it uses their Steam account. test_session_start says if the harness plugin isn't deployed.
+
+1. Plan, unless the lead gave you one. For each mod under test read mod_reviews (what it does), nexus_mod_info (its page) and plugin_records (its quests, NPCs, items, spells and cells, with the ids the console takes). Then steps per mechanic:
+   - Places: {\"cell\": \"<cell editor id>\"}, or {\"console\": \"player.moveto <reference id>\"}; then {\"wait\": 10} and {\"screenshot\": \"...\"}.
+   - Combat: {\"console\": \"tgm\"} unless survival is the point, {\"console\": \"player.placeatme <NPC form id> 2\"} (the mod's NPCs or the game's own enemies), {\"wait\": 20}, a screenshot.
+   - Quests: {\"console\": \"startquest <quest editor id>\"} or {\"console\": \"setstage <quest editor id> <stage>\"}, {\"console\": \"movetoqt <quest editor id>\"}, wait, screenshot.
+   - Items and magic: player.additem <form id> 1, player.equipitem <form id>, player.addspell <form id>; wait, screenshot.
+   - World: fw <weather form id>, set gamehour to 22, set timescale to 200 to let time pass; wait.
+   - Scripts: wait long enough for them to run (30 to 60 seconds) and read the Papyrus log at the end.
+2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Open every screenshot before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
+3. If the game closes, the step's answer ends the session with the crash log read back to the mods it names: report that to the lead and stop.
+4. test_session_stop when done: crash, Papyrus errors with their mods, FPS.
+5. Report per mechanic: worked, didn't, or couldn't tell, with the screenshots; crashes and script errors with the mods behind them; the lowest FPS and where. Don't change the setup: fixing is the installer's job.
+Limits: console commands run, but their text output isn't read back, and you can't press keys or walk except through the console (coc, player.moveto, player.setpos).";
+
+const LEAD: &str = "\
+You lead rmm's mod team for this {game} setup. The user wants: {request}
+
+The team has three roles, each with its own prompt on this server: researcher (find_mods), installer (install_safely) and tester (test_mods). The user gives each role to an AI in rmm's Settings (team_tasks shows who): hand a role's steps to it with ask_teammate, with everything it needs from you, and play the roles given to you yourself.
+1. Researcher: a ranked list of candidates with confidence scores. Show it to the user, who picks. Never pick for them.
+2. Installer, for each pick: download, safety review (or the saved one), placement, deploy.
+3. Tester, guided by you: from the new mods' reviews, pages and plugin_records, decide what to test and where: combat, quests, items, magic, NPCs, weather and world, interface, and performance in heavy places (cities, big battles). Send the tester the plan, read its reports and screenshots, and send follow-up steps (another place, the next quest stage, a bigger fight) until each mechanic works or clearly fails.
+4. Failures: a crash or script errors point at mods (read_crash_log, read_papyrus_log). Have the installer fix the order or rules or disable the culprit, or ask the user, then test again.
+5. Report to the user: what was installed, the review verdicts, order changes, what was tested and how it went.
+Ask the user before: downloads that need their click, starting the game (it uses their Steam account), and removing mods they had before.";
+
+#[derive(Deserialize, JsonSchema)]
+struct WantArgs {
+    /// What the user wants: a description of the mod, "works with <mod>", or "fits my list".
+    request: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct InstallPromptArgs {
+    /// A Nexus mod id or page link, or a mod's name to look up.
+    what: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct TestPromptArgs {
+    /// Mods or mechanics to test (default: the mods installed last).
+    focus: Option<String>,
+    /// A save to start from (default: a cell, from the main menu).
+    save: Option<String>,
+}
+
+#[prompt_router]
+impl Rmm {
+    fn role(&self, text: &str, fills: &[(&str, &str)]) -> Vec<PromptMessage> {
+        let game = self.inst().map_or_else(|_| "the game".to_string(), |i| i.config.game.steam_dir().to_string());
+        let text = fills.iter().fold(text.replace("{game}", &game), |t, (k, v)| t.replace(&format!("{{{k}}}"), v));
+        vec![PromptMessage::new_text(Role::User, text)]
+    }
+
+    #[prompt(description = "Researcher: find Nexus mods that match what the user describes (in words or images), work with a mod they name, or fit their list, ranked by confidence.")]
+    async fn find_mods(&self, Parameters(a): Parameters<WantArgs>) -> Vec<PromptMessage> {
+        self.role(RESEARCHER, &[("request", &a.request)])
+    }
+
+    #[prompt(description = "Installer: download a mod, check it isn't malicious (or reuse its saved review), review its code, place it in the mod and plugin order, and deploy.")]
+    async fn install_safely(&self, Parameters(a): Parameters<InstallPromptArgs>) -> Vec<PromptMessage> {
+        self.role(INSTALLER, &[("what", &a.what)])
+    }
+
+    #[prompt(description = "Tester: play the game in a small background window through a live test session (teleports, fights, quests, items) and report crashes, script errors and FPS.")]
+    async fn test_mods(&self, Parameters(a): Parameters<TestPromptArgs>) -> Vec<PromptMessage> {
+        let focus = a.focus.unwrap_or_else(|| "the mods installed last".into());
+        let save = a.save.unwrap_or_else(|| "a cell, from the main menu".into());
+        self.role(TESTER, &[("focus", &focus), ("save", &save)])
+    }
+
+    #[prompt(description = "Lead: run the whole mod team for a request: research, the user's pick, install and review, then guide the tester through each mechanic.")]
+    async fn mod_team(&self, Parameters(a): Parameters<WantArgs>) -> Vec<PromptMessage> {
+        self.role(LEAD, &[("request", &a.request)])
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
+#[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for Rmm {
+    async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, ErrorData> {
+        // An app's calls go to its session's chat; save_chat_note adds its note itself.
+        let call = (self.log.is_some() && request.name != "save_chat_note")
+            .then(|| (request.name.to_string(), request.arguments.clone().map(serde_json::Value::Object).unwrap_or_default(), app_name(&context.peer)));
+        let r = self.tool_router.call(ToolCallContext::new(self, request, context)).await;
+        if let Some((name, args, app)) = call {
+            let (ok, text) = match &r {
+                Ok(CallToolResponse::Complete(res)) => (res.is_error != Some(true), res.content.iter().filter_map(|c| c.as_text()).map(|t| t.text.as_str()).collect::<Vec<_>>().join("\n")),
+                Ok(_) => (true, String::new()),
+                Err(e) => (false, e.message.to_string()),
+            };
+            self.session_chat(app, |c| {
+                c.log.push(Event::Call { name: name.clone(), args });
+                c.log.push(Event::Result { name, ok, text: agent::cut(&text, 2000) });
+            });
+        }
+        r
+    }
+
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_prompts().build())
             .with_server_info(Implementation::new("rmm", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
@@ -713,11 +1187,37 @@ impl ServerHandler for Rmm {
 
 impl Rmm {
     pub fn new(root: PathBuf) -> Rmm {
-        Rmm { root, jobs: Default::default(), tool_router: Rmm::tool_router() }
+        Rmm { root, jobs: Default::default(), session: Default::default(), log: None, tool_router: Rmm::tool_router(), prompt_router: Rmm::prompt_router() }
+    }
+
+    /// This server for one outside AI app's session: its calls are kept as a chat in the instance.
+    /// rmm's own AI uses `new`, as it keeps its chats itself.
+    pub fn recorded(mut self) -> Rmm {
+        self.log = Some(Default::default());
+        self
+    }
+
+    /// Changes the session's chat (made on first use, in an instance only) and saves it; None when
+    /// nothing is kept. Keeping it never fails a call.
+    fn session_chat(&self, app: Option<String>, change: impl FnOnce(&mut agent::Chat)) -> Option<String> {
+        let mut log = self.log.as_ref()?.lock().unwrap();
+        if log.is_none() {
+            Instance::open(&self.root).ok()?;
+        }
+        let chat = log.get_or_insert_with(|| agent::Chat::external(app.as_deref().unwrap_or("An AI app")));
+        change(chat);
+        chat.updated = now();
+        chat.save(&self.root).ok()?;
+        Some(chat.id.clone())
     }
 }
 
+/// The connected app's name, from its handshake.
+fn app_name(peer: &Peer<RoleServer>) -> Option<String> {
+    peer.peer_info().map(|i| i.client_info.title.clone().unwrap_or_else(|| i.client_info.name.clone()))
+}
+
 pub async fn serve(root: PathBuf) -> anyhow::Result<()> {
-    Rmm::new(root).serve(stdio()).await?.waiting().await?;
+    Rmm::new(root).recorded().serve(stdio()).await?.waiting().await?;
     Ok(())
 }

@@ -124,6 +124,15 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
         listed.extend(extra.into_iter().map(|n| (n, false)));
     }
 
+    // MO2's own categories: `id|name|…` per line (the Nexus ids and parent that follow vary by version).
+    let categories: HashMap<i64, String> = fs::read_to_string(dir.join("categories.dat"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('|');
+            Some((f.next()?.trim().parse().ok()?, f.next()?.trim().to_string()))
+        })
+        .collect();
     let mut incoming = Vec::new();
     for (n, enabled) in listed {
         if let Some(sep) = n.strip_suffix("_separator") {
@@ -138,7 +147,7 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
             r.warnings.push(format!("{n}: listed in modlist.txt, but its folder is missing"));
             continue;
         }
-        let meta = mo2_meta(&folder, &n, &downloads);
+        let meta = mo2_meta(&folder, &n, &downloads, &categories);
         incoming.push(Incoming { id: sanitize(&n), enabled, from: Some((folder, meta, false)) });
     }
 
@@ -161,16 +170,24 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
     Ok(r)
 }
 
-fn mo2_meta(folder: &Path, name: &str, downloads: &Path) -> ModMeta {
+fn mo2_meta(folder: &Path, name: &str, downloads: &Path, categories: &HashMap<i64, String>) -> ModMeta {
     let ini = qt_ini(&fs::read_to_string(folder.join("meta.ini")).unwrap_or_default());
     let general = ini.get("General");
     let get = |k: &str| general.and_then(|m| m.get(k)).filter(|v| !v.is_empty()).cloned();
     let file_id = ini.get("installedFiles").and_then(|m| m.iter().find(|(k, _)| k.ends_with("fileid")).and_then(|(_, v)| v.parse().ok()));
+    // `category="3,12,"`: MO2 category ids, -1 or 0 for none.
+    let cats: Vec<String> = get("category").unwrap_or_default().split(',').filter_map(|c| categories.get(&c.trim().parse().ok()?).cloned()).collect();
     ModMeta {
         name: name.into(),
         source: get("installationFile").map(|f| if Path::new(&f).is_absolute() { f } else { downloads.join(f).display().to_string() }),
         notes: get("comments"),
-        nexus: get("modid").and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0).map(|mod_id| NexusRef { mod_id, file_id, version: get("version") }),
+        categories: (!cats.is_empty()).then_some(cats),
+        nexus: get("modid").and_then(|v| v.parse().ok()).filter(|&n: &u64| n > 0).map(|mod_id| NexusRef {
+            mod_id,
+            file_id,
+            version: get("version"),
+            category: get("nexusCategory").and_then(|c| c.parse().ok()).filter(|&c: &u64| c > 0),
+        }),
         ..Default::default()
     }
 }
@@ -312,7 +329,7 @@ pub fn import_vortex(inst: &Instance, backup: &Path, staging: Option<&Path>, pro
             source: a["fileName"].as_str().map(|f| downloads.join(f).display().to_string()),
             fomod: serde_json::from_value::<crate::fomod::Choices>(a["installerChoices"].clone()).ok().filter(|c| !c.options.is_empty()),
             notes: a["notes"].as_str().filter(|s| !s.is_empty()).map(str::to_owned),
-            nexus: num(&a["modId"]).filter(|&n| n > 0).map(|mod_id| NexusRef { mod_id, file_id: num(&a["fileId"]), version: a["version"].as_str().map(str::to_owned) }),
+            nexus: num(&a["modId"]).filter(|&n| n > 0).map(|mod_id| NexusRef { mod_id, file_id: num(&a["fileId"]), version: a["version"].as_str().map(str::to_owned), category: None }),
             ..Default::default()
         };
         let root = matches!(m["type"].as_str(), Some("dinput" | "enb"));

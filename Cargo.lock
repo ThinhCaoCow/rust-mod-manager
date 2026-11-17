@@ -4198,6 +4198,7 @@ name = "rmm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "getrandom 0.3.4",
  "rmcp",
@@ -4233,11 +4234,13 @@ dependencies = [
  "esplugin",
  "extism",
  "fd-lock",
+ "flate2",
  "fuser",
  "getrandom 0.3.4",
  "libc",
  "libloadorder",
  "libloot",
+ "object 0.40.0",
  "regex",
  "roxmltree",
  "rustls",
@@ -4252,6 +4255,7 @@ dependencies = [
  "toml 1.2.1+spec-1.1.0",
  "walkdir",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "winreg",
  "zip",
 ]

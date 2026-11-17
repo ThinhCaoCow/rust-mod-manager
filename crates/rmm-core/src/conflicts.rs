@@ -210,6 +210,105 @@ pub fn file_conflicts(inst: &Instance, profile: &Profile, id: &str) -> Result<Ve
     Ok(out)
 }
 
+/// A file or folder in the Data folder as the game sees it after a deploy (MO2's Data tab).
+#[derive(Debug, Serialize, PartialEq)]
+pub struct DataEntry {
+    /// The name in its folder; the path from Data in a search.
+    pub name: String,
+    pub dir: bool,
+    /// Folders: how many files are inside (None: only the game's own files are).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<usize>,
+    /// Files: the mods providing it in load order, the last one wins. Empty: the game's own file.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mods: Vec<String>,
+    /// A file only in archives: the archive it comes from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct DataQuery {
+    /// A folder in Data, such as `meshes/actors`; empty for Data itself.
+    #[serde(default)]
+    pub dir: String,
+    /// Search every folder for paths containing this instead (the first FIND_LIMIT).
+    #[serde(default)]
+    pub find: String,
+    /// Only files more than one mod provides.
+    #[serde(default)]
+    pub conflicts_only: bool,
+    /// Also files inside the BSA/BA2 archives the game loads.
+    #[serde(default)]
+    pub archives: bool,
+}
+
+pub const FIND_LIMIT: usize = 1000;
+
+/// One folder of Data: its subfolders, then its files with the mods behind each.
+pub fn data_view(inst: &Instance, profile: &Profile, q: &DataQuery) -> Result<Vec<DataEntry>> {
+    if q.dir.split(['/', '\\']).any(|c| c == "..") {
+        anyhow::bail!("not a folder in Data: {}", q.dir);
+    }
+    let map = file_map(inst, profile)?;
+    let arch = if q.archives { archived(inst, profile, &map)? } else { BTreeMap::new() };
+    // path key -> (spelling, providers in load order, the archive when no loose file wins)
+    let mut all: BTreeMap<&str, (&str, Vec<&str>, Option<&str>)> = BTreeMap::new();
+    for (key, owners) in &arch {
+        all.insert(key.as_str(), (key.as_str(), owners.iter().map(|(m, _)| map.mods[*m].as_str()).collect(), owners.last().map(|(_, a)| a.as_str())));
+    }
+    for (key, (rel, owners)) in map.files.iter().filter(|(k, _)| !k.starts_with("root/")) {
+        let e = all.entry(key.as_str()).or_insert((rel.as_str(), vec![], None));
+        (e.0, e.2) = (rel.as_str(), None);
+        e.1.extend(owners.iter().map(|&m| map.mods[m].as_str()));
+    }
+    let shown = |mods: &[&str]| !q.conflicts_only || mods.len() > 1;
+    let file = |name: &str, mods: &[&str], archive: Option<&str>| DataEntry {
+        name: name.into(),
+        dir: false,
+        files: None,
+        mods: mods.iter().map(|m| m.to_string()).collect(),
+        archive: archive.map(Into::into),
+    };
+    if !q.find.is_empty() {
+        let find = path_key(&q.find);
+        let hits = all.iter().filter(|(k, (_, mods, _))| k.contains(&find) && shown(mods));
+        return Ok(hits.take(FIND_LIMIT).map(|(_, (rel, mods, a))| file(rel, mods, *a)).collect());
+    }
+    let prefix = match path_key(&q.dir).trim_matches('/') {
+        "" => String::new(),
+        d => format!("{d}/"),
+    };
+    let depth = prefix.matches('/').count();
+    let mut dirs: BTreeMap<String, DataEntry> = BTreeMap::new();
+    let mut files = Vec::new();
+    for (_, (rel, mods, a)) in all.range(prefix.as_str()..).take_while(|(k, _)| k.starts_with(&prefix)).filter(|(_, (_, m, _))| shown(m)) {
+        let mut parts = rel.split('/').skip(depth);
+        let name = parts.next().unwrap_or_default();
+        if parts.next().is_none() {
+            files.push(file(name, mods, *a));
+            continue;
+        }
+        let d = dirs.entry(name.to_lowercase()).or_insert_with(|| DataEntry { name: name.into(), dir: true, files: Some(0), mods: vec![], archive: None });
+        d.files = Some(d.files.unwrap_or(0) + 1);
+    }
+    // What's in the game's Data folder that no mod puts there: the base game, manual installs.
+    if !q.conflicts_only {
+        let managed = crate::deploy::managed_keys(inst)?;
+        for e in std::fs::read_dir(inst.data_dir().join(&q.dir)).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let key = format!("{prefix}{}", path_key(&name));
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.entry(path_key(&name)).or_insert(DataEntry { name, dir: true, files: None, mods: vec![], archive: None });
+            } else if !all.contains_key(key.as_str()) && !managed.contains(&format!("data/{key}")) {
+                files.push(file(&name, &[], None));
+            }
+        }
+    }
+    files.sort_by_key(|f| f.name.to_lowercase());
+    Ok(dirs.into_values().chain(files).collect())
+}
+
 fn push_unique(v: &mut Vec<String>, s: &str) {
     if !v.iter().any(|x| x == s) {
         v.push(s.into());

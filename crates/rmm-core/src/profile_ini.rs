@@ -171,6 +171,20 @@ fn backup(inst: &Instance, name: &str) -> PathBuf {
     inst.root.join("ini-backup").join(name)
 }
 
+/// The folder the game saves in once the profile `p` is deployed.
+pub fn save_dir(inst: &Instance, p: &Profile) -> Option<PathBuf> {
+    let dir = inst.ini_dir()?;
+    let rel = if p.local_saves {
+        Some(format!("Saves\\{}\\", inst.config.profile))
+    } else if let Some(Saves { before }) = load(inst).ok().and_then(|st| st.saves) {
+        before // another profile's folder is set until the next deploy puts this back
+    } else {
+        fs::read(my_games(inst, inst.config.game.ini_name())).ok().and_then(|t| ini_get(&String::from_utf8_lossy(&t), "General", "sLocalSavePath"))
+    };
+    let rel = rel.filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "Saves\\".into()).replace('\\', "/");
+    Some(dir.join(rel.trim_end_matches('/')))
+}
+
 pub fn profile_ini_dir(inst: &Instance, profile: &str) -> PathBuf {
     inst.root.join("profiles").join(profile).join("ini")
 }

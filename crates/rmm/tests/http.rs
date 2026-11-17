@@ -28,7 +28,7 @@ fn mcp_over_http() {
     let root = tmp.path().join("inst");
     Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
 
-    let server = rmm::http::start(root, "127.0.0.1:0", "t0ken".into()).unwrap();
+    let server = rmm::http::start(root.clone(), "127.0.0.1:0", "t0ken".into()).unwrap();
     let addr = server.addr.to_string();
     let host = ("Host", addr.as_str());
     let auth = ("Authorization", "Bearer t0ken");
@@ -57,6 +57,16 @@ fn mcp_over_http() {
     assert_eq!(status, 200);
     assert_eq!(r["id"], "c1");
     assert_eq!(r["result"]["isError"], false, "{r}");
+
+    // The session is kept as a chat: its calls, and the note it saves (not logged as a call).
+    let note = json!({ "jsonrpc": "2.0", "id": "c2", "method": "tools/call", "params": { "name": "save_chat_note", "arguments": { "text": "Checked the mods.\nNothing left." } } });
+    let (_, _, r) = send(&addr, "POST", &[host, auth, session], &note);
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let chats = rmm::agent::chats(&root).unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!((chats[0].title.as_str(), chats[0].provider.as_str(), chats[0].model.as_str()), ("Checked the mods.", "mcp", "test"));
+    let text = rmm::agent::load_chat(&root, &chats[0].id).unwrap().transcript(10_000);
+    assert!(text.contains("Call list_mods {}") && text.contains("AI: Checked the mods.\nNothing left.") && !text.contains("save_chat_note"), "{text}");
 
     assert_eq!(send(&addr, "DELETE", &[host, auth, session], &Value::Null).0, 200);
     assert_eq!(send(&addr, "POST", &[host, auth, session], &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).0, 404, "ended");

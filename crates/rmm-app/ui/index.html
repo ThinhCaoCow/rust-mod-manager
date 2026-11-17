@@ -31,6 +31,7 @@
       <div id="profile-pop" class="pop" hidden></div>
     </div>
     <div class="spacer"></div>
+    <button id="nexus-btn" title="Your Nexus Mods account">Sign in to Nexus</button>
     <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
     <button id="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
     <button id="deploy" title="Preview and apply the changes to the game folder"></button>
@@ -40,11 +41,16 @@
   <nav class="tabs">
     <button data-tab="mods">Mods <span class="count" id="n-mods"></span></button>
     <button data-tab="plugins">Plugins <span class="count" id="n-plugins"></span></button>
+    <button data-tab="data">Data</button>
+    <button data-tab="saves">Saves <span class="count" id="n-saves"></span></button>
+    <button data-tab="downloads">Downloads <span class="count" id="n-downloads"></span></button>
     <button data-tab="problems">Problems <span class="count" id="n-problems"></span></button>
     <button data-tab="tools">Tools <span class="count" id="n-tools"></span></button>
     <button data-tab="history">History</button>
+    <button data-tab="ai" title="rmm's own AI, with your API key">AI</button>
+    <button data-tab="settings" title="AI providers, keys, and who does each mod team role">Settings</button>
     <div class="spacer"></div>
-    <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags" spellcheck="false">
+    <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags and categories" spellcheck="false">
     <button id="install" title="Installs after the selected mod, or at the end of the selected separator’s group. You can also drop archives on a row.">＋ Install mod…</button>
     <button id="nxm" title="Download and install a file from Nexus Mods by its nxm:// link">From Nexus…</button>
   </nav>
@@ -78,7 +84,7 @@
           <thead title="Right-click to choose columns"><tr></tr></thead>
           <tbody></tbody>
         </table>
-        <p class="empty" id="mods-empty" hidden>No mods yet. Drop a .zip or .7z here, or use Install mod.</p>
+        <p class="empty" id="mods-empty" hidden>No mods yet. Drop a .zip, .7z or .rar here, or use Install mod.</p>
       </div>
       <div class="ticks" id="ticks" aria-hidden="true"></div>
       <div class="notice plain" id="overwrite-bar" hidden></div>
@@ -90,6 +96,42 @@
           <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num">#</th></tr></thead>
           <tbody></tbody>
         </table>
+      </div>
+    </section>
+    <section class="pane" id="pane-data" hidden>
+      <div class="toolbar">
+        <nav class="crumbs" id="data-path" aria-label="Folder"></nav>
+        <div class="spacer"></div>
+        <input id="data-find" type="search" placeholder="Find a file" spellcheck="false" title="Searches every folder for paths containing this">
+        <label class="row" title="Only files more than one mod provides"><input type="checkbox" id="data-conflicts"> Conflicts only</label>
+        <label class="row" title="Also files inside the BSA/BA2 archives the game loads (slower)"><input type="checkbox" id="data-archives"> Archives</label>
+      </div>
+      <div class="scroll">
+        <table class="list" id="data">
+          <thead><tr><th>Name</th><th class="from-col">From</th><th class="from-col">Also in</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="data-empty" hidden></p>
+      </div>
+    </section>
+    <section class="pane" id="pane-saves" hidden>
+      <div class="toolbar"><span class="muted small" id="saves-note"></span><div class="spacer"></div><button id="saves-reload">Refresh</button></div>
+      <div class="scroll">
+        <table class="list" id="saves">
+          <thead><tr><th>Character</th><th class="num">Level</th><th>Location</th><th class="when-col">Saved</th><th class="issue-col">Plugins</th><th class="from-col">File</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="saves-empty" hidden></p>
+      </div>
+    </section>
+    <section class="pane" id="pane-downloads" hidden>
+      <div class="toolbar"><span class="muted small">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="downloads-reload">Refresh</button></div>
+      <div class="scroll">
+        <table class="list tall" id="downloads">
+          <thead><tr><th>File</th><th class="from-col">Installed as</th><th class="size-col">Size</th><th class="when-col">Downloaded</th><th class="run-col"></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="downloads-empty" hidden>No downloads yet.</p>
       </div>
     </section>
     <section class="pane" id="pane-problems" hidden>
@@ -107,8 +149,95 @@
       </div>
     </section>
     <section class="pane" id="pane-history" hidden>
-      <div class="toolbar"><span class="muted small">Every change to this profile, newest first. Undo steps back one; Restore goes back to before any of them, and Redo steps forward again.</span></div>
+      <div class="toolbar"><span class="muted small">Every change to this profile, newest first. Undo steps back one; Restore goes back to before any of them, and Redo steps forward again.</span><span class="spacer"></span><span class="muted small" id="trash-note"></span><button id="empty-trash" hidden>Empty trash…</button></div>
       <div class="scroll"><ol class="history" id="history"></ol></div>
+    </section>
+    <section class="pane" id="pane-ai" hidden>
+      <div class="toolbar wrap">
+        <button id="ai-to-settings" title="Providers, keys, and who does each role">AI settings…</button>
+        <span class="muted small" id="ai-note"></span>
+        <div class="spacer"></div>
+        <span class="muted small" id="ai-usage" title="Tokens and cost of this chat"></span>
+      </div>
+      <div class="ide">
+        <aside class="ide-side">
+          <div class="seg" role="tablist" aria-label="Side panel">
+            <button role="tab" data-side="files" aria-selected="true">Files</button>
+            <button role="tab" data-side="chats" aria-selected="false">Chats</button>
+          </div>
+          <div class="ide-list" id="ide-files">
+            <input id="ide-find" type="search" placeholder="Filter mods" spellcheck="false" aria-label="Filter mods">
+            <div class="ide-tree" id="ide-tree" role="tree" aria-label="Files"></div>
+            <button id="ide-edits" title="Every edit to these files, and Revert">Edits…</button>
+          </div>
+          <div class="ide-list" id="ide-chats" hidden>
+            <button id="ai-new" class="primary">＋ New chat</button>
+            <div id="ide-chat-list"></div>
+          </div>
+        </aside>
+        <section class="ide-editor">
+          <div class="ide-tabs" id="ide-tabs" role="tablist" aria-label="Open files"></div>
+          <div class="toolbar" id="ide-filebar" hidden>
+            <span class="muted small ide-path" id="ide-path"></span>
+            <div class="spacer"></div>
+            <button id="ide-ask" title="Send the selected lines (or the file's name) with your next message">Ask AI</button>
+            <button id="ide-reload" title="Read the file from disk again">Reload</button>
+            <button id="ide-save" class="primary" title="Save (Ctrl+S)">Save</button>
+          </div>
+          <div class="ide-code" id="ide-code" hidden>
+            <pre class="ide-gutter" id="ide-gutter" aria-hidden="true"></pre>
+            <textarea id="ide-text" spellcheck="false" wrap="off" aria-label="File contents"></textarea>
+          </div>
+          <div class="empty" id="ide-empty">
+            <p>Open a file from the list: a mod's scripts, INIs and configs, overwrite/, or the game's INI files.</p>
+            <p class="muted small">Every save keeps the old file, and Edits… puts one back. The AI's edits come to you as a diff to allow.</p>
+          </div>
+        </section>
+        <section class="ide-ai">
+          <div class="seg" role="tablist" aria-label="AI panel">
+            <button role="tab" data-view="chat" aria-selected="true">Chat</button>
+            <button role="tab" data-view="inspect" aria-selected="false">Inspector</button>
+          </div>
+          <div class="scroll" id="ai-scroll">
+            <div class="ai-log" id="ai-log" aria-live="polite"></div>
+            <div class="empty" id="ai-empty">
+              <p>Ask about your setup or the open file, or pick a role below.</p>
+              <p class="muted small">The Researcher finds mods on Nexus that fit a description, a picture or a mod you name. The Installer downloads your pick and checks it before it goes in. The Tester plays the game in a small window behind yours to try it. The Lead runs all three, handing each step to the AI chosen for it in Settings.<br>Reads and previews run straight away; you allow each change.</p>
+            </div>
+          </div>
+          <div class="scroll" id="ai-inspect" hidden></div>
+          <form class="ai-compose" id="ai-form">
+            <div class="ai-row" id="ai-ctx" hidden></div>
+            <textarea id="ai-text" rows="3" placeholder="Ask, or describe what you want… (Enter sends, Shift+Enter adds a line)" aria-label="Message"></textarea>
+            <div class="ai-row">
+              <select id="ai-role" aria-label="Role" title="A role for this message: what the AI is asked to do">
+                <option value="">Chat</option>
+                <option value="find_mods">Researcher: find mods</option>
+                <option value="install_safely">Installer: install safely</option>
+                <option value="test_mods">Tester: test in game</option>
+                <option value="mod_team">Lead: the whole team</option>
+              </select>
+              <button type="button" id="ai-attach" title="Attach pictures (PNG, JPEG, GIF, WebP); you can also drop them here">＋ Picture</button>
+              <input type="file" id="ai-file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+              <span class="ai-pics" id="ai-pics"></span>
+              <span class="muted small" id="ai-status"></span>
+              <div class="spacer"></div>
+              <button type="button" id="ai-stop" hidden>Stop</button>
+              <button id="ai-send" class="primary">Send</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </section>
+    <section class="pane" id="pane-settings" hidden>
+      <div class="scroll"><div class="settings">
+        <h2>AI providers</h2>
+        <p class="muted small">rmm's own AI runs on a provider you pay for, with your API key. Keys are kept in your user folder, never in the instance.</p>
+        <table class="set" id="set-providers"></table>
+        <h2>Mod team</h2>
+        <p class="muted small">Who answers in the AI tab. A message with a role goes to that role's AI, and the Lead hands each step to the AI of its role. An AI app such as Claude can take a role over MCP (<button class="link small" id="set-access">AI access…</button> or <code>rmm mcp</code>): steps for it wait on the team board until you ask the app to do its rmm team tasks, and it can hand steps to the roles on a provider here.</p>
+        <table class="set" id="set-team"></table>
+      </div></div>
     </section>
     <aside id="details" hidden></aside>
   </main>
@@ -117,6 +246,7 @@
 <div id="dropzone" hidden><div id="drop-text">Drop to install</div></div>
 <dialog id="dlg"></dialog>
 <datalist id="mod-names"></datalist>
+<datalist id="cat-names"></datalist>
 <div id="toasts"></div>
 <script src="app.js"></script>
 </body>

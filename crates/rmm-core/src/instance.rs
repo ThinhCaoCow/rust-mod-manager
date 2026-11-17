@@ -171,22 +171,33 @@ pub struct ModMeta {
     /// The user's notes on the mod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Category labels, like MO2's. None means never set, so the Nexus category shows instead;
+    /// an empty list means the user removed them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<String>>,
     /// Where the mod comes from on Nexus Mods, for update checks and download links.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nexus: Option<NexusRef>,
     /// sha256 of the archive it was installed from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// A review of the mod's code (an AI's or the user's), kept so it isn't checked again while
+    /// its files stay the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<crate::inspect::Review>,
 }
 
 /// A mod's page and file on Nexus Mods (the game comes from the instance).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, schemars::JsonSchema)]
 pub struct NexusRef {
     pub mod_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// The mod's category on Nexus, by id (`nexus::category_names` has the names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<u64>,
 }
 
 pub struct Instance {
@@ -373,8 +384,17 @@ impl Instance {
             .unwrap_or_else(|| ModMeta { name: id.into(), ..Default::default() })
     }
 
+    /// Written whole or not at all, through a temp file in mods/: moving it out changes the time of
+    /// mods/ itself, which the window watches, so a rename or a note from the CLI shows there. The
+    /// file keeps its time, which is the mod's install date.
     pub fn write_mod_meta(&self, id: &str, meta: &ModMeta) -> Result<()> {
-        fs::write(self.mod_dir(id).join(MOD_META), toml::to_string_pretty(meta)?)?;
+        let path = self.mod_dir(id).join(MOD_META);
+        let tmp = self.mods_dir().join(format!(".{id}.{MOD_META}.tmp"));
+        fs::write(&tmp, toml::to_string_pretty(meta)?)?;
+        if let Ok(t) = fs::metadata(&path).and_then(|m| m.modified()) {
+            fs::File::options().write(true).open(&tmp)?.set_modified(t)?;
+        }
+        fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -483,9 +503,19 @@ impl Instance {
         })
     }
 
-    /// (label, profile before the change) for every undo entry, oldest first.
+    /// (label, profile before the change) for every undo entry, oldest first. Mods deleted for good
+    /// (the trash emptied) are left out: going back can't bring them, and undo drops them too.
     fn snapshots(&self) -> Result<Vec<(String, Profile)>> {
-        self.stack("undo")?.into_iter().map(|(path, label)| Ok((label, toml::from_str(&fs::read_to_string(path)?)?))).collect()
+        let names = |dir: PathBuf| -> std::collections::HashSet<String> { fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect() };
+        let kept: std::collections::HashSet<String> = names(self.mods_dir()).into_iter().chain(names(self.root.join("trash"))).collect();
+        self.stack("undo")?
+            .into_iter()
+            .map(|(path, label)| {
+                let mut p: Profile = toml::from_str(&fs::read_to_string(path)?)?;
+                p.mods.retain(|m| is_separator(&m.id) || kept.contains(&m.id));
+                Ok((label, p))
+            })
+            .collect()
     }
 
     /// Move a mod folder to trash/ so an undo can bring it back.
@@ -498,14 +528,31 @@ impl Instance {
 
     fn shift(&self, from: &str, to: &str) -> Result<Option<String>> {
         let Some((path, label)) = self.stack(from)?.pop() else { return Ok(None) };
-        let snapshot: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
-        self.push(to, &label, &self.profile()?)?;
+        let mut snapshot: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
+        let current = self.profile()?;
+        self.push(to, &label, &current)?;
         fs::remove_file(&path)?;
-        write_atomic(&self.profile_file(), &toml::to_string_pretty(&snapshot)?)?;
         for m in &snapshot.mods {
             let trashed = self.root.join("trash").join(&m.id);
             if !self.mod_dir(&m.id).exists() && trashed.exists() {
                 fs::rename(trashed, self.mod_dir(&m.id))?;
+            }
+        }
+        // A mod whose files are gone for good (the trash was emptied) leaves the list.
+        snapshot.mods.retain(|m| is_separator(&m.id) || self.mod_dir(&m.id).is_dir());
+        write_atomic(&self.profile_file(), &toml::to_string_pretty(&snapshot)?)?;
+        // Mods the step takes off the list (an install undone, an uninstall redone) go back to
+        // trash/, unless another profile lists them; otherwise they'd stay installed unseen.
+        let kept: std::collections::HashSet<&str> = snapshot.mods.iter().map(|m| m.id.as_str()).collect();
+        let gone: Vec<&str> = current.mods.iter().map(|m| m.id.as_str()).filter(|id| !kept.contains(id) && !is_separator(id) && self.mod_dir(id).is_dir()).collect();
+        if !gone.is_empty() {
+            let mut listed = std::collections::HashSet::new();
+            for name in self.profiles()?.into_iter().filter(|n| *n != self.config.profile) {
+                let p: Profile = toml::from_str(&fs::read_to_string(self.root.join("profiles").join(name).join("profile.toml"))?)?;
+                listed.extend(p.mods.into_iter().map(|m| m.id));
+            }
+            for id in gone.into_iter().filter(|id| !listed.contains(*id)) {
+                self.trash_mod(id)?;
             }
         }
         Ok(Some(label))

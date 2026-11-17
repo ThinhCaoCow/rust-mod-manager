@@ -1,8 +1,8 @@
-use rmm::{http, mcp};
+use rmm::{agent, http, mcp};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, install, lockfile, logs, loot, nexus, ops, plugins, rules, tools};
+use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -40,7 +40,7 @@ enum Cmd {
     /// List mods in priority order (last wins).
     Mods,
     Show { id: String },
-    /// Install from a folder, .zip or .7z. It goes at the end (before generated tool output) or
+    /// Install from a folder, .zip, .7z or .rar. It goes at the end (before generated tool output) or
     /// where mod rules place it, unless --at gives a priority.
     Install {
         path: PathBuf,
@@ -94,8 +94,44 @@ enum Cmd {
     Separator(SeparatorCmd),
     /// Conflicts between mods, or every conflicting file of one mod and who wins it.
     Conflicts { id: Option<String> },
+    /// One folder of Data as the game sees it: subfolders, and each file with the mods behind it.
+    Data {
+        /// A folder in Data, such as meshes/actors (default: Data itself).
+        dir: Option<String>,
+        /// Search every folder for paths containing this instead.
+        #[arg(long)]
+        find: Option<String>,
+        /// Only files more than one mod provides.
+        #[arg(long)]
+        conflicts: bool,
+        /// Also files inside the BSA/BA2 archives the game loads.
+        #[arg(long)]
+        archives: bool,
+    },
+    /// The profile's saves, each with the plugins it was made with that aren't loaded now.
+    Saves {
+        /// Enable the installed mods and plugins this save (file name) needs.
+        #[arg(long)]
+        fix: Option<String>,
+    },
+    /// Archives in the instance's downloads folder and the mods installed from them.
+    Downloads,
+    /// How much uninstalled mods take in trash/ (undo restores them from there).
+    Trash {
+        /// Delete it all for good; undo can't bring those mods back afterwards.
+        #[arg(long)]
+        empty: bool,
+    },
     /// Set a mod's notes ("" clears them).
     Note { id: String, text: String },
+    /// Add or remove category labels on mods (like MO2's categories).
+    Category {
+        ids: Vec<String>,
+        #[arg(long)]
+        add: Vec<String>,
+        #[arg(long)]
+        remove: Vec<String>,
+    },
     /// Colour a mod or separator row: #rrggbb, or "" to remove it.
     Color { id: String, color: String },
     /// Lock a plugin where it is in the load order: sorts and moves leave it there.
@@ -111,6 +147,43 @@ enum Cmd {
         apply: bool,
     },
     Plugins,
+    /// Pairs of enabled plugins that change the same records, and which wins.
+    PluginConflicts { plugin: Option<String> },
+    /// Safety check of a mod (with Windows Defender), or a quick one of every mod.
+    Scan { id: Option<String> },
+    /// Show a file inside a mod: text, a disassembled Papyrus script, or a DLL's imports.
+    Read {
+        id: String,
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 400)]
+        limit: usize,
+    },
+    /// Records a plugin adds (quests, NPCs, items, spells, cells...) with the ids the console takes.
+    Records {
+        plugin: String,
+        /// Record type (repeatable), such as QUST, NPC_ or WEAP; default: the ones tests use.
+        #[arg(long = "kind")]
+        kinds: Vec<String>,
+        #[arg(long, default_value_t = 300)]
+        max: usize,
+    },
+    /// Save a review of a mod's code, kept with the mod so it isn't checked again.
+    Review {
+        id: String,
+        /// clean, suspicious or malicious.
+        #[arg(long)]
+        verdict: String,
+        /// What it does and what was checked.
+        #[arg(long)]
+        notes: String,
+        /// Where it belongs in the order, and why.
+        #[arg(long, default_value = "")]
+        load_order: String,
+    },
+    /// Saved reviews (one mod's, or every reviewed mod's), and whether the files changed since.
+    Reviews { id: Option<String> },
     /// Sort plugins with LOOT; --apply saves the order to the profile.
     Sort {
         #[arg(long)]
@@ -170,6 +243,10 @@ enum Cmd {
         /// Save a PNG of the game's window in each cell. Harness only.
         #[arg(long)]
         screenshots: bool,
+        /// Steps after the save and the cells, as JSON or @file, such as
+        /// [{"console": "tgm"}, {"wait": 10}, {"screenshot": "after"}]. Harness only.
+        #[arg(long)]
+        steps: Option<String>,
     },
     /// Show what deploying would change; --apply to do it.
     Deploy {
@@ -240,12 +317,88 @@ enum Cmd {
     Undo,
     Redo,
     History,
+    /// rmm's own AI with your API key: OpenRouter, Claude, OpenAI (GPT), Kimi, DeepSeek or Qwen.
+    #[command(subcommand)]
+    Ai(AiCmd),
     /// Serve the Model Context Protocol on stdio for AI clients.
     Mcp {
         /// Serve over HTTP on this address instead (e.g. 127.0.0.1:47823), at /mcp. Clients
         /// send `Authorization: Bearer <token>`; the token is printed on start.
         #[arg(long)]
         http: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AiCmd {
+    /// The providers, each with its model, server and whether a key is there.
+    Status,
+    /// Use this provider from now on. --model and --server change its model or API address
+    /// ("" puts back the default).
+    Use {
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// Another address for its API, such as Qwen's China region or a proxy.
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Save a provider's API key, after checking it with the provider. Reads it from stdin, so it
+    /// stays out of your shell history.
+    Key { provider: String },
+    /// Delete a provider's saved key.
+    Forget { provider: String },
+    /// The models the key can use (default: the provider in use).
+    Models { provider: Option<String> },
+    /// A provider's request settings; each one given replaces the saved one ("" clears it).
+    Options {
+        provider: String,
+        /// Added to rmm's own instructions for the AI.
+        #[arg(long)]
+        instructions: Option<String>,
+        /// Claude: low, medium, high (default), xhigh or max. Others: their reasoning effort.
+        #[arg(long)]
+        effort: Option<String>,
+        /// 0 to 2 (not Claude).
+        #[arg(long)]
+        temperature: Option<String>,
+        #[arg(long)]
+        max_tokens: Option<String>,
+    },
+    /// Who does each mod team role. With a role (lead, researcher, installer, tester) and a
+    /// provider, give it that provider (--model for another than its own), `mcp` for the AI app
+    /// connected over MCP, or "" for the provider in use.
+    Team {
+        role: Option<String>,
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// This instance's saved chats, newest first.
+    Chats,
+    /// Chat with the AI about this instance, through rmm's tools. Reads and dry runs run straight
+    /// away; each change waits for your y (yes), n (no) or a (yes to all in this chat). After each
+    /// answer, type the next message; an empty line ends.
+    Chat {
+        /// The first message; without it, the first line you type.
+        words: Vec<String>,
+        /// A mod team role for the first message (lead, researcher, installer, tester): it goes to
+        /// the AI set for that role (`rmm ai team`) unless --provider says otherwise.
+        #[arg(long)]
+        role: Option<String>,
+        /// A picture (PNG, JPEG, GIF, WebP) to send with the first message; repeat for more.
+        #[arg(long)]
+        image: Vec<PathBuf>,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Run changes without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Go on with a saved chat (an id from `rmm ai chats`).
+        #[arg(long)]
+        resume: Option<String>,
     },
 }
 
@@ -347,9 +500,29 @@ enum NexusCmd {
     Status,
     /// Mods with a newer file on Nexus (default: all with Nexus ids).
     Updates { ids: Vec<String> },
+    /// Search the game's mods on Nexus by name and description (no key needed).
+    Search {
+        words: Vec<String>,
+        /// A Nexus category, such as Armour or Patches.
+        #[arg(long)]
+        category: Option<String>,
+        /// relevance, endorsements, downloads, updated or created.
+        #[arg(long)]
+        sort: Option<String>,
+        #[arg(long)]
+        count: Option<u32>,
+        #[arg(long)]
+        offset: Option<u32>,
+        /// Include adult-only mods.
+        #[arg(long)]
+        adult: bool,
+    },
+    /// A mod's page: description, tags, what it needs and which mods need it.
+    Info { mod_id: u64 },
     /// Download and install a file by ids (Premium accounts) or nxm link.
     Install {
-        /// An nxm:// link, or <mod id>/<file id>.
+        /// An nxm:// link, a mod page link, a mod id (its newest main file) or <mod id>/<file id>.
+        /// All but nxm links need Premium.
         what: String,
     },
     /// Make nxm:// links open `rmm nxm` for this instance. Changes the system's handler for
@@ -421,6 +594,11 @@ enum ProfileCmd {
 }
 
 fn main() -> Result<()> {
+    // The command match is one big stack frame: unoptimised builds overflow Windows's 1 MB main stack.
+    std::thread::Builder::new().stack_size(16 << 20).spawn(run)?.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let open = || -> Result<Instance> {
         let dir = match &cli.instance {
@@ -483,11 +661,43 @@ fn main() -> Result<()> {
             let inst = open()?;
             print(&conflicts::file_conflicts(&inst, &inst.profile()?, &id)?)
         }
+        Cmd::Data { dir, find, conflicts, archives } => {
+            let inst = open()?;
+            let q = conflicts::DataQuery { dir: dir.unwrap_or_default(), find: find.unwrap_or_default(), conflicts_only: conflicts, archives };
+            print(&conflicts::data_view(&inst, &inst.profile()?, &q)?)
+        }
+        Cmd::Saves { fix: None } => print(&saves::list(&open()?)?),
+        Cmd::Saves { fix: Some(file) } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
+        Cmd::Downloads => print(&install::downloads(&open()?)?),
+        Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),
+        Cmd::Trash { empty: true } => print(&install::empty_trash(&open()?)?),
         Cmd::Note { id, text } => print(&serde_json::json!({ "previous": ops::set_mod_note(&open()?, &id, &text)? })),
+        Cmd::Category { ids, add, remove } => print(&ops::edit_categories(&open()?, &ids, &add, &remove)?),
         Cmd::Color { id, color } => done(ops::set_color(&open()?, &id, &color)),
         Cmd::LockPlugin { name, unlock } => done(ops::lock_plugin(&open()?, &name, !unlock)),
         Cmd::Restore { n, apply: false } => print(&open()?.restore_preview(n)?),
         Cmd::Restore { n, apply: true } => print(&serde_json::json!({ "undone": open()?.restore(n)? })),
+        Cmd::PluginConflicts { plugin } => {
+            let inst = open()?;
+            print(&plugins::record_overlaps(&inst, &inst.profile()?, plugin.as_deref())?)
+        }
+        Cmd::Scan { id } => print(&inspect::scan(&open()?, id.as_deref())?),
+        Cmd::Records { plugin, kinds, max } => {
+            let inst = open()?;
+            print(&plugins::new_records(&inst, &inst.profile()?, &plugin, &kinds, max)?)
+        }
+        Cmd::Review { id, verdict, notes, load_order } => print(&inspect::save_review(&open()?, &id, &verdict, &notes, &load_order)?),
+        Cmd::Reviews { id } => print(&inspect::reviews(&open()?, id.as_deref())?),
+        Cmd::Read { id, path, offset, limit } => {
+            let v = inspect::read_file(&open()?, &id, &path, offset, limit)?;
+            match &v.text {
+                Some(text) => {
+                    println!("{text}");
+                    Ok(())
+                }
+                None => print(&v),
+            }
+        }
         Cmd::Plugins => {
             let inst = open()?;
             print(&plugins::list(&inst, &inst.profile()?)?)
@@ -500,8 +710,12 @@ fn main() -> Result<()> {
         Cmd::CrashLog { path } => print(&logs::read_crash_log(&open()?, path.as_deref())?),
         Cmd::PapyrusLog { tail } => print(&logs::read_papyrus_log(&open()?, tail)?),
         Cmd::TestRun { apply: false, .. } => print(&harness::preview(&open()?)?),
-        Cmd::TestRun { apply: true, save, cells, dwell, timeout, keep_open, window, screenshots } => {
-            print(&harness::test_run(&open()?, &harness::Scenario { save, cells, dwell, timeout, keep_open, window, screenshots })?)
+        Cmd::TestRun { apply: true, save, cells, dwell, timeout, keep_open, window, screenshots, steps } => {
+            let steps = match steps {
+                Some(arg) => serde_json::from_str(&json_arg(&arg)?).context("--steps is a JSON list of steps, such as [{\"cell\": \"Riverwood\"}, {\"wait\": 10}]")?,
+                None => vec![],
+            };
+            print(&harness::test_run(&open()?, &harness::Scenario { save, cells, dwell, timeout, keep_open, window, screenshots, steps })?)
         }
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
         Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
@@ -575,13 +789,18 @@ fn main() -> Result<()> {
         }
         Cmd::Nexus(NexusCmd::Logout) => print(&serde_json::json!({ "forgot": nexus::forget_key()? })),
         Cmd::Nexus(NexusCmd::Status) => print(&nexus::status()),
+        Cmd::Nexus(NexusCmd::Search { words, category, sort, count, offset, adult }) => {
+            print(&nexus::search(&open()?, &nexus::Client::any(), &nexus::Search { query: words.join(" "), category, sort, count, offset, adult })?)
+        }
+        Cmd::Nexus(NexusCmd::Info { mod_id }) => print(&nexus::mod_info(&open()?, &nexus::Client::any(), mod_id)?),
         Cmd::Nexus(NexusCmd::Updates { ids }) => {
             print(&nexus::check_updates(&open()?, &nexus::Client::from_env()?, (!ids.is_empty()).then_some(ids.as_slice()))?)
         }
         Cmd::Nexus(NexusCmd::Install { what }) | Cmd::Nxm { link: what } => {
             let inst = open()?;
-            let link = nexus::link_or_ids(&inst, &what)?;
-            print(&nexus::install(&inst, &nexus::Client::from_env()?, &link, None)?)
+            let client = nexus::Client::from_env()?;
+            let link = nexus::resolve(&inst, &client, &what)?;
+            print(&nexus::install(&inst, &client, &link, None)?)
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;
@@ -590,6 +809,84 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "linux")]
         Cmd::Vfs => rmm_core::vfs::serve(&open()?, |data| eprintln!("Mounted the profile over {}. Ctrl+C unmounts.", data.display())),
+        Cmd::Ai(AiCmd::Status) => print(&agent::status()),
+        Cmd::Ai(AiCmd::Use { provider, model, server }) => print(&agent::configure(&provider, model.as_deref(), server.as_deref(), true)?),
+        Cmd::Ai(AiCmd::Key { provider }) => {
+            let p = agent::provider(&provider)?;
+            eprint!("Paste your {} API key: ", p.name);
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            let n = agent::set_key(p.id, &key)?;
+            eprintln!("Saved. {} took the key ({n} models).", p.name);
+            Ok(())
+        }
+        Cmd::Ai(AiCmd::Forget { provider }) => print(&serde_json::json!({ "forgot": agent::forget_key(&provider)? })),
+        Cmd::Ai(AiCmd::Models { provider }) => print(&agent::Conn::open(provider.as_deref(), None)?.models()?),
+        Cmd::Ai(AiCmd::Options { provider, instructions, effort, temperature, max_tokens }) => {
+            let id = agent::provider(&provider)?.id;
+            let mut o = agent::status().into_iter().find(|s| s.id == id).map(|s| s.options).unwrap_or_default();
+            let num = |v: &str| -> Result<Option<f64>> { Ok(if v.trim().is_empty() { None } else { Some(v.trim().parse().context("not a number")?) }) };
+            if let Some(v) = instructions {
+                o.instructions = v;
+            }
+            if let Some(v) = effort {
+                o.effort = Some(v);
+            }
+            if let Some(v) = temperature {
+                o.temperature = num(&v)?;
+            }
+            if let Some(v) = max_tokens {
+                o.max_tokens = num(&v)?.map(|n| n as u32);
+            }
+            print(&agent::set_options(id, o)?.options)
+        }
+        Cmd::Ai(AiCmd::Team { role, provider, model }) => match (role, provider) {
+            (Some(r), Some(p)) => {
+                agent::set_seat(&r, &p, model.as_deref().unwrap_or(""))?;
+                print(&agent::team())
+            }
+            (None, None) => print(&agent::team()),
+            _ => anyhow::bail!("give a role and a provider (mcp for the AI app connected over MCP, \"\" for the provider in use)"),
+        },
+        Cmd::Ai(AiCmd::Chats) => print(&agent::chats(&open()?.root)?),
+        Cmd::Ai(AiCmd::Chat { words, role, image, provider, model, yes, resume }) => {
+            let inst = open()?;
+            let saved = resume.map(|id| agent::load_chat(&inst.root, &id)).transpose()?;
+            // A role goes to its AI unless the provider is named; the AI app over MCP gets it as a team task.
+            let seat = match (&provider, &saved, &role) {
+                (None, None, Some(r)) => Some(agent::seat(agent::role(r)?.0)),
+                _ => None,
+            };
+            if seat.as_ref().is_some_and(|s| s.provider == agent::MCP) {
+                eprintln!("{}", agent::hand_to_app(&inst.root, role.as_deref().unwrap_or_default(), &words.join(" "))?);
+                return Ok(());
+            }
+            let conn = match seat {
+                Some(s) => agent::Conn::for_seat(&s)?,
+                None => agent::Conn::open(provider.as_deref().or(saved.as_ref().map(|c| c.provider.as_str())), model.as_deref())?,
+            };
+            let mut images = image.iter().map(|p| agent::Image::load(p)).collect::<Result<Vec<_>>>()?;
+            eprintln!("{} · {}. An empty line ends the chat.", conn.provider.name, conn.model);
+            let mut ai = match saved {
+                Some(chat) => agent::Agent::resume(conn, inst.root.clone(), chat)?,
+                None => agent::Agent::new(conn, inst.root.clone())?,
+            };
+            ai.trusted = yes;
+            let (mut text, mut role) = (words.join(" "), role);
+            loop {
+                if text.trim().is_empty() {
+                    eprint!("you> ");
+                    text.clear();
+                    if std::io::stdin().read_line(&mut text)? == 0 || text.trim().is_empty() {
+                        return Ok(());
+                    }
+                }
+                if let Err(e) = ai.send(role.take().as_deref(), text.trim(), &std::mem::take(&mut images), &mut Term) {
+                    eprintln!("error: {e:#}");
+                }
+                text.clear();
+            }
+        }
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
         Cmd::History => print(&open()?.history_details()?),
@@ -612,17 +909,55 @@ fn main() -> Result<()> {
     }
 }
 
+/// The chat in a terminal: the AI's words on stdout, its tool calls on stderr.
+struct Term;
+
+fn first_line(s: &str, max: usize) -> String {
+    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    match line.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line.into(),
+    }
+}
+
+impl agent::Ui for Term {
+    fn event(&mut self, e: agent::Event) {
+        match e {
+            agent::Event::User { .. } => {}
+            agent::Event::Text { text } => println!("{text}\n"),
+            agent::Event::Call { name, args } => eprintln!("> {name} {}", first_line(&args.to_string(), 160)),
+            agent::Event::Result { ok, text, .. } => eprintln!("  {} {}", if ok { "ok:" } else { "failed:" }, first_line(&text, 160)),
+            agent::Event::Notice { text } => eprintln!("! {text}"),
+        }
+    }
+
+    fn approve(&mut self, name: &str, args: &serde_json::Value) -> agent::Answer {
+        eprint!("Run {name} {args}? [y]es, [n]o, [a]ll changes in this chat: ");
+        let mut a = String::new();
+        let _ = std::io::stdin().read_line(&mut a);
+        match a.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => agent::Answer::Yes,
+            "a" | "all" => agent::Answer::Always,
+            _ => agent::Answer::No,
+        }
+    }
+}
+
 fn print<T: Serialize + ?Sized>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
 
-fn parse_choices(arg: &str) -> Result<rmm_core::fomod::Choices> {
-    let text = match arg.strip_prefix('@') {
+/// A JSON argument, or `@file` for one in a file.
+fn json_arg(arg: &str) -> Result<String> {
+    Ok(match arg.strip_prefix('@') {
         Some(file) => std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?,
         None => arg.to_owned(),
-    };
-    serde_json::from_str(&text).context("--choices is not valid FOMOD choices JSON")
+    })
+}
+
+fn parse_choices(arg: &str) -> Result<rmm_core::fomod::Choices> {
+    serde_json::from_str(&json_arg(arg)?).context("--choices is not valid FOMOD choices JSON")
 }
 
 fn parse_var(s: &str) -> Result<(String, String), String> {

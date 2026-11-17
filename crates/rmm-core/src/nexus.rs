@@ -89,22 +89,44 @@ impl Client {
         Ok(Client { base: std::env::var("RMM_NEXUS_API").unwrap_or_else(|_| API.into()), key: key.into() })
     }
 
+    /// Without a key: enough for search and mod pages (`graphql`), which Nexus serves signed out.
+    pub fn anonymous() -> Client {
+        Client { base: std::env::var("RMM_NEXUS_API").unwrap_or_else(|_| API.into()), key: String::new() }
+    }
+
+    /// The saved key's client, or an anonymous one.
+    pub fn any() -> Client {
+        Client::from_env().unwrap_or_else(|_| Client::anonymous())
+    }
+
     /// GET a JSON endpoint (`path` starts with `/v1/`).
     pub fn get(&self, path: &str) -> Result<Value> {
+        self.request(path, None)
+    }
+
+    /// A query against Nexus's GraphQL API (v2): search, descriptions, requirements.
+    pub fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let v = self.request("/v2/graphql", Some(&serde_json::json!({ "query": query, "variables": variables }).to_string()))?;
+        if let Some(e) = v["errors"].as_array().and_then(|e| e.first()) {
+            bail!("Nexus: {}", e["message"].as_str().unwrap_or("the query failed"));
+        }
+        Ok(v["data"].clone())
+    }
+
+    fn request(&self, path: &str, body: Option<&str>) -> Result<Value> {
         let url = format!("{}{path}", self.base);
         let version = env!("CARGO_PKG_VERSION");
         // The key goes to curl on stdin, never on its command line where other programs see it.
-        let config = format!(
-            "header = \"apikey: {}\"\nheader = \"Application-Name: rmm\"\nheader = \"Application-Version: {version}\"\nuser-agent = \"rmm/{version}\"\n",
-            self.key
-        );
-        let mut child = Command::new("curl")
-            .args(["-sS", "--max-time", "60", "-w", "\n%{http_code}", "-K", "-", "--", &url])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("cannot run curl")?;
+        let mut config = format!("header = \"Application-Name: rmm\"\nheader = \"Application-Version: {version}\"\nuser-agent = \"rmm/{version}\"\n");
+        if !self.key.is_empty() {
+            config += &format!("header = \"apikey: {}\"\n", self.key);
+        }
+        let mut args = vec!["-sS", "--max-time", "60", "-w", "\n%{http_code}", "-K", "-"];
+        if let Some(b) = body {
+            args.extend(["-H", "Content-Type: application/json", "-H", "Expect:", "--data-binary", b]);
+        }
+        args.extend(["--", &url]);
+        let mut child = Command::new("curl").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("cannot run curl")?;
         child.stdin.take().unwrap().write_all(config.as_bytes())?;
         let out = child.wait_with_output()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -387,6 +409,32 @@ struct Cache {
     files: BTreeMap<u64, Value>,
 }
 
+/// The game's category names on Nexus, apart from the cache: the mod list reads them on every
+/// reload, and the cache grows with every mod's files.
+const CATEGORIES: &str = "nexus-categories.json";
+
+/// Nexus's category names for the instance's game, as last read (no network).
+pub fn category_names(inst: &Instance) -> BTreeMap<u64, String> {
+    fs::read_to_string(inst.root.join(CATEGORIES)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Read the game's category names from Nexus, once. Returns whether it read them.
+// ponytail: read once and kept; a category Nexus renames keeps its old name until nexus-categories.json is deleted.
+pub fn refresh_categories(inst: &Instance, client: &Client) -> Result<bool> {
+    if !category_names(inst).is_empty() {
+        return Ok(false);
+    }
+    let game = client.get(&format!("/v1/games/{}.json", inst.config.game.nexus_domain()))?;
+    let names: BTreeMap<u64, String> = game["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["category_id"].as_u64()?, c["name"].as_str()?.to_string())))
+        .collect();
+    fs::write(inst.root.join(CATEGORIES), serde_json::to_string(&names)?)?;
+    Ok(!names.is_empty())
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -395,6 +443,7 @@ fn now() -> u64 {
 pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -> Result<Vec<Update>> {
     let domain = inst.config.game.nexus_domain();
     let cache_path = inst.root.join(CACHE);
+    let _ = refresh_categories(inst, client); // names for the Category column; the check stands without them
     let mut cache: Cache = fs::read_to_string(&cache_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let mods: Vec<(String, crate::instance::ModMeta)> = inst
         .profile()?
@@ -456,7 +505,7 @@ fn newer(id: &str, name: &str, n: &crate::instance::NexusRef, files: &Value, dom
         }
         // No file id (an MO2 import, say): the newest main file, if its version differs.
         None => {
-            let main = list.iter().filter(|f| f["category_name"] == "MAIN").max_by_key(|f| f["uploaded_timestamp"].as_u64().unwrap_or(0))?;
+            let main = newest_main(files)?;
             let v = main["version"].as_str();
             if v.is_none() || v == n.version.as_deref() {
                 return None;
@@ -477,6 +526,11 @@ fn newer(id: &str, name: &str, n: &crate::instance::NexusRef, files: &Value, dom
     })
 }
 
+/// A mod's newest main file in its files.json.
+fn newest_main(files: &Value) -> Option<&Value> {
+    files["files"].as_array()?.iter().filter(|f| f["category_name"] == "MAIN").max_by_key(|f| f["uploaded_timestamp"].as_u64().unwrap_or(0))
+}
+
 /// Download a mod file into `<instance>/downloads/`. Accounts without Premium need the key and
 /// expiry from an nxm link (the website's download button); Premium accounts can pass bare ids.
 pub fn download(inst: &Instance, client: &Client, link: &NxmLink) -> Result<PathBuf> {
@@ -488,6 +542,12 @@ fn download_info(inst: &Instance, client: &Client, link: &NxmLink) -> Result<(Pa
     let domain = inst.config.game.nexus_domain();
     if link.game != domain {
         bail!("the link is for {}, this instance is {domain}", link.game);
+    }
+    if link.key.is_none() && client.validate()?["is_premium"] != true {
+        bail!(
+            "only Premium accounts can download without the website: open https://www.nexusmods.com/{domain}/mods/{}?tab=files and click \"Mod manager download\" on the file (with rmm set to open Nexus links), or paste that button's nxm:// link",
+            link.mod_id
+        );
     }
     let base = format!("/v1/games/{domain}/mods/{}/files/{}", link.mod_id, link.file_id);
     let info = client.get(&format!("{base}.json"))?;
@@ -530,8 +590,17 @@ pub struct Fetched {
 pub fn fetch(inst: &Instance, client: &Client, link: &NxmLink) -> Result<Fetched> {
     let (path, info) = download_info(inst, client, link)?;
     let domain = inst.config.game.nexus_domain();
-    let name = client.get(&format!("/v1/games/{domain}/mods/{}.json", link.mod_id)).ok().and_then(|m| m["name"].as_str().map(str::to_owned));
-    let nexus = crate::instance::NexusRef { mod_id: link.mod_id, file_id: Some(link.file_id), version: info["version"].as_str().map(str::to_owned) };
+    let m = client.get(&format!("/v1/games/{domain}/mods/{}.json", link.mod_id)).unwrap_or_default();
+    let name = m["name"].as_str().map(str::to_owned);
+    let nexus = crate::instance::NexusRef {
+        mod_id: link.mod_id,
+        file_id: Some(link.file_id),
+        version: info["version"].as_str().map(str::to_owned),
+        category: m["category_id"].as_u64(),
+    };
+    if nexus.category.is_some() {
+        let _ = refresh_categories(inst, client); // the name is a nicety; the download stands without it
+    }
     Ok(Fetched { path, name, nexus })
 }
 
@@ -556,14 +625,42 @@ pub fn premium_link(inst: &Instance, mod_id: u64, file_id: u64) -> NxmLink {
     NxmLink { game: inst.config.game.nexus_domain().into(), mod_id, file_id, key: None, expires: None }
 }
 
-/// An nxm:// link, or `<mod id>/<file id>` (Premium accounts).
-pub fn link_or_ids(inst: &Instance, what: &str) -> Result<NxmLink> {
+/// What to download: an nxm:// link, a mod page link (`nexusmods.com/<game>/mods/<id>`, with
+/// `file_id=` when it names a file), `<mod id>/<file id>`, or a bare mod id. Without a file the
+/// mod's newest main file is taken. All but nxm links download only with Premium.
+pub fn resolve(inst: &Instance, client: &Client, what: &str) -> Result<NxmLink> {
     let what = what.trim();
-    match what.split_once('/') {
-        Some((m, f)) if !what.contains(':') => Ok(premium_link(inst, m.trim().parse()?, f.trim().parse()?)),
-        _ => parse_nxm(what),
+    if what.starts_with("nxm://") {
+        return parse_nxm(what);
     }
+    let domain = inst.config.game.nexus_domain();
+    let (mod_id, file_id) = if let Some(i) = what.find("nexusmods.com/") {
+        let path = &what[i + "nexusmods.com/".len()..];
+        let (game, rest) = path.split_once("/mods/").context("that isn't a mod page link (nexusmods.com/<game>/mods/<id>)")?;
+        if !game.eq_ignore_ascii_case(domain) {
+            bail!("the link is for {game}, this instance is {domain}");
+        }
+        let digits = |s: &str| s.chars().take_while(char::is_ascii_digit).collect::<String>();
+        let file = rest.split_once("file_id=").map(|(_, f)| digits(f)).filter(|f| !f.is_empty());
+        (digits(rest).parse().context("no mod id in the link")?, file.map(|f| f.parse()).transpose()?)
+    } else {
+        match what.split_once('/') {
+            Some((m, f)) => (m.trim().parse().context("give <mod id>/<file id>")?, Some(f.trim().parse().context("give <mod id>/<file id>")?)),
+            None => (what.parse().context("give an nxm:// link, a mod page link or a mod id")?, None),
+        }
+    };
+    let file_id = match file_id {
+        Some(f) => f,
+        None => {
+            let files = client.get(&format!("/v1/games/{domain}/mods/{mod_id}/files.json"))?;
+            newest_main(&files).and_then(|f| f["file_id"].as_u64()).with_context(|| format!("mod {mod_id} has no main file; name one with <mod id>/<file id>"))?
+        }
+    };
+    Ok(premium_link(inst, mod_id, file_id))
 }
+
+/// The page where users make a personal API key.
+pub const KEYS_PAGE: &str = "https://next.nexusmods.com/settings/api-keys";
 
 /// Make nxm:// links open `rmm nxm <link>` for this instance. Only when the user asks: it changes
 /// which program the system opens these links with (HKCU\Software\Classes\nxm on Windows, an
@@ -682,11 +779,230 @@ mod tests {
             ],
             "file_updates": [{ "old_file_id": 1, "new_file_id": 2 }, { "old_file_id": 2, "new_file_id": 3 }]
         });
-        let r = |file_id, version: &str| crate::instance::NexusRef { mod_id: 9, file_id, version: Some(version.into()) };
+        let r = |file_id, version: &str| crate::instance::NexusRef { mod_id: 9, file_id, version: Some(version.into()), category: None };
         let u = newer("A", "A", &r(Some(1), "1.0"), &files, "skyrimspecialedition").unwrap();
         assert_eq!((u.file_id, u.latest.as_deref(), u.url.as_str()), (3, Some("1.2"), "https://www.nexusmods.com/skyrimspecialedition/mods/9?tab=files&file_id=3"));
         assert!(newer("A", "A", &r(Some(3), "1.2"), &files, "x").is_none());
         assert_eq!(newer("A", "A", &r(None, "1.1"), &files, "x").unwrap().file_id, 3, "by version without a file id");
         assert!(newer("A", "A", &r(None, "1.2"), &files, "x").is_none());
+    }
+}
+
+/// What to look for on Nexus (`search`).
+#[derive(Deserialize, schemars::JsonSchema, Default, Debug)]
+pub struct Search {
+    /// Words to match in mod names and descriptions; empty lists the category's or game's mods.
+    #[serde(default)]
+    pub query: String,
+    /// Only this Nexus category (the names list_mods shows, such as "Armour" or "Patches").
+    #[serde(default)]
+    pub category: Option<String>,
+    /// "relevance" (default with a query), "endorsements", "downloads", "updated" or "created".
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// How many (default 20, at most 50).
+    #[serde(default)]
+    pub count: Option<u32>,
+    /// Skip this many, for the next page.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// Include adult-only mods (default false).
+    #[serde(default)]
+    pub adult: bool,
+}
+
+/// A mod on Nexus.
+#[derive(Serialize, Debug, Default)]
+pub struct Found {
+    pub mod_id: u64,
+    pub name: String,
+    pub summary: String,
+    pub category: String,
+    pub author: String,
+    pub version: String,
+    pub endorsements: u64,
+    pub downloads: u64,
+    /// Last update (RFC 3339).
+    pub updated: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<String>,
+    /// The installed mod with this Nexus id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct Results {
+    pub total: u64,
+    pub mods: Vec<Found>,
+}
+
+/// A mod another one needs, or one that needs it.
+#[derive(Serialize, Debug)]
+pub struct Requirement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<u64>,
+    pub name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    /// For requirements outside Nexus.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+}
+
+/// A mod's page: what `search` shows plus its description and requirements.
+#[derive(Serialize, Debug)]
+pub struct ModInfo {
+    #[serde(flatten)]
+    pub found: Found,
+    pub tags: Vec<String>,
+    /// The page's description as plain text (BBCode removed, links kept), up to 12,000 characters.
+    pub description: String,
+    pub requires: Vec<Requirement>,
+    pub dlc: Vec<String>,
+    /// Mods that list this one as a requirement (patches and add-ons for it); the first 100 are in required_by.
+    pub required_by_count: u64,
+    pub required_by: Vec<Requirement>,
+}
+
+const MOD_FIELDS: &str = "modId name summary category author version endorsements downloads updatedAt pictureUrl";
+
+/// Installed mods by their Nexus mod id.
+fn installed_by_nexus(inst: &Instance) -> BTreeMap<u64, String> {
+    inst.profile().map(|p| p.mods.iter().filter_map(|m| Some((inst.mod_meta(&m.id).nexus?.mod_id, m.id.clone()))).collect()).unwrap_or_default()
+}
+
+fn found(inst: &Instance, v: &Value, installed: &BTreeMap<u64, String>) -> Found {
+    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    let mod_id = v["modId"].as_u64().unwrap_or_default();
+    Found {
+        mod_id,
+        name: s("name"),
+        summary: s("summary"),
+        category: s("category"),
+        author: s("author"),
+        version: s("version"),
+        endorsements: v["endorsements"].as_u64().unwrap_or_default(),
+        downloads: v["downloads"].as_u64().unwrap_or_default(),
+        updated: s("updatedAt"),
+        url: format!("https://www.nexusmods.com/{}/mods/{mod_id}", inst.config.game.nexus_domain()),
+        picture: v["pictureUrl"].as_str().map(str::to_owned),
+        installed: installed.get(&mod_id).cloned(),
+    }
+}
+
+/// Search the game's mods on Nexus by name and description (no key needed).
+pub fn search(inst: &Instance, client: &Client, s: &Search) -> Result<Results> {
+    let query = s.query.trim();
+    let mut filter = serde_json::json!({ "gameDomainName": [{ "value": inst.config.game.nexus_domain() }] });
+    if !query.is_empty() {
+        filter["filter"] = serde_json::json!([{ "op": "OR", "nameStemmed": [{ "value": query, "op": "MATCHES" }], "description": [{ "value": query, "op": "MATCHES" }] }]);
+    }
+    if !s.adult {
+        filter["adultContent"] = serde_json::json!([{ "value": false }]);
+    }
+    if let Some(c) = s.category.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        // Nexus matches category names exactly; the saved names fix the case.
+        let names = category_names(inst);
+        let exact = names.values().find(|n| n.eq_ignore_ascii_case(c));
+        if exact.is_none() && !names.is_empty() {
+            bail!("Nexus has no category {c:?} for this game; it has: {}", names.values().cloned().collect::<Vec<_>>().join(", "));
+        }
+        filter["categoryName"] = serde_json::json!([{ "value": exact.map_or(c, String::as_str) }]);
+    }
+    let sort = match s.sort.as_deref().unwrap_or("relevance") {
+        "relevance" if !query.is_empty() => "relevance",
+        "relevance" | "endorsements" => "endorsements",
+        "downloads" => "downloads",
+        "updated" => "updatedAt",
+        "created" => "createdAt",
+        other => bail!("sort is relevance, endorsements, downloads, updated or created, not {other:?}"),
+    };
+    let data = client.graphql(
+        &format!("query($f: ModsFilter, $s: [ModsSort!], $n: Int, $o: Int) {{ mods(filter: $f, sort: $s, count: $n, offset: $o) {{ totalCount nodes {{ {MOD_FIELDS} }} }} }}"),
+        serde_json::json!({ "f": filter, "s": [{ sort: { "direction": "DESC" } }], "n": s.count.unwrap_or(20).clamp(1, 50), "o": s.offset.unwrap_or(0) }),
+    )?;
+    let installed = installed_by_nexus(inst);
+    Ok(Results {
+        total: data["mods"]["totalCount"].as_u64().unwrap_or_default(),
+        mods: data["mods"]["nodes"].as_array().into_iter().flatten().map(|v| found(inst, v, &installed)).collect(),
+    })
+}
+
+/// A mod's page on Nexus: description, tags, what it needs and what needs it, each marked when installed.
+pub fn mod_info(inst: &Instance, client: &Client, mod_id: u64) -> Result<ModInfo> {
+    let req = "nodes { modId modName notes url externalRequirement gameId }";
+    // One mod by id needs the game's number; a list query for it costs Nexus too much.
+    let game = client.graphql("query($d: String) { game(domainName: $d) { id } }", serde_json::json!({ "d": inst.config.game.nexus_domain() }))?;
+    let data = client.graphql(
+        &format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ {MOD_FIELDS} gameId description tags {{ name }} modRequirements {{ dlcRequirements {{ gameExpansion {{ name }} }} nexusRequirements(count: 100) {{ {req} }} modsRequiringThisMod(count: 100) {{ totalCount {req} }} }} }} }}"),
+        serde_json::json!({ "m": mod_id, "g": game["game"]["id"] }),
+    )?;
+    let v = &data["mod"];
+    if v.is_null() {
+        bail!("Nexus has no mod {mod_id} for this game (removed or hidden?)");
+    }
+    let installed = installed_by_nexus(inst);
+    let game = v["gameId"].to_string().trim_matches('"').to_string();
+    let list = |page: &Value| -> Vec<Requirement> {
+        page["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|n| n["gameId"].is_null() || n["gameId"].to_string().trim_matches('"') == game)
+            .map(|n| {
+                let id = n["modId"].as_str().and_then(|i| i.parse().ok()).or(n["modId"].as_u64()).filter(|_| n["externalRequirement"] != true);
+                Requirement {
+                    mod_id: id,
+                    name: n["modName"].as_str().unwrap_or_default().into(),
+                    notes: n["notes"].as_str().unwrap_or_default().into(),
+                    url: n["url"].as_str().unwrap_or_default().into(),
+                    installed: id.and_then(|i| installed.get(&i).cloned()),
+                }
+            })
+            .collect()
+    };
+    let r = &v["modRequirements"];
+    Ok(ModInfo {
+        found: found(inst, v, &installed),
+        tags: v["tags"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect(),
+        description: plain_text(v["description"].as_str().unwrap_or_default()),
+        requires: list(&r["nexusRequirements"]),
+        dlc: r["dlcRequirements"].as_array().into_iter().flatten().filter_map(|d| d["gameExpansion"]["name"].as_str().map(str::to_owned)).collect(),
+        required_by_count: r["modsRequiringThisMod"]["totalCount"].as_u64().unwrap_or_default(),
+        required_by: list(&r["modsRequiringThisMod"]),
+    })
+}
+
+/// A mod page's BBCode as plain text: links keep their address, images go.
+fn plain_text(bb: &str) -> String {
+    let t = bb.replace("<br />", "\n").replace("<br>", "\n").replace('\r', "").replace("[*]", "\n- ");
+    let t = regex::Regex::new(r"(?is)\[img[^\]]*\].*?\[/img\]").unwrap().replace_all(&t, "").into_owned();
+    let t = regex::Regex::new(r"(?i)\[url=([^\]]+)\]").unwrap().replace_all(&t, "$1 ").into_owned();
+    let tags = r"(?i)\[/?(b|i|u|s|center|left|right|justify|size|colou?r|font|url|img|quote|code|spoiler|list|line|heading|youtube|table|tr|td|th|hr|sub|sup|indent|email)(=[^\]]*)?\]|<[^>]*>";
+    let t = regex::Regex::new(tags).unwrap().replace_all(&t, "").into_owned();
+    let t = t.replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&nbsp;", " ");
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in t.lines().map(str::trim) {
+        blank = if line.is_empty() { blank + 1 } else { 0 };
+        if blank < 2 {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    let out = out.trim();
+    if out.chars().count() > 12_000 { out.chars().take(12_000).collect::<String>() + "…" } else { out.to_string() }
+}
+
+#[cfg(test)]
+mod text_tests {
+    #[test]
+    fn bbcode_to_text() {
+        let bb = "[center][size=5]Frostfall [SE][/size][/center]\r<br />[img]http://x/y.png[/img]<br /><br /><br />Needs [url=https://nexusmods.com/skyrimspecialedition/mods/667]Campfire[/url] &amp; more[list][*]one[/list]";
+        assert_eq!(super::plain_text(bb), "Frostfall [SE]\n\nNeeds https://nexusmods.com/skyrimspecialedition/mods/667 Campfire & more\n- one");
     }
 }

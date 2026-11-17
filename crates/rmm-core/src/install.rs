@@ -1,4 +1,4 @@
-//! Install a mod from a folder, .zip or .7z: extract, find the Data root (or run its FOMOD
+//! Install a mod from a folder, .zip, .7z or .rar: extract, find the Data root (or run its FOMOD
 //! installer), store under mods/<id>.
 use crate::fomod::{Choices, Env, FileState, Installer, Walk};
 use crate::instance::{ModMeta, index_dir};
@@ -38,13 +38,51 @@ pub fn install(inst: &Instance, source: &Path, name: Option<&str>, enable: bool,
 
 /// `install` at a given priority (0 = lowest) instead of the default place.
 pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bool, choices: Option<&Choices>, priority: Option<usize>) -> Result<InstallReport> {
+    // A folder keeps its whole name ("Address Library (1.7.104.0)"); an archive loses its extension.
+    let stem = if source.is_dir() { source.file_name() } else { source.file_stem() }.map(|s| s.to_string_lossy().into_owned());
+    let nexus = stem.as_deref().and_then(nexus_name);
     let name = name
         .map(str::to_owned)
-        // A folder keeps its whole name ("Address Library (1.7.104.0)"); an archive loses its extension.
-        .or_else(|| if source.is_dir() { source.file_name() } else { source.file_stem() }.map(|s| s.to_string_lossy().into_owned()))
+        .or_else(|| nexus.as_ref().map(|(n, _)| n.clone()))
+        .or(stem)
         .context("cannot derive a mod name from the source path")?;
     let id = unique_id(inst, &sanitize(&name));
-    install_with_id(inst, source, &id, &name, enable, choices, priority)
+    let r = install_with_id(inst, source, &id, &name, enable, choices, priority)?;
+    if let Some((_, n)) = nexus {
+        crate::nexus::remember(inst, &r.id, n)?; // so update checks find a manual download too
+    }
+    Ok(r)
+}
+
+/// The mod name, Nexus mod id and version in a Nexus download's file name, as MO2 reads them:
+/// "Address Library - All In One 47327 1.11.240 2026-08-21T23-48Z Hbu6377Rl" (the site's names
+/// now) or "Unofficial Skyrim Special Edition Patch-266-4-2-5a-1623868815" (older ones).
+fn nexus_name(stem: &str) -> Option<(String, crate::instance::NexusRef)> {
+    let found = |name: &str, id: &str, version: &str| {
+        let mod_id = id.bytes().all(|b| b.is_ascii_digit()).then(|| id.parse().ok()).flatten().filter(|_| !name.trim().is_empty())?;
+        Some((name.trim().to_string(), crate::instance::NexusRef { mod_id, file_id: None, version: Some(version.into()), category: None }))
+    };
+    if let [hash, time, version, id, name] = stem.rsplitn(5, ' ').collect::<Vec<_>>()[..] {
+        let t = time.as_bytes();
+        let is_time = t.len() == 17 && t.iter().enumerate().all(|(i, &b)| match i {
+            4 | 7 | 13 => b == b'-',
+            10 => b == b'T',
+            16 => b == b'Z',
+            _ => b.is_ascii_digit(),
+        });
+        if is_time && hash.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return found(name, id, version);
+        }
+    }
+    let (rest, time) = stem.rsplit_once('-')?;
+    if time.len() != 10 || !time.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // The name ends at the first "-<digits>-": the mod id, then the version.
+    rest.match_indices('-').find_map(|(i, _)| {
+        let (id, version) = rest[i + 1..].split_once('-')?;
+        found(&rest[..i], id, &version.replace('-', "."))
+    })
 }
 
 /// Install under an exact id (a lockfile's), which must be free and valid.
@@ -381,6 +419,79 @@ pub fn clear_overwrite(inst: &Instance) -> Result<usize> {
     })
 }
 
+/// What trash/ holds: uninstalled mods, replaced files of reinstalled mods and tool output, and
+/// cleared overwrite/. Undo restores mods from it, so nothing there is deleted on its own.
+#[derive(Debug, Serialize)]
+pub struct Trash {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+pub fn trash(inst: &Instance) -> Result<Trash> {
+    let dir = inst.root.join("trash");
+    let entries = fs::read_dir(&dir).map_or(0, |rd| rd.count());
+    let files = walkdir::WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file());
+    Ok(Trash { entries, bytes: files.filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum() })
+}
+
+/// Delete everything in trash/ for good to free the space. Undo can't bring those mods back
+/// afterwards (they leave the list instead). Returns what was there.
+pub fn empty_trash(inst: &Instance) -> Result<Trash> {
+    inst.locked(|| {
+        let t = trash(inst)?;
+        for e in fs::read_dir(inst.root.join("trash")).into_iter().flatten().flatten() {
+            if e.file_type()?.is_dir() { fs::remove_dir_all(e.path())? } else { fs::remove_file(e.path())? }
+        }
+        Ok(t)
+    })
+}
+
+/// An archive in the instance's `downloads/` folder (where Nexus downloads go).
+#[derive(Debug, Serialize)]
+pub struct Download {
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+    /// Unix seconds.
+    pub modified: u64,
+    /// Mods installed from a file of this name.
+    pub mods: Vec<String>,
+}
+
+/// The downloads folder, newest first.
+// ponytail: install from here records no Nexus ids; keep fetch's details beside the file if
+// update checks for such mods matter.
+pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
+    let mut from: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for e in fs::read_dir(inst.mods_dir()).into_iter().flatten().flatten() {
+        let id = e.file_name().to_string_lossy().into_owned();
+        if let Some(file) = inst.mod_meta(&id).source.as_deref().and_then(|s| Path::new(s).file_name()) {
+            from.entry(file.to_string_lossy().to_lowercase()).or_default().push(id);
+        }
+    }
+    let mut out = Vec::new();
+    for e in fs::read_dir(inst.root.join("downloads")).into_iter().flatten().flatten() {
+        let (name, m) = (e.file_name().to_string_lossy().into_owned(), e.metadata()?);
+        if !m.is_file() || name.ends_with(".part") {
+            continue;
+        }
+        let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        out.push(Download { mods: from.remove(&name.to_lowercase()).unwrap_or_default(), path: e.path(), size: m.len(), modified, name });
+    }
+    out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+    Ok(out)
+}
+
+/// Delete a file from the downloads folder. Mods installed from it stay; they can't be
+/// reinstalled from it any more.
+pub fn delete_download(inst: &Instance, name: &str) -> Result<()> {
+    let path = inst.root.join("downloads").join(name);
+    if name.contains(['/', '\\']) || name.starts_with('.') || !path.is_file() {
+        bail!("no download named {name}");
+    }
+    Ok(fs::remove_file(path)?)
+}
+
 pub fn is_plugin(name: &str) -> bool {
     ext_of(name).is_some_and(|e| matches!(e.as_str(), "esp" | "esm" | "esl"))
 }
@@ -396,8 +507,26 @@ fn extract(source: &Path, dest: &Path) -> Result<()> {
     match ext_of(&source.to_string_lossy()).as_deref() {
         Some("zip") => zip::ZipArchive::new(fs::File::open(source)?)?.extract(dest)?,
         Some("7z") => sevenz_rust2::decompress_file(source, dest).map_err(|e| anyhow!("7z: {e}"))?,
-        Some("rar") => bail!("RAR is not supported yet; extract it and install the folder"),
-        _ => bail!("{} is not a folder, .zip or .7z", source.display()),
+        Some("rar") => extract_rar(source, dest)?,
+        _ => bail!("{} is not a folder, .zip, .7z or .rar", source.display()),
+    }
+    Ok(())
+}
+
+/// RAR through libarchive's bsdtar, which reads RAR4 and RAR5 (not encrypted ones). Windows 10
+/// and 11 ship it as System32\tar.exe; elsewhere it's `bsdtar` (libarchive-tools). Like any bsdtar
+/// run without -P, it won't write outside `dest`.
+fn extract_rar(source: &Path, dest: &Path) -> Result<()> {
+    let tar = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("tar.exe")).filter(|t| t.is_file()).unwrap_or_else(|| "bsdtar".into());
+    fs::create_dir_all(dest)?;
+    let mut cmd = std::process::Command::new(&tar);
+    cmd.arg("-xf").arg(source).arg("-C").arg(dest);
+    // CREATE_NO_WINDOW: no console flashes up over the desktop app.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let out = cmd.output().with_context(|| format!("RAR needs {}", tar.display()))?;
+    if !out.status.success() {
+        bail!("RAR: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
 }

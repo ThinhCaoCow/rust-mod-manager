@@ -29,8 +29,40 @@ pub struct ModRow {
     /// textures, animations, interface, sound, archives, root, fomod, tool output.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<&'static str>,
+    /// Category labels: the ones set on the mod, else its Nexus category.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+/// A mod's categories: the ones set on it, else the name of its Nexus category.
+pub fn categories(meta: &crate::instance::ModMeta, nexus: &std::collections::BTreeMap<u64, String>) -> Vec<String> {
+    meta.categories.clone().unwrap_or_else(|| meta.nexus.as_ref().and_then(|n| nexus.get(&n.category?)).cloned().into_iter().collect())
+}
+
+/// Add and remove category labels on mods (case-insensitively; existing spelling wins). Like
+/// notes, categories live with the mod, so this isn't in the undo history.
+pub fn edit_categories(inst: &Instance, ids: &[String], add: &[String], remove: &[String]) -> Result<()> {
+    if let Some(id) = ids.iter().find(|id| is_separator(id) || !inst.mod_dir(id).join(crate::instance::MOD_META).is_file()) {
+        bail!("mod '{id}' is not installed");
+    }
+    let nexus = crate::nexus::category_names(inst);
+    inst.locked(|| {
+        for id in ids {
+            let mut meta = inst.mod_meta(id);
+            let mut c = categories(&meta, &nexus);
+            for a in add.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
+                if !c.iter().any(|x| x.eq_ignore_ascii_case(a)) {
+                    c.push(a.to_string());
+                }
+            }
+            c.retain(|x| !remove.iter().any(|r| r.trim().eq_ignore_ascii_case(x)));
+            meta.categories = Some(c);
+            inst.write_mod_meta(id, &meta)?;
+        }
+        Ok(())
+    })
 }
 
 /// Tags for a mod's files (`/`-separated, relative to the mod folder).
@@ -81,6 +113,7 @@ pub fn instance_info(inst: &Instance) -> Result<Value> {
 
 pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
     let p = inst.profile()?;
+    let nexus = crate::nexus::category_names(inst);
     p.mods
         .iter()
         .enumerate()
@@ -91,6 +124,7 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
             Ok(ModRow {
                 priority: i,
                 tags: if separator { vec![] } else { tags(&files, &meta) },
+                categories: categories(&meta, &nexus),
                 notes: meta.notes.clone(),
                 name: if separator { m.id[4..].to_string() } else { meta.name },
                 enabled: m.enabled,
@@ -122,6 +156,8 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
         "files": files.iter().take(max_files).collect::<Vec<_>>(),
         "files_truncated": files.len() > max_files,
         "conflicts": conflict,
+        // The saved review with whether the files are still the ones reviewed.
+        "review": crate::inspect::reviews(inst, Some(id))?.pop(),
     }))
 }
 
@@ -150,7 +186,14 @@ pub fn set_mods_enabled(inst: &Instance, ids: &[String], enabled: bool) -> Resul
             let Some(m) = p.mods.iter_mut().find(|m| m.id == **id) else { bail!("no mod '{id}'") };
             m.enabled = enabled;
         }
-        for pl in p.plugins.iter_mut().filter(|e| plugins.iter().any(|x| x.eq_ignore_ascii_case(&e.name))) {
+        // A plugin another enabled mod also provides (an updated copy) stays on.
+        let mut provided = std::collections::HashSet::new();
+        if !enabled {
+            for m in p.mods.iter().filter(|m| m.enabled && !is_separator(&m.id)) {
+                provided.extend(inst.mod_files(&m.id)?.into_iter().filter(|f| !f.contains('/') && is_plugin(f)).map(|f| f.to_lowercase()));
+            }
+        }
+        for pl in p.plugins.iter_mut().filter(|e| plugins.iter().any(|x| x.eq_ignore_ascii_case(&e.name)) && !provided.contains(&e.name.to_lowercase())) {
             pl.enabled = enabled;
         }
         Ok(())

@@ -255,7 +255,8 @@ async fn connection(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
 /// An rmcp server on an in-memory pipe, and a task that hands its answers to the waiting requests.
 fn open_session(shared: &Shared) -> Arc<Session> {
     let (ours, theirs) = tokio::io::duplex(1 << 20);
-    let server = shared.rmm.clone();
+    // Each session keeps its own chat.
+    let server = shared.rmm.clone().recorded();
     tokio::spawn(async move {
         if let Ok(running) = server.serve(tokio::io::split(theirs)).await {
             let _ = running.waiting().await;

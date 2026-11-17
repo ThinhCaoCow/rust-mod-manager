@@ -6,11 +6,14 @@
 use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use rmm_core::instance::OVERWRITE;
-use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, install, launch, lockfile, logs, loot, nexus, ops, plugins, rules, tools};
+use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, install, launch, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, workspace};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use rmm::agent::{self, Agent, Answer};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 
@@ -38,6 +41,162 @@ async fn mcp(current: tauri::State<'_, Current>, server: tauri::State<'_, Mcp>, 
     let url = format!("http://{}/mcp", http.addr);
     *slot = Some(http);
     Ok(json!({ "on": true, "url": url, "token": token }))
+}
+
+/// The AI tab's chat: the agent (for this instance folder), the window's answer to a change waiting
+/// for approval, and the Stop button.
+#[derive(Default)]
+struct Ai {
+    agent: Arc<Mutex<Option<(PathBuf, Agent)>>>,
+    answer: Mutex<Option<Sender<Answer>>>,
+    stop: Arc<AtomicBool>,
+}
+
+/// Providers, keys, models and settings (`status`, `use`, `key`, `forget`, `models`, `options`),
+/// and the instance's chats (`chats`, `chat`, `delete_chat`).
+#[tauri::command]
+async fn ai(current: tauri::State<'_, Current>, name: String, args: Value) -> Result<Value, String> {
+    let root = current.0.lock().unwrap().clone();
+    let work = move || -> Result<Value> {
+        let s = |k: &str| args[k].as_str().map(str::to_owned);
+        let need = |k: &str| s(k).with_context(|| format!("missing '{k}'"));
+        let root = || root.clone().context("no instance is open");
+        Ok(match name.as_str() {
+            "options" => json!(agent::set_options(&need("provider")?, serde_json::from_value(args["options"].clone())?)?),
+            "chats" => json!(agent::chats(&root()?)?),
+            "chat" => {
+                // The screen's log is enough to draw it; the provider's messages stay on disk.
+                let mut c = agent::load_chat(&root()?, &need("id")?)?;
+                c.messages.clear();
+                json!(c)
+            }
+            "delete_chat" => json!(agent::delete_chat(&root()?, &need("id")?)?),
+            "status" => json!(agent::status()),
+            "use" => json!(agent::configure(&need("provider")?, s("model").as_deref(), s("base").as_deref(), args["switch"] != false)?),
+            "team" => json!(agent::team()),
+            "seat" => json!(agent::set_seat(&need("role")?, &s("provider").unwrap_or_default(), &s("model").unwrap_or_default())?),
+            "key" => json!(agent::set_key(&need("provider")?, &need("key")?)?),
+            "forget" => json!(agent::forget_key(&need("provider")?)?),
+            "models" => json!(agent::Conn::open(s("provider").as_deref(), None)?.models()?),
+            other => bail!("unknown AI call '{other}'"),
+        })
+    };
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
+}
+
+/// The window as the agent's screen: events go out as `ai` events, approvals wait for `ai_answer`.
+struct Window {
+    app: tauri::AppHandle,
+    answers: Receiver<Answer>,
+    stop: Arc<AtomicBool>,
+}
+
+impl agent::Ui for Window {
+    fn event(&mut self, e: agent::Event) {
+        let _ = self.app.emit("ai", e);
+    }
+
+    fn approve(&mut self, name: &str, args: &Value) -> Answer {
+        let _ = self.app.emit("ai", json!({ "kind": "approve", "name": name, "args": args }));
+        self.answers.recv().unwrap_or(Answer::No)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn exchange(&mut self, x: &agent::Exchange) {
+        let _ = self.app.emit("ai-exchange", x);
+    }
+}
+
+/// Send a message in `chat` (a saved chat's id, or none for a new one). A role's message goes to the
+/// AI chosen for that role in Settings (a role given to the AI app over MCP goes on the team board);
+/// without one, the chat goes on with its own AI, and a new chat gets the provider in use. The turn
+/// runs on its own thread and ends with an `ai` event of kind `done` carrying the chat that ran.
+#[tauri::command]
+fn ai_send(app: tauri::AppHandle, current: tauri::State<'_, Current>, ai: tauri::State<'_, Ai>, text: String, role: Option<String>, images: Vec<String>, chat: Option<String>) -> Result<(), String> {
+    let root = current.0.lock().unwrap().clone().ok_or("no instance is open")?;
+    let (tx, answers) = std::sync::mpsc::channel();
+    *ai.answer.lock().unwrap() = Some(tx);
+    ai.stop.store(false, Ordering::Relaxed);
+    let (slot, stop) = (ai.agent.clone(), ai.stop.clone());
+    // Its own thread, not the async runtime's: the agent runs a runtime of its own for rmm's tools.
+    std::thread::spawn(move || {
+        let mut ui = Window { app: app.clone(), answers, stop };
+        let mut slot = slot.lock().unwrap();
+        let mut ran = false;
+        let mut turn = || -> Result<()> {
+            // Picked in the window (data: URLs) or dropped on it (paths).
+            let images = images.iter().map(|d| if d.starts_with("data:") { agent::Image::from_data_url(d) } else { agent::Image::load(Path::new(d)) }).collect::<Result<Vec<_>>>()?;
+            let role = role.as_deref().filter(|r| !r.is_empty());
+            let seat = role.map(|r| agent::role(r).map(|&(key, ..)| agent::seat(key))).transpose()?;
+            if let (Some(r), Some(s)) = (role, &seat)
+                && s.provider == agent::MCP
+            {
+                agent::Ui::event(&mut ui, agent::Event::Notice { text: agent::hand_to_app(&root, r, &text)? });
+                return Ok(());
+            }
+            let kept = matches!(slot.as_ref(), Some((r, a)) if *r == root && chat.as_deref() == Some(a.chat.id.as_str()));
+            if !kept {
+                *slot = None; // the old chat's tools stop first
+            }
+            let saved = match (&chat, kept) {
+                (Some(id), false) => Some(agent::load_chat(&root, id)?),
+                _ => None,
+            };
+            let on = slot.as_ref().map(|(_, a)| &a.chat).or(saved.as_ref()).map(|c| (c.provider.clone(), c.model.clone()));
+            let conn = match (seat, on) {
+                (Some(s), _) => agent::Conn::for_seat(&s)?,
+                (None, Some((p, m))) => agent::Conn::open(Some(&p), Some(&m))?,
+                (None, None) => agent::Conn::for_seat(&agent::seat("chat"))?,
+            };
+            match slot.as_mut() {
+                Some((_, a)) => {
+                    if a.conn.provider.id != conn.provider.id {
+                        bail!("this chat is with {}; start a new chat for {}", a.conn.provider.name, conn.provider.name);
+                    }
+                    a.conn = conn;
+                }
+                None => {
+                    let a = match saved {
+                        Some(c) => Agent::resume(conn, root.clone(), c)?,
+                        None => Agent::new(conn, root.clone())?,
+                    };
+                    *slot = Some((root.clone(), a));
+                }
+            }
+            let (_, a) = slot.as_mut().context("no chat")?;
+            ran = true;
+            a.send(role, &text, &images, &mut ui)
+        };
+        let error = turn().err().map(|e| format!("{e:#}"));
+        let chat = slot.as_ref().filter(|_| ran).map(|(_, a)| json!({ "id": a.chat.id, "title": a.chat.title, "usage": a.chat.usage, "provider": a.chat.provider, "model": a.chat.model }));
+        let _ = app.emit("ai", json!({ "kind": "done", "error": error, "chat": chat }));
+    });
+    Ok(())
+}
+
+/// The window's answer to the change waiting for approval: yes, no or always.
+#[tauri::command]
+fn ai_answer(ai: tauri::State<'_, Ai>, answer: String) {
+    let a = match answer.as_str() {
+        "yes" => Answer::Yes,
+        "always" => Answer::Always,
+        _ => Answer::No,
+    };
+    if let Some(tx) = ai.answer.lock().unwrap().as_ref() {
+        let _ = tx.send(a);
+    }
+}
+
+/// End the turn after the current step (declining a change that waits).
+#[tauri::command]
+fn ai_stop(ai: tauri::State<'_, Ai>) {
+    ai.stop.store(true, Ordering::Relaxed);
+    if let Some(tx) = ai.answer.lock().unwrap().as_ref() {
+        let _ = tx.send(Answer::No);
+    }
 }
 
 #[tauri::command]
@@ -115,6 +274,11 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         })?,
         "stamp" => json!(stamp(&inst)),
         "plan" => json!(deploy::deploy(&inst, true)?),
+        // The Deploy button's count, without the file lists (megabytes on a long list).
+        "pending" => {
+            let p = deploy::deploy(&inst, true)?;
+            json!(p.link.len() + p.remove.len() + p.external_changes.len() + p.played.len())
+        }
         "deploy" => json!(deploy::deploy(&inst, false)?),
         "purge" => json!(deploy::purge(&inst, flag("dry_run"))?),
         "launch" => json!(launch::launch(&inst, false)?),
@@ -198,12 +362,29 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "delete_profile" => json!(inst.delete_profile(&s("name")?)?),
         "crash_log" => json!(logs::read_crash_log(&inst, a["path"].as_str().map(Path::new))?),
         "papyrus_log" => json!(logs::read_papyrus_log(&inst, 60)?),
-        "nexus_status" => nexus::status(),
+        "nexus_status" => {
+            let mut st = nexus::status();
+            // Signed in: fetch the game's category names once, so Nexus categories show.
+            if st["user"].is_object() {
+                st["categories_read"] = json!(nexus::Client::from_env().and_then(|c| nexus::refresh_categories(&inst, &c)).unwrap_or(false));
+            }
+            st
+        }
         "nexus_set_key" => nexus::set_key(&s("key")?)?,
         "nexus_sso" => nexus::sso(&nexus::open_in_browser)?,
         "nexus_forget_key" => json!(nexus::forget_key()?),
         "check_updates" => json!(nexus::check_updates(&inst, &nexus::Client::from_env()?, None)?),
-        "nexus_fetch" => json!(nexus::fetch(&inst, &nexus::Client::from_env()?, &nexus::link_or_ids(&inst, &s("link")?)?)?),
+        "nexus_fetch" => {
+            let client = nexus::Client::from_env()?;
+            json!(nexus::fetch(&inst, &client, &nexus::resolve(&inst, &client, &s("link")?)?)?)
+        }
+        "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
+        // Only on the user's click: it makes this rmm the system's program for nxm:// links.
+        "nexus_handler" => {
+            let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm.exe" } else { "rmm" });
+            anyhow::ensure!(cli.is_file(), "rmm's command-line program isn't next to the app ({})", cli.display());
+            json!(nexus::register_handler(&cli, &inst.root)?)
+        }
         "addons" => json!(addons::list(&inst)?),
         "addon_install" => json!(addons::install(&inst, Path::new(&s("path")?), flag("dry_run"))?),
         "addon_remove" => json!(addons::remove(&inst, &s("name")?)?),
@@ -217,10 +398,26 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(lockfile::apply(&inst, &lockfile::read(Path::new(&s("path")?))?, &downloads, flag("dry_run"))?)
         }
         "file_conflicts" => json!(conflicts::file_conflicts(&inst, &p, &s("id")?)?),
+        "data" => json!(conflicts::data_view(&inst, &p, &serde_json::from_value(a.clone())?)?),
+        "saves" => json!(saves::list(&inst)?),
+        "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
+        "downloads" => json!(install::downloads(&inst)?),
+        "delete_download" => json!(install::delete_download(&inst, &s("name")?)?),
+        "trash" => json!(install::trash(&inst)?),
+        "empty_trash" => json!(install::empty_trash(&inst)?),
         "history_details" => json!(inst.history_details()?),
         "restore_preview" => json!(inst.restore_preview(n("n")?)?),
         "restore" => json!(inst.restore(n("n")?)?),
         "set_note" => json!(ops::set_mod_note(&inst, &s("id")?, &s("note")?)?),
+        "ide_list" => json!(workspace::list(&inst, a["path"].as_str().unwrap_or(""))?),
+        "ide_read" => json!(workspace::read(&inst, &s("path")?)?),
+        "ide_write" => json!(workspace::write(&inst, &s("path")?, &s("text")?, a["expect"].as_str(), "you")?),
+        "ide_edits" => json!(workspace::edits(&inst)?),
+        "ide_revert" => json!(workspace::revert(&inst, n("n")?)?),
+        "categories" => {
+            let list = |k: &str| serde_json::from_value::<Vec<String>>(a[k].clone()).unwrap_or_default();
+            json!(ops::edit_categories(&inst, &ids()?, &list("add"), &list("remove"))?)
+        }
         "set_color" => json!(ops::set_color(&inst, &s("id")?, &s("color")?)?),
         "lock_plugin" => json!(ops::lock_plugin(&inst, &s("name")?, flag("lock"))?),
         other => bail!("unknown call '{other}'"),
@@ -257,6 +454,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Current(Mutex::new(start)))
         .manage(Mcp(Mutex::new(None)))
+        .manage(Ai::default())
         .setup(|app| {
             // Long jobs report progress; send the window at most ~10 updates a second.
             let handle = app.handle().clone();
@@ -270,7 +468,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![call, mcp])
+        .invoke_handler(tauri::generate_handler![call, mcp, ai, ai_send, ai_answer, ai_stop])
         .run(tauri::generate_context!())
         .expect("error while running rmm");
 }

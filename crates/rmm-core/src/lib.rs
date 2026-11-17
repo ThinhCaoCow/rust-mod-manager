@@ -7,6 +7,7 @@ pub mod fomod;
 pub mod game;
 pub mod harness;
 pub mod import;
+pub mod inspect;
 pub mod lockfile;
 pub mod nexus;
 pub mod health;
@@ -20,7 +21,9 @@ pub mod plugins;
 pub mod profile_ini;
 pub mod proton;
 pub mod rules;
+pub mod saves;
 pub mod tools;
+pub mod workspace;
 #[cfg(target_os = "linux")]
 pub mod vfs;
 
@@ -49,7 +52,8 @@ pub use instance::{Instance, ModEntry, PluginEntry, Profile};
 /// Lowercase, forward-slash key used for every case-insensitive path comparison.
 /// A file in rmm's folder in the user's config folder (`%APPDATA%\rmm` on Windows).
 pub fn config_file(name: &str) -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("rmm").join(name))
+    // RMM_CONFIG_DIR: settings and keys somewhere else (tests, a portable setup).
+    std::env::var_os("RMM_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| dirs::config_dir().map(|d| d.join("rmm"))).map(|d| d.join(name))
 }
 
 /// Write a secret (API key, token) readable only by the user on Unix.
