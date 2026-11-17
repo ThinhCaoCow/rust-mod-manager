@@ -219,15 +219,20 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
     };
     match name {
         "detect" => return Ok((json!(Game::ALL.iter().filter_map(|g| game::detect(*g)).collect::<Vec<_>>()), root)),
+        "search_drives" => return Ok((json!(game::search_drives()), root)),
         "open" => {
             let inst = Instance::open(Path::new(&s("path")?))?;
             return Ok((ops::instance_info(&inst)?, Some(inst.root)));
         }
         "create" => {
             let g: Game = serde_json::from_value(a["game"].clone())?;
-            let found = game::detect(g).context("game not found; create the instance with `rmm init --game-path`")?;
-            let local = found.local_path.context("cannot work out where plugins.txt lives; use `rmm init --local-path`")?;
-            let inst = Instance::create(Path::new(&s("path")?), g, &found.game_path, &local)?;
+            // A folder the search found, or the one detection finds.
+            let game_path = match a["game_path"].as_str() {
+                Some(p) => PathBuf::from(p),
+                None => game::detect(g).context("game not found; create the instance with `rmm init --game-path`")?.game_path,
+            };
+            let local = game::local_path(g, &game_path).context("cannot work out where plugins.txt lives; use `rmm init --local-path`")?;
+            let inst = Instance::create(Path::new(&s("path")?), g, &game_path, &local)?;
             return Ok((ops::instance_info(&inst)?, Some(inst.root)));
         }
         // rmm's settings (no instance needed), with what the Settings tab needs to draw them.
@@ -402,6 +407,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "addon_remove" => json!(addons::remove(&inst, &s("name")?)?),
         "addon_call" => addons::call(&inst, &s("name")?, &s("function")?, &a["input"].clone())?,
         "import_sources" => json!(import::find_sources()),
+        // Of these MO2 instances, the ones for this instance's game.
+        "mo2_for_game" => json!(serde_json::from_value::<Vec<PathBuf>>(a["dirs"].clone())?.into_iter().filter(|d| import::mo2_game(d) == Some(inst.config.game)).collect::<Vec<_>>()),
         "mo2_profiles" => json!(import::mo2_profiles(Path::new(&s("dir")?))?),
         "import_mo2" => json!(import::import_mo2(&inst, Path::new(&s("dir")?), a["profile"].as_str(), flag("dry_run"))?),
         "import_vortex" => json!(import::import_vortex(&inst, Path::new(&s("path")?), a["staging"].as_str().map(Path::new), a["profile"].as_str(), flag("dry_run"))?),

@@ -81,10 +81,8 @@ pub fn find_sources() -> Sources {
 pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: bool) -> Result<ImportReport> {
     let ini = mo2_ini(dir)?;
     let get = |s: &str, k: &str| ini.get(s).and_then(|m| m.get(k)).filter(|v| !v.is_empty()).cloned();
-    let game = match get("General", "gameName").as_deref() {
-        Some("Skyrim Special Edition") => Game::SkyrimSe,
-        Some("Fallout 4") => Game::Fallout4,
-        other => bail!("this MO2 instance manages {}, which rmm doesn't support", other.unwrap_or("an unknown game")),
+    let Some(game) = game_of(&ini) else {
+        bail!("this MO2 instance manages {}, which rmm doesn't support", get("General", "gameName").as_deref().unwrap_or("an unknown game"))
     };
     if game != inst.config.game {
         bail!("this MO2 instance is for {game:?}, the rmm instance for {:?}", inst.config.game);
@@ -167,6 +165,19 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
     }
     bring_in(inst, &format!("import MO2 profile {name}"), &incoming, plugins, locks, &mut r)?;
     Ok(r)
+}
+
+/// The game an MO2 instance manages, when rmm supports it.
+pub fn mo2_game(dir: &Path) -> Option<Game> {
+    game_of(&mo2_ini(dir).ok()?)
+}
+
+fn game_of(ini: &HashMap<String, HashMap<String, String>>) -> Option<Game> {
+    match ini.get("General")?.get("gameName")?.as_str() {
+        "Skyrim Special Edition" => Some(Game::SkyrimSe),
+        "Fallout 4" => Some(Game::Fallout4),
+        _ => None,
+    }
 }
 
 fn mo2_ini(dir: &Path) -> Result<HashMap<String, HashMap<String, String>>> {

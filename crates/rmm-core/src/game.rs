@@ -237,6 +237,102 @@ pub fn detect(game: Game) -> Option<Detected> {
     })
 }
 
+/// What a search of every drive found.
+#[derive(Debug, Default, Serialize)]
+pub struct Search {
+    /// Game folders: the game's exe beside a Data folder (source "search").
+    pub games: Vec<Detected>,
+    /// MO2 instances: folders holding ModOrganizer.ini.
+    pub mo2: Vec<PathBuf>,
+}
+
+/// How many folders below a drive's root the search looks (Steam libraries put games 4 or 5 down).
+const SEARCH_DEPTH: usize = 6;
+
+/// Look through every local drive for game folders (copies outside Steam and other stores too)
+/// and MO2 instances (portable ones too). Skips Windows, hidden and system folders and links,
+/// and doesn't look inside what it finds.
+pub fn search_drives() -> Search {
+    let mut found = Search::default();
+    for root in drives() {
+        walk(&root, SEARCH_DEPTH, &mut found, true);
+    }
+    found
+}
+
+/// Fixed and removable drives (not network drives or discs).
+#[cfg(windows)]
+fn drives() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| format!("{}:\\", (b'A' + i) as char))
+        .filter(|root| {
+            let wide: Vec<u16> = root.encode_utf16().chain([0]).collect();
+            matches!(unsafe { GetDriveTypeW(wide.as_ptr()) }, 2 | 3) // DRIVE_REMOVABLE, DRIVE_FIXED
+        })
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn drives() -> Vec<PathBuf> {
+    vec![PathBuf::from("/")]
+}
+
+fn walk(dir: &Path, depth: usize, found: &mut Search, top: bool) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let (mut files, mut subdirs) = (Vec::new(), Vec::new());
+    for e in rd.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        if t.is_file() {
+            files.push(name);
+        } else if t.is_dir() && !skipped(&e, &name) {
+            subdirs.push((name, e.path())); // links aren't directories here, so no loops
+        }
+    }
+    let has = |f: &str| files.iter().any(|n| n.eq_ignore_ascii_case(f));
+    let mut hit = false;
+    for game in Game::ALL {
+        if has(game.exe()) && subdirs.iter().any(|(n, _)| n == "data") {
+            found.games.push(Detected { game, local_path: local_path(game, dir), game_path: dir.to_path_buf(), source: "search" });
+            hit = true;
+        }
+    }
+    if has("ModOrganizer.ini") {
+        found.mo2.push(dir.to_path_buf());
+        hit = true;
+    }
+    if hit || depth == 0 {
+        return;
+    }
+    for (_, p) in subdirs {
+        if top {
+            crate::progress::report(&format!("searching {}", p.display()), 0, 0);
+        }
+        walk(&p, depth - 1, found, false);
+    }
+}
+
+fn skipped(e: &std::fs::DirEntry, name: &str) -> bool {
+    if name.starts_with(['.', '$']) || name == "windows" || name == "node_modules" {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const HIDDEN_OR_SYSTEM: u32 = 0x2 | 0x4;
+        if e.metadata().is_ok_and(|m| m.file_attributes() & HIDDEN_OR_SYSTEM != 0) {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = e;
+    false
+}
+
 /// Folder holding plugins.txt, named by [`Game::local_folder`].
 /// - Windows: under `%LOCALAPPDATA%`.
 /// - Linux: under the Proton prefix of the Steam library holding the game.
@@ -311,6 +407,36 @@ pub fn parse_library_paths(vdf: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searches_folders_for_games_and_mo2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let put = |rel: &str| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        };
+        put("Games/Skyrim Downgraded/skyrimse.exe");
+        put("Games/Skyrim Downgraded/Data/Skyrim.esm");
+        put("Games/Skyrim Downgraded/Data/Nested/SkyrimSE.exe"); // not looked at: inside a find
+        put("Games/MO2/ModOrganizer.ini");
+        put("Games/MO2/mods/Old/ModOrganizer.ini");
+        put("Patcher/Fallout4.exe"); // no Data folder: not a game folder
+        put(".hidden/Fallout4.exe");
+        put(".hidden/Data/x");
+        put("a/b/c/Fallout4.exe");
+        put("a/b/c/Data/x");
+        let mut found = Search::default();
+        walk(tmp.path(), 3, &mut found, true);
+        let rel = |p: &Path| p.strip_prefix(tmp.path()).unwrap().to_string_lossy().replace('\\', "/");
+        let mut games: Vec<_> = found.games.iter().map(|d| (d.game, rel(&d.game_path))).collect();
+        games.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(games, [(Game::SkyrimSe, "Games/Skyrim Downgraded".to_string()), (Game::Fallout4, "a/b/c".to_string())]);
+        assert_eq!(found.mo2.iter().map(|p| rel(p)).collect::<Vec<_>>(), ["Games/MO2"]);
+        let mut shallow = Search::default();
+        walk(tmp.path(), 2, &mut shallow, true);
+        assert_eq!(shallow.games.len(), 1, "a/b/c is 3 folders down");
+    }
 
     #[cfg(windows)]
     #[test]

@@ -19,7 +19,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Find installed games.
-    Detect,
+    Detect {
+        /// Also look through every drive (slower): game folders outside Steam and the registry,
+        /// and MO2 instances, portable ones too.
+        #[arg(long)]
+        search: bool,
+    },
     /// Create an instance folder for a game.
     Init {
         dir: PathBuf,
@@ -622,7 +627,8 @@ fn run() -> Result<()> {
         Instance::open(&dir)
     };
     match cli.cmd {
-        Cmd::Detect => print(&Game::ALL.iter().filter_map(|g| game::detect(*g)).collect::<Vec<_>>()),
+        Cmd::Detect { search: false } => print(&Game::ALL.iter().filter_map(|g| game::detect(*g)).collect::<Vec<_>>()),
+        Cmd::Detect { search: true } => print(&game::search_drives()),
         Cmd::Init { dir, game: g, addon, game_path, local_path } => {
             if let Some(a) = &addon {
                 addons::games_in(a)?;

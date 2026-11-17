@@ -1848,6 +1848,7 @@ fn imports_an_mo2_instance() {
     let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
 
     assert_eq!(import::mo2_profiles(&mo2).unwrap(), ["Main", "Alt"], "the selected one first");
+    assert_eq!((import::mo2_game(&mo2), import::mo2_game(&game)), (Some(Game::SkyrimSe), None));
     let dry = import::import_mo2(&inst, &mo2, None, true).unwrap();
     assert_eq!((dry.mods.join(" "), dry.separators, dry.plugins), ("A B C".into(), 1, 3));
     assert!(!inst.mod_dir("A").exists() && order(&inst).is_empty());

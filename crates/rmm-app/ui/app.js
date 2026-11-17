@@ -255,15 +255,36 @@ tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'hi
 $('#filter').value = prefs.filter ?? '';
 filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, problems: 1 }));
 
+let gamesFound = []; // the welcome screen's game folders: detected, then any the search adds
+
 async function showWelcome() {
   $('#app').hidden = true;
   $('#welcome').hidden = false;
-  const found = await call('detect').catch(() => []);
-  const first = !recall() && found.length; // nothing opened before: making an instance comes first
-  $('#open-instance').classList.toggle('primary', !first);
+  gamesFound = await call('detect').catch(() => []);
+  drawGames();
+}
+
+function drawGames() {
+  const found = gamesFound, first = !recall(); // nothing opened before: making an instance comes first
+  $('#open-instance').classList.toggle('primary', !first || !found.length);
+  $('#search-drives').classList.toggle('primary', first && !found.length);
+  $('#search-note').hidden = found.length > 0;
+  $('#search-note').textContent = 'No game found through Steam or the registry. Auto search looks through every drive, for copies outside Steam too.';
   $('#create-games').innerHTML = found.map((d, i) =>
     `<button data-game="${esc(d.game)}" data-path="${esc(d.game_path)}"${first && !i ? ' class="primary"' : ''}>New instance for ${esc(GAMES[d.game] ?? d.game)}<br><span class="muted small">${esc(d.game_path)}</span></button>`).join('');
 }
+
+/** Same folder, whatever the case and trailing slash. */
+const samePath = (a, b) => String(a).replace(/[\\/]+$/, '').toLowerCase() === String(b).replace(/[\\/]+$/, '').toLowerCase();
+
+$('#search-drives').onclick = async () => {
+  const r = await act('Searching every drive', () => call('search_drives'), { reload: false });
+  if (!r || r === true) return;
+  const added = r.games.filter(g => !gamesFound.some(d => samePath(d.game_path, g.game_path)));
+  gamesFound = [...gamesFound, ...added];
+  drawGames();
+  toast(added.length ? `Found ${plural(added.length, 'more game folder')}.` : r.games.length ? 'No other game folders: the search found the same ones.' : 'No Skyrim Special Edition or Fallout 4 folder on any drive.');
+};
 
 async function enter(label, fn) {
   if (await act(label, fn)) showApp();
@@ -282,7 +303,7 @@ $('#create-games').onclick = async e => {
   const [here, there] = [path, b.dataset.path].map(p => p.slice(0, 2).toUpperCase());
   const drive = d => `drive ${d.replace(':', '')}`;
   if (here !== there && !await confirmBox('Another drive', `The game is on ${drive(there)} and this folder on ${drive(here)}. Deploys would then copy mod files into the game folder instead of linking them, which takes as much space again. A folder on ${drive(there)} avoids that.`, 'Use this folder', 'primary')) return;
-  enter('Creating the instance', () => call('create', { game: b.dataset.game, path }));
+  enter('Creating the instance', () => call('create', { game: b.dataset.game, game_path: b.dataset.path, path }));
 };
 
 // ---- Virtual lists: only the rows on screen are in the DOM -------------------------------------
@@ -1934,6 +1955,24 @@ async function importExport(what) {
       const pick = await dialog({ title: 'Import from Vortex', body: '<p>Read Vortex’s current setup? Close Vortex first so everything it knows is saved.</p><p class="muted small">rmm reads a copy and never changes Vortex’s files.</p>', actions: [['cancel', 'Cancel'], ['file', 'A backup file…'], ['ok', 'Current setup', 'primary']] });
       if (pick === 'ok') path = live;
       else if (pick !== 'file') return;
+    }
+    // MO2: the instances found so far, and Auto search for portable ones anywhere.
+    const game = GAMES[S.info.game] ?? S.info.game;
+    const forGame = dirs => call('mo2_for_game', { dirs }).catch(() => dirs);
+    let mo2 = what === 'mo2' ? await forGame(src.mo2) : [];
+    while (what === 'mo2') {
+      const body = mo2.length
+        ? `<p>MO2 instances for ${esc(game)} on this PC:</p><select id="mo2-dir" aria-label="MO2 instance">${mo2.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select>`
+        : `<p>No MO2 instance for ${esc(game)} in the usual place (AppData\\Local\\ModOrganizer). Auto search looks through every drive, for portable ones too.</p>`;
+      const v = await dialog({ title: 'Import from MO2', body, actions: [['cancel', 'Cancel'], ['search', 'Auto search all drives'], ['pick', 'Choose a folder…'], ...(mo2.length ? [['ok', 'Next', 'primary']] : [])] });
+      if (v === 'ok') path = $('#mo2-dir').value;
+      if (v === 'ok' || v === 'pick') break;
+      if (v !== 'search') return;
+      const r = await act('Searching every drive', () => call('search_drives'), { reload: false });
+      if (!r || r === true) continue;
+      const more = (await forGame(r.mo2)).filter(p => !mo2.some(q => samePath(p, q)));
+      if (!more.length) toast(`No other MO2 instances for ${game} on any drive.`);
+      mo2 = [...more, ...mo2];
     }
     path ??= what === 'mo2'
       ? await T.dialog.open({ directory: true, title: 'The MO2 instance folder (with ModOrganizer.ini)', defaultPath: src.mo2[0] })

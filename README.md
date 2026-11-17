@@ -22,7 +22,7 @@ wsl -- bash -lc "cd /mnt/d/Games/Rust_Mod_Manager && CARGO_TARGET_DIR=\$HOME/rmm
 ## Use
 
 ```
-rmm detect                                         # find installed games
+rmm detect                                         # find installed games (--search: look through every drive)
 rmm init D:\Mods\skyrim --game skyrim-se           # create an instance (paths auto-detected)
 set RMM_INSTANCE=D:\Mods\skyrim                    # or pass -i <dir> to every command
 rmm install "C:\Downloads\SkyUI_5_2_SE.7z"
