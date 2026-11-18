@@ -375,6 +375,7 @@ function render() {
   renderPlugins();
   renderHistory();
   renderDetails();
+  renderBisect();
 }
 
 const CRITERIA = {
@@ -1203,7 +1204,7 @@ async function crashLog(path) {
     ${rows ? `<p>Named in the log, most likely first:</p><table class="fc">${rows}</table>` : '<p class="muted">The log names nothing that mods provide.</p>'}
     ${r.next_steps.length ? `<h3>What to try</h3><ul>${r.next_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
     ${r.call_stack.length ? `<details><summary>Call stack</summary><pre>${esc(r.call_stack.join('\n'))}</pre></details>` : ''}
-    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><span class="muted small" id="crash-note" role="status"></span></div>
+    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><button type="button" id="find-culprit" title="Turn off half of the mods at a time and play, until one is left">Find the culprit…</button><span class="muted small" id="crash-note" role="status"></span></div>
     ${others.length ? `<label class="field">Older crash logs<select id="older"><option value="">Choose…</option>${others.map(o => `<option value="${esc(o.path)}">${esc(basename(o.path))} · ${esc(when(o.modified))}</option>`).join('')}</select></label>` : ''}
     <p class="muted small" style="margin-top:10px">A name in a crash log is a lead, not a verdict: the mod that crashed often isn't the one at fault.</p>`;
   const done = dialog({ title: 'Crash log', body, actions: [['cancel', 'Close']] });
@@ -1217,6 +1218,7 @@ async function crashLog(path) {
     const b = await saveBundle(r.path, note);
     if (b) note(`Saved ${b.path}`);
   };
+  $('#find-culprit').onclick = () => { $('#dlg').close(); setTimeout(() => startBisect(r)); };
   await done;
   $('#dlg').onclick = null;
 }
@@ -1244,26 +1246,72 @@ async function saveBundle(crash, fail) {
   try { return await call('support_bundle', { dir, crash }); } catch (e) { fail(`Couldn’t save the bundle: ${e}`); return null; }
 }
 
-$('#test-run').onclick = async () => {
+/** Ask what a test run does: a save, cells, seconds in each, the window, screenshots. */
+async function askScenario(title, intro) {
   const t = (await loadConf())?.test ?? { window: '960x540', dwell: 10, screenshots: true };
   const sizes = [['960x540', 'Small, behind your other windows'], ['1280x720', '1280×720, behind your other windows'], ['fullscreen', 'The game’s own display settings']];
   if (!sizes.some(([v]) => v === t.window)) sizes.unshift([t.window, `${t.window.replace('x', '×')}, behind your other windows`]);
-  const body = `<p>Deploys, starts the game through the script extender and checks that it holds up. With rmm's harness plugin installed as a mod it waits for the main menu, loads the save or goes to each cell with <code>coc</code>, and measures FPS; without it, it only watches the game. A crash log written during the run fails it.</p>
+  const body = `${intro}
     <label class="field">Save to load <input id="tr-save" type="text" placeholder="optional: the save's name without extension" spellcheck="false"></label>
     <label class="field">Cells to visit <input id="tr-cells" type="text" placeholder="Riverwood, WhiterunBreezehome" spellcheck="false"></label>
     <label class="field">Seconds in each cell <input id="tr-dwell" type="number" min="1" value="${t.dwell}"></label>
     <label class="field">Window <select id="tr-window">${sizes.map(([v, l]) => `<option value="${esc(v)}"${v === t.window ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
     <label class="row" style="margin-top:12px"><input id="tr-shots" type="checkbox" ${t.screenshots ? 'checked' : ''}> A screenshot in each cell</label>`;
-  if (await dialog({ title: 'Test run', body, actions: [['cancel', 'Cancel'], ['run', 'Start the game', 'primary']] }) !== 'run') return;
-  const scenario = {
+  if (await dialog({ title, body, actions: [['cancel', 'Cancel'], ['run', 'Start the game', 'primary']] }) !== 'run') return null;
+  return {
     save: $('#tr-save').value.trim() || null,
     cells: $('#tr-cells').value.split(',').map(c => c.trim()).filter(Boolean),
     dwell: Math.max(1, Number($('#tr-dwell').value) || t.dwell),
     window: $('#tr-window').value,
     screenshots: $('#tr-shots').checked,
   };
+}
+
+$('#test-run').onclick = async () => {
+  const scenario = await askScenario('Test run', `<p>Deploys, starts the game through the script extender and checks that it holds up. With rmm's harness plugin installed as a mod it waits for the main menu, loads the save or goes to each cell with <code>coc</code>, and measures FPS; without it, it only watches the game. A crash log written during the run fails it.</p>`);
+  if (!scenario) return;
   const r = await act('The test run', () => call('test_run', scenario));
   if (r && r !== true) await showTestRun(r);
+};
+
+/** Explain the bisect and start it over the crash log's mods, or every enabled mod. */
+async function startBisect(r) {
+  if (S.bisect) return toast('A search for the culprit is under way: finish or stop it in the bar under the tabs.');
+  const named = [...new Set(r.suspects.map(s => s.mod_id).filter(id => id && byId.get(id)?.enabled))];
+  const all = S.mods.filter(m => !m.separator && m.enabled).length;
+  const games = n => plural(Math.ceil(Math.log2(Math.max(n, 1))) + 1, 'game');
+  const body = `<p>rmm turns off half of the mods, with the mods that need them, and you play to where the game crashed. Then you say whether it still crashed: rmm turns them back on and halves what's left, until one mod is left. Each step is in History, and Stop turns everything back on.</p>
+    <p class="muted small">It works when the crash happens every time at the same place. With rmm's harness plugin, Test each step for me plays the game for you.</p>
+    <label class="row"><input type="radio" name="bi" value="named" ${named.length ? 'checked' : 'disabled'}> ${named.length ? `The ${plural(named.length, 'mod')} the crash log names (about ${games(named.length)})` : 'The crash log names no enabled mods'}</label>
+    <label class="row"><input type="radio" name="bi" value="all" ${named.length ? '' : 'checked'}> Every enabled mod but the script extender (about ${games(all)})</label>`;
+  if (await dialog({ title: 'Find the culprit', body, actions: [['cancel', 'Cancel'], ['go', 'Turn off the first half', 'primary']] }) !== 'go') return;
+  const args = $('input[name=bi]:checked')?.value === 'all' ? { all: true } : { mods: named };
+  await act('Turning off the first half', () => call('bisect', { action: 'start', ...args }));
+}
+
+/** The bar under the tabs while a bisect is under way: what's off, and how the game went. */
+function renderBisect() {
+  const b = S.bisect, bar = $('#bisect-bar');
+  bar.hidden = !b;
+  if (!b) return void (bar.innerHTML = '');
+  const list = ids => { const n = ids.map(nameOf); return n.length > 5 ? `${n.slice(0, 5).join(', ')} and ${n.length - 5} more` : n.join(', '); };
+  const text = b.done ? b.message
+    : `Step ${b.steps.length + 1}: ${plural(b.off.length, 'mod')} off (${list(b.off)}). Play to where the game crashed, then say how it went. ${plural(b.left.length, 'suspect')} left, about ${plural(b.steps_left, 'step')} to go.`;
+  const buttons = b.done
+    ? `${b.culprit ? `<button data-bi="show">Show ${esc(nameOf(b.culprit))}</button>` : ''}<button data-bi="stop">Done</button>`
+    : `<button data-bi="crashed">It still crashed</button><button data-bi="ok">It didn’t crash</button><button data-bi="run" title="Play each remaining step with a test run, the game in a small window behind yours">Test each step for me…</button><button data-bi="stop" title="Turn this step's mods back on and end the search">Stop</button>`;
+  bar.innerHTML = `<b>Find the culprit</b><span class="small" title="${esc(b.off.map(nameOf).join(', '))}">${esc(text)}</span><span class="spacer"></span>${buttons}`;
+}
+$('#bisect-bar').onclick = async e => {
+  const what = e.target.closest('[data-bi]')?.dataset.bi;
+  if (!what) return;
+  if (what === 'show') { showTab('mods'); return goTo(S.bisect.culprit); }
+  if (what === 'run') {
+    const scenario = await askScenario('Test each step', '<p>For each step left, rmm deploys, starts the game and checks that it holds up, as Test run does. A crash, or with the harness a step that fails, counts as a crash. Give it the save or the cells where the game crashed.</p>');
+    if (scenario) await act('Testing each step', () => call('bisect', { action: 'run', scenario }));
+    return;
+  }
+  await act(what === 'stop' ? 'Turning the mods back on' : 'Turning on this step’s mods, and off the next half', () => call('bisect', { action: what }));
 };
 
 /** A test run's result: pass or fail, timings, FPS per cell, crash suspects and screenshots. */

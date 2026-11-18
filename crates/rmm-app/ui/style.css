@@ -82,7 +82,8 @@ input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; m
 #create-games { display: grid; gap: 8px; }
 
 /* Layout */
-#app { height: 100%; display: grid; grid-template-rows: auto auto 1fr; }
+#app { height: 100%; display: grid; grid-template-rows: auto auto auto 1fr; }
+#app > main { grid-row: 4; } /* row 3 is the bisect bar, empty while hidden */
 .top {
   display: flex; align-items: center; gap: 8px;
   padding: 10px 14px;

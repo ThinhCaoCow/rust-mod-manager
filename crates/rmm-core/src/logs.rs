@@ -169,7 +169,7 @@ fn next_steps(inst: &Instance, r: &CrashReport, profile: &crate::instance::Profi
     }
     let mods: std::collections::BTreeSet<&str> = r.suspects.iter().filter_map(|s| s.mod_id.as_deref()).collect();
     if mods.len() > 1 {
-        out.push(format!("Still crashing? Disable half of the {} mods the log names and play to the same place: the half that still crashes holds the culprit. Undo turns them back on.", mods.len()));
+        out.push(format!("Still crashing? Disable half of the {} mods the log names and play to the same place: the half that still crashes holds the culprit. Undo turns them back on. Find the culprit… does this a step at a time.", mods.len()));
     }
     out
 }

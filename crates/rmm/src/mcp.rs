@@ -160,6 +160,34 @@ struct TestRunArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BisectAction {
+    Start,
+    Crashed,
+    Ok,
+    Run,
+    Status,
+    Stop,
+}
+#[derive(Deserialize, JsonSchema)]
+struct BisectArgs {
+    action: BisectAction,
+    /// start: the mods to test (list_mods ids); default: the mods the newest crash log names.
+    #[serde(default)]
+    mods: Vec<String>,
+    /// start without mods: every enabled mod but the script extender and the test harness.
+    #[serde(default)]
+    all: bool,
+    /// run: default true, shows the launch plan.
+    dry_run: Option<bool>,
+    /// run: return at once and report through tool_job (id "bisect").
+    background: Option<bool>,
+    /// run: what each test run does, as for test_run.
+    #[serde(flatten)]
+    scenario: harness::Scenario,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ReinstallArgs {
     id: String,
     /// New FOMOD choices (see fomod_options with the mod's source path); omit to keep the stored ones.
@@ -951,6 +979,40 @@ impl Rmm {
             jobs.lock().unwrap().insert("test_run".into(), job);
         });
         out(Ok(serde_json::json!({ "state": "running", "next": "poll tool_job with id test_run" })))
+    }
+
+    #[tool(description = "Find the mod behind a crash by halving. start turns off half of the suspects (the newest crash log's mods, the mods given, or all) with the enabled mods that need them (masters, requires rules), as one undoable step. Then the game is played to where it crashed: ask the user to, or use run. crashed or ok says whether it still crashed with those mods off: the step is undone and the next half turned off, until culprit names the mod (or message says none of them is). Pass on message to the user. run plays every remaining step with test_run (a failed run counts as a crash); dry_run defaults to true; ask the user first, since the game uses their Steam account; it takes a while, so background reports through tool_job with id bisect. status shows where it is; stop ends it and turns the step's mods back on.")]
+    async fn bisect(&self, Parameters(a): Parameters<BisectArgs>) -> Result<String, String> {
+        use rmm_core::bisect;
+        match a.action {
+            BisectAction::Status => out(self.inst().and_then(|i| bisect::status(&i))),
+            BisectAction::Start => out(self.inst_mut().and_then(|i| {
+                let mods = if a.mods.is_empty() { bisect::suspects(&i, a.all)? } else { a.mods };
+                bisect::start(&i, &mods)
+            })),
+            BisectAction::Crashed => out(self.inst_mut().and_then(|i| bisect::mark(&i, true))),
+            BisectAction::Ok => out(self.inst_mut().and_then(|i| bisect::mark(&i, false))),
+            BisectAction::Stop => out(self.inst_mut().and_then(|i| bisect::stop(&i))),
+            BisectAction::Run if a.dry_run.unwrap_or(true) => out(self.inst().and_then(|i| harness::preview(&i))),
+            BisectAction::Run => {
+                let inst = self.inst_mut().map_err(|e| format!("{e:#}"))?;
+                let scenario = a.scenario;
+                let play = move || bisect::run(&inst, |i| harness::test_run(i, &scenario).map(|r| (r.passed, r.summary)));
+                if !a.background.unwrap_or(false) {
+                    return out(play());
+                }
+                self.jobs.lock().unwrap().insert("bisect".into(), Job::Running { started: now() });
+                let jobs = self.jobs.clone();
+                std::thread::spawn(move || {
+                    let job = match play() {
+                        Ok(r) => Job::Done { report: serde_json::to_value(r).unwrap_or_default() },
+                        Err(e) => Job::Failed { error: format!("{e:#}") },
+                    };
+                    jobs.lock().unwrap().insert("bisect".into(), job);
+                });
+                out(Ok(serde_json::json!({ "state": "running", "next": "poll tool_job with id bisect" })))
+            }
+        }
     }
 
     #[tool(description = "Start the game for a live test you drive step by step: deploy, start it through the script extender in a small window behind the user's windows (window \"960x540\" unless set; \"fullscreen\" keeps the game's own settings), wait for the main menu, then load the save, visit the cells and run the steps. Needs rmm's harness plugin deployed. Then send test_session_step batches, looking at each result (cell, FPS, screenshot PNG) before the next, and end with test_session_stop. One live test at a time. dry_run defaults to true: shows the launch plan. Ask the user first: the game uses their Steam account.")]

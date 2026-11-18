@@ -288,7 +288,7 @@ impl Instance {
         });
         Some(found.unwrap_or_else(|| dir.join(name)))
     }
-    fn profile_dir(&self) -> PathBuf {
+    pub(crate) fn profile_dir(&self) -> PathBuf {
         self.root.join("profiles").join(&self.config.profile)
     }
     fn profile_file(&self) -> PathBuf {

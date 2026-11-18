@@ -3016,3 +3016,79 @@ fn workspace_files_edits_and_reverts() {
     let log = workspace::edits(&inst).unwrap();
     assert_eq!((log.len(), log[0].by.as_str(), log[0].lines_after), (5, "revert 3", 0));
 }
+
+#[test]
+fn bisect_finds_the_mod_behind_a_crash() {
+    use rmm_core::{bisect, rules};
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&tmp.path().join("SKSE/skse64_loader.exe"), "loader");
+    write(&tmp.path().join("Base/Base.esm"), plugin_bytes(&["Skyrim.esm"], true));
+    write(&tmp.path().join("Patch/Patch.esp"), plugin_bytes(&["Skyrim.esm", "Base.esm"], false));
+    for m in ["C", "D", "E", "G"] {
+        write(&tmp.path().join(m).join(format!("{m}.esp")), plugin_bytes(&["Skyrim.esm"], false));
+    }
+    write(&tmp.path().join("F/textures/f.dds"), "f");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    let all = ["SKSE", "Base", "Patch", "C", "D", "E", "F", "G"];
+    for m in all {
+        install::install(&inst, &tmp.path().join(m), None, true, None).unwrap();
+    }
+    rules::set_rule(&inst, &rules::ModRule { id: "G".into(), requires: vec!["C".into()], ..Default::default() }).unwrap();
+    let suspects = bisect::suspects(&inst, true).unwrap();
+    assert_eq!(suspects, ["Base", "Patch", "C", "D", "E", "F", "G"]);
+
+    // The game crashes while D is on. A mod is never on without what it needs.
+    let on = |inst: &Instance, id: &str| inst.profile().unwrap().mods.iter().any(|m| m.id == id && m.enabled);
+    let mut games = 0;
+    let crashes_with = |culprit: Option<&'static str>| {
+        move |inst: &Instance| {
+            assert!(!on(inst, "Patch") || on(inst, "Base"), "Patch is on without its master");
+            assert!(!on(inst, "G") || on(inst, "C"), "G is on without C, which its rule requires");
+            assert!(on(inst, "SKSE"));
+            Ok((culprit.is_none_or(|c| !on(inst, c)), "a test".to_string()))
+        }
+    };
+    let s = bisect::start(&inst, &suspects).unwrap();
+    assert!(s.message.starts_with("Step 1:") && s.state.off.len() >= 3, "{}", s.message);
+    let s = bisect::run(&inst, |i| {
+        games += 1;
+        crashes_with(Some("D"))(i)
+    })
+    .unwrap();
+    assert_eq!(s.culprit.as_deref(), Some("D"), "{s:?}");
+    assert!(s.message.starts_with("Found it: D."), "{}", s.message);
+    assert!(games <= 4 && s.state.steps.len() == games, "{games} games");
+    assert!(all.iter().all(|m| on(&inst, m)), "every step was undone");
+    assert!(inst.profile().unwrap().plugins.iter().all(|p| p.enabled));
+    assert!(!inst.history().unwrap().first().is_some_and(|l| l.starts_with("bisect")));
+    assert!(bisect::start(&inst, &suspects).unwrap_err().to_string().contains("under way"));
+    assert!(bisect::stop(&inst).unwrap().is_some() && bisect::status(&inst).unwrap().is_none());
+
+    // A crash none of them causes: each half is ruled out, then the last one on its own.
+    bisect::start(&inst, &suspects).unwrap();
+    let s = bisect::run(&inst, crashes_with(Some("SKSE"))).unwrap();
+    assert!(s.culprit.is_none() && s.state.left.is_empty() && s.message.starts_with("Not found"), "{s:?}");
+    bisect::stop(&inst).unwrap();
+
+    // By hand: one step with E off, which didn't crash.
+    let s = bisect::start(&inst, &["D".into(), "E".into()]).unwrap();
+    assert_eq!(s.state.off, ["E"]);
+    assert!(!on(&inst, "E") && on(&inst, "D"));
+    let s = bisect::mark(&inst, false).unwrap();
+    assert_eq!(s.culprit.as_deref(), Some("E"));
+    assert!(on(&inst, "E"));
+    bisect::stop(&inst).unwrap();
+
+    // Undone by hand already: fine. Another change since the step: refused, and stop says so.
+    bisect::start(&inst, &["D".into(), "E".into()]).unwrap();
+    inst.undo().unwrap();
+    assert_eq!(bisect::mark(&inst, true).unwrap().state.off, ["D"]);
+    ops::set_mods_enabled(&inst, &["F".into()], false).unwrap();
+    assert!(bisect::mark(&inst, true).unwrap_err().to_string().contains("the setup changed"));
+    let s = bisect::stop(&inst).unwrap().unwrap();
+    assert!(s.message.contains("History: D"), "{}", s.message);
+}

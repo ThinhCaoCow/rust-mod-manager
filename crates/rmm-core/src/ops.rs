@@ -184,17 +184,22 @@ pub fn set_mod_enabled(inst: &Instance, id: &str, enabled: bool) -> Result<()> {
 
 /// Enable or disable several mods and their plugins in one undo step. Separators are skipped.
 pub fn set_mods_enabled(inst: &Instance, ids: &[String], enabled: bool) -> Result<()> {
+    let verb = if enabled { "enable" } else { "disable" };
+    let label = match ids {
+        [one] => format!("{verb} {one}"),
+        _ => format!("{verb} {} mods", ids.iter().filter(|id| !is_separator(id)).count()),
+    };
+    set_enabled_as(inst, ids, enabled, &label)
+}
+
+/// `set_mods_enabled` with its own undo label.
+pub(crate) fn set_enabled_as(inst: &Instance, ids: &[String], enabled: bool, label: &str) -> Result<()> {
     let ids: Vec<&String> = ids.iter().filter(|id| !is_separator(id)).collect();
     let mut plugins = Vec::new();
     for id in &ids {
         plugins.extend(inst.mod_files(id)?.into_iter().filter(|f| !f.contains('/') && is_plugin(f)));
     }
-    let verb = if enabled { "enable" } else { "disable" };
-    let label = match ids.as_slice() {
-        [one] => format!("{verb} {one}"),
-        _ => format!("{verb} {} mods", ids.len()),
-    };
-    inst.edit(&label, |p| {
+    inst.edit(label, |p| {
         for id in &ids {
             let Some(m) = p.mods.iter_mut().find(|m| m.id == **id) else { bail!("no mod '{id}'") };
             m.enabled = enabled;

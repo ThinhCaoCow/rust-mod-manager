@@ -1,6 +1,7 @@
 //! rmm-core: everything the CLI, MCP server and UI share. See SPEC.md.
 pub mod addons;
 pub mod archives;
+pub mod bisect;
 pub mod conflicts;
 pub mod deploy;
 pub mod fomod;

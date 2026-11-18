@@ -280,6 +280,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
                 "conflicts": conflicts,
                 "plugins": plugins.join().unwrap()?,
                 "overwrite": inst.mod_files(OVERWRITE)?.len(),
+                "bisect": rmm_core::bisect::status(&inst)?,
             }))
         })?,
         "stamp" => json!(stamp(&inst)),
@@ -293,6 +294,26 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "purge" => json!(deploy::purge(&inst, flag("dry_run"))?),
         "launch" => json!(launch::launch(&inst, false)?),
         "test_run" => json!(harness::test_run(&inst, &serde_json::from_value(a.clone())?)?),
+        "bisect" => {
+            use rmm_core::bisect;
+            match s("action")?.as_str() {
+                "start" => {
+                    let mut mods: Vec<String> = serde_json::from_value(a["mods"].clone()).unwrap_or_default();
+                    if mods.is_empty() {
+                        mods = bisect::suspects(&inst, flag("all"))?;
+                    }
+                    json!(bisect::start(&inst, &mods)?)
+                }
+                "crashed" => json!(bisect::mark(&inst, true)?),
+                "ok" => json!(bisect::mark(&inst, false)?),
+                "stop" => json!(bisect::stop(&inst)?),
+                "run" => {
+                    let scenario: harness::Scenario = serde_json::from_value(a["scenario"].clone())?;
+                    json!(bisect::run(&inst, |i| harness::test_run(i, &scenario).map(|r| (r.passed, r.summary)))?)
+                }
+                other => bail!("unknown bisect action '{other}'"),
+            }
+        }
         // A test run's screenshot as a data: URL; only from the instance's test-runs folder.
         "screenshot" => {
             let file = fs::canonicalize(s("path")?)?;

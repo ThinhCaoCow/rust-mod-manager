@@ -2,7 +2,7 @@ use rmm::{agent, http, mcp};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, settings, tools};
+use rmm_core::{Game, Instance, addons, bisect, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, settings, tools};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -268,33 +268,14 @@ enum Cmd {
     TestRun {
         #[arg(long)]
         apply: bool,
-        /// Save to load (name without extension). Harness only.
-        #[arg(long)]
-        save: Option<String>,
-        /// Cell to visit with coc (repeatable); without --save the first one starts the game.
-        /// Harness only.
-        #[arg(long = "cell")]
-        cells: Vec<String>,
-        /// Seconds in each cell (default 10).
-        #[arg(long)]
-        dwell: Option<u64>,
-        /// Seconds to wait for the main menu and each cell, or to keep running without the harness.
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Leave the game running afterwards.
-        #[arg(long)]
-        keep_open: bool,
-        /// The game's window: WxH (default 960x540, kept behind other windows) or fullscreen.
-        #[arg(long)]
-        window: Option<String>,
-        /// Save a PNG of the game's window in each cell. Harness only.
-        #[arg(long)]
-        screenshots: bool,
-        /// Steps after the save and the cells, as JSON or @file, such as
-        /// [{"console": "tgm"}, {"wait": 10}, {"screenshot": "after"}]. Harness only.
-        #[arg(long)]
-        steps: Option<String>,
+        #[command(flatten)]
+        scenario: ScenarioArgs,
     },
+    /// Find the mod behind a crash: turn off half of the suspects at a time (with the mods that
+    /// need them), play or test after each step and say whether it still crashed, until one is
+    /// left. Each step is undone before the next.
+    #[command(subcommand)]
+    Bisect(BisectCmd),
     /// Show what deploying would change; --apply to do it.
     Deploy {
         #[arg(long)]
@@ -614,6 +595,75 @@ enum AddonCmd {
     },
 }
 
+/// What a test run does (`rmm test-run`, `rmm bisect run`).
+#[derive(clap::Args)]
+struct ScenarioArgs {
+    /// Save to load (name without extension). Harness only.
+    #[arg(long)]
+    save: Option<String>,
+    /// Cell to visit with coc (repeatable); without --save the first one starts the game.
+    /// Harness only.
+    #[arg(long = "cell")]
+    cells: Vec<String>,
+    /// Seconds in each cell (default 10).
+    #[arg(long)]
+    dwell: Option<u64>,
+    /// Seconds to wait for the main menu and each cell, or to keep running without the harness.
+    #[arg(long)]
+    timeout: Option<u64>,
+    /// Leave the game running afterwards.
+    #[arg(long)]
+    keep_open: bool,
+    /// The game's window: WxH (default 960x540, kept behind other windows) or fullscreen.
+    #[arg(long)]
+    window: Option<String>,
+    /// Save a PNG of the game's window in each cell. Harness only.
+    #[arg(long)]
+    screenshots: bool,
+    /// Steps after the save and the cells, as JSON or @file, such as
+    /// [{"console": "tgm"}, {"wait": 10}, {"screenshot": "after"}]. Harness only.
+    #[arg(long)]
+    steps: Option<String>,
+}
+
+impl ScenarioArgs {
+    fn scenario(self) -> Result<harness::Scenario> {
+        let ScenarioArgs { save, cells, dwell, timeout, keep_open, window, screenshots, steps } = self;
+        let steps = match steps {
+            Some(arg) => serde_json::from_str(&json_arg(&arg)?).context("--steps is a JSON list of steps, such as [{\"cell\": \"Riverwood\"}, {\"wait\": 10}]")?,
+            None => vec![],
+        };
+        Ok(harness::Scenario { save, cells, dwell, timeout, keep_open, window, screenshots, steps })
+    }
+}
+
+#[derive(Subcommand)]
+enum BisectCmd {
+    /// Start: turn off half of the mods the newest crash log names, the mods given, or with
+    /// --all every enabled mod but the script extender and the test harness.
+    Start {
+        mods: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// The game still crashed with this step's mods off.
+    Crashed,
+    /// The game didn't crash with them off.
+    Ok,
+    /// Play every step with a test run until the bisect ends; --apply to do it. A failed run
+    /// counts as a crash.
+    Run {
+        #[arg(long)]
+        apply: bool,
+        #[command(flatten)]
+        scenario: ScenarioArgs,
+    },
+    /// Where the bisect is: the mods off now, the suspects left, the steps so far.
+    Status,
+    /// End it and turn this step's mods back on.
+    Stop,
+}
+
 #[derive(Subcommand)]
 enum LockCmd {
     /// Write the active profile to modlist.lock.toml (or --out).
@@ -807,13 +857,21 @@ fn run() -> Result<()> {
         Cmd::PapyrusLog { tail } => print(&logs::read_papyrus_log(&open()?, tail)?),
         Cmd::ScriptExtenderLog => print(&logs::script_extender_log(&open()?, true)?),
         Cmd::TestRun { apply: false, .. } => print(&harness::preview(&open()?)?),
-        Cmd::TestRun { apply: true, save, cells, dwell, timeout, keep_open, window, screenshots, steps } => {
-            let steps = match steps {
-                Some(arg) => serde_json::from_str(&json_arg(&arg)?).context("--steps is a JSON list of steps, such as [{\"cell\": \"Riverwood\"}, {\"wait\": 10}]")?,
-                None => vec![],
-            };
-            print(&harness::test_run(&open()?, &harness::Scenario { save, cells, dwell, timeout, keep_open, window, screenshots, steps })?)
+        Cmd::TestRun { apply: true, scenario } => print(&harness::test_run(&open()?, &scenario.scenario()?)?),
+        Cmd::Bisect(BisectCmd::Start { mods, all }) => {
+            let inst = open()?;
+            let mods = if mods.is_empty() { bisect::suspects(&inst, all)? } else { mods };
+            print(&bisect::start(&inst, &mods)?)
         }
+        Cmd::Bisect(BisectCmd::Crashed) => print(&bisect::mark(&open()?, true)?),
+        Cmd::Bisect(BisectCmd::Ok) => print(&bisect::mark(&open()?, false)?),
+        Cmd::Bisect(BisectCmd::Run { apply: false, .. }) => print(&harness::preview(&open()?)?),
+        Cmd::Bisect(BisectCmd::Run { apply: true, scenario }) => {
+            let s = scenario.scenario()?;
+            print(&bisect::run(&open()?, |i| harness::test_run(i, &s).map(|r| (r.passed, r.summary)))?)
+        }
+        Cmd::Bisect(BisectCmd::Status) => print(&bisect::status(&open()?)?),
+        Cmd::Bisect(BisectCmd::Stop) => print(&bisect::stop(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
         Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
