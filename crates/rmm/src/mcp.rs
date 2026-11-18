@@ -273,6 +273,10 @@ struct Mo2Args {
     dir: String,
     /// MO2 profile; default: the one MO2 has selected.
     profile: Option<String>,
+    /// Every MO2 profile, each into the rmm profile of its name (made when missing); returns a
+    /// report per profile.
+    #[serde(default)]
+    all: bool,
     /// Default true: report what would come in.
     dry_run: Option<bool>,
 }
@@ -1103,9 +1107,13 @@ impl Rmm {
         out(Ok(import::find_sources()))
     }
 
-    #[tool(description = "Bring in an MO2 profile: mod folders (hard-linked on the same volume, else copied; meta.ini stays behind, Root/ becomes root/), names, Nexus ids, comments as notes, mod order (reversed from modlist.txt), enabled state, separators, plugin order and locks, and overwrite/. Goes into the active profile as one undoable step; mods already installed under the same name are left as they are. dry_run defaults to true.")]
+    #[tool(description = "Bring in an MO2 profile: mod folders (hard-linked on the same volume, else copied; meta.ini and .mohidden files stay behind, Root/ becomes root/), names, Nexus ids, comments as notes, ignored update versions, mod order (reversed from modlist.txt), enabled state, separators, plugin order and locks, overwrite/, the profile's own INIs and saves (MO2's profile options), and MO2's Executables as tools (rmm's preset when it has one; mods a program made become that tool's output). Goes into the active profile as one undoable step, or with all every MO2 profile into the rmm profile of its name; mods and tools already there are left as they are. dry_run defaults to true.")]
     async fn import_mo2(&self, Parameters(a): Parameters<Mo2Args>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|i| import::import_mo2(&i, std::path::Path::new(&a.dir), a.profile.as_deref(), a.dry_run.unwrap_or(true))))
+        let (dir, dry) = (std::path::Path::new(&a.dir), a.dry_run.unwrap_or(true));
+        match a.all {
+            true => out(self.inst_mut().and_then(|i| import::import_mo2_all(&i, dir, dry))),
+            false => out(self.inst_mut().and_then(|i| import::import_mo2(&i, dir, a.profile.as_deref(), dry))),
+        }
     }
 
     #[tool(description = "Bring in a Vortex profile from Vortex's live state (the state.v2 folder; read from a copy, ask the user to close Vortex first) or a state backup: mods from the staging folder (dinput/enb mods go under root/), names, Nexus ids, FOMOD choices, enabled state, and Vortex's rules as mod rules, which then order the list; plugins from plugins.txt/loadorder.txt and Vortex's LOOT userlist. dry_run defaults to true. Purge Vortex's deployment before rmm deploys.")]

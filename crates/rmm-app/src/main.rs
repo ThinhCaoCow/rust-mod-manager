@@ -455,6 +455,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         // Of these MO2 instances, the ones for this instance's game.
         "mo2_for_game" => json!(serde_json::from_value::<Vec<PathBuf>>(a["dirs"].clone())?.into_iter().filter(|d| import::mo2_game(d) == Some(inst.config.game)).collect::<Vec<_>>()),
         "mo2_profiles" => json!(import::mo2_profiles(Path::new(&s("dir")?))?),
+        "import_mo2" if flag("all") => json!(import::import_mo2_all(&inst, Path::new(&s("dir")?), flag("dry_run"))?),
         "import_mo2" => json!(import::import_mo2(&inst, Path::new(&s("dir")?), a["profile"].as_str(), flag("dry_run"))?),
         "import_vortex" => json!(import::import_vortex(&inst, Path::new(&s("path")?), a["staging"].as_str().map(Path::new), a["profile"].as_str(), flag("dry_run"))?),
         "export_lockfile" => json!(lockfile::write(&inst, None)?),

@@ -496,12 +496,16 @@ enum SeparatorCmd {
 enum ImportCmd {
     /// MO2 instances and Vortex state backups in their usual places.
     Sources,
-    /// An MO2 instance folder (holding ModOrganizer.ini); --apply to do it.
+    /// An MO2 instance folder (holding ModOrganizer.ini); --apply to do it. Also brings in the
+    /// profile's own INIs and saves, and MO2's Executables as tools.
     Mo2 {
         dir: PathBuf,
         /// MO2 profile (default: the one MO2 has selected).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         profile: Option<String>,
+        /// Every MO2 profile, each into the rmm profile of its name (made when missing).
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         apply: bool,
     },
@@ -921,7 +925,8 @@ fn run() -> Result<()> {
             print(&serde_json::json!({ "profile": inst.config.profile, "local_inis": p.local_inis, "local_saves": p.local_saves }))
         }
         Cmd::Import(ImportCmd::Sources) => print(&import::find_sources()),
-        Cmd::Import(ImportCmd::Mo2 { dir, profile, apply }) => print(&import::import_mo2(&open()?, &dir, profile.as_deref(), !apply)?),
+        Cmd::Import(ImportCmd::Mo2 { dir, all: true, apply, .. }) => print(&import::import_mo2_all(&open()?, &dir, !apply)?),
+        Cmd::Import(ImportCmd::Mo2 { dir, profile, apply, .. }) => print(&import::import_mo2(&open()?, &dir, profile.as_deref(), !apply)?),
         Cmd::Import(ImportCmd::Vortex { backup, staging, profile, apply }) => {
             print(&import::import_vortex(&open()?, &backup, staging.as_deref(), profile.as_deref(), !apply)?)
         }

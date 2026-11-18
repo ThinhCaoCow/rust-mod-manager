@@ -157,7 +157,8 @@ fn restore_own(inst: &Instance, st: &mut State) -> Result<()> {
     Ok(())
 }
 
-fn names(inst: &Instance) -> [String; 3] {
+/// The game's INIs a profile can keep its own copies of.
+pub(crate) fn names(inst: &Instance) -> [String; 3] {
     let main = inst.config.game.ini_name();
     [main.to_string(), main.replace(".ini", "Prefs.ini"), main.replace(".ini", "Custom.ini")]
 }

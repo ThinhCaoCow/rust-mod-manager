@@ -1,13 +1,16 @@
 //! Bring in a setup from Mod Organizer 2 or Vortex: mod folders (hard-linked when they share a
 //! volume, copied otherwise), names, Nexus ids, FOMOD choices, notes, mod order and enabled state,
-//! separators, plugin order and locks, and Vortex's mod rules. The formats are written up in
-//! `docs/internals/mo2.md` and `docs/internals/vortex.md` (§9.4 in each).
+//! separators, plugin order and locks, and Vortex's mod rules. From MO2 also: every profile at
+//! once, each profile's own INIs and saves, its Executables as tools, the mods its programs
+//! wrote as those tools' outputs, ignored update versions, and hidden files left out. The formats
+//! are written up in `docs/internals/mo2.md` and `docs/internals/vortex.md` (§9.4 in each).
 //!
 //! Mods go in under their own names; one that is already installed under that id is left as it
 //! is, so importing again only adds what is new. The profile change is one undoable step.
 use crate::install::sanitize;
-use crate::instance::{ModEntry, ModMeta, NexusRef, OVERWRITE, PluginEntry, index_dir};
+use crate::instance::{InstanceConfig, ModEntry, ModMeta, NexusRef, OVERWRITE, PluginEntry, Profile, index_dir};
 use crate::rules::ModRule;
+use crate::tools::Tool;
 use crate::{Game, Instance};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -28,6 +31,18 @@ pub struct ImportReport {
     pub existing: Vec<String>,
     pub plugins: usize,
     pub rules: usize,
+    /// The rmm profile it went into.
+    pub into: String,
+    /// MO2's Executables added as tools (their titles).
+    pub tools: Vec<String>,
+    /// Mods made by a program, now that tool's output ("name (tool id)"): its next run in rmm
+    /// replaces them in their place.
+    pub outputs: Vec<String>,
+    /// The MO2 profile's own INIs and saves copied in (or that would be).
+    pub inis: usize,
+    pub saves: usize,
+    /// Files MO2 had hidden (`.mohidden`), left out.
+    pub hidden: usize,
     /// Files hard-linked (sharing the source's disk space) and copied.
     pub linked: usize,
     pub copied: usize,
@@ -92,7 +107,7 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
     let name = profile.map(str::to_owned).or_else(|| get("General", "selected_profile")).context("no profile given, and ModOrganizer.ini has none selected")?;
     let pdir = sub("profiles_directory", "profiles").join(&name);
     let modlist = fs::read_to_string(pdir.join("modlist.txt")).with_context(|| format!("MO2 profile '{name}' has no modlist.txt"))?;
-    let mut r = ImportReport { dry_run, profile: name.clone(), ..Default::default() };
+    let mut r = ImportReport { dry_run, profile: name.clone(), into: inst.config.profile.clone(), ..Default::default() };
 
     // modlist.txt names the highest priority first; rmm's list is last-wins.
     let mut seen = HashSet::new();
@@ -157,14 +172,234 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
             Some((n.trim().to_string(), i.trim().parse().ok()?))
         })
         .collect();
+    // The profile's options, and the mods MO2 has programs write into ("Create files in mod").
+    let settings = fs::read_to_string(pdir.join("settings.ini")).unwrap_or_default();
+    let general = qt_section(&settings, "General");
+    let on = |k: &str| general.iter().any(|(key, v)| key == k && v.eq_ignore_ascii_case("true"));
+    let (local_inis, local_saves) = (on("LocalSettings"), on("LocalSaves"));
+    let into_mod: HashMap<String, String> = qt_section(&settings, "custom_overwrites").into_iter().collect();
+    let exes = mo2_executables(&fs::read_to_string(dir.join("ModOrganizer.ini")).unwrap_or_default());
+    let tools = mo2_tools(inst, exes, &mods_dir, &into_mod, &mut r)?;
+    mark_outputs(inst, &tools, &mut incoming, &mut r)?;
+    if !dry_run {
+        for (id, t) in &tools {
+            crate::tools::put(inst, id, t)?;
+        }
+    }
     if !dry_run && overwrite_dir.is_dir() {
-        let (l, c) = link_tree(&overwrite_dir, &inst.mod_dir(OVERWRITE), false, true)?;
+        let (l, c, _) = link_tree(&overwrite_dir, &inst.mod_dir(OVERWRITE), false, true)?;
         if l + c > 0 {
             r.warnings.push(format!("{} files from MO2's overwrite folder are now in overwrite/", l + c));
         }
     }
-    bring_in(inst, &format!("import MO2 profile {name}"), &incoming, plugins, locks, &mut r)?;
+    bring_in(inst, &format!("import MO2 profile {name}"), &incoming, plugins, locks, &mut r, |p| {
+        p.local_inis |= local_inis;
+        p.local_saves |= local_saves;
+    })?;
+    profile_files(inst, &pdir, local_inis, local_saves, &mut r);
     Ok(r)
+}
+
+/// Import every profile of an MO2 instance, each into the rmm profile of its name (made when
+/// missing). Mods and tools come in with the first; the active profile stays the active one.
+pub fn import_mo2_all(inst: &Instance, dir: &Path, dry_run: bool) -> Result<Vec<ImportReport>> {
+    let mut out: Vec<ImportReport> = Vec::new();
+    for name in mo2_profiles(dir)? {
+        let profile = match inst.profiles()?.into_iter().find(|n| n.eq_ignore_ascii_case(&name)) {
+            Some(n) => n,
+            None if dry_run => name.clone(),
+            None => {
+                inst.create_profile(&name, false)?;
+                name.clone()
+            }
+        };
+        let at = Instance { root: inst.root.clone(), config: InstanceConfig { profile, ..inst.config.clone() } };
+        let mut r = import_mo2(&at, dir, Some(&name), dry_run)?;
+        if dry_run && !out.is_empty() {
+            let mut first = std::mem::take(&mut r.mods);
+            r.existing.append(&mut first);
+            (r.tools, r.outputs) = (vec![], vec![]);
+        }
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// One of MO2's Executables (`[customExecutables]` in ModOrganizer.ini).
+struct Mo2Exe {
+    title: String,
+    binary: PathBuf,
+    args: Vec<String>,
+    cwd: String,
+    hide: bool,
+}
+
+fn mo2_executables(ini: &str) -> Vec<Mo2Exe> {
+    let mut rows: BTreeMap<usize, HashMap<String, String>> = BTreeMap::new();
+    for (k, v) in qt_section(ini, "customExecutables") {
+        if let Some((i, key)) = k.split_once('\\')
+            && let Ok(i) = i.parse()
+        {
+            rows.entry(i).or_default().insert(key.to_string(), v);
+        }
+    }
+    rows.into_values()
+        .filter_map(|x| {
+            let get = |k: &str| x.get(k).cloned().unwrap_or_default();
+            let binary = get("binary");
+            (!binary.is_empty()).then(|| Mo2Exe { title: get("title"), args: split_args(&get("arguments")), cwd: get("workingDirectory"), hide: get("hide") == "true", binary: binary.into() })
+        })
+        .collect()
+}
+
+/// MO2's Executables as rmm tools, by tool id. Programs rmm has a preset for get it (and its
+/// arguments); others run as MO2 ran them. Left out: the game, its launcher and script extender
+/// (Play starts those), Explore Virtual Folder (MO2's virtual Data), hidden ones, programs that
+/// aren't there, and ones rmm has as a tool already. A program inside a mod runs from the
+/// deployed Data folder, as it ran from MO2's virtual one.
+fn mo2_tools(inst: &Instance, exes: Vec<Mo2Exe>, mods_dir: &Path, into_mod: &HashMap<String, String>, r: &mut ImportReport) -> Result<Vec<(String, Tool)>> {
+    let game = inst.config.game;
+    let skip = [game.exe().to_string(), game.exe().replace(".exe", "Launcher.exe"), game.loader().to_string(), "explorer++.exe".into()].map(|s| s.to_lowercase());
+    let key = |p: &Path| p.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let mods = key(mods_dir) + "/";
+    let mut have = crate::tools::list(inst)?;
+    let mut out = Vec::new();
+    for e in exes {
+        let file = e.binary.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if e.hide || skip.contains(&file) {
+            continue;
+        }
+        let bin = e.binary.to_string_lossy().replace('\\', "/");
+        let in_mod = bin.to_ascii_lowercase().starts_with(&mods).then(|| &bin[mods.len()..]).and_then(|rest| rest.split_once('/'));
+        let exe = match in_mod {
+            Some((_, rel)) => match rel.split_once('/') {
+                Some((top, rest)) if top.eq_ignore_ascii_case("root") => inst.config.game_path.join(rest),
+                _ => inst.data_dir().join(rel),
+            },
+            None if e.binary.is_file() => e.binary.clone(),
+            None => {
+                r.warnings.push(format!("MO2's executable {}: {} isn't there", e.title, e.binary.display()));
+                continue;
+            }
+        };
+        if have.values().any(|t| key(&t.exe) == key(&exe)) {
+            continue;
+        }
+        let preset = mo2_preset(&file).and_then(|p| Some((p, crate::tools::preset(game, p)?)));
+        let mut tool = match &preset {
+            Some((_, t)) => {
+                if !e.args.is_empty() {
+                    r.warnings.push(format!("{}: rmm runs it with the {} preset's arguments, not MO2's ({})", e.title, t.name, e.args.join(" ")));
+                }
+                t.clone()
+            }
+            None => Tool { name: e.title.clone(), args: e.args.clone(), ..Default::default() },
+        };
+        tool.exe = exe;
+        tool.cwd = (!e.cwd.is_empty()).then(|| PathBuf::from(&e.cwd));
+        tool.output_mod = into_mod.get(&e.title).cloned().or(tool.output_mod);
+        let base = preset.map(|(p, _)| p.to_string()).unwrap_or_else(|| tool_id(&e.title));
+        let id = (1..).map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") }).find(|id| !have.contains_key(id)).unwrap();
+        have.insert(id.clone(), tool.clone());
+        r.tools.push(e.title);
+        out.push((id, tool));
+    }
+    Ok(out)
+}
+
+/// The rmm preset for a program, by its file name.
+fn mo2_preset(file: &str) -> Option<&'static str> {
+    let stem = file.strip_suffix(".exe")?.trim_end_matches("x64").trim_end_matches("64").trim();
+    Some(match stem {
+        "sseedit" | "fo4edit" | "xedit" => "xedit",
+        "sseeditquickautoclean" | "fo4editquickautoclean" => "xedit-qac",
+        "bodyslide" => "bodyslide",
+        "texgen" => "texgen",
+        "dyndolod" => "dyndolod",
+        "xlodgen" => "xlodgen",
+        "pgpatcher" | "parallaxgen" => "pgpatcher",
+        s if s.starts_with("pandora") => "pandora",
+        _ => return None,
+    })
+}
+
+/// A tool id from a program's title: lowercase letters and digits, '-' and '_'.
+fn tool_id(title: &str) -> String {
+    let id: String = title.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' }).collect();
+    let id = id.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+    if id.is_empty() { "tool".into() } else { id }
+}
+
+/// Mods a program made (no archive, and named as a tool's output, or the mod MO2 had it write
+/// into) become that tool's output, so its next run in rmm replaces them in their place. Mods an
+/// xEdit-style tool adds to stay plain mods.
+fn mark_outputs(inst: &Instance, added: &[(String, Tool)], incoming: &mut [Incoming], r: &mut ImportReport) -> Result<()> {
+    let presets = crate::tools::PRESETS.iter().filter_map(|p| Some((p.to_string(), crate::tools::preset(inst.config.game, p)?)));
+    let mut makers: HashMap<String, (String, String)> = HashMap::new(); // output, lowercase -> tool id, output
+    for (id, t) in presets.chain(crate::tools::list(inst)?).chain(added.iter().cloned()) {
+        let name = t.output_mod.clone().unwrap_or_else(|| format!("{} Output", t.name));
+        if !t.edit_in_place && !name.contains('{') {
+            makers.insert(name.to_lowercase(), (id, name));
+        }
+    }
+    for m in incoming.iter_mut() {
+        let Some((_, meta, _)) = &mut m.from else { continue };
+        if meta.source.is_some() || inst.mod_dir(&m.id).exists() {
+            continue;
+        }
+        if let Some((id, name)) = makers.get(&meta.name.to_lowercase()) {
+            meta.source = Some(format!("tool:{id}"));
+            meta.name = name.clone();
+            r.outputs.push(format!("{name} ({id})"));
+        }
+    }
+    Ok(())
+}
+
+/// Copy an MO2 profile's own INIs into the rmm profile's, and its own saves into the folder that
+/// profile saves in. Files already there stay; a file that can't be copied is a warning.
+fn profile_files(inst: &Instance, pdir: &Path, inis: bool, saves: bool, r: &mut ImportReport) {
+    let mut todo: Vec<(bool, PathBuf, PathBuf)> = Vec::new(); // is a save, from, to
+    if inis {
+        let dest = crate::profile_ini::profile_ini_dir(inst, &inst.config.profile);
+        let have: Vec<PathBuf> = fs::read_dir(pdir).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        for name in crate::profile_ini::names(inst) {
+            if let Some(from) = have.iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&name))) {
+                todo.push((false, from.clone(), dest.join(&name)));
+            }
+        }
+    }
+    let from = pdir.join("saves");
+    if saves && from.is_dir() {
+        match inst.ini_dir() {
+            Some(d) => {
+                let dest = d.join("Saves").join(&inst.config.profile);
+                for e in walkdir::WalkDir::new(&from).into_iter().flatten().filter(|e| e.file_type().is_file()) {
+                    if let Ok(rel) = e.path().strip_prefix(&from) {
+                        todo.push((true, e.path().to_path_buf(), dest.join(rel)));
+                    }
+                }
+            }
+            None => r.warnings.push("the MO2 profile's saves weren't copied: rmm doesn't know where the game's My Games folder is".into()),
+        }
+    }
+    for (save, from, to) in todo {
+        if to.exists() {
+            continue;
+        }
+        if !r.dry_run {
+            let copied = fs::create_dir_all(to.parent().unwrap_or(Path::new("."))).and_then(|_| fs::copy(&from, &to));
+            if let Err(e) = copied {
+                r.warnings.push(format!("couldn't copy {} to {}: {e}", from.display(), to.display()));
+                continue;
+            }
+        }
+        if save {
+            r.saves += 1;
+        } else {
+            r.inis += 1;
+        }
+    }
 }
 
 /// The game an MO2 instance manages, when rmm supports it.
@@ -227,6 +462,7 @@ fn mo2_meta(folder: &Path, name: &str, downloads: &Path, categories: &HashMap<i6
             version: get("version"),
             category: get("nexusCategory").and_then(|c| c.parse().ok()).filter(|&c: &u64| c > 0),
         }),
+        skip_version: get("ignoredVersion"),
         ..Default::default()
     };
     (meta, mo2_color(&text))
@@ -316,6 +552,65 @@ fn qt_ini(text: &str) -> HashMap<String, HashMap<String, String>> {
         let v = v.trim();
         let v = v.strip_prefix("@ByteArray(").and_then(|x| x.strip_suffix(')')).unwrap_or(v);
         out.entry(section.clone()).or_default().insert(k.trim().to_string(), v.trim_matches('"').replace("\\\\", "\\"));
+    }
+    out
+}
+
+/// One section of a Qt INI as (key, value) pairs, with the keys' %-escapes and the values'
+/// quotes, `\` escapes and `@ByteArray()` undone.
+fn qt_section(text: &str, name: &str) -> Vec<(String, String)> {
+    let (mut on, mut out) = (false, Vec::new());
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') && l.ends_with(']') {
+            on = l[1..l.len() - 1] == *name;
+            continue;
+        }
+        if let Some((k, v)) = l.split_once('=').filter(|_| on) {
+            let v = v.trim();
+            let v: String = qt_unescape(v.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(v)).into_iter().filter_map(char::from_u32).collect();
+            let v = v.strip_prefix("@ByteArray(").and_then(|x| x.strip_suffix(')')).map(str::to_owned).unwrap_or(v);
+            out.push((qt_key(k.trim()), v));
+        }
+    }
+    out
+}
+
+/// A Qt INI key with its `%XX` and `%UXXXX` escapes undone.
+fn qt_key(k: &str) -> String {
+    let c: Vec<char> = k.chars().collect();
+    let hex = |at: usize, n: usize| c.get(at..at + n).and_then(|h| u32::from_str_radix(&h.iter().collect::<String>(), 16).ok()).and_then(char::from_u32);
+    let (mut out, mut i) = (String::new(), 0);
+    while i < c.len() {
+        let (ch, n) = match (c[i], c.get(i + 1)) {
+            ('%', Some('U')) => hex(i + 2, 4).map_or(('%', 1), |ch| (ch, 6)),
+            ('%', _) => hex(i + 1, 2).map_or(('%', 1), |ch| (ch, 3)),
+            (ch, _) => (ch, 1),
+        };
+        out.push(ch);
+        i += n;
+    }
+    out
+}
+
+/// A command line's arguments: split at spaces outside double quotes, the quotes removed.
+// ponytail: no backslash-before-quote rule; MO2's argument lines don't need it.
+fn split_args(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for ch in s.chars() {
+        match ch {
+            '"' => (quoted, any) = (!quoted, true),
+            c if c.is_whitespace() && !quoted => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
@@ -415,7 +710,7 @@ pub fn import_vortex(inst: &Instance, backup: &Path, staging: Option<&Path>, pro
     else {
         bail!("no {gid} profile{} in the backup", profile.map(|p| format!(" named '{p}'")).unwrap_or_default());
     };
-    let mut r = ImportReport { dry_run, profile: prof["name"].as_str().unwrap_or(pid).to_string(), ..Default::default() };
+    let mut r = ImportReport { dry_run, profile: prof["name"].as_str().unwrap_or(pid).to_string(), into: inst.config.profile.clone(), ..Default::default() };
 
     let mut list: Vec<(&String, &Value)> = mods.iter().filter(|(_, m)| m["state"] == "installed" && m["type"] != "collection").collect();
     list.sort_by(|a, b| (a.1["attributes"]["installTime"].as_str(), a.0).cmp(&(b.1["attributes"]["installTime"].as_str(), b.0)));
@@ -490,7 +785,7 @@ pub fn import_vortex(inst: &Instance, backup: &Path, staging: Option<&Path>, pro
     let active = state["settings"]["profiles"]["activeProfileId"].as_str() == Some(pid.as_str()) || last == Some(pid.as_str());
     let pdir = if active { inst.config.local_path.clone() } else { userdata.join(gid).join("profiles").join(pid) };
     let plugins = plugin_lists(&pdir.join("plugins.txt"), &pdir.join("loadorder.txt"));
-    bring_in(inst, &format!("import Vortex profile {}", r.profile), &incoming, plugins, BTreeMap::new(), &mut r)?;
+    bring_in(inst, &format!("import Vortex profile {}", r.profile), &incoming, plugins, BTreeMap::new(), &mut r, |_| {})?;
     if dry_run {
         return Ok(r);
     }
@@ -536,8 +831,8 @@ fn plugin_lists(plugins_txt: &Path, loadorder_txt: &Path) -> Vec<PluginEntry> {
 }
 
 /// Copy the mod folders in, then set the profile in one undoable step: the imported list first,
-/// then mods the profile had that the import doesn't name.
-fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<PluginEntry>, locks: BTreeMap<String, usize>, r: &mut ImportReport) -> Result<()> {
+/// then mods the profile had that the import doesn't name; `also` changes the rest.
+fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<PluginEntry>, locks: BTreeMap<String, usize>, r: &mut ImportReport, also: impl FnOnce(&mut Profile)) -> Result<()> {
     for (i, m) in incoming.iter().enumerate() {
         crate::progress::report("importing mods", i, incoming.len());
         let Some((dir, meta, root)) = &m.from else {
@@ -554,8 +849,8 @@ fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<Pl
         }
         let tmp = inst.root.join(".staging").join(format!("import-{}", m.id));
         let _ = fs::remove_dir_all(&tmp);
-        let (l, c) = link_tree(dir, &tmp, *root, false)?;
-        (r.linked, r.copied) = (r.linked + l, r.copied + c);
+        let (l, c, h) = link_tree(dir, &tmp, *root, false)?;
+        (r.linked, r.copied, r.hidden) = (r.linked + l, r.copied + c, r.hidden + h);
         fs::write(tmp.join(".rmm-index"), index_dir(&tmp)?.join("\n"))?;
         fs::write(tmp.join(crate::instance::MOD_META), toml::to_string_pretty(meta)?)?;
         fs::rename(&tmp, inst.mod_dir(&m.id))?;
@@ -573,15 +868,18 @@ fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<Pl
         p.plugins = plugins.into_iter().chain(others).collect();
         p.locks.extend(locks);
         p.colors.extend(incoming.iter().filter_map(|m| Some((m.id.clone(), m.color.clone()?))));
+        also(p);
         Ok(())
     })
 }
 
-/// Hard-link (or, across volumes, copy) a mod folder's files into `dest`. MO2's `meta.ini` and
-/// Vortex's marker files stay behind; a top `Root` folder (Root Builder) becomes `root/`, and
-/// with `under_root` everything goes there. Returns (linked, copied).
-fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> Result<(usize, usize)> {
-    let (mut linked, mut copied) = (0, 0);
+/// Hard-link (or, across volumes, copy) a mod folder's files into `dest`. MO2's `meta.ini`,
+/// the files MO2 hides (`.mohidden`, or in a folder so named) and Vortex's marker files stay
+/// behind; a top `Root` folder (Root Builder) becomes `root/`, and with `under_root` everything
+/// goes there. Returns (linked, copied, hidden).
+// ponytail: hidden files are left out, not kept hidden; rmm has no per-mod hiding to keep them in.
+fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> Result<(usize, usize, usize)> {
+    let (mut linked, mut copied, mut hidden) = (0, 0, 0);
     fs::create_dir_all(dest)?;
     for e in walkdir::WalkDir::new(src).min_depth(1) {
         let e = e?;
@@ -591,6 +889,10 @@ fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> 
         let rel = e.path().strip_prefix(src)?.to_string_lossy().replace('\\', "/");
         let low = rel.to_lowercase();
         if matches!(low.as_str(), "meta.ini" | "__folder_managed_by_vortex" | "rmm-mod.toml" | ".rmm-index") {
+            continue;
+        }
+        if low.split('/').any(|c| c.ends_with(".mohidden")) {
+            hidden += 1;
             continue;
         }
         let rel = match rel.split_once('/') {
@@ -609,7 +911,7 @@ fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> 
             copied += 1;
         }
     }
-    Ok((linked, copied))
+    Ok((linked, copied, hidden))
 }
 
 #[cfg(test)]

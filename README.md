@@ -47,7 +47,7 @@ rmm profile options --local-inis true --local-saves true    # and its own INIs a
 rmm mod-rule "My Patch" --after "Big Mod"         # suggestion; `rmm sort-mods --apply` satisfies them
 rmm undo                                           # every change is undoable
 rmm purge --apply                                  # restore the vanilla game folder
-rmm import mo2 "D:\MO2\Skyrim" --apply             # or: rmm import vortex <state.v2 or backup.json>; rmm import sources
+rmm import mo2 "D:\MO2\Skyrim" --all --apply       # every profile; or --profile <name>; rmm import vortex <state.v2 or backup.json>; rmm import sources
 rmm lock export                                    # modlist.lock.toml; `rmm lock apply <file> --downloads <dir>` rebuilds
 rmm nexus login                                    # paste your API key (or --sso once Nexus registers rmm); then `rmm nexus updates`, `rmm nxm <link>`
 rmm nexus install https://www.nexusmods.com/skyrimspecialedition/mods/32444   # Premium: a mod page or id installs its newest main file

@@ -208,12 +208,17 @@ pub fn add(inst: &Instance, id: &str, spec: ToolSpec) -> Result<Tool> {
     if let Some(e) = spec.edit_in_place {
         tool.edit_in_place = e;
     }
+    put(inst, id, &tool)?;
+    Ok(tool)
+}
+
+/// Store a tool under `id`, replacing one there.
+pub(crate) fn put(inst: &Instance, id: &str, tool: &Tool) -> Result<()> {
     inst.locked(|| {
         let mut tools = list(inst)?;
         tools.insert(id.into(), tool.clone());
         write_atomic(&inst.root.join(TOOLS), &toml::to_string_pretty(&tools)?)
-    })?;
-    Ok(tool)
+    })
 }
 
 pub fn remove(inst: &Instance, id: &str) -> Result<()> {

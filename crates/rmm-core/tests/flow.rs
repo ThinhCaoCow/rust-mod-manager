@@ -2118,6 +2118,102 @@ fn imports_an_mo2_instance() {
 }
 
 #[test]
+fn imports_all_of_an_mo2_instance() {
+    isolate();
+    use rmm_core::{import, instance::InstanceConfig, nexus, tools};
+    use std::collections::BTreeMap;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, mo2, bin, my) = (tmp.path().join("game"), tmp.path().join("mo2"), tmp.path().join("bin"), tmp.path().join("mygames"));
+    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("skse64_loader.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    for exe in ["SSEEdit.exe", "mytool.exe", "hidden.exe"] {
+        write(&bin.join(exe), "exe");
+    }
+    let exes = [
+        ("Skyrim Special Edition", format!("{}/SkyrimSE.exe", slash(&game)), ""),
+        ("SKSE", format!("{}/skse64_loader.exe", slash(&game)), ""),
+        ("SSEEdit", format!("{}/SSEEdit.exe", slash(&bin)), ""),
+        ("BodySlide x64", format!("{}/mods/BodySlide/CalienteTools/BodySlide/BodySlide x64.exe", slash(&mo2)), ""),
+        ("My Tool", format!("{}/mytool.exe", slash(&bin)), r#"-a \"b c\""#),
+        ("Gone", format!("{}/gone.exe", slash(&bin)), ""),
+        ("Hidden", format!("{}/hidden.exe", slash(&bin)), ""),
+    ];
+    let mut ini = String::from("[General]\r\ngameName=Skyrim Special Edition\r\nselected_profile=@ByteArray(Main)\r\n\r\n[customExecutables]\r\n");
+    for (i, (title, binary, args)) in exes.iter().enumerate() {
+        let n = i + 1;
+        ini += &format!("{n}\\arguments={args}\r\n{n}\\binary={binary}\r\n{n}\\hide={}\r\n{n}\\title={title}\r\n{n}\\workingDirectory={}\r\n", *title == "Hidden", if *title == "My Tool" { slash(&bin) } else { String::new() });
+    }
+    ini += &format!("size={}\r\n", exes.len());
+    write(&mo2.join("ModOrganizer.ini"), ini);
+    write(&mo2.join("mods/A/A.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&mo2.join("mods/A/textures/a.dds.mohidden"), "hidden by MO2");
+    write(&mo2.join("mods/A/old.mohidden/x.nif"), "a hidden folder");
+    write(&mo2.join("mods/A/meta.ini"), "[General]\r\nmodid=123\r\nversion=1.0\r\nignoredVersion=2.0\r\n");
+    write(&mo2.join("mods/BodySlide/CalienteTools/BodySlide/BodySlide x64.exe"), "exe");
+    write(&mo2.join("mods/BodySlide Output/meshes/body.nif"), "built");
+    write(&mo2.join("mods/Tool Stuff/stuff.txt"), "made by My Tool");
+    write(&mo2.join("mods/C/meshes/c.nif"), "C");
+    write(&mo2.join("profiles/Main/modlist.txt"), "+Tool Stuff\r\n+BodySlide Output\r\n+BodySlide\r\n+A\r\n");
+    write(&mo2.join("profiles/Main/plugins.txt"), "*A.esp\r\n");
+    write(&mo2.join("profiles/Main/settings.ini"), "[General]\r\nLocalSaves=true\r\nLocalSettings=true\r\n\r\n[custom_overwrites]\r\nMy%20Tool=Tool Stuff\r\n");
+    write(&mo2.join("profiles/Main/skyrim.ini"), "[General]\r\nsMain=1\r\n");
+    write(&mo2.join("profiles/Main/skyrimprefs.ini"), "[Display]\r\n");
+    write(&mo2.join("profiles/Main/saves/Save1.ess"), "save");
+    write(&mo2.join("profiles/Main/saves/Save1.skse"), "co-save");
+    write(&mo2.join("profiles/Alt/modlist.txt"), "+C\r\n");
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    inst.config.ini_path = Some(my.clone());
+    let at = |p: &str| Instance { root: inst.root.clone(), config: InstanceConfig { profile: p.into(), ..inst.config.clone() } };
+
+    // A dry run: every profile, mods and tools listed with the first.
+    let dry = import::import_mo2_all(&inst, &mo2, true).unwrap();
+    assert_eq!(dry.iter().map(|r| format!("{}>{}", r.profile, r.into)).collect::<Vec<_>>(), ["Main>Main", "Alt>Alt"]);
+    assert_eq!((dry[0].mods.len(), dry[1].mods.len(), dry[1].existing.len()), (5, 0, 5));
+    assert_eq!(dry[0].tools, ["SSEEdit", "BodySlide x64", "My Tool"], "not the game, SKSE, a missing or a hidden one");
+    assert!(dry[0].warnings.iter().any(|w| w.contains("Gone")), "{:?}", dry[0].warnings);
+    assert_eq!(dry[0].outputs, ["BodySlide Output (bodyslide)", "Tool Stuff (my-tool)"]);
+    assert_eq!((dry[0].inis, dry[0].saves, dry[1].inis), (2, 2, 0));
+    assert_eq!(inst.profiles().unwrap(), ["default"], "nothing made");
+    assert!(tools::list(&inst).unwrap().is_empty() && !my.exists());
+
+    let done = import::import_mo2_all(&inst, &mo2, false).unwrap();
+    assert_eq!(inst.profiles().unwrap(), ["Alt", "default", "Main"]);
+    assert_eq!((order(&at("Main")), order(&at("Alt"))), ("A+ BodySlide+ BodySlide Output+ Tool Stuff+ C".into(), "C+ A BodySlide BodySlide Output Tool Stuff".into()));
+    assert!(order(&inst).is_empty(), "the active profile stays as it was");
+    let main = at("Main").profile().unwrap();
+    assert!(main.local_inis && main.local_saves && !at("Alt").profile().unwrap().local_saves, "MO2's profile options");
+    assert_eq!(fs::read_to_string(inst.root.join("profiles/Main/ini/Skyrim.ini")).unwrap(), "[General]\r\nsMain=1\r\n");
+    assert!(inst.root.join("profiles/Main/ini/SkyrimPrefs.ini").is_file() && my.join("Saves/Main/Save1.skse").is_file());
+
+    // Hidden files stay behind; the ignored version is skipped by update checks.
+    assert_eq!((done[0].hidden, inst.mod_files("A").unwrap()), (2, vec!["A.esp".to_string()]));
+    let meta = inst.mod_meta("A");
+    assert_eq!(meta.skip_version.as_deref(), Some("2.0"));
+    let update = |latest: &str| nexus::Update { id: "A".into(), name: "A".into(), mod_id: 123, installed: Some("1.0".into()), latest: Some(latest.into()), file_id: 9, file_name: "A".into(), url: String::new() };
+    assert!(!nexus::offered(&update("2.0"), &meta) && nexus::offered(&update("2.1"), &meta));
+
+    // MO2's programs are tools: the presets rmm has, the rest as MO2 ran them.
+    let t = tools::list(&inst).unwrap();
+    assert_eq!(t.keys().collect::<Vec<_>>(), ["bodyslide", "my-tool", "xedit"]);
+    assert!(t["xedit"].edit_in_place && t["xedit"].exe == bin.join("SSEEdit.exe"));
+    assert!(slash(&t["bodyslide"].exe).ends_with("game/Data/CalienteTools/BodySlide/BodySlide x64.exe"), "run from the deployed Data folder");
+    assert_eq!((t["my-tool"].args.clone(), t["my-tool"].output_mod.as_deref()), (vec!["-a".to_string(), "b c".into()], Some("Tool Stuff")));
+    assert_eq!((inst.mod_meta("BodySlide Output").source.as_deref(), inst.mod_meta("Tool Stuff").source.as_deref()), (Some("tool:bodyslide"), Some("tool:my-tool")));
+
+    // BodySlide's next run replaces the output MO2 made, in its place.
+    deploy::deploy(&at("Main"), false).unwrap();
+    let vars = BTreeMap::from([("groups".to_string(), "CBBE".to_string())]);
+    assert_eq!(tools::run(&at("Main"), "bodyslide", &vars, true, None).unwrap().previous.as_deref(), Some("BodySlide Output"));
+
+    // Again: nothing new.
+    let again = import::import_mo2_all(&inst, &mo2, false).unwrap();
+    assert!(again.iter().all(|r| r.mods.is_empty() && r.tools.is_empty() && r.outputs.is_empty() && r.saves == 0 && r.inis == 0), "{again:?}");
+    assert_eq!(tools::list(&inst).unwrap().len(), 3);
+}
+
+#[test]
 fn imports_a_vortex_backup() {
     isolate();
     use rmm_core::import;

@@ -498,7 +498,7 @@ function updatesBlock(m, meta) {
       ${u ? '<button data-act="skip-update" title="Don’t offer this file; a later one is offered">Skip this version</button>' : ''}
     </div>
     <label class="row" style="margin:0"><input type="checkbox" data-act="pin" ${m.pinned ? 'checked' : ''}> Hold at this version (update checks don’t offer newer ones)</label>
-    ${meta.skip_file && !u && !m.pinned ? '<div class="row"><span class="muted small">A newer file is skipped.</span><button class="link" data-act="unskip">Offer it again</button></div>' : ''}`;
+    ${(meta.skip_file || meta.skip_version) && !u && !m.pinned ? '<div class="row"><span class="muted small">A newer file is skipped.</span><button class="link" data-act="unskip">Offer it again</button></div>' : ''}`;
 }
 
 function renderModHead() {
@@ -2154,19 +2154,35 @@ async function importExport(what) {
     const args = what === 'mo2' ? { dir: path } : { path };
     const profiles = what === 'mo2' ? await call('mo2_profiles', { dir: path }).catch(() => []) : [];
     if (profiles.length > 1) {
-      const body = `<p>Which MO2 profile? Its mods come in with their order, and its plugin order.</p><select id="mo2-profile" aria-label="MO2 profile">${profiles.map((p, i) => `<option value="${esc(p)}">${esc(p)}${i ? '' : ' (selected in MO2)'}</option>`).join('')}</select>`;
+      const body = `<p>Which MO2 profile? Its mods come in with their order, and its plugin order.</p><select id="mo2-profile" aria-label="MO2 profile">${profiles.map((p, i) => `<option value="${esc(p)}">${esc(p)}${i ? '' : ' (selected in MO2)'}</option>`).join('')}<option value="*">All ${profiles.length} profiles, each into an rmm profile of its name</option></select>`;
       if (await dialog({ title: 'Import from MO2', body, actions: [['cancel', 'Cancel'], ['ok', 'Next', 'primary']] }) !== 'ok') return;
-      args.profile = $('#mo2-profile').value;
+      if ($('#mo2-profile').value === '*') args.all = true;
+      else args.profile = $('#mo2-profile').value;
     }
     const run = dry_run => call(what === 'mo2' ? 'import_mo2' : 'import_vortex', { ...args, dry_run });
     const r = await act('Reading the setup', () => run(true), { reload: false });
     if (!r || r === true) return;
-    const body = `<p>${what === 'mo2' ? 'MO2' : 'Vortex'} profile <b>${esc(r.profile)}</b>: ${plural(r.mods.length, 'mod')} to bring in, ${plural(r.separators, 'separator')}, ${plural(r.plugins, 'plugin')}${what === 'vortex' ? `, ${plural(r.rules, 'mod rule')}` : ''}.</p>
-      <p class="muted small">Files are hard-linked when they’re on the same drive (no extra space), copied otherwise. The list becomes this profile’s order in one step that Undo reverts; mods already here stay as they are.${what === 'vortex' ? ' Purge Vortex’s deployment before deploying with rmm.' : ''}</p>`
-      + part('to bring in', r.mods) + part('already installed, kept as they are', r.existing) + part('warnings', r.warnings);
+    // One report, or one per MO2 profile; mods and tools come in with the first.
+    const all = [].concat(r), first = all[0];
+    const sum = k => all.reduce((n, x) => n + (x[k] ?? 0), 0);
+    const warnings = [...new Set(all.flatMap(x => x.warnings))];
+    const into = args.all
+      ? `<p>${plural(all.length, 'MO2 profile')}, each into the rmm profile of its name (${all.map(x => esc(x.into)).join(', ')}; missing ones are made): ${plural(first.mods.length, 'mod')} to bring in, ${plural(first.separators, 'separator')}.</p>`
+      : `<p>${what === 'mo2' ? 'MO2' : 'Vortex'} profile <b>${esc(r.profile)}</b>: ${plural(r.mods.length, 'mod')} to bring in, ${plural(r.separators, 'separator')}, ${plural(r.plugins, 'plugin')}${what === 'vortex' ? `, ${plural(r.rules, 'mod rule')}` : ''}.</p>`;
+    const own = [sum('inis') && `${plural(sum('inis'), 'INI')} into the profile’s own`, sum('saves') && `${plural(sum('saves'), 'save file')} into its own save folder`].filter(Boolean);
+    const body = into + (own.length ? `<p>MO2 kept INIs and saves per profile, and so will rmm: ${own.join(', and ')} are copied in.</p>` : '')
+      + `<p class="muted small">Files are hard-linked when they’re on the same drive (no extra space), copied otherwise. The list becomes ${args.all ? 'each' : 'this'} profile’s order in one step that Undo reverts; mods already here stay as they are.${what === 'vortex' ? ' Purge Vortex’s deployment before deploying with rmm.' : ''}</p>`
+      + part('to bring in', first.mods) + part('already installed, kept as they are', first.existing)
+      + part('MO2 programs that become tools', first.tools ?? []) + part('made by a program, replaced when you run it in rmm', first.outputs ?? [])
+      + part('warnings', warnings);
     if (await dialog({ title: `Import from ${what === 'mo2' ? 'MO2' : 'Vortex'}`, body, actions: [['cancel', 'Cancel'], ['ok', 'Import', 'primary']] }) !== 'ok') return;
     const done = await act('Importing', () => run(false));
-    if (done && done !== true) toast(`Imported ${plural(done.mods.length, 'mod')} (${done.linked.toLocaleString()} files linked, ${done.copied.toLocaleString()} copied).${done.warnings.length ? '\n' + done.warnings.join('\n') : ''}`, done.warnings.length ? 'warn' : 'info');
+    if (!done || done === true) return;
+    const res = [].concat(done), n = k => res.reduce((t, x) => t + (x[k]?.length ?? x[k] ?? 0), 0);
+    const notes = [...new Set(res.flatMap(x => x.warnings))];
+    if (n('hidden')) notes.push(`${plural(n('hidden'), 'file')} MO2 had hidden stayed behind.`);
+    toast(`Imported ${plural(n('mods'), 'mod')}${args.all ? ` into ${plural(res.length, 'profile')}` : ''} (${n('linked').toLocaleString()} files linked, ${n('copied').toLocaleString()} copied)${n('tools') ? `, and ${plural(n('tools'), 'tool')}` : ''}.${notes.length ? '\n' + notes.join('\n') : ''}`, notes.length ? 'warn' : 'info');
+    if (n('tools')) loadTools();
     return;
   }
   // Apply a lockfile.

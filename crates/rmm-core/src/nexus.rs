@@ -539,7 +539,9 @@ pub fn saved_updates(inst: &Instance) -> BTreeMap<String, Update> {
 
 /// Whether a found update still applies to the mod: not held, not skipped, not installed since.
 pub fn offered(u: &Update, meta: &crate::instance::ModMeta) -> bool {
-    meta.nexus.as_ref().is_some_and(|n| n.mod_id == u.mod_id && n.file_id != Some(u.file_id)) && !meta.pinned && meta.skip_file != Some(u.file_id)
+    meta.nexus.as_ref().is_some_and(|n| n.mod_id == u.mod_id && n.file_id != Some(u.file_id)) && !meta.pinned
+        && meta.skip_file != Some(u.file_id)
+        && (meta.skip_version.is_none() || meta.skip_version != u.latest)
 }
 
 /// How to hold a mod's updates back.
@@ -566,7 +568,7 @@ pub fn hold_updates(inst: &Instance, ids: &[String], hold: Hold) -> Result<()> {
             let mut meta = inst.mod_meta(id);
             match hold {
                 Hold::Pin => meta.pinned = true,
-                Hold::Release => (meta.pinned, meta.skip_file) = (false, None),
+                Hold::Release => (meta.pinned, meta.skip_file, meta.skip_version) = (false, None, None),
                 Hold::Skip => {
                     let u = found.get(id).filter(|u| meta.nexus.as_ref().is_some_and(|n| n.mod_id == u.mod_id));
                     meta.skip_file = Some(u.with_context(|| format!("no update found for '{id}'; check for updates first"))?.file_id);
