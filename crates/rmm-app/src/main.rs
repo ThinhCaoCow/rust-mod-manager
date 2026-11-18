@@ -330,6 +330,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(format!("data:image/png;base64,{}", BASE64_STANDARD.encode(fs::read(file)?)))
         }
         "health" => json!(health::check(&inst)?),
+        "lacking_requirements" => json!(nexus::lacking_requirements(&inst, &p)),
         "details" => ops::mod_details(&inst, &s("id")?, 300)?,
         // A mod's FOMOD installer as it plays out with the window's choices; null when it has none.
         "fomod" => {

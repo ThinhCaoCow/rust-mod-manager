@@ -1149,6 +1149,11 @@ impl Rmm {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
     }
 
+    #[tool(description = "What the enabled mods' Nexus pages list as required that this setup lacks: each requirement with the mod that needs it, its Nexus mod id and page (none for the script extender's site or a DLC), whether it is installed but disabled (and as which mod), and whether it is a DLC (missing from the game's Data folder). health_check says the same in words. install_from_nexus installs one; set_mods_enabled turns one on.", annotations(read_only_hint = true))]
+    async fn missing_requirements(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| Ok(nexus::lacking_requirements(&i, &i.profile()?))))
+    }
+
     #[tool(description = "Look downloads up on Nexus by their MD5, many at once (MO2's Query Info): each file's mod and file ids, version and the mod's name, or not found (not from Nexus, or changed since). What's found is kept for installs from the file, and installed mods made from one that have no Nexus ids get them, so check_mod_updates sees them. Needs the user's API key.")]
     async fn identify_downloads(&self, Parameters(a): Parameters<IdentifyArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| nexus::identify(&i, &nexus::Client::from_env()?, &a.names)))

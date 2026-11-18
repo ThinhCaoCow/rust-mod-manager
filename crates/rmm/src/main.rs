@@ -606,6 +606,13 @@ enum NexusCmd {
     /// installs from them, and the mods already made from them, get their Nexus ids for update
     /// checks.
     Identify { names: Vec<String> },
+    /// Requirements the enabled mods' Nexus pages list that aren't installed, or are but are off
+    /// (and DLC that isn't there). --install installs the ones on Nexus (Premium: each one's newest
+    /// main file, installer defaults) and turns on the others, in one step.
+    Requirements {
+        #[arg(long)]
+        install: bool,
+    },
     /// Search the game's mods on Nexus by name and description (no key needed).
     Search {
         words: Vec<String>,
@@ -1085,6 +1092,11 @@ fn run() -> Result<()> {
         Cmd::Nexus(NexusCmd::Search { words, category, sort, count, offset, adult }) => {
             print(&nexus::search(&open()?, &nexus::Client::any(), &nexus::Search { query: words.join(" "), category, sort, count, offset, adult })?)
         }
+        Cmd::Nexus(NexusCmd::Requirements { install: false }) => {
+            let inst = open()?;
+            print(&nexus::lacking_requirements(&inst, &inst.profile()?))
+        }
+        Cmd::Nexus(NexusCmd::Requirements { install: true }) => print(&nexus::install_lacking(&open()?, &nexus::Client::from_env()?)?),
         Cmd::Nexus(NexusCmd::Identify { names }) => print(&nexus::identify(&open()?, &nexus::Client::from_env()?, &names)?),
         Cmd::Nexus(NexusCmd::Info { mod_id }) => print(&nexus::mod_info(&open()?, &nexus::Client::any(), mod_id)?),
         Cmd::Nexus(NexusCmd::Updates { ids }) => {

@@ -1201,6 +1201,7 @@ function renderProblems() {
     }).join('')
     : `<li class="info"><span class="sev">ok</span><span class="subject">No problems found${hidden ? ' apart from ignored ones' : ''}.</span></li>`;
   $('#show-ignored').hidden = !hidden;
+  $('#install-missing').hidden = !all.some(i => i.kind === 'nexus_requirement' && !ignored.has(keyOf(i)));
   $('#show-ignored').textContent = showIgnored ? 'Hide ignored' : `Show ${hidden} ignored`;
   // Mods with a finding, for the Problems filter.
   D.flagged = new Set(all.filter(i => !ignored.has(keyOf(i)) && i.severity !== 'info').map(i => targetOf(i)?.mod).filter(Boolean));
@@ -1211,6 +1212,41 @@ function renderProblems() {
   if (filters.has('problems')) renderMods();
   $('#problems-note').textContent = `${plural(all.length - failures.length, 'finding')}. LOOT's messages are included once its masterlist is downloaded.`;
 }
+
+/** What the mods' Nexus pages list as required and this setup lacks: install it all (Premium) or
+ *  open the Files tabs (free), and turn on what's installed but off. */
+$('#install-missing').onclick = async () => {
+  let list = await call('lacking_requirements').catch(e => { toast(String(e), 'error'); return null; });
+  if (!list) return;
+  list = list.filter(l => !ignored.has(`nexus_requirement|${l.for_mod}`));
+  const by = new Map();
+  for (const l of list) {
+    const k = l.disabled ?? l.mod_id ?? l.name.toLowerCase();
+    const e = by.get(k) ?? { ...l, for: [] };
+    e.for.push(nameOf(l.for_mod));
+    by.set(k, e);
+  }
+  const rows = [...by.values()];
+  if (!rows.length) return toast('Nothing the mods need is missing.');
+  const premium = !!nexus.user?.is_premium;
+  const get = rows.filter(r => r.mod_id && !r.disabled), off = rows.filter(r => r.disabled), other = rows.filter(r => !r.mod_id && !r.disabled);
+  const li = (name, r) => `<li><b>${esc(name)}</b> <span class="muted small">for ${esc(r.for.join(', '))}</span></li>`;
+  const body = (get.length ? `<p>${premium ? 'To download and install, each one’s newest main file' : 'To download on Nexus'}:</p><ul>${get.map(r => li(r.name, r)).join('')}</ul>` : '')
+    + (off.length ? `<p>Installed but off, to turn on:</p><ul>${off.map(r => li(nameOf(r.disabled), r)).join('')}</ul>` : '')
+    + (other.length ? `<p class="muted small">Not on Nexus, so these are yours to get: ${other.map(r => esc(r.dlc ? `the ${r.name} DLC (on Steam)` : `${r.name} (${r.page})`)).join('; ')}.</p>` : '')
+    + (get.length && !premium ? '<p class="muted small">Free accounts download through the website: rmm opens each one’s Files tab, where “Mod manager download” installs it here.</p>' : '');
+  const what = [get.length && (premium ? `install ${get.length}` : `open ${plural(get.length, 'page')}`), off.length && `turn on ${off.length}`].filter(Boolean).join(' and ');
+  if (!what) return dialog({ title: 'What’s missing', body, actions: [['cancel', 'Close']] });
+  if (await dialog({ title: 'What’s missing', body, actions: [['cancel', 'Cancel'], ['ok', what[0].toUpperCase() + what.slice(1), 'primary']] }) !== 'ok') return;
+  if (off.length) await act('Turning the mods on', () => call('enable_mods', { ids: off.map(r => r.disabled), enabled: true }));
+  if (!get.length) return;
+  if (premium) {
+    nxmQueue.push(...get.map(r => ({ link: String(r.mod_id), at: null })));
+    return runQueue();
+  }
+  for (const r of get.slice(0, 10)) await call('open_nexus_mod', { mod_id: r.mod_id }).catch(e => toast(String(e), 'error'));
+  if (get.length > 10) toast(`Opened the first 10 pages; Install what’s missing… opens the rest once those are in.`);
+};
 
 // ---- Tabs, filters, keys --------------------------------------------------------------------
 

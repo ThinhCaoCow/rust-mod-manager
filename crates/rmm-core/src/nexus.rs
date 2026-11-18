@@ -1211,6 +1211,9 @@ pub struct Needed {
     /// For requirements outside Nexus.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
+    /// A DLC (`name` is Nexus's name for it), checked by its master file in the game's Data folder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dlc: bool,
 }
 
 /// A mod another one needs, or one that needs it, and the installed mod that is it.
@@ -1322,8 +1325,40 @@ fn needed(page: &Value, game: &Value) -> Vec<Needed> {
             name: n["modName"].as_str().unwrap_or_default().into(),
             notes: n["notes"].as_str().unwrap_or_default().into(),
             url: n["url"].as_str().unwrap_or_default().into(),
+            dlc: false,
         })
         .collect()
+}
+
+/// A mod page's DLC requirements.
+fn dlc_needed(requirements: &Value) -> Vec<Needed> {
+    requirements["dlcRequirements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["gameExpansion"]["name"].as_str())
+        .map(|name| Needed { mod_id: None, name: name.into(), notes: String::new(), url: String::new(), dlc: true })
+        .collect()
+}
+
+/// A DLC's master file, by Nexus's name for it. Others (Creation Club bundles) aren't checked.
+fn dlc_master(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    [
+        ("dawnguard", "Dawnguard.esm"),
+        ("hearthfire", "HearthFires.esm"),
+        ("dragonborn", "Dragonborn.esm"),
+        ("automatron", "DLCRobot.esm"),
+        ("wasteland workshop", "DLCworkshop01.esm"),
+        ("far harbor", "DLCCoast.esm"),
+        ("contraptions workshop", "DLCworkshop02.esm"),
+        ("vault-tec workshop", "DLCworkshop03.esm"),
+        ("nuka-world", "DLCNukaWorld.esm"),
+        ("nuka world", "DLCNukaWorld.esm"),
+    ]
+    .iter()
+    .find(|(k, _)| n.contains(k))
+    .map(|(_, f)| *f)
 }
 
 /// A mod's page on Nexus: description, tags, what it needs and what needs it, each marked when installed.
@@ -1368,14 +1403,15 @@ pub fn refresh_requirements(inst: &Instance, client: &Client, mod_ids: &[u64]) -
         return Ok(());
     }
     let game = game_number(inst, client)?;
-    let query = format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ gameId modRequirements {{ nexusRequirements(count: 100) {{ {REQ_NODES} }} }} }} }}");
+    let query = format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ gameId modRequirements {{ dlcRequirements {{ gameExpansion {{ name }} }} nexusRequirements(count: 100) {{ {REQ_NODES} }} }} }} }}");
     let mut all = requirements(inst);
     for (i, &m) in mod_ids.iter().enumerate() {
         crate::progress::report("reading requirements on Nexus", i, mod_ids.len());
         let Ok(data) = client.graphql(&query, serde_json::json!({ "m": m, "g": game })) else { continue };
         let v = &data["mod"];
         if !v.is_null() {
-            all.insert(m, needed(&v["modRequirements"]["nexusRequirements"], &v["gameId"]));
+            let r = &v["modRequirements"];
+            all.insert(m, needed(&r["nexusRequirements"], &v["gameId"]).into_iter().chain(dlc_needed(r)).collect());
         }
     }
     fs::write(inst.root.join(REQUIREMENTS), serde_json::to_string(&all)?)?;
@@ -1422,12 +1458,58 @@ fn waived(r: &Needed, game: Option<([u32; 4], &[[u32; 2]])>) -> bool {
     false
 }
 
-/// Enabled mods whose Nexus page lists a requirement that isn't installed, or is but is disabled:
-/// (mod id, message). A mod's Nexus id is the recorded one or the one in its archive's name, and a
-/// requirement also counts as installed when a mod has its name or is a stand-in for it. The script
-/// extender counts when its loader is in the game folder or an enabled mod. Other sites'
-/// requirements aren't checked, nor ones their note waives for this game (see `waived`).
+/// A requirement an enabled mod's Nexus page lists that this setup lacks.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Lacking {
+    /// The mod whose page lists it.
+    pub for_mod: String,
+    pub name: String,
+    /// Its Nexus mod id; None for the script extender (another site) or a DLC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<u64>,
+    /// Where to get it ("nexusmods.com/...", "skse.silverlock.org"); empty for a DLC.
+    pub page: String,
+    /// Installed but disabled: that mod's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dlc: bool,
+}
+
+/// Enabled mods' Nexus requirements that aren't installed, or are but are disabled, as Problems
+/// shows them: (mod id, message).
 pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile) -> Vec<(String, String)> {
+    let mut by_mod: Vec<(String, Vec<String>)> = Vec::new();
+    for l in lacking_requirements(inst, profile) {
+        let text = match &l.disabled {
+            _ if l.dlc => format!("the {} DLC, not in the game's Data folder", l.name),
+            Some(id) => match inst.mod_meta(id).name {
+                n if n.eq_ignore_ascii_case(&l.name) => format!("{}, installed but disabled", l.name),
+                n => format!("{}, installed as {n} but disabled", l.name),
+            },
+            None => format!("{} ({}), not installed", l.name, l.page),
+        };
+        match by_mod.last_mut() {
+            Some((m, v)) if *m == l.for_mod => v.push(text),
+            _ => by_mod.push((l.for_mod, vec![text])),
+        }
+    }
+    by_mod
+        .into_iter()
+        .map(|(m, lacking)| {
+            let it = if lacking.len() == 1 { "it" } else { "them" };
+            (m, format!("its Nexus page lists as required: {}. Ignore this if you have {it} another way", lacking.join("; ")))
+        })
+        .collect()
+}
+
+/// Enabled mods' Nexus requirements that aren't installed, or are but are disabled. A mod's Nexus
+/// id is the recorded one or the one in its archive's name, and a requirement also counts as
+/// installed when a mod has its name or is a stand-in for it. The script extender counts when its
+/// loader is in the game folder or an enabled mod, and a DLC when its master is in the game's Data
+/// folder. Other sites' requirements aren't checked, nor ones their note waives for this game (see
+/// `waived`).
+pub fn lacking_requirements(inst: &Instance, profile: &crate::instance::Profile) -> Vec<Lacking> {
     let all = requirements(inst);
     if all.is_empty() {
         return vec![];
@@ -1456,18 +1538,33 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
         let n = r.name.to_lowercase();
         r.url.contains("silverlock.org") || n.contains("script extender") || ["skse", "skse64", "sksevr", "f4se", "f4sevr"].contains(&n.as_str())
     };
+    let data_files: std::collections::HashSet<String> =
+        fs::read_dir(inst.data_dir()).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
     let mut out = Vec::new();
     for (m, nx, _) in mods.iter().filter(|x| x.0.enabled) {
         let Some(reqs) = nx.and_then(|n| all.get(&n)) else { continue };
-        let mut lacking = Vec::new();
+        let lack = |r: &Needed, page: &str, disabled: Option<String>| Lacking {
+            for_mod: m.id.clone(),
+            name: r.name.clone(),
+            mod_id: r.mod_id,
+            page: page.to_string(),
+            disabled,
+            dlc: r.dlc,
+        };
         for r in reqs.iter().filter(|r| r.mod_id.is_none_or(|id| Some(id) != *nx) && !waived(r, game)) {
             let page = match r.mod_id {
                 Some(id) => format!("nexusmods.com/{domain}/mods/{id}"),
                 None => r.url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
             };
+            if r.dlc {
+                if dlc_master(&r.name).is_some_and(|f| !data_files.contains(&f.to_lowercase())) {
+                    out.push(lack(r, "", None));
+                }
+                continue;
+            }
             if is_se(r) {
                 if !se_on {
-                    lacking.push(format!("{} ({page}), not installed", r.name));
+                    out.push(lack(r, &page, None));
                 }
                 continue;
             }
@@ -1478,18 +1575,52 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
             let same: Vec<&(&crate::ModEntry, Option<u64>, String)> =
                 mods.iter().filter(|x| x.1 == r.mod_id || x.1.is_some_and(|id| stand_ins.contains(&id)) || x.2.eq_ignore_ascii_case(&r.name)).collect();
             match same.iter().find(|x| x.0.enabled).or(same.first()) {
-                None => lacking.push(format!("{} ({page}), not installed", r.name)),
-                Some(x) if !x.0.enabled && x.2.eq_ignore_ascii_case(&r.name) => lacking.push(format!("{}, installed but disabled", r.name)),
-                Some(x) if !x.0.enabled => lacking.push(format!("{}, installed as {} but disabled", r.name, x.2)),
+                None => out.push(lack(r, &page, None)),
+                Some(x) if !x.0.enabled => out.push(lack(r, &page, Some(x.0.id.clone()))),
                 Some(_) => {}
             }
         }
-        if !lacking.is_empty() {
-            let it = if lacking.len() == 1 { "it" } else { "them" };
-            out.push((m.id.clone(), format!("its Nexus page lists as required: {}. Ignore this if you have {it} another way", lacking.join("; "))));
-        }
     }
     out
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct InstalledLacking {
+    pub installed: Vec<String>,
+    pub turned_on: Vec<String>,
+    /// Requirement, then why.
+    pub failed: Vec<(String, String)>,
+    /// The script extender, DLC and other sites' downloads: for the user to get.
+    pub left: Vec<Lacking>,
+}
+
+/// Install every lacking requirement that's on Nexus (its newest main file, with the installer's
+/// defaults: Premium only) and turn on the installed but disabled ones, in one undoable step.
+pub fn install_lacking(inst: &Instance, client: &Client) -> Result<InstalledLacking> {
+    let lacking = lacking_requirements(inst, &inst.profile()?);
+    let mut r = InstalledLacking::default();
+    let mut off: Vec<String> = lacking.iter().filter_map(|l| l.disabled.clone()).collect();
+    off.sort();
+    off.dedup();
+    if !off.is_empty() {
+        crate::ops::set_mods_enabled(inst, &off, true)?;
+        r.turned_on = off;
+    }
+    let mut done = std::collections::HashSet::new();
+    for l in lacking.into_iter().filter(|l| l.disabled.is_none()) {
+        let Some(id) = l.mod_id else {
+            r.left.push(l);
+            continue;
+        };
+        if !done.insert(id) {
+            continue;
+        }
+        match resolve(inst, client, &id.to_string()).and_then(|link| install(inst, client, &link, None)) {
+            Ok(i) => r.installed.push(i.id),
+            Err(e) => r.failed.push((l.name, format!("{e:#}"))),
+        }
+    }
+    Ok(r)
 }
 
 /// A mod page's BBCode as plain text: links keep their address, images go.
@@ -1525,7 +1656,7 @@ mod text_tests {
     #[test]
     fn notes_that_waive_a_requirement() {
         let eras: &[[u32; 2]] = &[[1, 5], [1, 6], [1, 7]];
-        let waived = |name: &str, notes: &str, v: [u32; 4]| super::waived(&super::Needed { mod_id: Some(1), name: name.into(), notes: notes.into(), url: String::new() }, Some((v, eras)));
+        let waived = |name: &str, notes: &str, v: [u32; 4]| super::waived(&super::Needed { mod_id: Some(1), name: name.into(), notes: notes.into(), url: String::new(), dlc: false }, Some((v, eras)));
         let (ae, se) = ([1, 6, 1170, 0], [1, 5, 97, 0]);
         for (name, notes, on_ae, on_se) in [
             ("Nemesis", "Technically optional but very strongly recommended.", true, true),
@@ -1542,6 +1673,6 @@ mod text_tests {
         ] {
             assert_eq!((waived(name, notes, ae), waived(name, notes, se)), (on_ae, on_se), "{name}: {notes}");
         }
-        assert!(!super::waived(&super::Needed { mod_id: Some(1), name: "BEES".into(), notes: "older than 1.6.1130".into(), url: String::new() }, None), "no game version: keep it");
+        assert!(!super::waived(&super::Needed { mod_id: Some(1), name: "BEES".into(), notes: "older than 1.6.1130".into(), url: String::new(), dlc: false }, None), "no game version: keep it");
     }
 }

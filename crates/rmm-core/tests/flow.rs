@@ -3432,6 +3432,72 @@ fn reports_missing_nexus_requirements() {
     assert_eq!(needs(&inst), [], "a disabled mod's requirements don't matter");
 }
 
+/// A DLC requirement counts by its master in Data; Install all installs what's on Nexus and turns
+/// on what's off, and leaves the rest to the user.
+#[test]
+fn installs_lacking_requirements() {
+    isolate();
+    use rmm_core::nexus;
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    let src = tmp.path().join("src");
+    for m in ["Frostfall", "Campfire"] {
+        write(&src.join(m).join(format!("{m}.txt")), m);
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    nexus::remember(&inst, "Frostfall", rmm_core::instance::NexusRef { mod_id: 671, ..Default::default() }).unwrap();
+    nexus::remember(&inst, "Campfire", rmm_core::instance::NexusRef { mod_id: 667, ..Default::default() }).unwrap();
+    ops::set_mods_enabled(&inst, &["Campfire".into()], false).unwrap();
+    fs::write(
+        inst.root.join("nexus-requirements.json"),
+        r#"{"671": [{"mod_id": 667, "name": "Campfire"}, {"mod_id": 555, "name": "PapyrusUtil SE"}, {"name": "Dawnguard", "dlc": true},
+            {"name": "Creation Club: Fishing", "dlc": true}, {"name": "SKSE64", "url": "https://skse.silverlock.org/"}]}"#,
+    )
+    .unwrap();
+    let lacking = || nexus::lacking_requirements(&inst, &inst.profile().unwrap());
+    let l = lacking();
+    assert_eq!(
+        l.iter().map(|l| (l.name.as_str(), l.mod_id, l.disabled.as_deref(), l.dlc)).collect::<Vec<_>>(),
+        [("Campfire", Some(667), Some("Campfire"), false), ("PapyrusUtil SE", Some(555), None, false), ("Dawnguard", None, None, true), ("SKSE64", None, None, false)],
+        "a DLC rmm can't check is left out"
+    );
+    let words = health::check(&inst).unwrap().into_iter().find(|i| i.kind == "nexus_requirement").unwrap().message;
+    assert!(words.contains("Campfire, installed but disabled; PapyrusUtil SE (nexusmods.com/skyrimspecialedition/mods/555), not installed; the Dawnguard DLC, not in the game's Data folder; SKSE64"), "{words}");
+    write(&game.join("Data/Dawnguard.esm"), plugin_bytes(&[], true));
+    assert!(!lacking().iter().any(|l| l.dlc));
+
+    let json = |v: serde_json::Value| v.to_string().into_bytes();
+    let d = "/v1/games/skyrimspecialedition/mods";
+    let mut zip = Vec::new();
+    {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut zip));
+        z.start_file("SKSE/Plugins/PapyrusUtil.dll", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(b"dll").unwrap();
+        z.finish().unwrap();
+    }
+    let size = zip.len();
+    let (base, _) = mock_nexus(|base| {
+        std::collections::HashMap::from([
+            ("/v1/users/validate.json".to_string(), json(serde_json::json!({ "user_id": 1, "name": "tester", "is_premium": true }))),
+            (format!("{d}/555/files.json"), json(serde_json::json!({ "files": [{ "file_id": 9, "category_name": "MAIN", "uploaded_timestamp": 1 }] }))),
+            (format!("{d}/555/files/9.json"), json(serde_json::json!({ "file_id": 9, "file_name": "PapyrusUtil SE-555-4-6-1700000000.zip", "size_in_bytes": size, "version": "4.6" }))),
+            (format!("{d}/555/files/9/download_link.json"), json(serde_json::json!([{ "URI": format!("{base}/cdn/pu.zip") }]))),
+            ("/cdn/pu.zip".to_string(), zip),
+            (format!("{d}/555.json"), json(serde_json::json!({ "name": "PapyrusUtil SE" }))),
+        ])
+    });
+    let mut client = nexus::Client::new("test-key").unwrap();
+    client.base = base;
+    let r = nexus::install_lacking(&inst, &client).unwrap();
+    assert_eq!((r.installed.clone(), r.turned_on.clone(), r.failed.len()), (vec!["PapyrusUtil SE".to_string()], vec!["Campfire".to_string()], 0), "{r:?}");
+    assert_eq!(r.left.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["SKSE64"]);
+    assert_eq!(inst.mod_meta("PapyrusUtil SE").nexus.map(|n| n.mod_id), Some(555));
+    assert_eq!(lacking().iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["SKSE64"]);
+}
+
 /// `rmm nxm` leaves links for the window that holds the instance's window lock, in order.
 #[test]
 fn nxm_links_go_to_the_open_window() {
