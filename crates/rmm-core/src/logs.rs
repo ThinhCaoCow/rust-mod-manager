@@ -129,7 +129,7 @@ pub fn read_crash_log(inst: &Instance, path: Option<&Path>) -> Result<CrashRepor
 fn providers(inst: &Instance, profile: &crate::instance::Profile) -> Result<impl Fn(&str) -> Option<String> + use<>> {
     let on = crate::conflicts::file_map(inst, profile)?.winners();
     let mut all = profile.clone();
-    all.mods.iter_mut().for_each(|m| m.enabled = true);
+    all.mods.iter_mut().filter(|m| !crate::instance::is_separator(&m.id)).for_each(|m| m.enabled = true);
     let any = crate::conflicts::file_map(inst, &all)?.winners();
     Ok(move |rel: &str| {
         let k = path_key(rel);
@@ -218,6 +218,119 @@ pub struct ScriptHits {
     pub script: String,
     pub mod_id: Option<String>,
     pub count: usize,
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct SeLog {
+    pub path: PathBuf,
+    pub modified: Option<u64>,
+    /// Each plugin DLL the script extender checked, in its order.
+    pub plugins: Vec<SePlugin>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+pub struct SePlugin {
+    pub file: String,
+    pub mod_id: Option<String>,
+    pub loaded: bool,
+    /// Why it didn't load, in the log's words; None when the log ends after checking it.
+    pub problem: Option<String>,
+    /// Its mod was installed or updated after this run, so the log may be out of date for it.
+    pub changed: bool,
+}
+
+/// A script extender log line about a plugin DLL: what it says, the DLL's path, and the rest.
+static SE_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(checking plugin|couldn't load plugin|plugin) (.*?\.dll)\b ?(.*)$").unwrap());
+/// The version info after a plugin's path, "(00000001 Name 01000020)", and the error code and
+/// handle SKSE ends the line with.
+static SE_NOISE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\([0-9a-f]{8}\s.*\s[0-9a-f]{8}\)\s*|\s*(?:[0-9a-f]{8}\s*)?\(handle \d+\)\s*$").unwrap());
+
+/// The script extender's log from the last game run (`skse64.log` or `f4se.log` in My Games):
+/// which plugin DLLs loaded, which didn't and why, and the mod each comes from. With `all` false,
+/// only the ones that didn't load.
+pub fn script_extender_log(inst: &Instance, all: bool) -> Result<SeLog> {
+    let game = inst.config.game;
+    let se = if game.base() == Game::SkyrimSe { "SKSE" } else { "F4SE" };
+    let name = format!("{}.log", game.loader().split('_').next().unwrap_or_default());
+    let path = inst.ini_dir().context("can't find your Documents folder, where the game keeps its logs")?.join(se).join(name);
+    let Ok(bytes) = fs::read(&path) else { return Ok(SeLog { path, ..Default::default() }) };
+    let at = modified(&path);
+    let mut plugins = parse_se_log(&String::from_utf8_lossy(&bytes));
+    plugins.retain(|p| all || !p.loaded);
+    if !plugins.is_empty() {
+        let owner = providers(inst, &inst.profile()?)?;
+        for p in &mut plugins {
+            p.mod_id = owner(&format!("{se}/Plugins/{}", p.file));
+            let installed = p.mod_id.as_ref().and_then(|id| modified(&inst.mod_dir(id).join(crate::instance::MOD_META)));
+            p.changed = installed.zip(at).is_some_and(|(m, log)| m > log);
+        }
+    }
+    Ok(SeLog { path, modified: at, plugins })
+}
+
+/// What a script extender log says about each plugin DLL, in the order it checked them.
+pub fn parse_se_log(text: &str) -> Vec<SePlugin> {
+    let mut out: Vec<SePlugin> = Vec::new();
+    for line in text.lines() {
+        let Some(c) = SE_LINE.captures(line.trim()) else { continue };
+        let file = c[2].rsplit(['\\', '/']).next().unwrap_or_default().to_string();
+        let rest = SE_NOISE.replace_all(&c[3], "").trim().to_string();
+        let low = rest.to_lowercase();
+        let i = out.iter().position(|p| p.file.eq_ignore_ascii_case(&file)).unwrap_or_else(|| {
+            out.push(SePlugin { file, mod_id: None, loaded: false, problem: None, changed: false });
+            out.len() - 1
+        });
+        if c[1].eq_ignore_ascii_case("checking plugin") {
+            continue;
+        }
+        if low.contains("no version data") || low.contains("does not appear to be") {
+            out.remove(i); // a DLL that isn't a plugin, like Crash Logger's msdia140.dll
+        } else if low.contains("loaded correctly") {
+            out[i].loaded = true;
+        } else if c[1].eq_ignore_ascii_case("couldn't load plugin") {
+            out[i].problem = Some(format!("couldn't load it: {}", rest.trim_matches(['(', ')'])));
+        } else {
+            out[i].problem = Some(rest);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod se_log_tests {
+    #[test]
+    fn reads_which_plugins_loaded() {
+        // Lines as SKSE 2.2.6 and F4SE 0.6.23 write them, plus the failures they report.
+        let log = r#"SKSE64 runtime: initialize (version = 2.2.6 01064920 01DD76456613595D, os = 6.2 (9200))
+plugin directory = D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\
+checking plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\AnimationQueueFix.dll
+checking plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\Fuz Ro D'oh.dll
+checking plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\msdia140.dll
+plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\msdia140.dll (00000000  00000000) no version data 0 (handle 0)
+checking plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\OldThing.dll
+checking plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\Missing Dep.dll
+checking plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\Hangs.dll
+loading plugin "AnimationQueueFix"
+plugin 1 allocated 14 bytes from branch pool
+plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\AnimationQueueFix.dll (00000001 AnimationQueueFix 01000020) loaded correctly (handle 3)
+plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\Fuz Ro D'oh.dll (00000001 Fuz Ro D'oh 020507B8) loaded correctly (handle 4)
+plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\OldThing.dll (00000001 Old Thing (SE) 00000002) disabled, address library needs to be updated 00000000 (handle 0)
+couldn't load plugin D:\Games\Skyrim Special Edition\Data\SKSE\Plugins\\Missing Dep.dll (Error 126: The specified module could not be found.)
+plugin msdia140.dll does not appear to be an F4SE plugin
+"#;
+        let p = super::parse_se_log(log);
+        let got: Vec<(&str, bool, Option<&str>)> = p.iter().map(|p| (p.file.as_str(), p.loaded, p.problem.as_deref())).collect();
+        assert_eq!(
+            got,
+            [
+                ("AnimationQueueFix.dll", true, None),
+                ("Fuz Ro D'oh.dll", true, None),
+                ("OldThing.dll", false, Some("disabled, address library needs to be updated")),
+                ("Missing Dep.dll", false, Some("couldn't load it: Error 126: The specified module could not be found.")),
+                ("Hangs.dll", false, None),
+            ]
+        );
+    }
 }
 
 static FORM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\([0-9A-Fa-f]{8}\)|0x[0-9A-Fa-f]+").unwrap());

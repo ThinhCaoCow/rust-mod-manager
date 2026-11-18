@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 /// The open instance folder.
 struct Current(Mutex<Option<PathBuf>>);
@@ -329,16 +329,20 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let name = a["name"].as_str().map(str::trim).filter(|n| !n.is_empty());
             let at = a["priority"].as_u64().map(|n| n as usize);
             let r = install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at)?;
-            if let Ok(n) = serde_json::from_value(a["nexus"].clone()) {
+            if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
+                let id = n.mod_id;
                 nexus::remember(&inst, &r.id, n)?;
+                let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]); // for Problems; the install stands without
             }
             json!(r)
         }
         "reinstall" => json!(install::reinstall(&inst, &s("id")?, choices()?.as_ref())?),
         "update_mod" => {
             let r = install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref())?;
-            if let Ok(n) = serde_json::from_value(a["nexus"].clone()) {
+            if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
+                let id = n.mod_id;
                 nexus::remember(&inst, &r.id, n)?;
+                let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]); // a new version can need new mods
             }
             json!(r)
         }
@@ -383,6 +387,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "delete_profile" => json!(inst.delete_profile(&s("name")?)?),
         "crash_log" => json!(logs::read_crash_log(&inst, a["path"].as_str().map(Path::new))?),
         "papyrus_log" => json!(logs::read_papyrus_log(&inst, 60)?),
+        "se_log" => json!(logs::script_extender_log(&inst, true)?),
+        // nxm links `rmm nxm` left for this window (the website's "Mod manager download" buttons).
+        "nxm_links" => json!(nexus::take_links(&inst.root)),
         "nexus_status" => {
             let mut st = nexus::status();
             // Who opens nxm:// links, and whether it's this instance (`rmm -i "<root>" nxm`).
@@ -499,6 +506,32 @@ fn main() {
                 if last.0 != stage || last.1.elapsed() > Duration::from_millis(100) {
                     *last = (stage.to_string(), Instant::now());
                     let _ = handle.emit("progress", json!({ "stage": stage, "done": done, "total": total }));
+                }
+            });
+            // Hold the open instance's window lock, so `rmm nxm` leaves links for this window, and
+            // bring the window up when links arrive; the page takes them with `nxm_links`.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut held: Option<(PathBuf, fs::File)> = None;
+                let mut waiting = 0;
+                loop {
+                    let root = handle.state::<Current>().0.lock().unwrap().clone();
+                    if held.as_ref().map(|h| &h.0) != root.as_ref() {
+                        held = root.and_then(|r| nexus::hold_window(&r).ok().map(|f| (r, f)));
+                        waiting = 0;
+                    }
+                    if let Some((r, _)) = &held {
+                        let now = nexus::pending_links(r);
+                        if now > waiting {
+                            if let Some(w) = handle.get_webview_window("main") {
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                            let _ = handle.emit("nxm", now);
+                        }
+                        waiting = now;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             });
             Ok(())

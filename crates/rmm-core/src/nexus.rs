@@ -58,6 +58,97 @@ pub fn parse_nxm(link: &str) -> Result<NxmLink> {
     })
 }
 
+/// The file an open window keeps locked on its instance, and the folder where nxm links wait for it.
+const WINDOW_LOCK: &str = ".window-lock";
+const INBOX: &str = ".nxm-inbox";
+
+/// Lock the instance for this window, so `rmm nxm` sends links here. Closing the file unlocks it,
+/// and so does the window closing or crashing.
+pub fn hold_window(root: &Path) -> Result<fs::File> {
+    let f = fs::OpenOptions::new().create(true).write(true).truncate(false).open(root.join(WINDOW_LOCK))?;
+    if let Err(e) = f.try_lock() {
+        bail!("another window has {} open ({e})", root.display());
+    }
+    Ok(f)
+}
+
+/// Whether a window has the instance open.
+pub fn window_open(root: &Path) -> bool {
+    fs::OpenOptions::new().write(true).open(root.join(WINDOW_LOCK)).is_ok_and(|f| matches!(f.try_lock(), Err(fs::TryLockError::WouldBlock)))
+}
+
+/// Where `hand_to_window` put a link.
+#[derive(Debug, PartialEq)]
+pub enum Handed {
+    /// To the window that has the instance open.
+    ToWindow,
+    /// To a window it started for the instance.
+    OpenedWindow,
+    /// Nowhere: there is no window program to start. The caller installs it.
+    NoWindow,
+}
+
+/// Give an nxm link (a "Mod manager download" button's) to the window that has the instance open,
+/// or start `app`, rmm's window program, on the instance to take it. The window downloads it and
+/// installs it like a dropped file: FOMOD installers show their options, and a newer version of
+/// an installed mod is offered as an update.
+pub fn hand_to_window(root: &Path, link: &str, app: &Path) -> Result<Handed> {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    parse_nxm(link)?;
+    let open = window_open(root);
+    if !open && !app.is_file() {
+        return Ok(Handed::NoWindow);
+    }
+    let inbox = root.join(INBOX);
+    fs::create_dir_all(&inbox)?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("{:020}-{}-{seq}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(), std::process::id());
+    fs::write(inbox.join(format!("{name}.tmp")), link.trim())?;
+    fs::rename(inbox.join(format!("{name}.tmp")), inbox.join(format!("{name}.nxm")))?; // never read half-written
+    if open {
+        return Ok(Handed::ToWindow);
+    }
+    // Several links clicked while no window is open start one.
+    let starting = inbox.join(".starting");
+    let recent = fs::metadata(&starting).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e < Duration::from_secs(30));
+    if !recent {
+        fs::write(&starting, "")?;
+        Command::new(app)
+            .arg("--instance")
+            .arg(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("cannot start {}", app.display()))?;
+    }
+    Ok(Handed::OpenedWindow)
+}
+
+/// How many links wait for the window.
+pub fn pending_links(root: &Path) -> usize {
+    inbox_files(root).len()
+}
+
+/// The links waiting for the window, oldest first, taken out of the inbox.
+pub fn take_links(root: &Path) -> Vec<String> {
+    inbox_files(root)
+        .into_iter()
+        .filter_map(|p| {
+            let link = fs::read_to_string(&p).ok()?;
+            fs::remove_file(&p).ok()?;
+            Some(link.trim().to_string())
+        })
+        .filter(|l| parse_nxm(l).is_ok())
+        .collect()
+}
+
+fn inbox_files(root: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(root.join(INBOX)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "nxm")).collect();
+    files.sort();
+    files
+}
+
 /// A connection to the Nexus API with the user's key.
 pub struct Client {
     pub base: String,
@@ -461,6 +552,8 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         .filter_map(|u| Some((u["mod_id"].as_u64()?, u["latest_file_update"].as_u64().unwrap_or(0))))
         .collect();
     let mut out = Vec::new();
+    let known = requirements(inst);
+    let mut reread = Vec::new(); // mods whose requirements to read again
     for (i, (id, meta)) in mods.iter().enumerate() {
         crate::progress::report("checking Nexus for updates", i, mods.len());
         let n = meta.nexus.as_ref().unwrap();
@@ -473,12 +566,16 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
             let files = client.get(&format!("/v1/games/{domain}/mods/{}/files.json", n.mod_id))?;
             cache.files.insert(n.mod_id, files);
             cache.checked.insert(n.mod_id, now());
+            reread.push(n.mod_id);
+        } else if !known.contains_key(&n.mod_id) {
+            reread.push(n.mod_id);
         }
         if let Some(u) = newer(id, &meta.name, n, &cache.files[&n.mod_id], domain) {
             out.push(u);
         }
     }
     fs::write(&cache_path, serde_json::to_string(&cache)?)?;
+    let _ = refresh_requirements(inst, client, &reread); // the update check stands without them
     Ok(out)
 }
 
@@ -616,6 +713,7 @@ pub fn install(inst: &Instance, client: &Client, link: &NxmLink, choices: Option
     let f = fetch(inst, client, link)?;
     let r = crate::install::install(inst, &f.path, f.name.as_deref(), true, Some(&choices.cloned().unwrap_or_default()))?;
     remember(inst, &r.id, f.nexus)?;
+    let _ = refresh_requirements(inst, client, &[link.mod_id]); // Problems uses them; the install stands without
     Ok(r)
 }
 
@@ -851,17 +949,25 @@ pub struct Results {
     pub mods: Vec<Found>,
 }
 
-/// A mod another one needs, or one that needs it.
-#[derive(Serialize, Debug)]
-pub struct Requirement {
-    #[serde(skip_serializing_if = "Option::is_none")]
+/// A mod another one lists as required on its Nexus page (or one that lists it).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Needed {
+    /// None for a requirement outside Nexus (the script extender's site, say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mod_id: Option<u64>,
     pub name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
     /// For requirements outside Nexus.
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
+}
+
+/// A mod another one needs, or one that needs it, and the installed mod that is it.
+#[derive(Serialize, Debug)]
+pub struct Requirement {
+    #[serde(flatten)]
+    pub needed: Needed,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed: Option<String>,
 }
@@ -945,38 +1051,44 @@ pub fn search(inst: &Instance, client: &Client, s: &Search) -> Result<Results> {
     })
 }
 
+const REQ_NODES: &str = "nodes { modId modName notes url externalRequirement gameId }";
+
+/// The game's number on Nexus: one mod by id needs it, and a list query for it costs Nexus too much.
+fn game_number(inst: &Instance, client: &Client) -> Result<Value> {
+    let game = client.graphql("query($d: String) { game(domainName: $d) { id } }", serde_json::json!({ "d": inst.config.game.nexus_domain() }))?;
+    Ok(game["game"]["id"].clone())
+}
+
+/// A requirements list from Nexus, without other games' mods.
+fn needed(page: &Value, game: &Value) -> Vec<Needed> {
+    let game = game.to_string().trim_matches('"').to_string();
+    page["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|n| n["gameId"].is_null() || n["gameId"].to_string().trim_matches('"') == game)
+        .map(|n| Needed {
+            mod_id: n["modId"].as_str().and_then(|i| i.parse().ok()).or(n["modId"].as_u64()).filter(|_| n["externalRequirement"] != true),
+            name: n["modName"].as_str().unwrap_or_default().into(),
+            notes: n["notes"].as_str().unwrap_or_default().into(),
+            url: n["url"].as_str().unwrap_or_default().into(),
+        })
+        .collect()
+}
+
 /// A mod's page on Nexus: description, tags, what it needs and what needs it, each marked when installed.
 pub fn mod_info(inst: &Instance, client: &Client, mod_id: u64) -> Result<ModInfo> {
-    let req = "nodes { modId modName notes url externalRequirement gameId }";
-    // One mod by id needs the game's number; a list query for it costs Nexus too much.
-    let game = client.graphql("query($d: String) { game(domainName: $d) { id } }", serde_json::json!({ "d": inst.config.game.nexus_domain() }))?;
     let data = client.graphql(
-        &format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ {MOD_FIELDS} gameId description tags {{ name }} modRequirements {{ dlcRequirements {{ gameExpansion {{ name }} }} nexusRequirements(count: 100) {{ {req} }} modsRequiringThisMod(count: 100) {{ totalCount {req} }} }} }} }}"),
-        serde_json::json!({ "m": mod_id, "g": game["game"]["id"] }),
+        &format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ {MOD_FIELDS} gameId description tags {{ name }} modRequirements {{ dlcRequirements {{ gameExpansion {{ name }} }} nexusRequirements(count: 100) {{ {REQ_NODES} }} modsRequiringThisMod(count: 100) {{ totalCount {REQ_NODES} }} }} }} }}"),
+        serde_json::json!({ "m": mod_id, "g": game_number(inst, client)? }),
     )?;
     let v = &data["mod"];
     if v.is_null() {
         bail!("Nexus has no mod {mod_id} for this game (removed or hidden?)");
     }
     let installed = installed_by_nexus(inst);
-    let game = v["gameId"].to_string().trim_matches('"').to_string();
     let list = |page: &Value| -> Vec<Requirement> {
-        page["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|n| n["gameId"].is_null() || n["gameId"].to_string().trim_matches('"') == game)
-            .map(|n| {
-                let id = n["modId"].as_str().and_then(|i| i.parse().ok()).or(n["modId"].as_u64()).filter(|_| n["externalRequirement"] != true);
-                Requirement {
-                    mod_id: id,
-                    name: n["modName"].as_str().unwrap_or_default().into(),
-                    notes: n["notes"].as_str().unwrap_or_default().into(),
-                    url: n["url"].as_str().unwrap_or_default().into(),
-                    installed: id.and_then(|i| installed.get(&i).cloned()),
-                }
-            })
-            .collect()
+        needed(page, &v["gameId"]).into_iter().map(|n| Requirement { installed: n.mod_id.and_then(|i| installed.get(&i).cloned()), needed: n }).collect()
     };
     let r = &v["modRequirements"];
     Ok(ModInfo {
@@ -988,6 +1100,97 @@ pub fn mod_info(inst: &Instance, client: &Client, mod_id: u64) -> Result<ModInfo
         required_by_count: r["modsRequiringThisMod"]["totalCount"].as_u64().unwrap_or_default(),
         required_by: list(&r["modsRequiringThisMod"]),
     })
+}
+
+/// What each Nexus mod lists as required on its page, by its Nexus mod id. Apart from the cache,
+/// which the health check would otherwise read whole.
+const REQUIREMENTS: &str = "nexus-requirements.json";
+
+/// The requirements read so far (no network).
+pub fn requirements(inst: &Instance) -> BTreeMap<u64, Vec<Needed>> {
+    fs::read_to_string(inst.root.join(REQUIREMENTS)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Read what these Nexus mods list as required on their pages, and keep it. A mod Nexus no longer
+/// shows keeps what was read before.
+pub fn refresh_requirements(inst: &Instance, client: &Client, mod_ids: &[u64]) -> Result<()> {
+    if mod_ids.is_empty() {
+        return Ok(());
+    }
+    let game = game_number(inst, client)?;
+    let query = format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ gameId modRequirements {{ nexusRequirements(count: 100) {{ {REQ_NODES} }} }} }} }}");
+    let mut all = requirements(inst);
+    for (i, &m) in mod_ids.iter().enumerate() {
+        crate::progress::report("reading requirements on Nexus", i, mod_ids.len());
+        let Ok(data) = client.graphql(&query, serde_json::json!({ "m": m, "g": game })) else { continue };
+        let v = &data["mod"];
+        if !v.is_null() {
+            all.insert(m, needed(&v["modRequirements"]["nexusRequirements"], &v["gameId"]));
+        }
+    }
+    fs::write(inst.root.join(REQUIREMENTS), serde_json::to_string(&all)?)?;
+    Ok(())
+}
+
+/// Enabled mods whose Nexus page lists a requirement that isn't installed, or is but is disabled:
+/// (mod id, message). A mod's Nexus id is the recorded one or the one in its archive's name, and a
+/// requirement also counts as installed when a mod has its name. The script extender counts when
+/// its loader is in the game folder or an enabled mod. Other sites' requirements aren't checked.
+pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile) -> Vec<(String, String)> {
+    let all = requirements(inst);
+    if all.is_empty() {
+        return vec![];
+    }
+    let domain = inst.config.game.nexus_domain();
+    let mods: Vec<(&crate::ModEntry, Option<u64>, String)> = profile
+        .mods
+        .iter()
+        .filter(|m| !crate::instance::is_separator(&m.id))
+        .map(|m| {
+            let meta = inst.mod_meta(&m.id);
+            let nx = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| crate::install::nexus_id_in_name(meta.source.as_deref()?));
+            (m, nx, meta.name)
+        })
+        .collect();
+    let loader = inst.config.game.loader();
+    let se_on = inst.config.game_path.join(loader).is_file()
+        || crate::launch::script_extender_mods(inst).unwrap_or_default().iter().any(|id| profile.mods.iter().any(|m| &m.id == id && m.enabled));
+    let is_se = |r: &Needed| {
+        let n = r.name.to_lowercase();
+        r.url.contains("silverlock.org") || n.contains("script extender") || ["skse", "skse64", "sksevr", "f4se", "f4sevr"].contains(&n.as_str())
+    };
+    let mut out = Vec::new();
+    for (m, nx, _) in mods.iter().filter(|x| x.0.enabled) {
+        let Some(reqs) = nx.and_then(|n| all.get(&n)) else { continue };
+        let mut lacking = Vec::new();
+        for r in reqs.iter().filter(|r| r.mod_id.is_none_or(|id| Some(id) != *nx)) {
+            let page = match r.mod_id {
+                Some(id) => format!("nexusmods.com/{domain}/mods/{id}"),
+                None => r.url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
+            };
+            if is_se(r) {
+                if !se_on {
+                    lacking.push(format!("{} ({page}), not installed", r.name));
+                }
+                continue;
+            }
+            if r.mod_id.is_none() {
+                continue; // another site's download; rmm can't tell whether it's there
+            }
+            let same: Vec<&(&crate::ModEntry, Option<u64>, String)> = mods.iter().filter(|x| x.1 == r.mod_id || x.2.eq_ignore_ascii_case(&r.name)).collect();
+            match same.iter().find(|x| x.0.enabled).or(same.first()) {
+                None => lacking.push(format!("{} ({page}), not installed", r.name)),
+                Some(x) if !x.0.enabled && x.2.eq_ignore_ascii_case(&r.name) => lacking.push(format!("{}, installed but disabled", r.name)),
+                Some(x) if !x.0.enabled => lacking.push(format!("{}, installed as {} but disabled", r.name, x.2)),
+                Some(_) => {}
+            }
+        }
+        if !lacking.is_empty() {
+            let it = if lacking.len() == 1 { "it" } else { "them" };
+            out.push((m.id.clone(), format!("its Nexus page lists as required: {}. Ignore this if you have {it} another way", lacking.join("; "))));
+        }
+    }
+    out
 }
 
 /// A mod page's BBCode as plain text: links keep their address, images go.

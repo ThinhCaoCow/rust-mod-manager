@@ -34,7 +34,7 @@ FOMOD installers: fomod_options shows the steps, options and the resolved choice
 choices (calling fomod_options again shows steps they unlock) and pass them to install_mod.
 Tools: add_tool registers a program (presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod); run_tool deploys, runs it, captures what it wrote (its {output} folder plus new or changed Data files) into a generated mod that replaces its previous output, and deploys again. Preview with dry_run=true first. Long runs (DynDOLOD, grass) can go in the background (run_tool background=true, then poll tool_job).
 launch_game deploys and starts the game through its script extender after checking the versions match. \
-test_run starts it and checks it holds up; read_crash_log and read_papyrus_log point at the mods behind a crash or script errors.
+test_run starts it and checks it holds up; read_crash_log and read_papyrus_log point at the mods behind a crash or script errors, and read_script_extender_log says which SKSE/F4SE plugins loaded.
 Separators (add_separator) are headings in the mod list with ids starting \"sep:\"; they hold no files and are never enabled. \
 move_mods moves a separator and the mods under it when you list them all.
 Mod rules (set_mod_rule: a mod loads after, requires, or is incompatible with other mods) are suggestions: health_check reports broken ones and sort_mods reorders the list to satisfy the load-after rules. set_mod_rule replaces the whole rule, so pass every list.
@@ -909,6 +909,11 @@ impl Rmm {
         out(self.inst().and_then(|i| logs::read_papyrus_log(&i, a.tail.unwrap_or(40))))
     }
 
+    #[tool(description = "Which script extender plugins (SKSE/F4SE DLLs) loaded in the last game run, read from skse64.log or f4se.log: each with the mod that provides it and, when it didn't load, the log's reason (an Address Library or game version mismatch, a missing dependency). changed marks plugins whose mod was installed or updated after that run.")]
+    async fn read_script_extender_log(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| logs::script_extender_log(&i, true)))
+    }
+
     #[tool(description = "Deploy, start the game through the script extender and test it. With rmm's harness plugin deployed the run is scripted: main menu, a save, coc through cells with FPS, PNGs of the window with screenshots. The game runs in a small window behind the others unless window is \"fullscreen\". Without it, the game must keep running for `timeout` seconds. A crash log written during the run fails it and is read back to mods; the Papyrus log is summarised. Closes the game afterwards unless keep_open. dry_run defaults to true. Long runs can go in the background (then poll tool_job with id test_run).")]
     async fn test_run(&self, Parameters(a): Parameters<TestRunArgs>) -> Result<String, String> {
         if a.dry_run.unwrap_or(true) {
@@ -974,7 +979,7 @@ impl Rmm {
         out(Ok(nexus::status()))
     }
 
-    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. Needs the user's API key.", annotations(read_only_hint = true))]
+    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Needs the user's API key.", annotations(read_only_hint = true))]
     async fn check_mod_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
     }

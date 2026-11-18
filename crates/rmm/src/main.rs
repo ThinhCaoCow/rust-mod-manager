@@ -244,6 +244,9 @@ enum Cmd {
         #[arg(long, default_value_t = 40)]
         tail: usize,
     },
+    /// Which script extender plugins (SKSE/F4SE DLLs) loaded in the last game run, and why one
+    /// didn't, from skse64.log or f4se.log.
+    ScriptExtenderLog,
     /// Deploy, start the game and test it (scripted with the harness plugin, otherwise by
     /// watching the process), then read the logs back to mods; --apply to do it.
     TestRun {
@@ -339,8 +342,10 @@ enum Cmd {
     /// Nexus Mods: API key, update checks, downloads.
     #[command(subcommand)]
     Nexus(NexusCmd),
-    /// Download and install the file an nxm:// link points at (what the website's "Mod manager
-    /// download" button opens, once `rmm nexus register-handler` has been run).
+    /// What the website's "Mod manager download" button runs, once `rmm nexus register-handler`
+    /// has been run: hands the nxm:// link to the rmm window for the instance, starting it if it's
+    /// closed, where FOMOD installers show their options. Without the window program beside rmm,
+    /// it downloads and installs the file here (`rmm nexus install` always does).
     Nxm { link: String },
     Undo,
     Redo,
@@ -760,6 +765,7 @@ fn run() -> Result<()> {
         Cmd::Check => print(&health::check(&open()?)?),
         Cmd::CrashLog { path } => print(&logs::read_crash_log(&open()?, path.as_deref())?),
         Cmd::PapyrusLog { tail } => print(&logs::read_papyrus_log(&open()?, tail)?),
+        Cmd::ScriptExtenderLog => print(&logs::script_extender_log(&open()?, true)?),
         Cmd::TestRun { apply: false, .. } => print(&harness::preview(&open()?)?),
         Cmd::TestRun { apply: true, save, cells, dwell, timeout, keep_open, window, screenshots, steps } => {
             let steps = match steps {
@@ -847,7 +853,20 @@ fn run() -> Result<()> {
         Cmd::Nexus(NexusCmd::Updates { ids }) => {
             print(&nexus::check_updates(&open()?, &nexus::Client::from_env()?, (!ids.is_empty()).then_some(ids.as_slice()))?)
         }
-        Cmd::Nexus(NexusCmd::Install { what }) | Cmd::Nxm { link: what } => {
+        Cmd::Nxm { link } => {
+            let inst = open()?;
+            let app = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm-app.exe" } else { "rmm-app" });
+            match nexus::hand_to_window(&inst.root, &link, &app)? {
+                nexus::Handed::ToWindow => println!("Sent to the rmm window for {}.", inst.root.display()),
+                nexus::Handed::OpenedWindow => println!("Opening the rmm window for {}; it installs the file.", inst.root.display()),
+                nexus::Handed::NoWindow => {
+                    let client = nexus::Client::from_env()?;
+                    print(&nexus::install(&inst, &client, &nexus::parse_nxm(&link)?, None)?)?
+                }
+            }
+            Ok(())
+        }
+        Cmd::Nexus(NexusCmd::Install { what }) => {
             let inst = open()?;
             let client = nexus::Client::from_env()?;
             let link = nexus::resolve(&inst, &client, &what)?;

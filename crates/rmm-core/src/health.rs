@@ -30,6 +30,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("mod_rule_broken", "A load-after rule is broken"),
     ("mod_requires", "A mod's required mod isn't enabled"),
     ("mod_incompatible", "Incompatible mods are both enabled"),
+    ("nexus_requirement", "A mod's Nexus page lists a requirement that isn't installed or enabled"),
     ("load_order_unreadable", "The load order can't be read"),
     ("plugin_unreadable", "A plugin can't be read"),
     ("missing_masters", "A plugin's masters are missing"),
@@ -42,6 +43,9 @@ pub const KINDS: &[(&str, &str)] = &[
     ("ba2_limit", "Too many BA2 archives (Fallout 4)"),
     ("script_extender_missing", "Script extender plugins without the loader"),
     ("script_extender_mismatch", "The script extender doesn't match the game version"),
+    ("game_updated", "The game's version changed since the last Play"),
+    ("address_library_mismatch", "Address Library has no file for the game version"),
+    ("script_extender_plugin", "A script extender plugin didn't load in the last run"),
     ("deploy_blocked", "Deploy can't run"),
     ("not_deployed", "Changes not deployed yet"),
     ("external_change", "Deployed files changed outside rmm"),
@@ -75,6 +79,10 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         if !u.clashes.is_empty() {
             add("error", "mod_incompatible", &u.id, format!("is incompatible with {}, which {} enabled too (a mod rule)", u.clashes.join(", "), if u.clashes.len() == 1 { "is" } else { "are" }));
         }
+    }
+
+    for (id, message) in crate::nexus::missing_requirements(inst, &profile) {
+        add("warning", "nexus_requirement", &id, message);
     }
 
     // libloadorder reads the game's INIs from the real Documents folder; if that fails (a OneDrive
@@ -162,12 +170,30 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         add("error", "script_extender_missing", game.loader(), "script extender plugins are installed but the loader is not".into());
     }
     let root = &inst.config.game_path;
-    if root.join(game.loader()).is_file()
+    let version = crate::launch::game_version(root, game).ok();
+    if let Some(v) = &version
+        && root.join(game.loader()).is_file()
         && crate::settings::get().launch.script_extender
-        && let Ok(v) = crate::launch::game_version(root, game)
-        && let Err(e) = crate::launch::se_runtime(root, game, &v)
+        && let Err(e) = crate::launch::se_runtime(root, game, v)
     {
         add("error", "script_extender_mismatch", game.loader(), format!("{e:#}. Play won't start the game until it matches"));
+    }
+    let se = if game.base() == crate::Game::SkyrimSe { "SKSE" } else { "F4SE" };
+    if let Some(v) = &version {
+        if let Some(m) = crate::launch::game_updated(inst, &v.map(|x| x.to_string()).join(".")) {
+            add("warning", "game_updated", game.exe(), format!("{m}. The script extender, Address Library and many {se} plugins are made for one game version; the other findings here say what no longer matches. This goes away at the next Play"));
+        }
+        if let Some(m) = crate::launch::address_library(&inst.data_dir().join(se).join("Plugins"), game, v) {
+            add("error", "address_library_mismatch", "Address Library", m);
+        }
+    }
+    // Plugins from this setup's enabled mods that didn't load in the last run, unless their mod changed since.
+    if let Ok(log) = crate::logs::script_extender_log(inst, false) {
+        for p in log.plugins.into_iter().filter(|p| !p.changed) {
+            let Some(id) = p.mod_id.filter(|id| profile.mods.iter().any(|m| &m.id == id && m.enabled)) else { continue };
+            let why = p.problem.unwrap_or_else(|| "the log ends after checking it, so the game may have closed or crashed while loading it".into());
+            add("warning", "script_extender_plugin", &id, format!("{} didn't load in the last game run: {why} (Script extender log…)", p.file));
+        }
     }
 
     match crate::deploy::deploy(inst, true) {

@@ -300,6 +300,69 @@ fn updates_a_mod_in_place() {
     assert!(install::update(&inst, &snow, &src.join("Gone"), None).unwrap_err().to_string().contains("is gone"));
 }
 
+/// A game update: Problems says the version changed since the last Play, that Address Library has
+/// no file for it, and which script extender plugins didn't load in the last run.
+#[test]
+fn guards_against_game_updates() {
+    isolate();
+    use rmm_core::{launch, logs};
+    use std::time::{Duration, SystemTime};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, my) = (tmp.path().join("game"), tmp.path().join("my"));
+    let exe = |pad: &[u8], build: u32| {
+        let mut e = [b"MZ", pad].concat();
+        e.extend([0xBD, 0x04, 0xEF, 0xFE, 0, 0, 1, 0]);
+        e.extend(((1u32 << 16) | 6).to_le_bytes());
+        e.extend((build << 16).to_le_bytes());
+        e
+    };
+    write(&game.join("SkyrimSE.exe"), exe(b"", 1170));
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    inst.config.ini_path = Some(my.clone());
+    let src = tmp.path().join("src");
+    write(&src.join("Address Library/SKSE/Plugins/versionlib-1-6-1170-0.bin"), "lib");
+    write(&src.join("Fixes/SKSE/Plugins/Fixes.dll"), "dll");
+    for m in ["Address Library", "Fixes"] {
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    deploy::deploy(&inst, false).unwrap();
+    let ours = ["game_updated", "address_library_mismatch", "script_extender_plugin"];
+    let found = |inst: &Instance| -> Vec<(String, String)> {
+        health::check(inst).unwrap().into_iter().filter(|i| ours.contains(&i.kind)).map(|i| (i.kind.to_string(), i.subject)).collect()
+    };
+    assert_eq!(found(&inst), []);
+
+    // The last Play was on 1.6.1170; then the game updates to 1.6.1179.
+    fs::write(inst.root.join("game-version.txt"), "1.6.1170.0").unwrap();
+    assert_eq!(found(&inst), []);
+    write(&game.join("SkyrimSE.exe"), exe(b"!", 1179));
+    assert_eq!(found(&inst), [("game_updated".into(), "SkyrimSE.exe".into()), ("address_library_mismatch".into(), "Address Library".into())]);
+    let w = launch::launch(&inst, true).unwrap().warnings.join("\n");
+    assert!(w.contains("the game was 1.6.1170.0 at your last Play and is 1.6.1179.0 now"), "{w}");
+    assert!(w.contains("Address Library has no file for game version 1.6.1179.0 (its newest are for 1.6.1170.0)"), "{w}");
+
+    // The last run's log: Fixes.dll (from a mod) didn't load; a DLL no mod has is left out.
+    let log = my.join("SKSE/skse64.log");
+    let p = r"D:\Games\Skyrim\Data\SKSE\Plugins\";
+    write(&log, format!("checking plugin {p}\\Fixes.dll\nchecking plugin {p}\\Manual.dll\nplugin {p}\\Fixes.dll (00000001 Fixes 00000002) disabled, address library needs to be updated 00000000 (handle 0)\n"));
+    let at = |t: SystemTime| fs::File::options().write(true).open(&log).unwrap().set_modified(t).unwrap();
+    at(SystemTime::now() + Duration::from_secs(3600));
+    assert!(found(&inst).contains(&("script_extender_plugin".into(), "Fixes".into())));
+    let msg = health::check(&inst).unwrap().into_iter().find(|i| i.kind == "script_extender_plugin").unwrap().message;
+    assert_eq!(msg, "Fixes.dll didn't load in the last game run: disabled, address library needs to be updated (Script extender log…)");
+    let all = logs::script_extender_log(&inst, true).unwrap().plugins;
+    assert_eq!(all.iter().map(|p| (p.file.as_str(), p.mod_id.as_deref())).collect::<Vec<_>>(), [("Fixes.dll", Some("Fixes")), ("Manual.dll", None)]);
+    // A disabled mod's plugin won't load anyway.
+    ops::set_mods_enabled(&inst, &["Fixes".into()], false).unwrap();
+    assert!(!found(&inst).iter().any(|f| f.0 == "script_extender_plugin"));
+    ops::set_mods_enabled(&inst, &["Fixes".into()], true).unwrap();
+    // A mod installed or updated after the run isn't blamed for it.
+    at(SystemTime::now() - Duration::from_secs(3600));
+    assert!(!found(&inst).iter().any(|f| f.0 == "script_extender_plugin"));
+    assert!(logs::script_extender_log(&inst, true).unwrap().plugins[0].changed);
+}
+
 #[test]
 fn reinstall_relinks_without_external_changes() {
     isolate();
@@ -2704,13 +2767,90 @@ fn nexus_search_and_mod_pages() {
     assert_eq!((found.mods[0].installed.as_deref(), found.mods[1].installed.as_deref()), (None, Some("Campfire")));
     let info = nexus::mod_info(&inst, &client, 671).unwrap();
     assert_eq!(info.description, "Needs https://www.nexusmods.com/skyrimspecialedition/mods/667 Campfire.");
-    assert_eq!((info.requires[0].mod_id, info.requires[0].installed.as_deref()), (Some(667), Some("Campfire")));
+    assert_eq!((info.requires[0].needed.mod_id, info.requires[0].installed.as_deref()), (Some(667), Some("Campfire")));
     assert_eq!((info.required_by_count, info.required_by.len(), info.tags.as_slice()), (2, 1, &["Gameplay".to_string()][..]), "other games' mods are left out");
     assert_eq!(hits.lock().unwrap()["/v2/graphql"], 3);
+
+    // Frostfall's requirements are kept; Problems says so once Campfire is disabled.
+    write(&tmp.path().join("Frostfall/Frostfall.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    install::install(&inst, &tmp.path().join("Frostfall"), None, true, None).unwrap();
+    nexus::remember(&inst, "Frostfall", rmm_core::instance::NexusRef { mod_id: 671, ..Default::default() }).unwrap();
+    nexus::refresh_requirements(&inst, &client, &[671]).unwrap();
+    assert_eq!(nexus::requirements(&inst)[&671][0].name, "Campfire");
+    let needs = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "nexus_requirement").map(|i| (i.subject, i.message)).collect::<Vec<_>>();
+    assert_eq!(needs(&inst), []);
+    ops::set_mods_enabled(&inst, &["Campfire".into()], false).unwrap();
+    assert_eq!(needs(&inst), [("Frostfall".into(), "its Nexus page lists as required: Campfire, installed but disabled. Ignore this if you have it another way".into())]);
     fs::write(inst.root.join("nexus-categories.json"), r#"{"29":"Armour"}"#).unwrap();
     let wrong = nexus::search(&inst, &client, &nexus::Search { category: Some("Armor".into()), ..Default::default() }).unwrap_err();
     assert!(format!("{wrong:#}").contains("it has: Armour"), "{wrong:#}");
     assert!(nexus::search(&inst, &client, &nexus::Search { category: Some("armour".into()), sort: Some("newest".into()), ..Default::default() }).is_err(), "unknown sort");
+}
+
+/// Which of a mod's Nexus requirements count as missing: by Nexus id (recorded or in the archive's
+/// name) or name, the script extender by its loader, and not other sites' downloads.
+#[test]
+fn reports_missing_nexus_requirements() {
+    isolate();
+    use rmm_core::nexus;
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    let src = tmp.path().join("src");
+    write(&src.join("SkyUI/interface/skyui.swf"), "x");
+    write(&src.join("Address Library for SKSE Plugins-32444-11-1710536800/SKSE/Plugins/versionlib-1-6-1170-0.bin"), "x");
+    for m in ["SkyUI", "Address Library for SKSE Plugins-32444-11-1710536800"] {
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    nexus::remember(&inst, "SkyUI", rmm_core::instance::NexusRef { mod_id: 12604, ..Default::default() }).unwrap();
+    fs::write(
+        inst.root.join("nexus-requirements.json"),
+        r#"{"12604": [{"name": "SKSE64", "url": "https://skse.silverlock.org/"}, {"mod_id": 32444, "name": "Address Library for SKSE Plugins"},
+            {"mod_id": 555, "name": "PapyrusUtil SE"}, {"name": "A tool", "url": "https://example.com/tool"}, {"mod_id": 12604, "name": "SkyUI"}]}"#,
+    )
+    .unwrap();
+    let needs = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "nexus_requirement").map(|i| (i.subject, i.message)).collect::<Vec<_>>();
+    let id = "Address Library for SKSE Plugins";
+    assert_eq!(
+        needs(&inst),
+        [("SkyUI".into(), "its Nexus page lists as required: SKSE64 (skse.silverlock.org), not installed; PapyrusUtil SE (nexusmods.com/skyrimspecialedition/mods/555), not installed. Ignore this if you have them another way".into())]
+    );
+    ops::set_mods_enabled(&inst, &[id.into()], false).unwrap();
+    assert!(needs(&inst)[0].1.contains("(skse.silverlock.org), not installed; Address Library for SKSE Plugins, installed but disabled; PapyrusUtil SE"), "{:?}", needs(&inst));
+    ops::set_mods_enabled(&inst, &[id.into()], true).unwrap();
+    // The loader in the game folder is the script extender; a mod with the name is the requirement.
+    write(&game.join("skse64_loader.exe"), "loader");
+    write(&src.join("PapyrusUtil SE/SKSE/Plugins/PapyrusUtil.dll"), "x");
+    install::install(&inst, &src.join("PapyrusUtil SE"), None, true, None).unwrap();
+    assert_eq!(needs(&inst), []);
+    ops::set_mods_enabled(&inst, &["SkyUI".into()], false).unwrap();
+    fs::remove_file(game.join("skse64_loader.exe")).unwrap();
+    assert_eq!(needs(&inst), [], "a disabled mod's requirements don't matter");
+}
+
+/// `rmm nxm` leaves links for the window that holds the instance's window lock, in order.
+#[test]
+fn nxm_links_go_to_the_open_window() {
+    use rmm_core::nexus::{self, Handed};
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, no_app) = (tmp.path(), tmp.path().join("no-window-program.exe"));
+    let (a, b) = ("nxm://skyrimspecialedition/mods/1/files/2?key=k&expires=9", "nxm://skyrimspecialedition/mods/3/files/4");
+    assert!(!nexus::window_open(root));
+    assert_eq!(nexus::hand_to_window(root, a, &no_app).unwrap(), Handed::NoWindow, "no window and no program to start: install here");
+    let lock = nexus::hold_window(root).unwrap();
+    assert!(nexus::window_open(root));
+    assert!(nexus::hold_window(root).is_err(), "one window per instance");
+    for l in [a, b] {
+        assert_eq!(nexus::hand_to_window(root, l, &no_app).unwrap(), Handed::ToWindow);
+    }
+    assert!(nexus::hand_to_window(root, "https://example.com/x", &no_app).is_err(), "only nxm links");
+    assert_eq!(nexus::pending_links(root), 2);
+    assert_eq!(nexus::take_links(root), [a, b]);
+    assert_eq!((nexus::pending_links(root), nexus::take_links(root).len()), (0, 0));
+    drop(lock);
+    assert!(!nexus::window_open(root), "closing the window unlocks it");
 }
 
 #[test]

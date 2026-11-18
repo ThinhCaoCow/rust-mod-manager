@@ -247,6 +247,7 @@ function showApp() {
   remember(S.info.root);
   showTab(tab);
   nexusShow().then(async () => { if ((await loadConf())?.nexus.check_on_start && nexus.user) checkUpdates(true); });
+  takeLinks(); // a link that started the window
 }
 
 // The last tab, filter and state chips come back with the window.
@@ -1257,6 +1258,22 @@ $('#papyrus-log').onclick = async () => {
   await done;
   $('#dlg').onclick = null;
 };
+$('#se-log').onclick = async () => {
+  const r = await act('Reading the script extender log', () => call('se_log'), { reload: false });
+  if (!r || r === true) return;
+  const se = basename(r.path).toLowerCase().startsWith('f4se') ? 'F4SE' : 'SKSE';
+  const failed = r.plugins.filter(p => !p.loaded);
+  const row = p => `<tr><td>${esc(p.file)}${p.changed ? ' <span class="muted">(its mod changed since)</span>' : ''}</td>
+    <td>${p.loaded ? 'loaded' : `<span class="pill lose">${esc(p.problem ?? 'not loaded: the log ends after checking it')}</span>`}</td><td>${modLink(p.mod_id)}</td></tr>`;
+  const body = !r.modified ? `<p class="muted">There is no ${esc(basename(r.path))} yet. ${se} writes it each time the game starts through it.</p>` : `
+    <p class="muted small">${esc(basename(r.path))} · ${esc(when(r.modified))} · ${plural(r.plugins.length - failed.length, 'plugin')} loaded${failed.length ? `, ${failed.length} didn't` : ''}</p>
+    ${r.plugins.length ? `<table class="fc">${[...failed, ...r.plugins.filter(p => p.loaded)].map(row).join('')}</table>` : `<p class="muted">No ${se} plugins were loaded.</p>`}`;
+  const done = dialog({ title: 'Script extender log', body, actions: [['cancel', 'Close']] });
+  $('#dlg').classList.add('wide');
+  $('#dlg').onclick = e => { const id = e.target.closest('[data-goto]')?.dataset.goto; if (id) { $('#dlg').close(); showTab('mods'); goTo(id); } };
+  await done;
+  $('#dlg').onclick = null;
+};
 $('#show-ignored').onclick = () => { showIgnored = !showIgnored; renderProblems(); };
 $('#issues').onclick = e => {
   const dismiss = e.target.closest('[data-dismiss]')?.dataset.dismiss;
@@ -1798,7 +1815,7 @@ function handlerNow() {
 async function offerHandler() {
   if (nexus.handler_here || !nexus.user) return;
   const free = nexus.user.is_premium ? '' : ' That’s how free accounts download.';
-  const v = await dialog({ title: 'Open Nexus links with rmm?', body: `<p>The “Mod manager download” buttons on nexusmods.com would then install into this instance.${free}</p><p class="muted small">${esc(handlerNow())} The Nexus button can change this later.</p>`,
+  const v = await dialog({ title: 'Open Nexus links with rmm?', body: `<p>The “Mod manager download” buttons on nexusmods.com would then install into this instance, in this window (it opens if it’s closed), where installers show their options.${free}</p><p class="muted small">${esc(handlerNow())} The Nexus button can change this later.</p>`,
     actions: [['cancel', 'Not now'], ['ok', 'Open them with rmm', 'primary']] });
   if (v === 'ok') setHandler();
 }
@@ -1843,6 +1860,25 @@ $('#nexus-btn').onclick = async () => {
     nexusShow();
   } else if (v === 'handler') setHandler();
 };
+
+// Links from nexusmods.com's "Mod manager download" buttons, which `rmm nxm` leaves for this window:
+// downloaded one at a time and installed like a dropped file (FOMOD options, the update offer).
+let nxmQueue = [], nxmRunning = false;
+async function takeLinks() {
+  nxmQueue.push(...await call('nxm_links').catch(() => []));
+  if (nxmRunning || !nxmQueue.length) return;
+  nxmRunning = true;
+  try {
+    if (!await nexusReady('Downloads from Nexus Mods need your API key.')) return void (nxmQueue = []);
+    while (nxmQueue.length) {
+      while (busy) await new Promise(r => setTimeout(r, 400));
+      const link = nxmQueue.shift();
+      const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link }), { reload: false, problem: true });
+      if (f && f !== true) await install([f.path], null, f);
+    }
+  } finally { nxmRunning = false; }
+}
+T.event.listen('nxm', () => takeLinks());
 
 $('#nxm').onclick = async () => {
   const free = nexus.user && !nexus.user.is_premium;
