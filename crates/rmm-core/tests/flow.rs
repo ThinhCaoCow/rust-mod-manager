@@ -2474,6 +2474,73 @@ fn lockfile_round_trip_keeps_user_mods() {
     assert_eq!(order(&two), "B-1 sep:Textures Alpha+ Mine+");
 }
 
+/// A game folder whose exe says `version` and with the script extender's runtime for it.
+fn versioned_game(dir: &Path, version: [u32; 3]) {
+    let mut exe = b"MZ".to_vec();
+    exe.extend([0xBD, 0x04, 0xEF, 0xFE, 0, 0, 1, 0]);
+    exe.extend(((version[0] << 16) | version[1]).to_le_bytes());
+    exe.extend((version[2] << 16).to_le_bytes());
+    write(&dir.join("SkyrimSE.exe"), exe);
+    write(&dir.join(format!("skse64_{}_{}_{}.dll", version[0], version[1], version[2])), "");
+    write(&dir.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+}
+
+/// A pack brings the mods no archive does, with the notes; apply warns about another game
+/// version; diff and the readable list say what's what.
+#[test]
+fn lockfile_pack_diff_and_markdown() {
+    use rmm_core::lockfile;
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, game2, dl) = (tmp.path().join("game"), tmp.path().join("game2"), tmp.path().join("dl"));
+    versioned_game(&game, [1, 6, 1170]);
+    versioned_game(&game2, [1, 6, 640]);
+    fs::create_dir_all(&dl).unwrap();
+    let mut z = zip::ZipWriter::new(fs::File::create(dl.join("A-1.zip")).unwrap());
+    z.start_file("A.esp", zip::write::SimpleFileOptions::default()).unwrap();
+    z.write_all(&plugin_bytes(&["Skyrim.esm"], false)).unwrap();
+    z.finish().unwrap();
+    write(&tmp.path().join("Patch/Patch.esp"), plugin_bytes(&["Skyrim.esm", "A.esp"], false));
+
+    let one = Instance::create(&tmp.path().join("one"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    install::install(&one, &dl.join("A-1.zip"), Some("Alpha"), true, None).unwrap();
+    ops::add_separator(&one, "Patches", None).unwrap();
+    install::install(&one, &tmp.path().join("Patch"), None, true, None).unwrap();
+    ops::set_mod_note(&one, "Alpha", "Read the FAQ first.").unwrap();
+    let pack = tmp.path().join("share.zip");
+    let w = lockfile::write(&one, Some(&pack), lockfile::Format::Pack).unwrap();
+    assert_eq!(w.packed, ["Patch"], "Alpha comes from its archive");
+    let lock = lockfile::read(&pack).unwrap();
+    assert_eq!(lock.env.game_version.as_deref(), Some("1.6.1170.0"));
+    assert_eq!(lock.env.script_extender, ["skse64_1_6_1170.dll"]);
+
+    let md = lockfile::markdown(&lock);
+    for want in ["# Skyrim Special Edition mod list", "Made with game version 1.6.1170.0", "- [x] Alpha (`A-1.zip`)", "  > Read the FAQ first.", "## Patches", "- [x] Patch", "1. A.esp", "2. Patch.esp"] {
+        assert!(md.contains(want), "{want} in\n{md}");
+    }
+
+    // A friend on an older game version.
+    let two = Instance::create(&tmp.path().join("two"), Game::SkyrimSe, &game2, &tmp.path().join("local2")).unwrap();
+    let r = lockfile::apply(&two, &lock, std::slice::from_ref(&dl), false).unwrap();
+    assert_eq!((r.install.join(" "), r.missing.len()), ("Alpha Patch".into(), 0));
+    assert!(r.warnings.iter().any(|w| w.contains("game version 1.6.1170.0, this game is 1.6.640.0")), "{:?}", r.warnings);
+    assert!(r.warnings.iter().any(|w| w.contains("skse64_1_6_640.dll")), "{:?}", r.warnings);
+    assert!(two.mod_dir("Patch").join("Patch.esp").is_file());
+    assert_eq!(two.mod_meta("Patch").source, None, "not the unpacked folder, which is gone");
+    assert!(!two.root.join(".pack").exists());
+    assert_eq!(two.mod_meta("Alpha").notes.as_deref(), Some("Read the FAQ first."));
+    assert_eq!(order(&two), "Alpha+ sep:Patches Patch+");
+    assert!(lockfile::diff(&lock, &lockfile::export(&two).unwrap()).added.is_empty());
+
+    // Then they change things.
+    ops::set_mods_enabled(&two, &["Alpha".to_string()], false).unwrap();
+    ops::move_mods(&two, &["Patch".to_string()], 0).unwrap();
+    let d = lockfile::diff(&lock, &lockfile::export(&two).unwrap());
+    assert_eq!(d.versions, ["game version: 1.6.1170.0 → 1.6.640.0", "script extender: skse64_1_6_1170.dll → skse64_1_6_640.dll"]);
+    assert_eq!((d.turned_off.join(" "), d.moved.len(), d.added.len(), d.removed.len(), d.changed.len()), ("Alpha".into(), 1, 0, 0, 0));
+    assert_eq!(d.plugins_off, ["A.esp"]);
+}
+
 type Hits = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>;
 
 /// A stand-in for the Nexus API on 127.0.0.1. `routes` gets the server's base URL and returns

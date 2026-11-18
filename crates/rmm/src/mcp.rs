@@ -286,8 +286,20 @@ struct VortexArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct ExportArgs {
-    /// Where to write it; default: modlist.lock.toml in the instance.
+    /// Where to write it; default: modlist.lock.toml, modlist.pack.zip or modlist.md in the instance.
     path: Option<String>,
+    /// toml (default): the lockfile. pack: a zip of the lockfile and the files of mods no archive
+    /// brings back (patches the user made, mods made from Overwrite or a folder, an xEdit patch).
+    /// markdown: a readable list for a post or a friend.
+    #[serde(default)]
+    format: lockfile::Format,
+}
+#[derive(Deserialize, JsonSchema)]
+struct DiffLockArgs {
+    /// A lockfile or pack.
+    path: String,
+    /// A second one to compare it with; default: the active profile now.
+    other: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct ApplyLockArgs {
@@ -1168,12 +1180,24 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Write the active profile as modlist.lock.toml: every mod with its archive name and sha256, FOMOD choices, Nexus ids and a fingerprint of its files, plus the order, enabled state, colours, plugin order and mod rules. Returns the path.")]
+    #[tool(description = "Write the active profile as modlist.lock.toml: every mod with its archive name and sha256, FOMOD choices, Nexus ids, notes and a fingerprint of its files, plus the order, enabled state, colours, plugin order, mod rules and the game, script extender and Address Library versions. format pack zips it with the files of mods no archive brings back; markdown writes a readable list instead. Returns the path (and the packed mods).")]
     async fn export_lockfile(&self, Parameters(a): Parameters<ExportArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| lockfile::write(&i, a.path.as_deref().map(std::path::Path::new))))
+        out(self.inst().and_then(|i| lockfile::write(&i, a.path.as_deref().map(std::path::Path::new), a.format)))
     }
 
-    #[tool(description = "Rebuild a setup from a lockfile: install missing mods from archives in `downloads` (matched by name, checked by sha256, with the locked FOMOD choices), list what still has to be downloaded (with Nexus links), then set order, enabled state, colours, plugin order and mod rules. Mods the profile has that the lockfile doesn't list are kept after the mod they followed. dry_run defaults to true.")]
+    #[tool(description = "What changed from a lockfile (or pack) to the active profile, or to a second lockfile: the game, script extender and Address Library versions; mods added, removed, changed (other files: another version or other FOMOD choices), turned on or off, and moved; the same for plugins.", annotations(read_only_hint = true))]
+    async fn diff_lockfile(&self, Parameters(a): Parameters<DiffLockArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| {
+            let old = lockfile::read(std::path::Path::new(&a.path))?;
+            let new = match &a.other {
+                Some(o) => lockfile::read(std::path::Path::new(o))?,
+                None => lockfile::export(&i)?,
+            };
+            Ok(lockfile::diff(&old, &new))
+        }))
+    }
+
+    #[tool(description = "Rebuild a setup from a lockfile or pack: install missing mods from archives in `downloads` (matched by name, checked by sha256, with the locked FOMOD choices) or from the pack, list what still has to be downloaded (with Nexus links), then set order, enabled state, colours, plugin order and mod rules, and fill in notes and Nexus ids the mods lack. Mods the profile has that the lockfile doesn't list are kept after the mod they followed. Warns when the game or script extender version differs from the lockfile's. dry_run defaults to true.")]
     async fn apply_lockfile(&self, Parameters(a): Parameters<ApplyLockArgs>) -> Result<String, String> {
         let downloads: Vec<std::path::PathBuf> = a.downloads.iter().map(std::path::PathBuf::from).collect();
         out(self.inst_mut().and_then(|i| lockfile::apply(&i, &lockfile::read(std::path::Path::new(&a.path))?, &downloads, a.dry_run.unwrap_or(true))))

@@ -469,7 +469,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "import_mo2" if flag("all") => json!(import::import_mo2_all(&inst, Path::new(&s("dir")?), flag("dry_run"))?),
         "import_mo2" => json!(import::import_mo2(&inst, Path::new(&s("dir")?), a["profile"].as_str(), flag("dry_run"))?),
         "import_vortex" => json!(import::import_vortex(&inst, Path::new(&s("path")?), a["staging"].as_str().map(Path::new), a["profile"].as_str(), flag("dry_run"))?),
-        "export_lockfile" => json!(lockfile::write(&inst, None)?),
+        "export_lockfile" => json!(lockfile::write(&inst, a["path"].as_str().map(Path::new), serde_json::from_value(a["format"].clone()).unwrap_or_default())?),
+        "diff_lockfile" => json!(lockfile::diff(&lockfile::read(Path::new(&s("path")?))?, &lockfile::export(&inst)?)),
         "apply_lockfile" => {
             let downloads: Vec<PathBuf> = serde_json::from_value(a["downloads"].clone()).unwrap_or_default();
             json!(lockfile::apply(&inst, &lockfile::read(Path::new(&s("path")?))?, &downloads, flag("dry_run"))?)

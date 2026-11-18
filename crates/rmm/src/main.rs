@@ -729,13 +729,20 @@ enum BisectCmd {
 
 #[derive(Subcommand)]
 enum LockCmd {
-    /// Write the active profile to modlist.lock.toml (or --out).
+    /// Write the active profile to modlist.lock.toml (or --out). --pack writes a zip of it with the
+    /// files of mods no archive brings back (patches you made, mods made from Overwrite or a
+    /// folder); --markdown a readable list for a post.
     Export {
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long, conflicts_with = "markdown")]
+        pack: bool,
+        #[arg(long)]
+        markdown: bool,
     },
-    /// Install what a lockfile needs from archives in --downloads, list what is missing, and set
-    /// the order; --apply to do it. Mods you added that it doesn't list are kept.
+    /// Install what a lockfile (or pack) needs from archives in --downloads and the pack, list
+    /// what is missing, and set the order; --apply to do it. Mods you added that it doesn't list
+    /// are kept. Warns when the game or script extender version differs from the lockfile's.
     Apply {
         file: PathBuf,
         #[arg(long)]
@@ -743,6 +750,9 @@ enum LockCmd {
         #[arg(long)]
         apply: bool,
     },
+    /// What changed from a lockfile to the active profile, or to a second lockfile: versions, mods
+    /// and plugins added, removed, changed, turned on or off, and moved.
+    Diff { file: PathBuf, other: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -1028,7 +1038,18 @@ fn run() -> Result<()> {
         Cmd::Addon(AddonCmd::Call { name, function, input }) => {
             print(&addons::call(&open()?, &name, &function, &serde_json::from_str(&input).context("the input is not JSON")?)?)
         }
-        Cmd::Lock(LockCmd::Export { out }) => print(&serde_json::json!({ "written": lockfile::write(&open()?, out.as_deref())? })),
+        Cmd::Lock(LockCmd::Export { out, pack, markdown }) => {
+            let format = if pack { lockfile::Format::Pack } else if markdown { lockfile::Format::Markdown } else { lockfile::Format::Toml };
+            print(&lockfile::write(&open()?, out.as_deref(), format)?)
+        }
+        Cmd::Lock(LockCmd::Diff { file, other }) => {
+            let old = lockfile::read(&file)?;
+            let new = match other {
+                Some(o) => lockfile::read(&o)?,
+                None => lockfile::export(&open()?)?,
+            };
+            print(&lockfile::diff(&old, &new))
+        }
         Cmd::Lock(LockCmd::Apply { file, downloads, apply }) => print(&lockfile::apply(&open()?, &lockfile::read(&file)?, &downloads, !apply)?),
         Cmd::Nexus(NexusCmd::Login { sso: true }) => print(&nexus::sso(&|url| {
             eprintln!("Approve rmm on Nexus in your browser: {url}");

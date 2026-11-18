@@ -180,23 +180,10 @@ pub(crate) fn game_updated(inst: &Instance, now: &str) -> Option<String> {
 /// that use it won't load. Its files name the version: `SKSE/Plugins/versionlib-1-6-1170-0.bin`
 /// (`version-1-5-97-0.bin` before 1.6, `.csv` in VR), `F4SE/Plugins/version-1-10-163-0.bin`.
 pub(crate) fn address_library(plugins: &Path, game: Game, version: &[u32; 4]) -> Option<String> {
-    let mut have: Vec<[u32; 4]> = fs::read_dir(plugins)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            let v = name.strip_prefix("versionlib-").or_else(|| name.strip_prefix("version-"))?;
-            let v = v.strip_suffix(".bin").or_else(|| v.strip_suffix(".csv"))?;
-            // "1-6-1170-0-1" is a second file for 1.6.1170.0.
-            let parts: Vec<u32> = v.split('-').take(4).map(|p| p.parse().ok()).collect::<Option<_>>()?;
-            parts.try_into().ok()
-        })
-        .collect();
+    let have = address_library_versions(plugins);
     if have.is_empty() || have.contains(version) {
         return None;
     }
-    have.sort();
-    have.dedup();
     let dotted = |v: &[u32; 4]| v.map(|x| x.to_string()).join(".");
     let newest = have.iter().rev().take(3).map(dotted).collect::<Vec<_>>().join(", ");
     let (se, page) = match game {
@@ -209,6 +196,25 @@ pub(crate) fn address_library(plugins: &Path, game: Game, version: &[u32; 4]) ->
     Some(format!(
         "Address Library has no file for game version {now} (its newest are for {newest}), so {se} plugins that use it won't load. Install the Address Library for {now}{page}, or wait for one if this game version is new"
     ))
+}
+
+/// The game versions Address Library has files for in a `Plugins` folder, oldest first.
+pub(crate) fn address_library_versions(plugins: &Path) -> Vec<[u32; 4]> {
+    let Ok(rd) = fs::read_dir(plugins) else { return vec![] };
+    let mut have: Vec<[u32; 4]> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let v = name.strip_prefix("versionlib-").or_else(|| name.strip_prefix("version-"))?;
+            let v = v.strip_suffix(".bin").or_else(|| v.strip_suffix(".csv"))?;
+            // "1-6-1170-0-1" is a second file for 1.6.1170.0.
+            let parts: Vec<u32> = v.split('-').take(4).map(|p| p.parse().ok()).collect::<Option<_>>()?;
+            parts.try_into().ok()
+        })
+        .collect();
+    have.sort();
+    have.dedup();
+    have
 }
 
 /// The installed script extender's runtime DLL for this game version. The loader shows an error box
@@ -256,7 +262,7 @@ fn exe_version(exe: &Path) -> Result<[u32; 4]> {
 
 /// Runtime DLLs in the game folder and the game version each was built for:
 /// `skse64_1_6_1170.dll` -> 1.6.1170. The steam loader DLL doesn't parse and is skipped.
-fn runtimes(root: &Path, game: Game) -> Result<Vec<(String, [u32; 3])>> {
+pub(crate) fn runtimes(root: &Path, game: Game) -> Result<Vec<(String, [u32; 3])>> {
     let loader = game.loader();
     let prefix = &loader[..=loader.find('_').unwrap()];
     let mut out = Vec::new();

@@ -2048,7 +2048,8 @@ $('#profile-btn').onclick = e => {
     + `<button class="item" data-opt="local_saves" title="Deploy points the game's saves at Saves\\${esc(cur)}\\. Purge puts your save folder back."><span class="check">${S.options?.local_saves ? '✓' : ''}</span>Own saves</button>`
     + '<hr><button class="item" data-io="mo2"><span class="check"></span>Import from MO2…</button>'
     + '<button class="item" data-io="vortex"><span class="check"></span>Import from Vortex…</button>'
-    + '<button class="item" data-io="export"><span class="check"></span>Export lockfile</button>'
+    + '<button class="item" data-io="export" title="A lockfile, a pack with your own files, or a readable list"><span class="check"></span>Share this setup…</button>'
+    + '<button class="item" data-io="diff"><span class="check"></span>Compare with a lockfile…</button>'
     + '<button class="item" data-io="apply"><span class="check"></span>Apply a lockfile…</button>';
   pop.hidden = false;
 };
@@ -2412,9 +2413,30 @@ $('#ai-access').onclick = async () => {
 async function importExport(what) {
   const part = (label, list) => list?.length ? `<details><summary><b>${list.length.toLocaleString()}</b> ${label}</summary><pre>${esc(list.join('\n'))}</pre></details>` : '';
   if (what === 'export') {
-    const path = await act('Writing the lockfile', () => call('export_lockfile'), { reload: false });
-    if (path && path !== true) toast(`Wrote ${path}`);
+    const format = await dialog({ title: 'Share this setup', body: `<dl class="choices">
+      <dt>Lockfile</dt><dd>Every mod’s download, installer choices and Nexus page, the order, the plugins, your notes, and the game and script extender versions. rmm rebuilds the setup from it with Apply a lockfile; the mods are downloaded again.</dd>
+      <dt>Pack</dt><dd>A zip of the lockfile and the files of the mods no download brings back: patches you made, mods made from Overwrite or a folder.</dd>
+      <dt>Readable list</dt><dd>Markdown for a post or a friend: the mods under their separators with Nexus links and notes, then the plugins.</dd></dl>`,
+      actions: [['cancel', 'Cancel'], ['markdown', 'Readable list'], ['pack', 'Pack'], ['toml', 'Lockfile', 'primary']] });
+    if (!['toml', 'pack', 'markdown'].includes(format)) return;
+    const dir = await T.dialog.open({ directory: true, title: 'Where to save it' });
+    if (!dir) return;
+    const path = `${dir}\\${{ toml: 'modlist.lock.toml', pack: 'modlist.pack.zip', markdown: 'modlist.md' }[format]}`;
+    const r = await act('Writing it', () => call('export_lockfile', { path, format }), { reload: false });
+    if (r && r !== true) toast(`Saved ${r.path}${format === 'pack' ? ` with ${plural(r.packed.length, 'mod')} of your own` : ''}.`);
     return;
+  }
+  if (what === 'diff') {
+    const path = await T.dialog.open({ title: 'A lockfile to compare with', filters: [{ name: 'rmm lockfile or pack', extensions: ['toml', 'zip'] }] });
+    if (!path) return;
+    const d = await act('Comparing', () => call('diff_lockfile', { path }), { reload: false });
+    if (!d || d === true) return;
+    const sec = (label, list) => list.length ? `<details><summary><b>${label}</b> (${list.length.toLocaleString()})</summary><pre>${esc(list.join('\n'))}</pre></details>` : '';
+    const body = sec('Versions', d.versions) + sec('Mods added', d.added) + sec('Mods removed', d.removed)
+      + sec('Mods with other files (another version or other installer choices)', d.changed) + sec('Mods turned on', d.turned_on) + sec('Mods turned off', d.turned_off)
+      + sec('Mods moved', d.moved) + sec('Plugins added', d.plugins_added) + sec('Plugins removed', d.plugins_removed)
+      + sec('Plugins turned on', d.plugins_on) + sec('Plugins turned off', d.plugins_off) + sec('Plugins moved', d.plugins_moved);
+    return dialog({ title: `This profile and ${basename(path)}`, body: body || '<p>This profile matches the lockfile.</p>', actions: [['cancel', 'Close']] });
   }
   if (what === 'mo2' || what === 'vortex') {
     const src = await call('import_sources').catch(() => ({ mo2: [], vortex: [] }));
@@ -2483,7 +2505,7 @@ async function importExport(what) {
     return;
   }
   // Apply a lockfile.
-  const path = await T.dialog.open({ title: 'A lockfile', filters: [{ name: 'rmm lockfile', extensions: ['toml'] }] });
+  const path = await T.dialog.open({ title: 'A lockfile', filters: [{ name: 'rmm lockfile or pack', extensions: ['toml', 'zip'] }] });
   if (!path) return;
   const dl = await T.dialog.open({ directory: true, title: 'Where the mod archives are (cancel to skip installing)' });
   const downloads = dl ? [dl] : [];
@@ -2491,7 +2513,7 @@ async function importExport(what) {
   const r = await act('Reading the lockfile', () => run(true), { reload: false });
   if (!r || r === true) return;
   const missing = r.missing.map(m => `${m.name ?? m.id}${m.tool ? ` (made by the tool “${m.tool}”)` : m.archive ? ` (${m.archive})` : ''}${m.url ? `\n    ${m.url}` : ''}`);
-  const body = `<p>${r.ok.toLocaleString()} mods already match. ${plural(r.install.length, 'mod')} to install from the archives.</p>`
+  const body = `<p>${r.ok.toLocaleString()} mods already match. ${plural(r.install.length, 'mod')} to install from the archives${/\.zip$/i.test(path) ? ' and the pack' : ''}.</p>`
     + part('to install', r.install) + part('missing: download these, then apply again', missing)
     + part('installed with other files (another version or other choices), left as they are', r.differs)
     + part('yours, not in the lockfile: kept after the mod they follow', r.kept) + part('warnings', r.warnings)
@@ -3675,7 +3697,7 @@ const PLAIN = {
   restore: () => ['Go back to an earlier point in History', UNDO],
   revert_edit: () => ['Put an edited file back as it was', ''],
   support_bundle: () => ['Save a support bundle', ''],
-  export_lockfile: () => ['Save a lockfile', ''],
+  export_lockfile: a => [a.format === 'pack' ? 'Save a pack of this setup' : a.format === 'markdown' ? 'Save a readable list of your mods' : 'Save a lockfile', ''],
   call_addon: a => [`Run the add-on ${a.addon}`, ''],
 };
 function plainCall(name, args) {
