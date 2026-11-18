@@ -590,6 +590,10 @@ enum NexusCmd {
         #[arg(long)]
         release: bool,
     },
+    /// Look downloads up on Nexus by their MD5 (default: every one not identified yet), so
+    /// installs from them, and the mods already made from them, get their Nexus ids for update
+    /// checks.
+    Identify { names: Vec<String> },
     /// Search the game's mods on Nexus by name and description (no key needed).
     Search {
         words: Vec<String>,
@@ -1066,6 +1070,7 @@ fn run() -> Result<()> {
         Cmd::Nexus(NexusCmd::Search { words, category, sort, count, offset, adult }) => {
             print(&nexus::search(&open()?, &nexus::Client::any(), &nexus::Search { query: words.join(" "), category, sort, count, offset, adult })?)
         }
+        Cmd::Nexus(NexusCmd::Identify { names }) => print(&nexus::identify(&open()?, &nexus::Client::from_env()?, &names)?),
         Cmd::Nexus(NexusCmd::Info { mod_id }) => print(&nexus::mod_info(&open()?, &nexus::Client::any(), mod_id)?),
         Cmd::Nexus(NexusCmd::Updates { ids }) => {
             print(&nexus::check_updates(&open()?, &nexus::Client::from_env()?, (!ids.is_empty()).then_some(ids.as_slice()))?)

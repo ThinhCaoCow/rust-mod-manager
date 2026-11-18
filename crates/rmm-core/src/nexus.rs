@@ -724,24 +724,199 @@ pub(crate) fn fetch_file(inst: &Instance, client: &Client, mod_id: u64, file_id:
     let links = client.get(&format!("{base}/download_link.json{query}"))?;
     let uri = links.as_array().and_then(|l| l.first()).and_then(|l| l["URI"].as_str()).context("Nexus sent no download link")?;
     fs::create_dir_all(dest.parent().unwrap())?;
-    crate::progress::report(&format!("downloading {name}"), 0, 0);
-    fetch_url(uri, &dest)?;
+    fetch_sized(uri, &dest, info["size_in_bytes"].as_u64(), &format!("downloading {name} (MB)"))?;
     Ok((dest, info))
 }
 
 pub(crate) fn fetch_url(url: &str, dest: &Path) -> Result<()> {
+    fetch_sized(url, dest, None, "downloading")
+}
+
+/// Download `url` to `dest` through `dest.part`, which a failed or stopped download leaves for
+/// the next try to carry on from. A known `size` shows progress (in MB) and checks the result.
+fn fetch_sized(url: &str, dest: &Path, size: Option<u64>, stage: &str) -> Result<()> {
     // curl rejects spaces and other raw bytes in a URL, and Nexus's CDN links carry file names.
     let url: String = url.bytes().map(|b| if b.is_ascii_graphic() { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
-    let url = url.as_str();
     let mut tmp = dest.as_os_str().to_owned();
     tmp.push(".part");
-    let out = Command::new("curl").args(["-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https", "--retry", "2", "-o"]).arg(&tmp).args(["--", url]).output().context("cannot run curl")?;
-    if !out.status.success() {
-        let _ = fs::remove_file(&tmp);
-        bail!("download failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let tmp = PathBuf::from(tmp);
+    if size.is_some_and(|s| fs::metadata(&tmp).is_ok_and(|m| m.len() > s)) {
+        fs::remove_file(&tmp)?; // another file's leftovers
+    }
+    let mb = |b: u64| (b >> 20) as usize;
+    let len = |p: &Path| fs::metadata(p).map_or(0, |m| m.len());
+    let mut resume = true;
+    loop {
+        if size.is_some_and(|s| len(&tmp) == s) {
+            break; // finished last time, short of the rename
+        }
+        let mut cmd = Command::new("curl");
+        cmd.args(["-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https", "--retry", "2"]);
+        if resume {
+            cmd.args(["-C", "-"]); // carry on from what .part has
+        }
+        cmd.arg("-o").arg(&tmp).args(["--", &url]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // no console window
+        let mut child = cmd.spawn().context("cannot run curl")?;
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            crate::progress::report(stage, mb(len(&tmp)), size.map_or(0, |s| mb(s).max(1)));
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        if status.success() {
+            break;
+        }
+        if resume && status.code() == Some(33) {
+            // The server can't send part of a file: start over.
+            let _ = fs::remove_file(&tmp);
+            resume = false;
+            continue;
+        }
+        let mut err = String::new();
+        let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err);
+        let kept = len(&tmp);
+        let more = if kept > 0 { format!(" ({} MB kept; trying again carries on from there)", mb(kept)) } else { String::new() };
+        bail!("download failed: {}{more}", err.trim());
+    }
+    if let Some(s) = size {
+        let got = fs::metadata(&tmp)?.len();
+        if got != s {
+            let _ = fs::remove_file(&tmp);
+            bail!("the download came out at {got} bytes, Nexus says {s}; try again");
+        }
     }
     fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+/// The downloads identified on Nexus, by file name (lowercase), in `downloads/.nexus.json`: what
+/// rmm downloaded itself and what `identify` found.
+pub fn identified(inst: &Instance) -> BTreeMap<String, Identified> {
+    fs::read_to_string(inst.downloads_dir().join(IDENTIFIED)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+const IDENTIFIED: &str = ".nexus.json";
+
+/// A download's mod and file on Nexus.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Identified {
+    /// The mod's name on Nexus.
+    pub name: Option<String>,
+    pub nexus: crate::instance::NexusRef,
+}
+
+fn remember_download(inst: &Instance, file: &str, id: Identified) -> Result<()> {
+    let mut all = identified(inst);
+    all.insert(file.to_lowercase(), id);
+    fs::write(inst.downloads_dir().join(IDENTIFIED), serde_json::to_string_pretty(&all)?)?;
+    Ok(())
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct IdentifyReport {
+    /// File name, then what it is.
+    pub found: Vec<(String, Identified)>,
+    /// Files Nexus doesn't know (not from Nexus, or changed since).
+    pub not_found: Vec<String>,
+    /// File name, then why.
+    pub failed: Vec<(String, String)>,
+    /// Installed mods that got their Nexus ids from these files.
+    pub mods: Vec<String>,
+}
+
+/// Look downloads up on Nexus by their MD5, many in one go (MO2's Query Info): `names` in the
+/// downloads folder, or every one not identified yet. What's found is kept for installs from the
+/// file, and installed mods made from one that have no Nexus ids get them, so update checks
+/// see them.
+pub fn identify(inst: &Instance, client: &Client, names: &[String]) -> Result<IdentifyReport> {
+    let known = identified(inst);
+    let names: Vec<String> = if names.is_empty() {
+        crate::install::downloads(inst)?.into_iter().map(|d| d.name).filter(|n| !known.contains_key(&n.to_lowercase())).collect()
+    } else {
+        names.to_vec()
+    };
+    let domain = inst.config.game.nexus_domain();
+    let mut r = IdentifyReport::default();
+    for (i, name) in names.iter().enumerate() {
+        crate::progress::report("identifying downloads", i, names.len());
+        let path = inst.downloads_dir().join(name);
+        if name.contains(['/', '\\']) || !path.is_file() {
+            r.failed.push((name.clone(), "no such download".into()));
+            continue;
+        }
+        let md5 = md5_file(&path)?;
+        let hits = match client.get(&format!("/v1/games/{domain}/mods/md5_search/{md5}.json")) {
+            Ok(v) => v,
+            Err(e) if format!("{e:#}").starts_with("Nexus has no ") => {
+                r.not_found.push(name.clone());
+                continue;
+            }
+            // A refused key or the day's requests used up: the rest would fail the same way.
+            Err(e) if ["refused the API key", "request limit"].iter().any(|m| format!("{e:#}").contains(m)) => {
+                r.failed.extend(names[i..].iter().map(|n| (n.clone(), format!("{e:#}"))));
+                break;
+            }
+            Err(e) => {
+                r.failed.push((name.clone(), format!("{e:#}")));
+                continue;
+            }
+        };
+        let hit = hits.as_array().and_then(|h| h.iter().find(|h| h["file_details"]["md5"].as_str().is_none_or(|m| m.eq_ignore_ascii_case(&md5))));
+        let Some(hit) = hit.filter(|h| h["mod"]["mod_id"].is_u64()) else {
+            r.not_found.push(name.clone());
+            continue;
+        };
+        let id = Identified {
+            name: hit["mod"]["name"].as_str().map(str::to_owned),
+            nexus: crate::instance::NexusRef {
+                mod_id: hit["mod"]["mod_id"].as_u64().unwrap_or_default(),
+                file_id: hit["file_details"]["file_id"].as_u64(),
+                version: hit["file_details"]["version"].as_str().map(str::to_owned),
+                category: hit["mod"]["category_id"].as_u64(),
+            },
+        };
+        remember_download(inst, name, id.clone())?;
+        r.found.push((name.clone(), id));
+    }
+    // Installed mods made from these files, without Nexus ids.
+    let found: BTreeMap<String, &Identified> = r.found.iter().map(|(n, id)| (n.to_lowercase(), id)).collect();
+    for d in crate::install::downloads(inst)? {
+        let Some(id) = found.get(&d.name.to_lowercase()) else { continue };
+        for m in d.mods {
+            if inst.mod_meta(&m).nexus.is_none() {
+                remember(inst, &m, id.nexus.clone())?;
+                r.mods.push(m);
+            }
+        }
+    }
+    if found.values().any(|id| id.nexus.category.is_some()) {
+        let _ = refresh_categories(inst, client);
+    }
+    Ok(r)
+}
+
+/// A file's MD5, which Nexus finds files by: certutil on Windows, md5sum elsewhere.
+fn md5_file(path: &Path) -> Result<String> {
+    let mut cmd = if cfg!(windows) { Command::new("certutil") } else { Command::new("md5sum") };
+    if cfg!(windows) {
+        cmd.arg("-hashfile").arg(path).arg("MD5");
+    } else {
+        cmd.arg(path);
+    }
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let out = cmd.output().context("cannot run certutil")?;
+    let hex = |w: &str| w.len() == 32 && w.bytes().all(|b| b.is_ascii_hexdigit());
+    // certutil: the hash on the second line (with spaces between bytes before Windows 10);
+    // md5sum: the first word.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| [l.split_whitespace().next().unwrap_or("").to_string(), l.replace(' ', "")].into_iter().find(|w| hex(w)))
+        .map(|w| w.to_lowercase())
+        .with_context(|| format!("cannot read the MD5 of {}", path.display()))
 }
 
 /// A downloaded file and what to record about it.
@@ -767,6 +942,10 @@ pub fn fetch(inst: &Instance, client: &Client, link: &NxmLink) -> Result<Fetched
     };
     if nexus.category.is_some() {
         let _ = refresh_categories(inst, client); // the name is a nicety; the download stands without it
+    }
+    if let Some(file) = path.file_name() {
+        // So an install from the Downloads tab later records the ids too.
+        let _ = remember_download(inst, &file.to_string_lossy(), Identified { name: name.clone(), nexus: nexus.clone() });
     }
     Ok(Fetched { path, name, nexus })
 }

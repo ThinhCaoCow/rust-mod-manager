@@ -521,11 +521,12 @@ pub struct Download {
     pub modified: u64,
     /// Mods installed from a file of this name.
     pub mods: Vec<String>,
+    /// Its mod and file on Nexus, when rmm downloaded it or `nexus::identify` found it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nexus: Option<crate::nexus::Identified>,
 }
 
 /// The downloads folder, newest first.
-// ponytail: install from here records no Nexus ids; keep fetch's details beside the file if
-// update checks for such mods matter.
 pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
     let mut from: std::collections::HashMap<String, Vec<String>> = Default::default();
     for e in fs::read_dir(inst.mods_dir()).into_iter().flatten().flatten() {
@@ -534,14 +535,16 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
             from.entry(file.to_string_lossy().to_lowercase()).or_default().push(id);
         }
     }
+    let mut known = crate::nexus::identified(inst);
     let mut out = Vec::new();
     for e in fs::read_dir(inst.downloads_dir()).into_iter().flatten().flatten() {
         let (name, m) = (e.file_name().to_string_lossy().into_owned(), e.metadata()?);
-        if !m.is_file() || name.ends_with(".part") {
+        if !m.is_file() || name.ends_with(".part") || name.starts_with('.') {
             continue;
         }
         let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-        out.push(Download { mods: from.remove(&name.to_lowercase()).unwrap_or_default(), path: e.path(), size: m.len(), modified, name });
+        let lower = name.to_lowercase();
+        out.push(Download { mods: from.remove(&lower).unwrap_or_default(), nexus: known.remove(&lower), path: e.path(), size: m.len(), modified, name });
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
     Ok(out)

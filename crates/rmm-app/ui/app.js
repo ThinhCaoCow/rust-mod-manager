@@ -2233,21 +2233,55 @@ $('#nexus-btn').onclick = async () => {
 
 // Links from nexusmods.com's "Mod manager download" buttons, which `rmm nxm` leaves for this window:
 // downloaded one at a time and installed like a dropped file (FOMOD options, the update offer).
-let nxmQueue = [], nxmRunning = false;
+// From Nexus… queues its link here too. A failed download stays on the Downloads tab with Retry,
+// which carries on from what it got.
+let nxmQueue = [], nxmRunning = false, nxmNow = null, nxmFailed = [];
 async function takeLinks() {
-  nxmQueue.push(...await call('nxm_links').catch(() => []));
+  nxmQueue.push(...(await call('nxm_links').catch(() => [])).map(link => ({ link, at: null })));
+  runQueue();
+}
+async function runQueue() {
+  renderQueue();
   if (nxmRunning || !nxmQueue.length) return;
   nxmRunning = true;
   try {
     if (!await nexusReady('Downloads from Nexus Mods need your API key.')) return void (nxmQueue = []);
     while (nxmQueue.length) {
       while (busy) await new Promise(r => setTimeout(r, 400));
-      const link = nxmQueue.shift();
-      const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link }), { reload: false, problem: true });
-      if (f && f !== true) await install([f.path], null, f);
+      nxmNow = nxmQueue.shift();
+      renderQueue();
+      let error = '';
+      const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link: nxmNow.link }).catch(e => { error = String(e); throw e; }), { reload: false, problem: true });
+      const job = nxmNow;
+      nxmNow = null;
+      if (f && f !== true) {
+        renderQueue();
+        if (downloadsData) loadDownloads();
+        await install([f.path], job.at, f);
+      } else nxmFailed.push({ ...job, error });
     }
-  } finally { nxmRunning = false; }
+  } finally { nxmRunning = false; nxmNow = null; renderQueue(); }
 }
+/** A link as words: an nxm link's mod and file, or the link itself. */
+function linkName(link) {
+  const m = /^nxm:\/\/[^/]+\/mods\/(\d+)\/files\/(\d+)/i.exec(link);
+  return m ? `Nexus mod ${m[1]}, file ${m[2]}` : link;
+}
+function renderQueue() {
+  const rows = [];
+  if (nxmNow) rows.push(`<div>Downloading ${esc(linkName(nxmNow.link))}…${nxmQueue.length ? ` <span class="muted small">${nxmQueue.length} more waiting</span>` : ''}</div>`);
+  else if (nxmQueue.length) rows.push(`<div class="muted small">${plural(nxmQueue.length, 'download')} waiting.</div>`);
+  nxmFailed.forEach((f, i) => rows.push(`<div><span class="pill bad">Failed</span> ${esc(linkName(f.link))} <span class="muted small">${esc(f.error)}</span> <button data-retry="${i}">Retry</button> <button class="link" data-drop="${i}">Remove</button></div>`));
+  $('#dl-queue').innerHTML = rows.join('');
+  $('#dl-queue').hidden = !rows.length;
+  $('#n-downloads').classList.toggle('bad', nxmFailed.length > 0);
+}
+$('#dl-queue').onclick = e => {
+  const retry = e.target.closest('[data-retry]')?.dataset.retry, drop = e.target.closest('[data-drop]')?.dataset.drop;
+  if (retry !== undefined) nxmQueue.push(...nxmFailed.splice(+retry, 1));
+  else if (drop !== undefined) nxmFailed.splice(+drop, 1);
+  runQueue();
+};
 T.event.listen('nxm', () => takeLinks());
 
 $('#nxm').onclick = async () => {
@@ -2257,8 +2291,8 @@ $('#nxm').onclick = async () => {
     : 'Paste a mod page link or a mod id (Premium: downloads its newest main file), a collection’s link, or the nxm:// link of a file’s “Mod manager download” button.', '');
   if (!link || !await nexusReady('Downloads from Nexus Mods need your API key.')) return;
   if (link.includes('/collections/')) return installCollection(link);
-  const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link }), { reload: false, problem: true });
-  if (f && f !== true) install([f.path], slotAfter(selIds().length === 1 ? selIds()[0] : null), f);
+  nxmQueue.push({ link, at: slotAfter(selIds().length === 1 ? selIds()[0] : null) });
+  runQueue();
 };
 
 /** A Nexus collection: what it would install, then install it into a new profile (as Vortex
@@ -2777,21 +2811,42 @@ async function loadDownloads() {
 
 function renderDownloads() {
   const l = downloadsData;
+  for (const n of dlSel) if (!l.some(d => d.name === n)) dlSel.delete(n);
   $('#n-downloads').textContent = l.length || '';
-  $('#downloads tbody').innerHTML = l.map(d => `<tr data-name="${esc(d.name)}">
+  $('#downloads tbody').innerHTML = l.map(d => `<tr data-name="${esc(d.name)}"${dlSel.has(d.name) ? ' class="sel"' : ''}>
+    <td class="check-col"><input type="checkbox" data-pick ${dlSel.has(d.name) ? 'checked' : ''}></td>
     <td class="name" title="${esc(d.name)}">${esc(d.name)}</td>
+    <td class="name">${d.nexus ? `<button class="link" data-page="${d.nexus.nexus.mod_id}" title="Open its Files tab on Nexus">${esc(d.nexus.name ?? `mod ${d.nexus.nexus.mod_id}`)}</button>${d.nexus.nexus.version ? ` <span class="muted small">${esc(d.nexus.nexus.version)}</span>` : ''}` : '<span class="muted">—</span>'}</td>
     <td class="name">${d.mods.length ? d.mods.map(srcLink).join(', ') : '<span class="muted">Not installed</span>'}</td>
     <td class="num">${bytes(d.size)}</td><td class="muted">${esc(when(d.modified))}</td>
     <td class="run-col">${d.mods.length ? '<button data-reinstall title="Install it again over the mod made from it">Reinstall…</button>' : '<button data-install class="primary">Install</button>'} <button data-delete class="link">Delete</button></td></tr>`).join('');
   $('#downloads-empty').hidden = l.length > 0;
+  $('#dl-all').checked = l.length > 0 && dlSel.size === l.length;
+  const sel = selDownloads();
+  $('#dl-install').hidden = $('#dl-delete').hidden = !sel.length;
+  $('#dl-install').textContent = `Install ${plural(sel.length, 'file')}`;
+  $('#dl-delete').textContent = `Delete ${plural(sel.length, 'file')}…`;
+  const unknown = (sel.length ? sel : l).filter(d => !d.nexus).length;
+  $('#dl-identify').disabled = !unknown;
+  $('#dl-identify').textContent = unknown ? `Identify ${plural(unknown, 'file')} on Nexus` : 'Identify on Nexus';
 }
+const dlSel = new Set();
+const selDownloads = () => (downloadsData ?? []).filter(d => dlSel.has(d.name));
+/** What install() records about a download from Nexus. */
+const nxOf = d => d.nexus ? { name: d.nexus.name, nexus: d.nexus.nexus } : null;
 
 $('#downloads tbody').addEventListener('click', async e => {
   const id = e.target.closest('[data-goto]')?.dataset.goto;
   if (id) { showTab('mods'); return goTo(id); }
   const d = downloadsData.find(x => x.name === e.target.closest('tr[data-name]')?.dataset.name);
   if (!d) return;
-  if (e.target.closest('[data-install]')) install([d.path]);
+  const page = e.target.closest('[data-page]')?.dataset.page;
+  if (page) return call('open_nexus_mod', { mod_id: Number(page) }).catch(err => toast(String(err), 'error'));
+  if (e.target.closest('[data-pick]')) {
+    if (e.target.checked) dlSel.add(d.name); else dlSel.delete(d.name);
+    return renderDownloads();
+  }
+  if (e.target.closest('[data-install]')) install([{ path: d.path, nx: nxOf(d) }]);
   else if (e.target.closest('[data-reinstall]')) reinstall(d.mods[0]);
   else if (e.target.closest('[data-delete]')) {
     const left = d.mods.length ? ' The mods installed from it stay, but Reinstall can’t use it any more.' : '';
@@ -2800,6 +2855,38 @@ $('#downloads tbody').addEventListener('click', async e => {
   }
 });
 $('#downloads-reload').onclick = loadDownloads;
+$('#dl-all').onchange = e => {
+  dlSel.clear();
+  if (e.target.checked) for (const d of downloadsData ?? []) dlSel.add(d.name);
+  renderDownloads();
+};
+$('#dl-install').onclick = () => {
+  const sel = selDownloads();
+  dlSel.clear();
+  renderDownloads();
+  install(sel.map(d => ({ path: d.path, nx: nxOf(d) })));
+};
+$('#dl-delete').onclick = async () => {
+  const sel = selDownloads(), used = sel.filter(d => d.mods.length).length;
+  if (!await confirmBox(`Delete ${plural(sel.length, 'file')}?`, `They’re deleted for good.${used ? ` ${used} of them ${used === 1 ? 'has' : 'have'} installed mods, which stay but can’t be reinstalled from them.` : ''}`, 'Delete')) return;
+  await act('Deleting the downloads', async () => { for (const d of sel) await call('delete_download', { name: d.name }); }, { reload: false });
+  dlSel.clear();
+  loadDownloads();
+};
+$('#dl-identify').onclick = async () => {
+  const sel = selDownloads();
+  const names = (sel.length ? sel : downloadsData ?? []).filter(d => !d.nexus).map(d => d.name);
+  if (!names.length || !await nexusReady('Identifying files on Nexus needs your API key.')) return;
+  const r = await act('Identifying downloads on Nexus', () => call('identify_downloads', { names }), { reload: false });
+  if (!r || r === true) return;
+  const lines = [`Found ${r.found.length} of ${plural(names.length, 'file')} on Nexus.`];
+  if (r.not_found.length) lines.push(`${plural(r.not_found.length, 'file')} Nexus doesn’t know (not from Nexus, or changed since): ${r.not_found.join(', ')}`);
+  if (r.failed.length) lines.push(`${plural(r.failed.length, 'file')} couldn’t be looked up: ${r.failed[0][1]}`);
+  if (r.mods.length) lines.push(`${plural(r.mods.length, 'installed mod')} got ${r.mods.length === 1 ? 'its' : 'their'} Nexus ids, so update checks see ${r.mods.length === 1 ? 'it' : 'them'}.`);
+  toast(lines.join('\n'), r.failed.length ? 'warn' : 'info');
+  loadDownloads();
+  if (r.mods.length) load();
+};
 
 // ---- Install --------------------------------------------------------------------------------
 
@@ -2817,9 +2904,11 @@ function slotAfter(id) {
 }
 
 /** `nx`: what nexus_fetch found about a downloaded file, recorded on the new mod. */
-async function install(paths, at = null, nx = null) {
+async function install(paths, at = null, nx0 = null) {
   let plugins = 0;
-  for (const path of paths) {
+  for (const item of paths) {
+    // A path, or { path, nx } with that file's Nexus details.
+    const { path, nx } = typeof item === 'string' ? { path: item, nx: nx0 } : item;
     // Another version of an installed mod (the same Nexus mod): offer to update it in place.
     const same = await call('same_mod', { path, mod_id: nx?.nexus?.mod_id ?? null }).catch(() => null);
     if (same) {

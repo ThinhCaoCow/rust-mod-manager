@@ -222,6 +222,12 @@ struct AddonCallArgs {
     input: Option<serde_json::Value>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct IdentifyArgs {
+    /// File names in the downloads folder (list_downloads); default: every one not identified yet.
+    #[serde(default)]
+    names: Vec<String>,
+}
+#[derive(Deserialize, JsonSchema)]
 struct UpdatesArgs {
     /// Mod ids to check; default: every mod with Nexus ids.
     ids: Option<Vec<String>>,
@@ -1115,6 +1121,11 @@ impl Rmm {
     #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Leaves out updates the user holds back (hold_updates); list_mods shows the rest on each mod. Needs the user's API key.", annotations(read_only_hint = true))]
     async fn check_mod_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
+    }
+
+    #[tool(description = "Look downloads up on Nexus by their MD5, many at once (MO2's Query Info): each file's mod and file ids, version and the mod's name, or not found (not from Nexus, or changed since). What's found is kept for installs from the file, and installed mods made from one that have no Nexus ids get them, so check_mod_updates sees them. Needs the user's API key.")]
+    async fn identify_downloads(&self, Parameters(a): Parameters<IdentifyArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| nexus::identify(&i, &nexus::Client::from_env()?, &a.names)))
     }
 
     #[tool(description = "Hold back mods' updates when the user wants a version kept: pin keeps a mod at its version, skip passes over the newer file the last check_mod_updates found (a later one is offered), release offers updates again. Held updates are left out of check_mod_updates and list_mods (which marks pinned mods). Lives with the mods like notes, not in undo history.")]

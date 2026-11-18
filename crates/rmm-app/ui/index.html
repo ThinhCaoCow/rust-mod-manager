@@ -132,10 +132,11 @@
       </div>
     </section>
     <section class="pane" id="pane-downloads" hidden>
-      <div class="toolbar"><span class="muted small">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="downloads-reload">Refresh</button></div>
+      <div class="toolbar"><span class="muted small" id="downloads-note">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="dl-delete" class="link" hidden></button><button id="dl-install" class="primary" hidden></button><button id="dl-identify" title="Look the files up on Nexus by their contents, so installs from them and the mods made from them get update checks">Identify on Nexus</button><button id="downloads-reload">Refresh</button></div>
+      <div class="notice plain" id="dl-queue" hidden></div>
       <div class="scroll">
         <table class="list tall" id="downloads">
-          <thead><tr><th>File</th><th class="from-col">Installed as</th><th class="size-col">Size</th><th class="when-col">Downloaded</th><th class="run-col"></th></tr></thead>
+          <thead><tr><th class="check-col"><input type="checkbox" id="dl-all" title="Select every file"></th><th>File</th><th class="from-col">On Nexus</th><th class="from-col">Installed as</th><th class="size-col">Size</th><th class="when-col">Downloaded</th><th class="run-col"></th></tr></thead>
           <tbody></tbody>
         </table>
         <p class="empty" id="downloads-empty" hidden>No downloads yet.</p>

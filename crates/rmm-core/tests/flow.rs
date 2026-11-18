@@ -2580,6 +2580,65 @@ fn mock_nexus(routes: impl FnOnce(&str) -> std::collections::HashMap<String, Vec
     (base, hits)
 }
 
+/// Downloads are looked up on Nexus by MD5, many at once; a mod made from one gets its ids. A
+/// download whose server can't resume starts over, and leftovers bigger than the file go.
+#[test]
+fn identifies_downloads_and_downloads_again() {
+    isolate();
+    use rmm_core::nexus;
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    let dl = inst.downloads_dir();
+    write(&dl.join("SkyUI.7z"), "abc"); // MD5 900150983cd24fb0d6963f7d28e17f72
+    write(&dl.join("Mine.zip"), "xyz");
+    write(&tmp.path().join("src/UI/ui.txt"), "ui");
+    install::install(&inst, &tmp.path().join("src/UI"), None, true, None).unwrap();
+    let mut meta = inst.mod_meta("UI");
+    meta.source = Some(dl.join("SkyUI.7z").display().to_string());
+    inst.write_mod_meta("UI", &meta).unwrap();
+
+    let json = |v: serde_json::Value| v.to_string().into_bytes();
+    let d = "/v1/games/skyrimspecialedition/mods";
+    let (base, hits) = mock_nexus(|base| {
+        std::collections::HashMap::from([
+            (format!("{d}/md5_search/900150983cd24fb0d6963f7d28e17f72.json"), json(serde_json::json!([{
+                "mod": { "mod_id": 12604, "name": "SkyUI", "category_id": 42 },
+                "file_details": { "file_id": 35407, "version": "5.2SE", "md5": "900150983cd24fb0d6963f7d28e17f72" }
+            }]))),
+            ("/v1/users/validate.json".to_string(), json(serde_json::json!({ "user_id": 1, "name": "tester", "is_premium": true }))),
+            (format!("{d}/7/files/8.json"), json(serde_json::json!({ "file_id": 8, "file_name": "Big.zip", "size_in_bytes": 10 }))),
+            (format!("{d}/7/files/8/download_link.json"), json(serde_json::json!([{ "URI": format!("{base}/cdn/big.zip") }]))),
+            ("/cdn/big.zip".to_string(), b"0123456789".to_vec()),
+        ])
+    });
+    let mut client = nexus::Client::new("test-key").unwrap();
+    client.base = base;
+
+    let r = nexus::identify(&inst, &client, &[]).unwrap();
+    assert_eq!(r.found.len(), 1, "{r:?}");
+    assert_eq!((r.found[0].0.as_str(), r.found[0].1.name.as_deref(), r.found[0].1.nexus.file_id), ("SkyUI.7z", Some("SkyUI"), Some(35407)));
+    assert_eq!((r.not_found.clone(), r.mods.clone()), (vec!["Mine.zip".to_string()], vec!["UI".to_string()]));
+    assert_eq!(inst.mod_meta("UI").nexus.map(|n| n.mod_id), Some(12604));
+    let listed = install::downloads(&inst).unwrap();
+    assert_eq!(listed.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().len(), 2, "the store isn't listed");
+    assert!(listed.iter().any(|d| d.name == "SkyUI.7z" && d.nexus.as_ref().is_some_and(|n| n.nexus.version.as_deref() == Some("5.2SE"))));
+    let again = nexus::identify(&inst, &client, &[]).unwrap();
+    assert_eq!((again.found.len(), again.not_found.len()), (0, 1), "only what isn't identified yet");
+
+    // The stand-in CDN can't resume, so the left-over part is dropped and the file comes whole.
+    write(&dl.join("Big.zip.part"), "0123");
+    let link = nexus::premium_link(&inst, 7, 8);
+    assert_eq!(fs::read(nexus::download(&inst, &client, &link).unwrap()).unwrap(), b"0123456789");
+    fs::remove_file(dl.join("Big.zip")).unwrap();
+    write(&dl.join("Big.zip.part"), "far more than ten bytes");
+    assert_eq!(fs::read(nexus::download(&inst, &client, &link).unwrap()).unwrap(), b"0123456789");
+    assert!(!dl.join("Big.zip.part").exists());
+    assert_eq!(hits.lock().unwrap()["/cdn/big.zip"], 3, "once to try to resume, once whole, once whole");
+}
+
 /// A collection from a stand-in Nexus: a dry run, then an install into a new profile. A mod
 /// already installed from the same file is turned on there, a "dinput" mod's non-Data files go
 /// to the game folder (and stay there on reinstall), and the user's own profile is left alone.
