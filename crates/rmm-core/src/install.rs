@@ -564,11 +564,20 @@ fn ext_of(name: &str) -> Option<String> {
     Path::new(name).extension().map(|e| e.to_string_lossy().to_lowercase())
 }
 
-fn extract(source: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn extract(source: &Path, dest: &Path) -> Result<()> {
     if source.is_dir() {
         return copy_dir(source, dest);
     }
-    match ext_of(&source.to_string_lossy()).as_deref() {
+    // By the first bytes, then the extension: archives are sometimes named for another format.
+    let mut head = [0u8; 6];
+    let _ = std::io::Read::read(&mut fs::File::open(source)?, &mut head);
+    let kind = match head {
+        [b'P', b'K', 3, 4, ..] => Some("zip"),
+        [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C] => Some("7z"),
+        [b'R', b'a', b'r', b'!', ..] => Some("rar"),
+        _ => None,
+    };
+    match kind.map(str::to_owned).or_else(|| ext_of(&source.to_string_lossy())).as_deref() {
         Some("zip") => zip::ZipArchive::new(fs::File::open(source)?)?.extract(dest)?,
         Some("7z") => sevenz_rust2::decompress_file(source, dest).map_err(|e| anyhow!("7z: {e}"))?,
         Some("rar") => extract_rar(source, dest)?,

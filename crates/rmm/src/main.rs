@@ -174,7 +174,13 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    Plugins,
+    /// The profile's plugins in load order; --enable and --disable turn plugins on or off first.
+    Plugins {
+        #[arg(long)]
+        enable: Vec<String>,
+        #[arg(long)]
+        disable: Vec<String>,
+    },
     /// Pairs of enabled plugins that change the same records, and which wins.
     PluginConflicts { plugin: Option<String> },
     /// Safety check of a mod (with Windows Defender), or a quick one of every mod.
@@ -574,6 +580,20 @@ enum NexusCmd {
         /// All but nxm links need Premium.
         what: String,
     },
+    /// Install a collection (Premium accounts): its mods with the curator's installer choices,
+    /// its mod rules, plugin list and tools. Shows what it would install; --apply installs.
+    Collection {
+        /// The collection's link or id.
+        link: String,
+        /// A revision number (default: the newest).
+        #[arg(long)]
+        revision: Option<u64>,
+        /// Its optional mods too.
+        #[arg(long)]
+        optional: bool,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Make nxm:// links open `rmm nxm` for this instance. Changes the system's handler for
     /// nxm links (HKCU\Software\Classes\nxm on Windows, xdg-mime on Linux).
     RegisterHandler,
@@ -839,8 +859,13 @@ fn run() -> Result<()> {
                 None => print(&v),
             }
         }
-        Cmd::Plugins => {
+        Cmd::Plugins { enable, disable } => {
             let inst = open()?;
+            for (names, on) in [(enable, true), (disable, false)] {
+                for n in names {
+                    ops::set_plugin_enabled(&inst, &n, on)?;
+                }
+            }
             print(&plugins::list(&inst, &inst.profile()?)?)
         }
         Cmd::Sort { apply } => print(&loot::sort(&open()?, !apply)?),
@@ -979,6 +1004,9 @@ fn run() -> Result<()> {
             let client = nexus::Client::from_env()?;
             let link = nexus::resolve(&inst, &client, &what)?;
             print(&nexus::install(&inst, &client, &link, None)?)
+        }
+        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, apply }) => {
+            print(&rmm_core::collection::install(&open()?, &nexus::Client::from_env()?, &link, revision, optional, !apply)?)
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;

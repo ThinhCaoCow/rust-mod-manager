@@ -300,6 +300,9 @@ impl Installer {
             out.steps.push(view);
             out.choices.options.push(chosen);
         }
+        for sc in choices.options.iter().filter(|sc| !out.steps.iter().any(|s| s.name == sc.name)) {
+            out.warnings.push(format!("the choices for '{}' weren't used: the installer doesn't show that step with these choices", sc.name));
+        }
         let mut install = self.required.clone();
         for (c, f) in &self.conditional {
             if c.holds(&flags, env) {

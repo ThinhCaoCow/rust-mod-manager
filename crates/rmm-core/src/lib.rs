@@ -2,6 +2,7 @@
 pub mod addons;
 pub mod archives;
 pub mod bisect;
+pub mod collection;
 pub mod conflicts;
 pub mod deploy;
 pub mod fomod;

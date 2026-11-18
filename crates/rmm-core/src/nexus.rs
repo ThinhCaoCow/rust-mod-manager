@@ -703,23 +703,36 @@ fn download_info(inst: &Instance, client: &Client, link: &NxmLink) -> Result<(Pa
             link.mod_id
         );
     }
-    let base = format!("/v1/games/{domain}/mods/{}/files/{}", link.mod_id, link.file_id);
-    let info = client.get(&format!("{base}.json"))?;
     let query = match (&link.key, link.expires) {
         (Some(k), Some(e)) => format!("?key={k}&expires={e}"),
         _ => String::new(),
     };
+    fetch_file(inst, client, link.mod_id, link.file_id, &query)
+}
+
+/// Download a file into the downloads folder under its name on Nexus, unless a file of that name
+/// and size is there already. Returns where it is and the file's details. (Download links of
+/// newer uploads end in an id, not the file's name.)
+pub(crate) fn fetch_file(inst: &Instance, client: &Client, mod_id: u64, file_id: u64, query: &str) -> Result<(PathBuf, Value)> {
+    let base = format!("/v1/games/{}/mods/{mod_id}/files/{file_id}", inst.config.game.nexus_domain());
+    let info = client.get(&format!("{base}.json"))?;
+    let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{mod_id}-{file_id}"));
+    let dest = inst.downloads_dir().join(&name);
+    if info["size_in_bytes"].as_u64().is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s)) {
+        return Ok((dest, info));
+    }
     let links = client.get(&format!("{base}/download_link.json{query}"))?;
     let uri = links.as_array().and_then(|l| l.first()).and_then(|l| l["URI"].as_str()).context("Nexus sent no download link")?;
-    let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{}-{}", link.mod_id, link.file_id));
-    let dest = inst.downloads_dir().join(&name);
     fs::create_dir_all(dest.parent().unwrap())?;
     crate::progress::report(&format!("downloading {name}"), 0, 0);
     fetch_url(uri, &dest)?;
     Ok((dest, info))
 }
 
-fn fetch_url(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn fetch_url(url: &str, dest: &Path) -> Result<()> {
+    // curl rejects spaces and other raw bytes in a URL, and Nexus's CDN links carry file names.
+    let url: String = url.bytes().map(|b| if b.is_ascii_graphic() { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
+    let url = url.as_str();
     let mut tmp = dest.as_os_str().to_owned();
     tmp.push(".part");
     let out = Command::new("curl").args(["-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https", "--retry", "2", "-o"]).arg(&tmp).args(["--", url]).output().context("cannot run curl")?;

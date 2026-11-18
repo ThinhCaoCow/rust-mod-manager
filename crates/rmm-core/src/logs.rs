@@ -85,7 +85,9 @@ pub fn crash_logs(inst: &Instance) -> Vec<LogFile> {
         .filter_map(|e| e.ok())
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_lowercase();
-            n.starts_with("crash") && (n.ends_with(".log") || n.ends_with(".txt"))
+            // crash-<date>.log (Crash Logger, Buffout 4, Trainwreck), Crash_<date>.txt (.NET
+            // Script Framework); not the plugins' own logs (CrashLogger.log, CrashFixCompendium.log).
+            (n.starts_with("crash-") || n.starts_with("crash_")) && (n.ends_with(".log") || n.ends_with(".txt"))
         })
         .filter_map(|e| Some(LogFile { modified: modified(&e.path())?, path: e.path() }))
         .collect();

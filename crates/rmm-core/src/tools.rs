@@ -383,7 +383,8 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
             };
             Ok((k.clone(), Some(v)))
         });
-        restore = Some((path.clone(), edit_json(path, set.collect::<Result<_>>()?)?));
+        let existed = path.exists();
+        restore = Some((path.clone(), edit_json(path, set.collect::<Result<_>>()?)?, existed));
     }
     let man = deploy::manifest_files(inst)?;
     let swapped = swaps(&man, &rewrites);
@@ -410,10 +411,15 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
             r.warnings.push(format!("{exe} never started, so the run didn't wait for it"));
         }
     }
-    if let Some((path, previous)) = restore
-        && let Err(e) = edit_json(&path, previous)
-    {
-        r.warnings.push(format!("couldn't put back the settings rmm changed in {}: {e:#}", path.display()));
+    if let Some((path, previous, existed)) = restore {
+        match edit_json(&path, previous) {
+            Err(e) => r.warnings.push(format!("couldn't put back the settings rmm changed in {}: {e:#}", path.display())),
+            // A file rmm made that holds nothing once its keys are out isn't left behind.
+            Ok(_) if !existed && fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|v| hollow(&v)) => {
+                let _ = fs::remove_file(&path);
+            }
+            Ok(_) => {}
+        }
     }
     match launched {
         Ok(_) => {}
@@ -457,8 +463,11 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         }
         None => fs::rename(&staging, &dest)?,
     }
+    // The tool's settings file is rmm's to set and put back, not output, even when the tool is
+    // a mod run from Data.
+    let settings_key = r.settings_file.as_ref().and_then(|p| p.strip_prefix(game).ok()).map(|p| path_key(&p.to_string_lossy()));
     // Keys and paths are game-relative; Data files go to the mod's top level, others to root/.
-    for (key, (rel, size, mtime)) in &after {
+    for (key, (rel, size, mtime)) in after.iter().filter(|(k, _)| Some(*k) != settings_key.as_ref()) {
         let path = game.join(rel);
         let to = dest.join(deploy::mod_rel(rel));
         match before.get(key) {
@@ -509,7 +518,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         }
     }
     for (key, (rel, ..)) in &before {
-        if after.contains_key(key) {
+        if after.contains_key(key) || Some(key) == settings_key.as_ref() {
             continue;
         }
         r.deleted.push(rel.clone());
@@ -632,6 +641,11 @@ fn vars(inst: &Instance, tool: &Tool, state: &Path, staging: &Path, given: &BTre
 
 /// Set (Some) or remove (None) dotted keys in a JSON settings file, keeping the rest of it.
 /// Returns each key's previous value: passing that back undoes the edit.
+/// Only empty objects, all the way down.
+fn hollow(v: &Value) -> bool {
+    v.as_object().is_some_and(|o| o.values().all(hollow))
+}
+
 fn edit_json(path: &Path, changes: Vec<(String, Option<Value>)>) -> Result<Vec<(String, Option<Value>)>> {
     let mut root = match fs::read(path) {
         // .NET tools may write a byte-order mark.

@@ -72,8 +72,9 @@ fn full_flow() {
     write(&src.join("A/meshes/a.nif"), "a-mesh");
     write(&src.join("A/A.esp"), plugin_bytes(&["Skyrim.esm"], false));
 
-    // Mod B: zip with one wrapper folder (the installer must descend into it).
-    let zip_path = src.join("B-1-0.zip");
+    // Mod B: zip with one wrapper folder (the installer must descend into it), named .7z as
+    // some uploads are: the installer goes by its first bytes.
+    let zip_path = src.join("B-1-0.7z");
     {
         let mut z = zip::ZipWriter::new(fs::File::create(&zip_path).unwrap());
         let opts = zip::write::SimpleFileOptions::default();
@@ -790,6 +791,11 @@ fn fomod_installers() {
     let walk = install::fomod_options(&inst, &src, Some(&blue)).unwrap();
     assert_eq!(walk.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["1 Colour", "2 Extras"]);
 
+    // Choices for a step these choices hide are reported, not silently dropped.
+    let hidden = choices(serde_json::json!({"options": [{"name": "2 Extras", "groups": [{"name": "Extras", "choices": [{"name": "Glow"}]}]}]}));
+    let w = install::fomod_options(&inst, &src, Some(&hidden)).unwrap();
+    assert!(w.warnings.iter().any(|x| x.contains("'2 Extras' weren't used")), "{:?}", w.warnings);
+
     let green = choices(serde_json::json!({"options": [{"name": "1 Colour", "groups": [{"name": "Colour", "choices": [{"name": "Green"}]}]}]}));
     assert!(format!("{:#}", install::fomod_options(&inst, &src, Some(&green)).unwrap_err()).contains("can't be used"));
     let two = choices(serde_json::json!({"options": [{"name": "1 Colour", "groups": [{"name": "Colour", "choices": [{"name": "Red"}, {"name": "Blue"}]}]}]}));
@@ -1272,6 +1278,20 @@ fn tool_settings_kept_files_and_sort() {
     let r2 = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
     assert_eq!(read(&root.join("mods/gen Output (2)/Pandora_Engine/ActiveMods.json")).matches("run").count(), 2);
     assert!(r2.sort.is_none() && r2.warnings.is_empty(), "{r2:?}");
+
+    // A tool installed as a mod runs from Data, so its settings file is in Data: rmm sets it and
+    // puts it back, and it isn't the tool's output.
+    write(&src.join("m/tool.bat"), "@echo off\r\nmkdir \"%~1\" 2>nul\r\necho x> \"%~1\\out.txt\"");
+    install::install(&inst, &src.join("m"), Some("Tool"), true, None).unwrap();
+    rmm_core::deploy::deploy(&inst, false).unwrap();
+    let set = BTreeMap::from([("games.SkyrimSE.outputPath".to_string(), "{output}".into())]);
+    let spec = ToolSpec { exe: game.join("Data/tool.bat"), args: Some(vec!["{output}".into()]), settings: Some(Settings { file: "Settings.json".into(), set }), ..Default::default() };
+    tools::add(&inst, "gen2", spec).unwrap();
+    let r3 = tools::run(&inst, "gen2", &BTreeMap::new(), false, None).unwrap();
+    assert!(r3.warnings.is_empty() && r3.changed.is_empty(), "{r3:?}");
+    assert_eq!(read(&root.join(format!("mods/{}/out.txt", r3.mod_id.as_deref().unwrap()))).trim(), "x");
+    assert!(!root.join(format!("mods/{}/Settings.json", r3.mod_id.as_deref().unwrap())).exists());
+    assert!(!game.join("Data/Settings.json").exists(), "rmm made it, and it's empty again");
 }
 
 /// Launch reads the game's version resource, refuses a script extender built for another version,
@@ -1314,6 +1334,9 @@ fn test_run_reads_logs_back_to_mods() {
     write(&tmp.path().join("Smp/SKSE/Plugins/hdtSMP64.dll"), "dll");
     write(&tmp.path().join("Smp/scripts/MyScript.pex"), "pex");
     install::install(&inst, &tmp.path().join("Smp"), None, true, None).unwrap();
+    // Plugins' own logs that start with "Crash" aren't crash logs.
+    write(&my.join("SKSE/CrashLogger.log"), "loaded");
+    write(&my.join("SKSE/CrashFixCompendium.log"), "loaded");
     assert!(logs::read_crash_log(&inst, None).unwrap_err().to_string().contains("no crash logs"));
 
     // The stand-in game exits at once; a crash log written during the run fails it.

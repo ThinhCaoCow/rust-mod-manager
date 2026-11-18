@@ -56,6 +56,8 @@ rmm read "Some Mod" scripts/foo.pex                 # a file inside a mod; Papyr
 rmm plugin-conflicts                                # plugins that change the same records, and which wins
 rmm records "Some Mod.esp"                          # what a plugin adds (quests, NPCs, items, cells) with console ids
 rmm review "Some Mod" --verdict clean --notes "..." # keep a review with the mod; `rmm reviews` shows if the files changed since
+rmm nexus collection https://www.nexusmods.com/games/skyrimspecialedition/collections/h2uqa3 --apply   # Premium: a whole collection
+rmm plugins --disable "Some Plugin.esp"              # plugins in load order; --enable / --disable turn them on or off
 rmm nexus search frost survival --category Immersion   # search Nexus (no key needed); `rmm nexus info 671` reads a mod's page
 rmm test-run --save MySave --cell Riverwood --screenshots --apply   # scripted with the harness plugin, in a small window behind the others (harness/README.md)
 rmm test-run --cell Riverwood --steps "[{\"console\":\"tgm\"},{\"wait\":10},{\"screenshot\":\"after\"}]" --apply   # a test plan

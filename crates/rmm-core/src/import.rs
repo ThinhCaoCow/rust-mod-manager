@@ -308,7 +308,7 @@ fn mo2_tools(inst: &Instance, exes: Vec<Mo2Exe>, mods_dir: &Path, into_mod: &Has
 }
 
 /// The rmm preset for a program, by its file name.
-fn mo2_preset(file: &str) -> Option<&'static str> {
+pub(crate) fn mo2_preset(file: &str) -> Option<&'static str> {
     let stem = file.strip_suffix(".exe")?.trim_end_matches("x64").trim_end_matches("64").trim();
     Some(match stem {
         "sseedit" | "fo4edit" | "xedit" => "xedit",
@@ -324,7 +324,7 @@ fn mo2_preset(file: &str) -> Option<&'static str> {
 }
 
 /// A tool id from a program's title: lowercase letters and digits, '-' and '_'.
-fn tool_id(title: &str) -> String {
+pub(crate) fn tool_id(title: &str) -> String {
     let id: String = title.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' }).collect();
     let id = id.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
     if id.is_empty() { "tool".into() } else { id }
