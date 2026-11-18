@@ -30,7 +30,9 @@ let collapsed = new Set();  // collapsed separators, kept per instance in localS
 let collapsedRoot = null;
 let filters = new Set();    // state filters that are on (keys of CRITERIA)
 let tab = 'mods';
-let selPlugin = null;       // selected plugin name
+let selPlugin = null;       // the plugin the panel shows: the one clicked last
+let plugSel = new Set();    // selected plugin names
+let plugAnchor = null;      // where a Shift-click range starts
 let lootRules = null;       // { rules, groups } once a plugin was selected; null = reload
 let toolsData = null;       // { tools, presets }
 let ignored = new Set();    // health findings ignored in this instance ("kind|subject")
@@ -60,10 +62,12 @@ function applyWin() {
   $('#ide-gutter').style.display = W.wrap ? 'none' : ''; // its numbers count unwrapped lines
   // Simple view: the tabs a beginner doesn't need yet (AI access is on Tools, the editor on AI).
   for (const t of SIMPLE_HIDES) $(`.tabs [data-tab="${t}"]`).hidden = W.simple;
+  visibleTabs().forEach((t, i) => { $(`.tabs [data-tab="${t}"]`).title = i < 9 ? `Ctrl+${i + 1}` : 'Ctrl+,'; });
   if (W.simple && SIMPLE_HIDES.includes(tab)) { tab = 'mods'; if (!$('#app').hidden) showTab('mods'); }
   if (S) renderStart();
 }
 const SIMPLE_HIDES = ['data', 'tools', 'ai'];
+const visibleTabs = () => $$('.tabs [data-tab]').filter(b => !b.hidden).map(b => b.dataset.tab);
 // `w`: the default width in pixels, as style.css sets it for `cls`.
 const COLS = {
   conflicts: { title: 'Conflicts', cls: 'conf-col', w: 200 },
@@ -157,6 +161,7 @@ async function load() {
   if (S.info.root !== collapsedRoot) { loadCollapsed(); loadIgnored(); }
   for (const id of selected) if (!byId.has(id)) selected.delete(id);
   if (selPlugin && !S.plugins.some(p => p.name === selPlugin)) selPlugin = null;
+  for (const n of plugSel) if (!S.plugins.some(p => p.name === n)) plugSel.delete(n);
   lootRules = null;
   if (tab === 'plugins' && selPlugin) loadLootRules();
   if (tab === 'tools' || toolsData) loadTools();
@@ -615,7 +620,7 @@ function pluginRow(p, i) {
     : p.enabled && p.missing_masters.length ? `<span class="pill bad" title="Needs ${esc(p.missing_masters.join(', '))} enabled and loaded earlier">Missing masters</span>` : '';
   const sp = selPlugin && S.plugins.find(x => x.name === selPlugin), om = oneMod();
   const rel = sp ? sp.masters.some(m => m.toLowerCase() === p.name.toLowerCase()) : !!om && p.mod_id === om.id;
-  const cls = [p.implicit ? 'locked' : '', p.enabled ? '' : 'off', p.name === selPlugin ? 'sel' : '', rel ? 'rel' : '', ...dragCls(lists.plugins, p.name, i)];
+  const cls = [p.implicit ? 'locked' : '', p.enabled ? '' : 'off', plugSel.has(p.name) ? 'sel' : '', rel ? 'rel' : '', ...dragCls(lists.plugins, p.name, i)];
   return `<tr data-i="${i}" data-name="${esc(p.name)}" class="${cls.join(' ')}">
     <td>${p.implicit ? '' : '<span class="grip" title="Drag to change load order">⋮⋮</span>'}</td>
     <td><input type="checkbox" ${p.enabled ? 'checked' : ''} ${p.implicit ? 'disabled title="Always loaded by the game"' : `aria-label="Enable ${esc(p.name)}"`}></td>
@@ -633,7 +638,7 @@ function renderPlugins() {
   $('#plugins').classList.toggle('filtering', !!f);
   $('#plugins-note').textContent = f
     ? `${lists.plugins.items.length.toLocaleString()} of ${plural(S.plugins.length, 'plugin')}`
-    : 'Masters always load before other plugins. Drag to reorder.';
+    : 'Masters always load before other plugins. Drag to reorder; Ctrl+↑/↓ moves the selected ones, Space turns them on or off, right-click for more.';
   paint(lists.plugins);
 }
 
@@ -859,7 +864,23 @@ function setLootRule(change) {
   act('Changing the LOOT rule', () => call('set_loot_rule', rule));
 }
 
-function pickPlugin(name) {
+/** Click (or arrow) selection in the plugin list: plain replaces, Ctrl toggles, Shift selects the
+ *  range from the anchor; null clears it. The panel shows the plugin picked last. */
+function pickPlugin(name, { shift = false, ctrl = false } = {}) {
+  const view = lists.plugins.items, at = n => view.findIndex(p => p.name === n);
+  if (!name) plugSel = new Set();
+  else if (shift && at(plugAnchor) >= 0 && at(name) >= 0) {
+    if (!ctrl) plugSel = new Set();
+    const [a, b] = [at(plugAnchor), at(name)];
+    for (let i = Math.min(a, b); i <= Math.max(a, b); i++) plugSel.add(view[i].name);
+  } else if (ctrl) {
+    if (!plugSel.delete(name)) plugSel.add(name);
+    plugAnchor = name;
+  } else {
+    plugSel = new Set([name]);
+    plugAnchor = name;
+  }
+  if (name && !plugSel.has(name)) name = [...plugSel].pop() ?? null;
   selPlugin = name;
   side = 'plugins';
   selPluginMod = name ? S.plugins.find(p => p.name === name)?.mod_id ?? null : null;
@@ -1501,6 +1522,15 @@ $('#redo').onclick = redo;
 document.addEventListener('keydown', e => {
   if (!S || $('#dlg').open) return;
   const k = e.key, low = k.toLowerCase();
+  if (!$('#ctx').hidden && k === 'Escape') { closeCtx(); return; }
+  // Shortcuts: Ctrl+1 to 9 and Ctrl+, for the tabs, Ctrl+D Deploy, Ctrl+P Play, F5 reads the instance again.
+  if (e.ctrlKey && !e.shiftKey && !e.altKey) {
+    const t = /^[1-9]$/.test(k) ? visibleTabs()[+k - 1] : k === ',' ? 'settings' : null;
+    if (t) { e.preventDefault(); return showTab(t); }
+    if (low === 'd') { e.preventDefault(); return $('#deploy').click(); }
+    if (low === 'p') { e.preventDefault(); return $('#play').click(); }
+  }
+  if (k === 'F5') { e.preventDefault(); return void load().catch(err => toast(String(err), 'error')); }
   if (e.ctrlKey && low === 'f' && lists[tab]) {
     e.preventDefault();
     const box = tab === 'data' ? $('#data-find') : $('#filter');
@@ -1517,7 +1547,10 @@ document.addEventListener('keydown', e => {
   }
   if (e.ctrlKey && low === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
   else if (e.ctrlKey && (low === 'y' || (low === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
-  else if (tab === 'mods' && !(e.target.closest('button') && (k === ' ' || k === 'Enter'))) modKeys(e);
+  else if (!(e.target.closest('button') && (k === ' ' || k === 'Enter'))) {
+    if (tab === 'plugins' || (tab === 'mods' && splitOn() && side === 'plugins')) pluginKeys(e);
+    else if (tab === 'mods') modKeys(e);
+  }
 });
 
 function modKeys(e) {
@@ -1537,6 +1570,7 @@ function modKeys(e) {
     if (e.ctrlKey && Math.abs(moves[k]) === 1) nudge(moves[k]);
     else go(i < 0 ? 0 : i + moves[k]);
   } else if (k === 'Home' || k === 'End') { e.preventDefault(); go(k === 'Home' ? 0 : view.length - 1); }
+  else if (e.ctrlKey && (k === 'ArrowLeft' || k === 'ArrowRight')) { e.preventDefault(); setAllGroups(k === 'ArrowRight'); }
   else if ((k === 'ArrowLeft' || k === 'ArrowRight') && c?.separator) toggleGroup(c.id, k === 'ArrowRight');
   else if (e.ctrlKey && k.toLowerCase() === 'a') {
     e.preventDefault();
@@ -1721,25 +1755,161 @@ $('#details').addEventListener('focusout', e => {
 $('#plugins tbody').addEventListener('click', e => {
   const tr = e.target.closest('tr[data-name]');
   if (!tr) return;
+  const name = tr.dataset.name;
   if (!e.target.matches('input[type=checkbox]')) {
-    if (!e.target.closest('.grip')) pickPlugin(tr.dataset.name === selPlugin ? null : tr.dataset.name);
+    const only = name === selPlugin && plugSel.size === 1 && !e.shiftKey && !e.ctrlKey;
+    if (!e.target.closest('.grip')) pickPlugin(only ? null : name, { shift: e.shiftKey, ctrl: e.ctrlKey });
     return;
   }
   if (busy) { busyNote(); return e.preventDefault(); }
-  act('Changing the plugin', () => call('enable_plugin', { name: tr.dataset.name, enabled: e.target.checked }));
+  // A checkbox in a selection of several applies to all of them.
+  setPluginsEnabled(plugSel.has(name) && plugSel.size > 1 ? selPlugins() : [name], e.target.checked);
 });
 draggable(lists.plugins, {
-  blockOf: p => [p.name],
-  drop: ([name], t, after) => {
-    const order = S.plugins.filter(p => !p.implicit).map(p => p.name);
-    const from = order.indexOf(name), ti = order.indexOf(t.name);
-    const slot = ti < 0 ? 0 : ti + (after ? 1 : 0);
-    const to = slot > from ? slot - 1 : slot;
-    if (to === from) return;
-    order.splice(to, 0, ...order.splice(from, 1));
-    act('Moving the plugin', () => call('plugin_order', { names: order }));
+  blockOf: p => plugSel.has(p.name) && plugSel.size > 1 ? selPlugins() : [p.name],
+  drop: (names, t, after) => {
+    if (names.includes(t.name)) return;
+    const ti = pluginsWithout(names).indexOf(t.name);
+    placePlugins(names, ti < 0 ? 0 : ti + (after ? 1 : 0));
   },
 });
+
+/** The selected plugins that can move or change, in load order. */
+const selPlugins = () => S.plugins.filter(p => plugSel.has(p.name) && !p.implicit).map(p => p.name);
+const pluginsWithout = names => { const set = new Set(names); return S.plugins.filter(p => !p.implicit && !set.has(p.name)).map(p => p.name); };
+
+function setPluginsEnabled(names, enabled) {
+  if (!names.length) return;
+  if (busy) return busyNote();
+  for (const p of S.plugins) if (names.includes(p.name)) p.enabled = enabled;
+  paint(lists.plugins);
+  act(names.length > 1 ? (enabled ? 'Enabling the plugins' : 'Disabling the plugins') : 'Changing the plugin', () => call('enable_plugins', { names, enabled }));
+}
+
+/** Put `names`, in their order, at `at` in the load order without them. */
+function placePlugins(names, at) {
+  const order = pluginsWithout(names);
+  order.splice(at, 0, ...names);
+  const now = S.plugins.filter(p => !p.implicit).map(p => p.name);
+  if (order.every((n, i) => n === now[i])) return;
+  act(names.length > 1 ? 'Moving the plugins' : 'Moving the plugin', () => call('plugin_order', { names: order }));
+}
+
+/** Ctrl+Up/Down: the selected plugins one place, together. */
+function nudgePlugins(dir) {
+  const names = selPlugins();
+  if (!names.length) return;
+  const first = S.plugins.filter(p => !p.implicit).map(p => p.name).indexOf(names[0]);
+  placePlugins(names, Math.max(0, Math.min(pluginsWithout(names).length, first + dir)));
+}
+
+async function movePluginsDialog() {
+  const names = selPlugins();
+  if (!names.length) return;
+  const rest = pluginsWithout(names);
+  const what = names.length > 1 ? `The ${plural(names.length, 'plugin')}, in their order,` : esc(names[0]);
+  const body = `<p>${what} go just after:</p><input id="pm-after" list="pm-names" placeholder="A plugin, or empty for the top" aria-label="The plugin to go after" spellcheck="false">
+    <datalist id="pm-names">${rest.map(n => `<option value="${esc(n)}">`).join('')}</datalist>
+    <label class="row" style="margin-top:10px"><input type="checkbox" id="pm-end"> To the bottom instead</label>`;
+  const done = dialog({ title: 'Move to', body, actions: [['cancel', 'Cancel'], ['ok', 'Move', 'primary']] });
+  $('#pm-after').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('#dlg').close('ok'); } };
+  $('#pm-after').focus();
+  if (await done !== 'ok') return;
+  if ($('#pm-end').checked) return placePlugins(names, rest.length);
+  const v = $('#pm-after').value.trim();
+  const at = v ? rest.findIndex(n => n.toLowerCase() === v.toLowerCase()) : -1;
+  if (v && at < 0) return toast(`No plugin is named “${v}”.`, 'warn');
+  placePlugins(names, at + 1);
+}
+
+function pluginKeys(e) {
+  const view = lists.plugins.items, k = e.key;
+  const i = view.findIndex(p => p.name === selPlugin);
+  const page = Math.max(1, Math.floor(scroller(lists.plugins).clientHeight / rowH) - 2);
+  const go = j => { if (view.length) pickPlugin(view[Math.max(0, Math.min(view.length - 1, j))].name, { shift: e.shiftKey }); };
+  const moves = { ArrowUp: -1, ArrowDown: 1, PageUp: -page, PageDown: page };
+  if (k in moves) {
+    e.preventDefault();
+    if (e.ctrlKey && Math.abs(moves[k]) === 1) nudgePlugins(moves[k]);
+    else go(i < 0 ? 0 : i + moves[k]);
+  } else if (k === 'Home' || k === 'End') { e.preventDefault(); go(k === 'Home' ? 0 : view.length - 1); }
+  else if (e.ctrlKey && k.toLowerCase() === 'a') {
+    e.preventDefault();
+    plugSel = new Set(view.map(p => p.name));
+    paint(lists.plugins);
+  } else if (k === ' ') {
+    e.preventDefault();
+    const names = selPlugins();
+    setPluginsEnabled(names, !names.every(n => S.plugins.find(p => p.name === n)?.enabled));
+  } else if (k === 'Escape') {
+    if (filterText()) { $('#filter').value = ''; filterChanged(); } else if (plugSel.size) pickPlugin(null);
+  }
+}
+
+// ---- Right-click menus ------------------------------------------------------------------------
+
+/** A menu at the pointer: items are [label, fn, class] or '-' for a line. */
+function ctxMenu(e, items) {
+  e.preventDefault();
+  const pop = $('#ctx');
+  pop.innerHTML = items.map((it, i) => it === '-' ? '<hr>' : `<button class="item ${it[2] ?? ''}" role="menuitem" data-i="${i}">${esc(it[0])}</button>`).join('');
+  pop.hidden = false;
+  const r = pop.getBoundingClientRect();
+  pop.style.left = `${Math.max(4, Math.min(e.clientX, innerWidth - r.width - 4))}px`;
+  pop.style.top = `${Math.max(4, Math.min(e.clientY, innerHeight - r.height - 4))}px`;
+  pop.onclick = ev => {
+    const b = ev.target.closest('[data-i]');
+    if (!b) return;
+    pop.hidden = true;
+    items[+b.dataset.i][1]();
+  };
+  $('button', pop)?.focus();
+}
+const closeCtx = () => { $('#ctx').hidden = true; };
+addEventListener('blur', closeCtx);
+for (const L of Object.values(lists)) scroller(L).addEventListener('scroll', closeCtx);
+
+$('#mods tbody').addEventListener('contextmenu', e => {
+  const tr = e.target.closest('tr[data-id]');
+  if (!tr) return;
+  const id = tr.dataset.id;
+  if (!byId.has(id)) return;
+  if (!selected.has(id)) pick(id);
+  const ids = selIds(), m = byId.get(id), mods = ids.filter(x => !isSep(x)), one = ids.length === 1;
+  const items = [];
+  if (mods.length) items.push([mods.length > 1 ? `Enable ${mods.length} mods` : 'Enable', () => setEnabled(mods, true)], [mods.length > 1 ? `Disable ${mods.length} mods` : 'Disable', () => setEnabled(mods, false)]);
+  items.push(['Move to…', moveDialog]);
+  if (one && m.separator) items.push(['Rename…', () => renameSep(id)], ['Select its mods', () => { toggleGroup(id, true); selected = new Set(D.kids.get(id).map(k => k.id)); selectionChanged(); }]);
+  if (one && !m.separator) items.push(['Rename…', () => renameMod(id)], ['Reinstall…', () => reinstall(id)], ['File conflicts', () => fileConflicts(id)]);
+  items.push('-', ['Collapse every group', () => setAllGroups(false)], ['Expand every group', () => setAllGroups(true)], '-');
+  items.push([ids.length > 1 ? `Remove ${ids.length} rows…` : m.separator ? 'Remove the separator…' : 'Uninstall…', removeSelected, 'danger']);
+  ctxMenu(e, items);
+});
+
+$('#plugins tbody').addEventListener('contextmenu', e => {
+  const tr = e.target.closest('tr[data-name]');
+  if (!tr) return;
+  if (!plugSel.has(tr.dataset.name)) pickPlugin(tr.dataset.name);
+  const names = selPlugins(), p = S.plugins.find(x => x.name === tr.dataset.name);
+  if (!names.length) return e.preventDefault(); // base-game plugins: nothing to change
+  const n = names.length > 1 ? ` ${names.length} plugins` : '';
+  const items = [[`Enable${n}`, () => setPluginsEnabled(names, true)], [`Disable${n}`, () => setPluginsEnabled(names, false)], ['Move to…', movePluginsDialog]];
+  if (names.length === 1) {
+    const locked = D.locks.has(p.name.toLowerCase());
+    items.push([locked ? 'Unlock its position' : 'Lock at this position', () => act(locked ? 'Unlocking the plugin' : 'Locking the plugin', () => call('lock_plugin', { name: p.name, lock: !locked }))]);
+    if (p.mod_id) items.push(['Show its mod', () => { showTab('mods'); goTo(p.mod_id); }]);
+  }
+  ctxMenu(e, items);
+});
+
+/** Collapse or expand every separator's group. */
+function setAllGroups(open) {
+  if (filtering()) return toast('Clear the filter first: it shows every matching mod anyway.');
+  collapsed = open ? new Set() : new Set(S.mods.filter(m => m.separator).map(m => m.id));
+  saveCollapsed();
+  renderMods();
+  renderDetails();
+}
 
 $('#loot').onclick = async () => {
   toast('Sorting with LOOT. The first sort downloads LOOT’s masterlist.');
@@ -1881,7 +2051,7 @@ $('#profile-btn').onclick = e => {
     + '<button class="item" data-io="apply"><span class="check"></span>Apply a lockfile…</button>';
   pop.hidden = false;
 };
-document.addEventListener('click', e => { if (!e.target.closest('.menu')) $('#profile-pop').hidden = true; });
+document.addEventListener('click', e => { if (!e.target.closest('.menu')) $('#profile-pop').hidden = true; if (!e.target.closest('#ctx')) closeCtx(); });
 
 $('#profile-pop').onclick = async e => {
   const t = e.target.closest('[data-delete],[data-switch],[data-new],[data-rename],[data-io],[data-opt]');

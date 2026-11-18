@@ -492,7 +492,11 @@ struct OrderArgs {
 #[derive(Deserialize, JsonSchema)]
 struct PluginEnableArgs {
     /// Plugin file name, e.g. "Unofficial Skyrim Special Edition Patch.esp".
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// Several plugins, as one undoable change (with or instead of name).
+    #[serde(default)]
+    names: Vec<String>,
     enabled: bool,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -825,9 +829,13 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| ops::set_mod_order(&i, &a.ids)))
     }
 
-    #[tool(description = "Enable or disable a single plugin.")]
+    #[tool(description = "Enable or disable plugins: one (name) or several (names), as one undoable change.")]
     async fn set_plugin_enabled(&self, Parameters(a): Parameters<PluginEnableArgs>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|i| ops::set_plugin_enabled(&i, &a.name, a.enabled)))
+        let names: Vec<String> = a.name.into_iter().chain(a.names).collect();
+        if names.is_empty() {
+            return Err("give name or names".into());
+        }
+        out(self.inst_mut().and_then(|i| ops::set_plugins_enabled(&i, &names, a.enabled)))
     }
 
     #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move; otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy.")]

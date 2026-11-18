@@ -588,6 +588,29 @@ fn fallout4_ini_checks() {
     assert!(message.starts_with("257 general BA2 archives"), "{message}");
 }
 
+/// Several plugins turned off at once are one undo step, and undo turns them all back on.
+#[test]
+fn several_plugins_in_one_step() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    for m in ["A", "B"] {
+        write(&tmp.path().join(m).join(format!("{m}.esp")), plugin_bytes(&[], false));
+        install::install(&inst, &tmp.path().join(m), None, true, None).unwrap();
+    }
+    let on = |inst: &Instance| inst.profile().unwrap().plugins.iter().filter(|p| p.enabled).map(|p| p.name.clone()).collect::<Vec<_>>();
+    assert_eq!(on(&inst), ["A.esp", "B.esp"]);
+    let steps = inst.history().unwrap().len();
+    ops::set_plugins_enabled(&inst, &["a.esp".into(), "B.esp".into()], false).unwrap();
+    assert!(on(&inst).is_empty());
+    assert_eq!((inst.history().unwrap().len(), inst.history().unwrap()[0].as_str()), (steps + 1, "disable 2 plugins"));
+    inst.undo().unwrap();
+    assert_eq!(on(&inst), ["A.esp", "B.esp"]);
+}
+
 /// A new playthrough copies the profile and its INIs, with saves of its own; saves are copied and
 /// moved between profiles with their co-saves.
 #[test]

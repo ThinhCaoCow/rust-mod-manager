@@ -383,6 +383,9 @@ pre.diff .del { background: var(--bad-bg); color: var(--bad); }
 .pop .item .x:hover { color: var(--bad); background: var(--bad-bg); }
 .pop .check { width: 14px; color: var(--accent); }
 .pop hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+/* A right-click menu, placed at the pointer. */
+.pop.ctx { position: fixed; top: 0; left: 0; min-width: 200px; z-index: 40; }
+.pop .item.danger { color: var(--bad); }
 
 /* Dialog */
 dialog {

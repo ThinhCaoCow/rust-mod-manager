@@ -396,6 +396,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "add_separator" => json!(ops::add_separator(&inst, &s("name")?, a["priority"].as_u64().map(|n| n as usize))?),
         "edit_separator" => json!(ops::edit_separator(&inst, &s("id")?, a["name"].as_str(), a["color"].as_str())?),
         "enable_plugin" => json!(ops::set_plugin_enabled(&inst, &s("name")?, flag("enabled"))?),
+        "enable_plugins" => json!(ops::set_plugins_enabled(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, flag("enabled"))?),
         "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?)?),
         "set_rule" => json!(rules::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
         "sort_mods" => json!(rules::sort(&inst, flag("dry_run"))?),

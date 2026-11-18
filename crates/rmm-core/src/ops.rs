@@ -396,11 +396,23 @@ pub fn set_mod_order(inst: &Instance, ids: &[String]) -> Result<()> {
 }
 
 pub fn set_plugin_enabled(inst: &Instance, name: &str, enabled: bool) -> Result<()> {
+    set_plugins_enabled(inst, &[name.to_string()], enabled)
+}
+
+/// Turn plugins on or off, as one undoable change.
+pub fn set_plugins_enabled(inst: &Instance, names: &[String], enabled: bool) -> Result<()> {
     let verb = if enabled { "enable" } else { "disable" };
-    inst.edit(&format!("{verb} plugin {name}"), |p| {
-        match p.plugins.iter_mut().find(|e| e.name.eq_ignore_ascii_case(name)) {
-            Some(e) => e.enabled = enabled,
-            None => p.plugins.push(crate::PluginEntry { name: name.into(), enabled }),
+    let label = match names {
+        [] => return Ok(()),
+        [one] => format!("{verb} plugin {one}"),
+        _ => format!("{verb} {} plugins", names.len()),
+    };
+    inst.edit(&label, |p| {
+        for name in names {
+            match p.plugins.iter_mut().find(|e| e.name.eq_ignore_ascii_case(name)) {
+                Some(e) => e.enabled = enabled,
+                None => p.plugins.push(crate::PluginEntry { name: name.clone(), enabled }),
+            }
         }
         Ok(())
     })

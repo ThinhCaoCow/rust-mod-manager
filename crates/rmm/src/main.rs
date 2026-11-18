@@ -917,9 +917,7 @@ fn run() -> Result<()> {
         Cmd::Plugins { enable, disable, moving, after, before } => {
             let inst = open()?;
             for (names, on) in [(enable, true), (disable, false)] {
-                for n in names {
-                    ops::set_plugin_enabled(&inst, &n, on)?;
-                }
+                ops::set_plugins_enabled(&inst, &names, on)?;
             }
             if let Some(m) = moving {
                 let all = inst.profile()?.plugins;
