@@ -237,8 +237,24 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Read a crash log (default: the newest) and rank the mods it points at.
-    CrashLog { path: Option<PathBuf> },
+    /// Read a crash log (default: the newest) and rank the mods it points at, with what to try.
+    /// --text prints a report to paste into a forum post or chat, without your Windows user name.
+    CrashLog {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        text: bool,
+    },
+    /// Save a support bundle to attach to a forum post or bug report: a summary, the health
+    /// check, the lockfile, the deploy plan, the crash, Papyrus and script extender logs and
+    /// rmm's settings, without your Windows user name. It goes in --dir (default: support/ in
+    /// the instance).
+    SupportBundle {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// A crash log (default: the newest).
+        #[arg(long)]
+        crash: Option<PathBuf>,
+    },
     /// Summarise the Papyrus log: errors by message and by script, and its last lines.
     PapyrusLog {
         #[arg(long, default_value_t = 40)]
@@ -778,7 +794,16 @@ fn run() -> Result<()> {
         Cmd::Rule { plugin: None, .. } => print(&loot::rules(&open()?)?),
         Cmd::Rule { plugin: Some(plugin), after, group } => print(&serde_json::json!({ "previous": loot::set_rule(&open()?, &loot::Rule { plugin, after, group })? })),
         Cmd::Check => print(&health::check(&open()?)?),
-        Cmd::CrashLog { path } => print(&logs::read_crash_log(&open()?, path.as_deref())?),
+        Cmd::CrashLog { path, text } => {
+            let inst = open()?;
+            let r = logs::read_crash_log(&inst, path.as_deref())?;
+            if !text {
+                return print(&r);
+            }
+            print!("{}", rmm_core::support::crash_text(&inst, &r));
+            Ok(())
+        }
+        Cmd::SupportBundle { dir, crash } => print(&rmm_core::support::bundle(&open()?, dir.as_deref(), crash.as_deref())?),
         Cmd::PapyrusLog { tail } => print(&logs::read_papyrus_log(&open()?, tail)?),
         Cmd::ScriptExtenderLog => print(&logs::script_extender_log(&open()?, true)?),
         Cmd::TestRun { apply: false, .. } => print(&harness::preview(&open()?)?),

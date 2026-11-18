@@ -137,6 +137,11 @@ struct CrashLogArgs {
     /// A crash log's path; default: the newest.
     path: Option<String>,
 }
+#[derive(Deserialize, JsonSchema)]
+struct BundleArgs {
+    /// A crash log's path; default: the newest.
+    crash: Option<String>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct PapyrusArgs {
@@ -907,9 +912,14 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| i.delete_profile(&a.name)))
     }
 
-    #[tool(description = "Read a crash log (Crash Logger SSE, Buffout 4, Trainwreck, NetScriptFramework; default: the newest) and rank the DLLs, plugins and files it names, with the mod providing each. The call stack counts most. Lists the other crash logs too.", annotations(read_only_hint = true))]
+    #[tool(description = "Read a crash log (Crash Logger SSE, Buffout 4, Trainwreck, NetScriptFramework; default: the newest) and rank the DLLs, plugins and files it names, with the mod providing each. The call stack counts most. next_steps says what to try, in plain words for the user. Lists the other crash logs too.", annotations(read_only_hint = true))]
     async fn read_crash_log(&self, Parameters(a): Parameters<CrashLogArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| logs::read_crash_log(&i, a.path.as_deref().map(std::path::Path::new))))
+    }
+
+    #[tool(description = "Save a support bundle for the user to attach to a forum post or bug report: summary.md (the setup, the crash with its suspects and next steps, problems, script extender plugins that didn't load), health.json, the lockfile, the deploy plan, the crash, Papyrus and script extender logs, and rmm's settings, with the Windows user name taken out of paths. Written to support/ in the instance; returns its path and what's in it.")]
+    async fn support_bundle(&self, Parameters(a): Parameters<BundleArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::support::bundle(&i, None, a.crash.as_deref().map(std::path::Path::new))))
     }
 
     #[tool(description = "Summarise the Papyrus log (Logs/Script/Papyrus.0.log): whether logging is on, errors grouped by message, scripts in error stacks with the mod providing each, and the last lines.", annotations(read_only_hint = true))]

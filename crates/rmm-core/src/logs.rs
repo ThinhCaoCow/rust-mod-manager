@@ -33,6 +33,8 @@ pub struct CrashReport {
     pub call_stack: Vec<String>,
     /// Other crash logs, newest first.
     pub others: Vec<LogFile>,
+    /// What to try, in plain words, from what the log names.
+    pub next_steps: Vec<String>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -121,7 +123,55 @@ pub fn read_crash_log(inst: &Instance, path: Option<&Path>) -> Result<CrashRepor
         s.mod_id.is_some() || !(NOISE.contains(&lower.as_str()) || lower.starts_with("skse64_") || lower.starts_with("f4se_"))
     });
     r.suspects.truncate(25);
+    r.next_steps = next_steps(inst, &r, &profile);
     Ok(r)
+}
+
+/// Plain advice from a read crash log: the game version it ran, the likeliest suspect by kind,
+/// and halving the suspects' mods when there are several.
+fn next_steps(inst: &Instance, r: &CrashReport, profile: &crate::instance::Profile) -> Vec<String> {
+    let mut out = Vec::new();
+    let now = crate::launch::game_version(&inst.config.game_path, inst.config.game).ok().map(|v| format!("{}.{}.{}", v[0], v[1], v[2]));
+    if let (Some(was), Some(now)) = (&r.game_version, &now)
+        && !was.starts_with(now.as_str())
+        && !now.starts_with(was.as_str())
+    {
+        out.push(format!("The game was {was} when this crash happened and is {now} now, so the log may be out of date."));
+    }
+    match r.suspects.iter().find_map(|s| Some((s, s.mod_id.as_deref()?))) {
+        Some((s, id)) => {
+            let m = inst.mod_meta(id).name;
+            let lower = s.name.to_lowercase();
+            let kind = match lower.rsplit('.').next().unwrap_or_default() {
+                "nif" => " (a mesh)",
+                "dds" => " (a texture)",
+                "hkx" => " (an animation or skeleton)",
+                "pex" => " (a script)",
+                "tri" => " (a face morph)",
+                "bsa" | "ba2" => " (an archive)",
+                "wav" | "xwm" | "fuz" => " (a sound)",
+                "swf" => " (an interface file)",
+                _ => "",
+            };
+            out.push(if lower.ends_with(".dll") {
+                let ver = now.as_ref().map(|v| format!(" ({v})")).unwrap_or_default();
+                format!("{} is a script extender plugin from {m}. One built for another game version crashes the game, often as it starts: check that {m} has a version for your game{ver}, or disable it and try again.", s.name)
+            } else if crate::install::is_plugin(&s.name) {
+                format!("{} comes from {m}. Check that its masters load before it (Problems lists missing ones) and sort the plugins, or disable {m} and try again.", s.name)
+            } else {
+                format!("{}{kind} comes from {m}. A broken or wrong-format file crashes the game where it's used: reinstall {m}, or disable it, and go back to the same place.", s.name)
+            });
+            if !profile.mods.iter().any(|e| e.id == id && e.enabled) {
+                out.push(format!("{m} is disabled now. If you turned it off after this crash, play again before changing anything else."));
+            }
+        }
+        None => out.push("Nothing the log names comes from a mod. Load an earlier save, or start a new game with the same mods: if that holds up, the save is the problem, not the mods.".into()),
+    }
+    let mods: std::collections::BTreeSet<&str> = r.suspects.iter().filter_map(|s| s.mod_id.as_deref()).collect();
+    if mods.len() > 1 {
+        out.push(format!("Still crashing? Disable half of the {} mods the log names and play to the same place: the half that still crashes holds the culprit. Undo turns them back on.", mods.len()));
+    }
+    out
 }
 
 /// Which mod provides a file: the enabled one that wins it, else any installed mod that has it

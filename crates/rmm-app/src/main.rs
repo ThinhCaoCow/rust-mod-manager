@@ -385,7 +385,14 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "rename_profile" => json!(inst.rename_profile(&s("from")?, &s("to")?)?),
         "set_profile_options" => json!(ops::set_profile_options(&inst, a["local_inis"].as_bool(), a["local_saves"].as_bool())?),
         "delete_profile" => json!(inst.delete_profile(&s("name")?)?),
-        "crash_log" => json!(logs::read_crash_log(&inst, a["path"].as_str().map(Path::new))?),
+        // With `text`, the report to paste into a post.
+        "crash_log" => {
+            let r = logs::read_crash_log(&inst, a["path"].as_str().map(Path::new))?;
+            let mut v = serde_json::to_value(&r)?;
+            v["text"] = json!(rmm_core::support::crash_text(&inst, &r));
+            v
+        }
+        "support_bundle" => json!(rmm_core::support::bundle(&inst, a["dir"].as_str().map(Path::new), a["crash"].as_str().map(Path::new))?),
         "papyrus_log" => json!(logs::read_papyrus_log(&inst, 60)?),
         "se_log" => json!(logs::script_extender_log(&inst, true)?),
         // nxm links `rmm nxm` left for this window (the website's "Mod manager download" buttons).

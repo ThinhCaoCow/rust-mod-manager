@@ -1358,6 +1358,30 @@ stack:
     assert_eq!((p.errors, p.warnings, p.tail.len()), (1, 1, 4));
     assert_eq!(p.messages, [("Cannot call Foo() on a None object, aborting function call".to_string(), 1)]);
     assert_eq!(p.scripts, [logs::ScriptHits { script: "MyScript".into(), mod_id: Some("Smp".into()), count: 1 }]);
+
+    // What to try, a report to paste, and a support bundle without the Windows user name.
+    use rmm_core::support;
+    let crash = logs::read_crash_log(&inst, None).unwrap();
+    assert!(crash.next_steps.iter().any(|s| s.starts_with("hdtSMP64.dll is a script extender plugin from Smp")), "{:?}", crash.next_steps);
+    assert!(crash.next_steps.last().unwrap().contains("half of the 2 mods"), "{:?}", crash.next_steps);
+    let text = support::crash_text(&inst, &crash);
+    assert!(text.contains("- hdtSMP64.dll (call stack): Smp") && text.contains("What rmm suggests:"), "{text}");
+    let b = support::bundle(&inst, Some(&tmp.path().join("out")), None).unwrap();
+    assert!(b.path.starts_with(tmp.path().join("out")) && b.skipped.is_empty(), "{b:?}");
+    for f in ["summary.md", "health.json", "modlist.lock.toml", "deploy-plan.json", "settings.json", "logs/crash-2026-11-16-22-00-00.log", "logs/Papyrus.0.log"] {
+        assert!(b.files.iter().any(|x| x == f), "{f} in {:?}", b.files);
+    }
+    let mut zip = zip::ZipArchive::new(fs::File::open(&b.path).unwrap()).unwrap();
+    let user = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
+    for i in 0..zip.len() {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut zip.by_index(i).unwrap(), &mut text).unwrap();
+        let lower = text.to_lowercase();
+        assert!(user.is_empty() || !(lower.contains(&format!("users\\{user}")) || lower.contains(&format!("users/{user}"))), "the user name in {text}");
+    }
+    let mut summary = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("summary.md").unwrap(), &mut summary).unwrap();
+    assert!(summary.contains("- hdtSMP64.dll (call stack): Smp") && summary.contains("## Problems"), "{summary}");
 }
 
 /// Wait until the stand-in game (a PING.EXE copy) has exited.

@@ -1201,7 +1201,9 @@ async function crashLog(path) {
   const body = `<p class="muted small">${esc(basename(r.path))} · ${esc(when(r.modified))}${r.logger ? ` · ${esc(r.logger)}` : ''}${r.game_version ? ` · game ${esc(r.game_version)}` : ''}</p>
     ${r.error ? `<p><b>${esc(r.error)}</b></p>` : ''}
     ${rows ? `<p>Named in the log, most likely first:</p><table class="fc">${rows}</table>` : '<p class="muted">The log names nothing that mods provide.</p>'}
+    ${r.next_steps.length ? `<h3>What to try</h3><ul>${r.next_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
     ${r.call_stack.length ? `<details><summary>Call stack</summary><pre>${esc(r.call_stack.join('\n'))}</pre></details>` : ''}
+    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><span class="muted small" id="crash-note" role="status"></span></div>
     ${others.length ? `<label class="field">Older crash logs<select id="older"><option value="">Choose…</option>${others.map(o => `<option value="${esc(o.path)}">${esc(basename(o.path))} · ${esc(when(o.modified))}</option>`).join('')}</select></label>` : ''}
     <p class="muted small" style="margin-top:10px">A name in a crash log is a lead, not a verdict: the mod that crashed often isn't the one at fault.</p>`;
   const done = dialog({ title: 'Crash log', body, actions: [['cancel', 'Close']] });
@@ -1209,10 +1211,38 @@ async function crashLog(path) {
   $('#dlg').onclick = e => { const id = e.target.closest('[data-goto]')?.dataset.goto; if (id) { $('#dlg').close(); showTab('mods'); goTo(id); } };
   const older = $('#older');
   if (older) older.onchange = () => { const p = older.value; if (p) { $('#dlg').close(); setTimeout(() => crashLog(p)); } };
+  const note = t => { $('#crash-note').textContent = t; };
+  $('#copy-report').onclick = async () => note(await copyText(r.text, $('#dlg')) ? 'Copied. Paste it into your post.' : 'Couldn’t copy the report.');
+  $('#save-bundle').onclick = async () => {
+    const b = await saveBundle(r.path, note);
+    if (b) note(`Saved ${b.path}`);
+  };
   await done;
   $('#dlg').onclick = null;
 }
 $('#crash-log').onclick = () => crashLog(null);
+$('#support-bundle').onclick = async () => {
+  const b = await saveBundle(null, t => toast(t, 'error'));
+  if (b) toast(`Saved ${b.path}. Your Windows user name is taken out; look inside before you share it.`);
+};
+
+/** Copy text; the fallback selects it in a text box inside `box` (an open dialog stays modal). */
+async function copyText(text, box = document.body) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* the fallback below */ }
+  const ta = Object.assign(document.createElement('textarea'), { value: text });
+  box.append(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  ta.remove();
+  return ok;
+}
+
+/** Ask for a folder and save a support bundle there (with `crash`, that crash log). */
+async function saveBundle(crash, fail) {
+  const dir = await T.dialog.open({ directory: true, title: 'Where to save the support bundle' });
+  if (!dir) return null;
+  try { return await call('support_bundle', { dir, crash }); } catch (e) { fail(`Couldn’t save the bundle: ${e}`); return null; }
+}
 
 $('#test-run').onclick = async () => {
   const t = (await loadConf())?.test ?? { window: '960x540', dwell: 10, screenshots: true };

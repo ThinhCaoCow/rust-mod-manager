@@ -23,6 +23,7 @@ pub mod proton;
 pub mod rules;
 pub mod saves;
 pub mod settings;
+pub mod support;
 pub mod tools;
 pub mod workspace;
 #[cfg(target_os = "linux")]
