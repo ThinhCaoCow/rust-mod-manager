@@ -274,9 +274,21 @@ enum Cmd {
     /// Health check.
     Check,
     /// Deploy, check the script extender matches the game, and start it (through Proton on Linux); --apply to do it.
+    /// --without-mods purges instead and starts the game's own exe, as when a game update broke
+    /// the script extender (the next launch deploys the mods again).
     Launch {
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        without_mods: bool,
+    },
+    /// Whether Steam may update the game. --hold makes the game's Steam manifest read-only so it
+    /// can't (a copy goes to ini-backup/), --release lets Steam update it again.
+    SteamUpdates {
+        #[arg(long, conflicts_with = "release")]
+        hold: bool,
+        #[arg(long)]
+        release: bool,
     },
     /// Read a crash log (default: the newest) and rank the mods it points at, with what to try.
     /// --text prints a report to paste into a forum post or chat, without your Windows user name.
@@ -978,7 +990,10 @@ fn run() -> Result<()> {
         Cmd::Bisect(BisectCmd::Status) => print(&bisect::status(&open()?)?),
         Cmd::Bisect(BisectCmd::Stop) => print(&bisect::stop(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
-        Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
+        Cmd::Launch { apply, without_mods: false } => print(&rmm_core::launch::launch(&open()?, !apply)?),
+        Cmd::Launch { apply, without_mods: true } => print(&rmm_core::launch::launch_vanilla(&open()?, !apply)?),
+        Cmd::SteamUpdates { hold: false, release: false } => print(&rmm_core::launch::steam_updates(&open()?)),
+        Cmd::SteamUpdates { hold, .. } => print(&rmm_core::launch::hold_steam_updates(&open()?, hold)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
         Cmd::Tool(ToolCmd::List) => print(&serde_json::json!({ "tools": tools::list(&open()?)?, "presets": tools::PRESETS })),
         Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, wait_for, edit_in_place, args }) => {

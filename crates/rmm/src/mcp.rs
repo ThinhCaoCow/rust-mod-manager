@@ -529,6 +529,23 @@ struct DryRun {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct LaunchArgs {
+    /// Preview only (default true). Set false to change the game folder.
+    dry_run: Option<bool>,
+    /// Purge instead of deploying and start the game's own exe, without the script extender:
+    /// for when a game update broke it. The next launch deploys the mods again.
+    #[serde(default)]
+    without_mods: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SteamUpdatesArgs {
+    /// true: make the game's Steam manifest read-only so Steam can't update the game (a copy is
+    /// kept); false: let Steam update it again; left out: only say which it is.
+    hold: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct AddToolArgs {
     /// Tool id: letters, digits, '-' and '_'. An id naming a preset uses that preset.
     id: String,
@@ -901,9 +918,18 @@ impl Rmm {
         out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| deploy::deploy(&i, a.dry_run.unwrap_or(true))))
     }
 
-    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one), through Proton on Linux. dry_run defaults to true and returns the deploy plan, game version and checks.")]
-    async fn launch_game(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::launch::launch(&i, a.dry_run.unwrap_or(true))))
+    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one), through Proton on Linux. without_mods purges instead and starts the game's own exe (after a game update broke the script extender). dry_run defaults to true and returns the deploy plan, game version and checks.")]
+    async fn launch_game(&self, Parameters(a): Parameters<LaunchArgs>) -> Result<String, String> {
+        let dry = a.dry_run.unwrap_or(true);
+        out(self.inst_for(dry).and_then(|i| if a.without_mods { rmm_core::launch::launch_vanilla(&i, dry) } else { rmm_core::launch::launch(&i, dry) }))
+    }
+
+    #[tool(description = "Whether Steam may update the game (a game update breaks the script extender and the mods that need it until they catch up). hold true makes the game's Steam manifest read-only so Steam can't, keeping a copy; false lets Steam update it again. Only when the user asks: it changes a file in their Steam library.")]
+    async fn steam_updates(&self, Parameters(a): Parameters<SteamUpdatesArgs>) -> Result<String, String> {
+        match a.hold {
+            None => out(self.inst().map(|i| rmm_core::launch::steam_updates(&i))),
+            Some(hold) => out(self.inst().and_then(|i| rmm_core::launch::hold_steam_updates(&i, hold))),
+        }
     }
 
     #[tool(description = "Remove all deployed files and restore originals. dry_run defaults to true.")]

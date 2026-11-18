@@ -2485,6 +2485,46 @@ fn versioned_game(dir: &Path, version: [u32; 3]) {
     write(&dir.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
 }
 
+/// Steam's updates are held by a read-only manifest (a copy kept) and let go again; playing
+/// without mods purges and starts the game's own exe.
+#[test]
+fn steam_updates_and_playing_without_mods() {
+    isolate();
+    use rmm_core::{deploy, health, launch};
+    let tmp = tempfile::tempdir().unwrap();
+    let steamapps = tmp.path().join("lib/steamapps");
+    let game = steamapps.join("common/Skyrim Special Edition");
+    versioned_game(&game, [1, 6, 1170]);
+    let manifest = steamapps.join("appmanifest_489830.acf");
+    write(&manifest, "\"AppState\" { \"appid\" \"489830\" }");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+
+    let st = launch::steam_updates(&inst);
+    assert_eq!((st.manifest.as_deref(), st.held), (Some(manifest.as_path()), false));
+    let st = launch::hold_steam_updates(&inst, true).unwrap();
+    assert!(st.held && fs::metadata(&manifest).unwrap().permissions().readonly());
+    assert_eq!(fs::read_to_string(st.backup.unwrap()).unwrap(), fs::read_to_string(&manifest).unwrap());
+    assert!(health::check(&inst).unwrap().iter().any(|i| i.kind == "steam_updates_held"));
+    assert!(!launch::hold_steam_updates(&inst, false).unwrap().held);
+    assert!(!fs::metadata(&manifest).unwrap().permissions().readonly());
+    assert!(!health::check(&inst).unwrap().iter().any(|i| i.kind == "steam_updates_held"));
+
+    write(&tmp.path().join("src/Mod/textures/a.dds"), "a");
+    install::install(&inst, &tmp.path().join("src/Mod"), None, true, None).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert!(game.join("Data/textures/a.dds").is_file());
+    let r = launch::launch_vanilla(&inst, true).unwrap();
+    assert_eq!((r.exe.file_name().unwrap().to_str(), r.script_extender.as_deref(), r.game_version.as_str()), (Some("SkyrimSE.exe"), None, "1.6.1170.0"));
+    assert!(r.deploy.remove.iter().any(|f| f.to_lowercase().replace('\\', "/").ends_with("textures/a.dds")), "{:?}", r.deploy.remove);
+    assert!(game.join("Data/textures/a.dds").is_file(), "a dry run leaves the game folder");
+
+    // A game outside a Steam library.
+    let other = Instance::create(&tmp.path().join("inst2"), Game::SkyrimSe, &tmp.path().join("lib/steamapps/common/Skyrim Special Edition"), &tmp.path().join("local2")).unwrap();
+    fs::remove_file(&manifest).unwrap();
+    assert!(launch::steam_updates(&other).manifest.is_none());
+    assert!(format!("{:#}", launch::hold_steam_updates(&other, true).unwrap_err()).contains("appmanifest_489830.acf"));
+}
+
 /// A pack brings the mods no archive does, with the notes; apply warns about another game
 /// version; diff and the readable list say what's what.
 #[test]

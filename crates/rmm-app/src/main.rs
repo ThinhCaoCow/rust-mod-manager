@@ -294,7 +294,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "deploy" => json!(deploy::deploy(&inst, false)?),
         "purge" => json!(deploy::purge(&inst, flag("dry_run"))?),
+        "launch" if flag("without_mods") => json!(launch::launch_vanilla(&inst, false)?),
         "launch" => json!(launch::launch(&inst, false)?),
+        "steam_updates" => match a["hold"].as_bool() {
+            Some(hold) => json!(launch::hold_steam_updates(&inst, hold)?),
+            None => json!(launch::steam_updates(&inst)),
+        },
         "test_run" => json!(harness::test_run(&inst, &serde_json::from_value(a.clone())?)?),
         "bisect" => {
             use rmm_core::bisect;

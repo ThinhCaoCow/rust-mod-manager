@@ -1853,7 +1853,7 @@ function pluginKeys(e) {
 function ctxMenu(e, items) {
   e.preventDefault();
   const pop = $('#ctx');
-  pop.innerHTML = items.map((it, i) => it === '-' ? '<hr>' : `<button class="item ${it[2] ?? ''}" role="menuitem" data-i="${i}">${esc(it[0])}</button>`).join('');
+  pop.innerHTML = items.map((it, i) => it === '-' ? '<hr>' : `<button class="item ${it[2] ?? ''}" role="menuitem" data-i="${i}"${it[3] ? ` title="${esc(it[3])}"` : ''}>${esc(it[0])}</button>`).join('');
   pop.hidden = false;
   const r = pop.getBoundingClientRect();
   pop.style.left = `${Math.max(4, Math.min(e.clientX, innerWidth - r.width - 4))}px`;
@@ -2021,7 +2021,15 @@ async function purge() {
 }
 
 $('#play').onclick = async () => {
-  const r = await act('Starting the game', () => call('launch'), { problem: true });
+  let error = '';
+  const r = await act('Starting the game', () => call('launch').catch(e => { error = String(e); throw e; }), { problem: true });
+  if (/script extender is built for game version/.test(error)) {
+    $$('#toasts .toast.error').pop()?.remove(); // the dialog says it
+    const v = await dialog({ title: 'The script extender doesn’t match the game', body: `<p>${esc(error)}</p><p class="muted small">Until there’s a matching one, Play without mods starts the game with none: rmm takes them out of the game folder (Purge), and the next Play puts them back. Saves made with mods are best left alone until then.</p>`,
+      actions: [['cancel', 'Close'], ['vanilla', 'Play without mods', 'primary']] });
+    if (v === 'vanilla') playVanilla(true);
+    return;
+  }
   if (!r) return;
   const what = [`game ${r.game_version}`, r.script_extender].filter(Boolean).join(', ');
   toast(`Started ${basename(r.exe)} (${what}).${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
@@ -2030,6 +2038,33 @@ $('#play').onclick = async () => {
     savePrefs();
     toast('Start the game with Play from now on: starting it from Steam or a desktop shortcut skips the script extender and any changes not deployed yet.');
   }
+};
+
+/** Purge and start the game's own exe; `asked`: the user already chose it in a dialog. */
+async function playVanilla(asked = false) {
+  if (!asked && !await confirmBox('Play without mods?', 'rmm takes your mods out of the game folder (Purge) and starts the game itself, without the script extender. The next Play puts the mods back. Saves made with mods are best left alone meanwhile.', 'Play without mods', 'primary')) return;
+  const r = await act('Starting the game without mods', () => call('launch', { without_mods: true }));
+  if (r && r !== true) toast(`Started ${basename(r.exe)} (game ${r.game_version}) without mods. Play puts them back.`);
+}
+
+/** Make the game's Steam manifest read-only (hold) or writable again. */
+async function steamHold(hold) {
+  if (hold && !await confirmBox('Hold game updates on Steam?', 'rmm makes the game’s Steam manifest read-only, so Steam can’t update the game, and keeps a copy of it. A game update breaks the script extender and the mods that need it until they catch up. Steam may say the game needs an update; Let Steam update the game, in this menu, undoes it.', 'Hold updates', 'primary')) return;
+  if (!hold && !await confirmBox('Let Steam update the game?', 'Its Steam manifest becomes writable again, and Steam may update the game right away. A game update breaks the script extender and the mods that need it until they catch up, and undoes a downgraded game.', 'Let Steam update it')) return;
+  const r = await act(hold ? 'Holding game updates' : 'Letting Steam update the game', () => call('steam_updates', { hold }), { reload: false });
+  if (r && r !== true) toast(r.held ? 'Steam can’t update the game now. Problems reminds you while it’s held.' : 'Steam can update the game again.');
+  runHealth();
+}
+
+$('#play-more').onclick = async e => {
+  e.stopPropagation();
+  const b = e.currentTarget.getBoundingClientRect();
+  const st = await call('steam_updates').catch(() => null);
+  const items = [['Play without mods…', () => playVanilla(), '', 'Takes your mods out of the game folder (Purge) and starts the game itself, without the script extender, as when a game update broke it. Play puts them back.'], '-'];
+  if (!st?.manifest) items.push(['Hold game updates on Steam', () => toast('rmm can’t find the game’s Steam manifest beside its folder, so this isn’t a Steam install it can hold updates for.'), 'muted', 'Not a Steam install rmm can find the manifest for']);
+  else if (st.held) items.push(['Let Steam update the game', () => steamHold(false), '', 'Makes the game’s Steam manifest writable again']);
+  else items.push(['Hold game updates on Steam…', () => steamHold(true), '', 'Makes the game’s Steam manifest read-only, so Steam can’t update the game and break the script extender']);
+  ctxMenu({ preventDefault() {}, clientX: b.right - 240, clientY: b.bottom + 4 }, items);
 };
 
 // ---- Profiles -------------------------------------------------------------------------------
@@ -3761,7 +3796,8 @@ const PLAIN = {
   update_masterlist: () => ['Download LOOT’s newest masterlist', ''],
   deploy: () => ['Deploy: put your mods into the game folder', 'Purge takes them out again.'],
   purge: () => ['Purge: take the mods out of the game folder', 'Deploy puts them back.'],
-  launch_game: () => ['Start the game', 'It deploys your changes first.'],
+  launch_game: a => a.without_mods ? ['Start the game without mods', 'It purges them; the next Play puts them back.'] : ['Start the game', 'It deploys your changes first.'],
+  steam_updates: a => [a.hold ? 'Stop Steam updating the game (its manifest becomes read-only)' : 'Let Steam update the game again', ''],
   add_tool: a => [`Add the tool ${a.id}`, ''],
   run_tool: a => [`Run ${a.id}`, 'What it makes becomes a mod; Undo takes it out.'],
   create_profile: a => [`Make the profile “${a.name}”`, ''],

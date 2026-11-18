@@ -44,6 +44,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("script_extender_missing", "Script extender plugins without the loader"),
     ("script_extender_mismatch", "The script extender doesn't match the game version"),
     ("game_updated", "The game's version changed since the last Play"),
+    ("steam_updates_held", "Steam's updates for the game are held back"),
     ("address_library_mismatch", "Address Library has no file for the game version"),
     ("script_extender_plugin", "A script extender plugin didn't load in the last run"),
     ("deploy_blocked", "Deploy can't run"),
@@ -179,9 +180,12 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         add("error", "script_extender_mismatch", game.loader(), format!("{e:#}. Play won't start the game until it matches"));
     }
     let se = if game.base() == crate::Game::SkyrimSe { "SKSE" } else { "F4SE" };
+    if crate::launch::steam_updates(inst).held {
+        add("info", "steam_updates_held", game.exe(), "Steam can't update the game: its Steam manifest is read-only. When you want the update, Let Steam update the game (beside Play, or `rmm steam-updates --release`)".into());
+    }
     if let Some(v) = &version {
         if let Some(m) = crate::launch::game_updated(inst, &v.map(|x| x.to_string()).join(".")) {
-            add("warning", "game_updated", game.exe(), format!("{m}. The script extender, Address Library and many {se} plugins are made for one game version; the other findings here say what no longer matches. This goes away at the next Play"));
+            add("warning", "game_updated", game.exe(), format!("{m}. The script extender, Address Library and many {se} plugins are made for one game version; the other findings here say what no longer matches. Until they catch up, Play without mods (beside Play) starts the game with none. This goes away at the next Play"));
         }
         if let Some(m) = crate::launch::address_library(&inst.data_dir().join(se).join("Plugins"), game, v) {
             add("error", "address_library_mismatch", "Address Library", m);

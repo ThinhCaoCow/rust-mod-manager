@@ -166,6 +166,85 @@ pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Re
     Ok(r)
 }
 
+/// Start the game without mods, as when a game update broke the script extender: purge the game
+/// folder (the next Play deploys the mods again) and start the game's own exe.
+pub fn launch_vanilla(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
+    let deploy = deploy::purge(inst, dry_run)?; // refuses while the game runs
+    let (root, game) = (&inst.config.game_path, inst.config.game);
+    let exe = root.join(game.exe());
+    let version = exe_version(&exe).with_context(|| format!("cannot read the version of {}", exe.display()))?;
+    let mut r = LaunchReport { dry_run, exe, game_version: version.map(|v| v.to_string()).join("."), script_extender: None, pid: None, warnings: vec![], deploy };
+    if !dry_run {
+        let mut cmd = if proton::needed(&r.exe) { proton::command(game, root, &r.exe)? } else { Command::new(&r.exe) };
+        let child = cmd
+            .args(crate::settings::split_args(&crate::settings::get().launch.args))
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("cannot start {}", r.exe.display()))?;
+        r.pid = Some(child.id());
+        // Not remembered as a Play: the version check is about playing with the mods.
+    }
+    Ok(r)
+}
+
+/// Steam's manifest for the game, `appmanifest_<app id>.acf` in the `steamapps` folder whose
+/// `common` folder has the game. None for a game outside a Steam library.
+pub fn app_manifest(game: Game, game_path: &Path) -> Option<PathBuf> {
+    let steamapps = game_path.parent()?.parent()?;
+    let p = steamapps.join(format!("appmanifest_{}.acf", game.steam_app_id()));
+    p.is_file().then_some(p)
+}
+
+/// Whether Steam may update the game.
+#[derive(Debug, Serialize)]
+pub struct SteamUpdates {
+    /// The game's Steam manifest; None when rmm can't find one (not a Steam install).
+    pub manifest: Option<PathBuf>,
+    /// The manifest is read-only, so Steam can't update the game.
+    pub held: bool,
+    /// The copy kept from before rmm first made it read-only.
+    pub backup: Option<PathBuf>,
+}
+
+fn manifest_backup(inst: &Instance, manifest: &Path) -> PathBuf {
+    inst.root.join("ini-backup").join(manifest.file_name().unwrap_or_default())
+}
+
+pub fn steam_updates(inst: &Instance) -> SteamUpdates {
+    let manifest = app_manifest(inst.config.game, &inst.config.game_path);
+    let held = manifest.as_ref().is_some_and(|m| fs::metadata(m).is_ok_and(|m| m.permissions().readonly()));
+    let backup = manifest.as_ref().map(|m| manifest_backup(inst, m)).filter(|b| b.is_file());
+    SteamUpdates { manifest, held, backup }
+}
+
+/// Hold Steam's updates for the game by making its manifest read-only (a game update breaks the
+/// script extender and the mods that need it until they catch up), keeping a copy of it first;
+/// `hold` false lets Steam update it again.
+pub fn hold_steam_updates(inst: &Instance, hold: bool) -> Result<SteamUpdates> {
+    let game = inst.config.game;
+    let Some(manifest) = app_manifest(game, &inst.config.game_path) else {
+        bail!(
+            "there's no Steam manifest (appmanifest_{}.acf) beside the game's folder in steamapps, so this isn't a Steam install rmm can hold updates for",
+            game.steam_app_id()
+        );
+    };
+    if hold {
+        let backup = manifest_backup(inst, &manifest);
+        fs::create_dir_all(backup.parent().unwrap())?;
+        fs::copy(&manifest, &backup).with_context(|| format!("cannot keep a copy of {}", manifest.display()))?;
+    }
+    let mut perm = fs::metadata(&manifest)?.permissions();
+    #[cfg(unix)]
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, if hold { 0o444 } else { 0o644 });
+    #[cfg(not(unix))]
+    perm.set_readonly(hold);
+    fs::set_permissions(&manifest, perm).with_context(|| format!("cannot change {}", manifest.display()))?;
+    Ok(steam_updates(inst))
+}
+
 /// The game version at the last Play, to notice a game update.
 const PLAYED: &str = "game-version.txt";
 

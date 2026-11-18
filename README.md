@@ -41,14 +41,14 @@ rmm deploy                                         # preview what changes in the
 rmm deploy --apply                                 # hard-link mods in, write plugins.txt
 rmm tool add xedit-qac --exe "D:\Tools\SSEEdit\SSEEdit.exe"   # presets: xedit, xedit-qac, xlodgen, bodyslide, synthesis, pandora, pgpatcher, texgen, dyndolod
 rmm run xedit-qac --var plugin=Update.esm --apply  # deploy, run, capture output as the mod "Cleaned Update.esm"
-rmm launch --apply                                 # deploy, check the SKSE/F4SE build matches the game, start it
+rmm launch --apply                                 # deploy, check the SKSE/F4SE build matches the game, start it (--without-mods: purge, start the game alone)
 rmm rule MyPatch.esp --after "Some Mod.esp"       # LOOT user rule; `rmm rule` lists them
 rmm profile create Lean --empty && rmm profile switch Lean   # per-profile mods and plugin order
 rmm profile options --local-inis true --local-saves true    # and its own INIs and saves
 rmm profile playthrough "Run 2"                    # a copy of this profile with saves of its own, made active
 rmm mod-rule "My Patch" --after "Big Mod"         # suggestion; `rmm sort-mods --apply` satisfies them
 rmm undo                                           # every change is undoable
-rmm purge --apply                                  # restore the vanilla game folder
+rmm purge --apply                                  # restore the vanilla game folder; `rmm steam-updates --hold` stops Steam updating the game
 rmm import mo2 "D:\MO2\Skyrim" --all --apply       # every profile; or --profile <name>; rmm import vortex <state.v2 or backup.json>; rmm import sources
 rmm lock export --pack                             # modlist.pack.zip: the lockfile and your own mods' files (or --markdown); `rmm lock apply <file> --downloads <dir>` rebuilds, `rmm lock diff <file>` compares
 rmm nexus login                                    # paste your API key (or --sso once Nexus registers rmm); then `rmm nexus updates`, `rmm nexus identify`, `rmm nxm <link>`
@@ -128,7 +128,7 @@ claude mcp add rmm -- D:\Games\Rust_Mod_Manager\target\release\rmm.exe -i D:\Mod
 
 For clients that connect to a URL, `rmm -i D:\Mods\skyrim mcp --http 127.0.0.1:47823` serves the same tools at `http://127.0.0.1:47823/mcp` and prints the bearer token; the window's "AI access" does the same while it is open.
 
-The server exposes 97 tools covering inspection (including the Data folder, saves and downloads), reviewing mods (a safety scan with Windows Defender and DLL checks, reading files with Papyrus scripts disassembled, record conflicts between plugins, saved reviews, what a plugin adds), editing mod files and INIs with every edit revertible, install (including FOMOD installers), profiles, ordering, separators and mod rules, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, test runs, live test sessions, logs and support bundles (the Windows user name taken out), finding the mod behind a crash by halving the suspects, purge, Nexus search and installs, import and lockfiles, add-ons, saved chats, the mod team board, and undo/redo. Writes to the game folder, installs from Nexus and imports default to `dry_run: true`. Every change to a profile lands in its undo history, so anything the AI does to a setup can be reversed.
+The server exposes 98 tools covering inspection (including the Data folder, saves and downloads), reviewing mods (a safety scan with Windows Defender and DLL checks, reading files with Papyrus scripts disassembled, record conflicts between plugins, saved reviews, what a plugin adds), editing mod files and INIs with every edit revertible, install (including FOMOD installers), profiles, ordering, separators and mod rules, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, test runs, live test sessions, logs and support bundles (the Windows user name taken out), finding the mod behind a crash by halving the suspects, purge, Nexus search and installs, import and lockfiles, add-ons, saved chats, the mod team board, and undo/redo. Writes to the game folder, installs from Nexus and imports default to `dry_run: true`. Every change to a profile lands in its undo history, so anything the AI does to a setup can be reversed.
 
 Each session of an AI app connected this way (Claude desktop, Claude Code, any MCP client) is saved as a chat in the instance (`ai/chats/`): every tool call and its answer, under the app's name. rmm never sees the conversation itself, so the server asks the app to save a short note when a task ends (`save_chat_note`: what you asked for, what it did and decided, what's left). The session then shows in the window's Chats list, and `list_chats` and `read_chat` let any AI read it, so rmm's own AI can carry on where the app left off.
 
