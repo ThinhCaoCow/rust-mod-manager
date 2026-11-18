@@ -531,8 +531,18 @@ enum NexusCmd {
     Logout,
     /// Whether a key is saved, and whose it is.
     Status,
-    /// Mods with a newer file on Nexus (default: all with Nexus ids).
+    /// Mods with a newer file on Nexus (default: all with Nexus ids), leaving out held ones.
     Updates { ids: Vec<String> },
+    /// Hold back mods' updates: keep them at their versions (by default), --skip the newer file
+    /// the last check found (a later one is offered), or --release to offer updates again.
+    Hold {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long, conflicts_with = "release")]
+        skip: bool,
+        #[arg(long)]
+        release: bool,
+    },
     /// Search the game's mods on Nexus by name and description (no key needed).
     Search {
         words: Vec<String>,
@@ -852,6 +862,10 @@ fn run() -> Result<()> {
         Cmd::Nexus(NexusCmd::Info { mod_id }) => print(&nexus::mod_info(&open()?, &nexus::Client::any(), mod_id)?),
         Cmd::Nexus(NexusCmd::Updates { ids }) => {
             print(&nexus::check_updates(&open()?, &nexus::Client::from_env()?, (!ids.is_empty()).then_some(ids.as_slice()))?)
+        }
+        Cmd::Nexus(NexusCmd::Hold { ids, skip, release }) => {
+            let hold = if release { nexus::Hold::Release } else if skip { nexus::Hold::Skip } else { nexus::Hold::Pin };
+            nexus::hold_updates(&open()?, &ids, hold)
         }
         Cmd::Nxm { link } => {
             let inst = open()?;

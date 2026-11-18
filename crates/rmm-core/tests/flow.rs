@@ -2282,6 +2282,28 @@ fn nexus_updates_and_downloads() {
     nexus::check_updates(&inst, &c, None).unwrap();
     assert_eq!(hits.lock().unwrap()[&format!("{d}/9/files.json")], 1, "the second check uses the cache");
 
+    // The mod list shows the version and the update the check found; holds leave it out.
+    let row = || ops::list_mods(&inst).unwrap().into_iter().find(|m| m.id == "A").unwrap();
+    assert_eq!((row().version.as_deref(), row().update.map(|u| u.file_id)), (Some("1.0"), Some(2)));
+    let hold = |h| nexus::hold_updates(&inst, &["A".to_string()], h);
+    hold(nexus::Hold::Skip).unwrap();
+    assert!(row().update.is_none() && nexus::check_updates(&inst, &c, None).unwrap().is_empty(), "the skipped file isn't offered");
+    let mut later = nexus::saved_updates(&inst)["A"].clone();
+    later.file_id = 3;
+    assert!(nexus::offered(&later, &inst.mod_meta("A")), "a later file is");
+    hold(nexus::Hold::Pin).unwrap();
+    hold(nexus::Hold::Release).unwrap();
+    assert_eq!((inst.mod_meta("A").skip_file, row().update.map(|u| u.file_id)), (None, Some(2)), "release clears the skip too");
+    hold(nexus::Hold::Pin).unwrap();
+    assert!(row().pinned && row().update.is_none() && nexus::check_updates(&inst, &c, None).unwrap().is_empty(), "a pinned mod isn't offered updates");
+    hold(nexus::Hold::Release).unwrap();
+    assert_eq!(nexus::check_updates(&inst, &c, None).unwrap().len(), 1);
+    assert!(nexus::hold_updates(&inst, &["Nope".to_string()], nexus::Hold::Pin).is_err());
+    let mut meta = inst.mod_meta("A");
+    meta.nexus.as_mut().unwrap().file_id = Some(2);
+    inst.write_mod_meta("A", &meta).unwrap();
+    assert!(row().update.is_none(), "installed since the check");
+
     let link = nexus::parse_nxm("nxm://skyrimspecialedition/mods/9/files/2?key=k&expires=5&user_id=1").unwrap();
     let r = nexus::install(&inst, &c, &link, None).unwrap();
     assert_eq!(r.name, "Alpha Mod");

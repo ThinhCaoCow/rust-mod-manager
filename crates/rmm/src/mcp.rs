@@ -216,6 +216,14 @@ struct UpdatesArgs {
     ids: Option<Vec<String>>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct HoldArgs {
+    /// Mod ids (list_mods).
+    ids: Vec<String>,
+    /// pin keeps the mods at their versions; skip passes over the newer file the last
+    /// check_mod_updates found (a later one is offered); release offers updates again.
+    hold: nexus::Hold,
+}
+#[derive(Deserialize, JsonSchema)]
 struct NexusInstallArgs {
     /// An nxm:// link from the website's "Mod manager download" button, or a mod page link
     /// (nexusmods.com/<game>/mods/<id>). Or give mod_id, and file_id unless the newest main file
@@ -979,9 +987,14 @@ impl Rmm {
         out(Ok(nexus::status()))
     }
 
-    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Needs the user's API key.", annotations(read_only_hint = true))]
+    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Leaves out updates the user holds back (hold_updates); list_mods shows the rest on each mod. Needs the user's API key.", annotations(read_only_hint = true))]
     async fn check_mod_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
+    }
+
+    #[tool(description = "Hold back mods' updates when the user wants a version kept: pin keeps a mod at its version, skip passes over the newer file the last check_mod_updates found (a later one is offered), release offers updates again. Held updates are left out of check_mod_updates and list_mods (which marks pinned mods). Lives with the mods like notes, not in undo history.")]
+    async fn hold_updates(&self, Parameters(a): Parameters<HoldArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| nexus::hold_updates(&i, &a.ids, a.hold)))
     }
 
     #[tool(description = "Download a file from Nexus with the user's account into the instance's downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording its Nexus ids. Give an nxm:// link, a mod page link, or a mod id (the newest main file unless file_id names one). Without Premium, Nexus only allows downloads through an nxm:// link from the website's button. Needs the user signed in (nexus_status). dry_run defaults to true: shows the file.")]

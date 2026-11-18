@@ -186,6 +186,12 @@ pub struct ModMeta {
     /// its files stay the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<crate::inspect::Review>,
+    /// Updates held back: the user keeps the mod at its version, and checks don't offer newer ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// A newer Nexus file the user skipped; a later one is offered again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_file: Option<u64>,
 }
 
 /// A mod's page and file on Nexus Mods (the game comes from the instance).
@@ -613,10 +619,10 @@ impl Instance {
         fs::rename(&live, &tmp)?;
         fs::rename(&kept, &live)?;
         fs::rename(&tmp, &kept)?;
-        // The source, FOMOD choices, Nexus ids and review go with the files; the name, notes and
-        // categories stay as the user last set them.
+        // The source, FOMOD choices, Nexus ids and review go with the files; the name, notes,
+        // categories and update holds stay as the user last set them.
         let back = self.mod_meta(id);
-        self.write_mod_meta(id, &ModMeta { name: now.name, notes: now.notes, categories: now.categories, ..back })
+        self.write_mod_meta(id, &ModMeta { name: now.name, notes: now.notes, categories: now.categories, pinned: now.pinned, skip_file: now.skip_file, ..back })
     }
 
     fn stack_dir(&self, name: &str) -> PathBuf {

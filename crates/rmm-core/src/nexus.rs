@@ -478,7 +478,7 @@ mod ws {
     }
 }
 
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Update {
     pub id: String,
     pub name: String,
@@ -529,7 +529,57 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Mods with a newer file on Nexus. `ids` limits the check (default: every mod with Nexus ids).
+/// The last check's updates, by mod id, held ones included (see `offered`).
+const UPDATES: &str = "nexus-updates.json";
+
+/// What the last update check found, by mod id (no network). `offered` says which still apply.
+pub fn saved_updates(inst: &Instance) -> BTreeMap<String, Update> {
+    fs::read_to_string(inst.root.join(UPDATES)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Whether a found update still applies to the mod: not held, not skipped, not installed since.
+pub fn offered(u: &Update, meta: &crate::instance::ModMeta) -> bool {
+    meta.nexus.as_ref().is_some_and(|n| n.mod_id == u.mod_id && n.file_id != Some(u.file_id)) && !meta.pinned && meta.skip_file != Some(u.file_id)
+}
+
+/// How to hold a mod's updates back.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Hold {
+    /// Keep the mod at its version: no update is offered until released.
+    Pin,
+    /// Skip the newer file the last check found; a later one is offered.
+    Skip,
+    /// Offer updates again.
+    Release,
+}
+
+/// Hold back (or release) the updates of mods. Lives with the mods, like notes, so it isn't in
+/// the undo history. Skip needs an update found by the last check.
+pub fn hold_updates(inst: &Instance, ids: &[String], hold: Hold) -> Result<()> {
+    let found = saved_updates(inst);
+    inst.locked(|| {
+        for id in ids {
+            if crate::instance::is_separator(id) || !inst.mod_dir(id).join(crate::instance::MOD_META).is_file() {
+                bail!("mod '{id}' is not installed");
+            }
+            let mut meta = inst.mod_meta(id);
+            match hold {
+                Hold::Pin => meta.pinned = true,
+                Hold::Release => (meta.pinned, meta.skip_file) = (false, None),
+                Hold::Skip => {
+                    let u = found.get(id).filter(|u| meta.nexus.as_ref().is_some_and(|n| n.mod_id == u.mod_id));
+                    meta.skip_file = Some(u.with_context(|| format!("no update found for '{id}'; check for updates first"))?.file_id);
+                }
+            }
+            inst.write_mod_meta(id, &meta)?;
+        }
+        Ok(())
+    })
+}
+
+/// Mods with a newer file on Nexus, leaving out the ones the user holds back (`hold_updates`).
+/// `ids` limits the check (default: every mod with Nexus ids).
 pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -> Result<Vec<Update>> {
     let domain = inst.config.game.nexus_domain();
     let cache_path = inst.root.join(CACHE);
@@ -551,6 +601,8 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         .flatten()
         .filter_map(|u| Some((u["mod_id"].as_u64()?, u["latest_file_update"].as_u64().unwrap_or(0))))
         .collect();
+    let mut found = saved_updates(inst);
+    found.retain(|id, _| !mods.iter().any(|(m, _)| m == id));
     let mut out = Vec::new();
     let known = requirements(inst);
     let mut reread = Vec::new(); // mods whose requirements to read again
@@ -571,10 +623,14 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
             reread.push(n.mod_id);
         }
         if let Some(u) = newer(id, &meta.name, n, &cache.files[&n.mod_id], domain) {
-            out.push(u);
+            if offered(&u, meta) {
+                out.push(u.clone());
+            }
+            found.insert(id.clone(), u);
         }
     }
     fs::write(&cache_path, serde_json::to_string(&cache)?)?;
+    fs::write(inst.root.join(UPDATES), serde_json::to_string(&found)?)?; // for the mod list's Update tags
     let _ = refresh_requirements(inst, client, &reread); // the update check stands without them
     Ok(out)
 }

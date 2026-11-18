@@ -407,6 +407,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "nexus_sso" => nexus::sso(&nexus::open_in_browser)?,
         "nexus_forget_key" => json!(nexus::forget_key()?),
         "check_updates" => json!(nexus::check_updates(&inst, &nexus::Client::from_env()?, None)?),
+        "hold_updates" => json!(nexus::hold_updates(&inst, &serde_json::from_value::<Vec<String>>(a["ids"].clone())?, serde_json::from_value(a["hold"].clone())?)?),
         "nexus_fetch" => {
             let client = nexus::Client::from_env()?;
             json!(nexus::fetch(&inst, &client, &nexus::resolve(&inst, &client, &s("link")?)?)?)

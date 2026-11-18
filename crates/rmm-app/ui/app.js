@@ -40,7 +40,6 @@ let historyData = null;     // history_details, loaded when the History tab show
 let side = 'mods';          // which list was clicked last, when both show
 let selPluginMod = null;    // the mod providing the selected plugin
 let dropAt = null;          // { id, priority } while a file is dragged over a mod row
-let updates = new Map();    // mod id -> newer Nexus file, from the last check
 
 // Window preferences: columns, their widths, the tab, the filter and the split view.
 const PREFS = 'rmm.prefs';
@@ -67,6 +66,7 @@ const COLS = {
   tags: { title: 'Tags', cls: 'tags-col', w: 160 },
   notes: { title: 'Notes', cls: 'notes-col', w: 200 },
   installed: { title: 'Installed', cls: 'date-col', w: 96 },
+  version: { title: 'Version', cls: 'ver-col', w: 90, tip: 'The installed version, as Nexus names it' },
   files: { title: 'Files', cls: 'num', w: 64 },
   priority: { title: '#', cls: 'num', w: 64, tip: 'Priority: higher wins file conflicts' },
 };
@@ -254,7 +254,7 @@ function showApp() {
 const START = W.startTab === 'last' ? prefs.tab : W.startTab;
 tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'ai', 'settings'].includes(START) ? START : 'mods';
 $('#filter').value = prefs.filter ?? '';
-filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, problems: 1 }));
+filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, update: 1, problems: 1 }));
 
 let gamesFound = []; // the welcome screen's game folders: detected, then any the search adds
 
@@ -386,6 +386,7 @@ const CRITERIA = {
   masters: m => D.missing.has(m.id),
   plugins: m => m.plugins.length > 0,
   recent: m => (m.installed ?? 0) >= Date.now() / 1000 - W.recentDays * 86400,
+  update: m => !!m.update,
   problems: m => D.broken.has(m.id) || D.missing.has(m.id) || !!D.C[m.id]?.fully_overridden || !!D.flagged?.has(m.id),
 };
 const filterText = () => $('#filter').value.trim().toLowerCase();
@@ -465,14 +466,16 @@ function modRow(m, i) {
   const warn = b ? `<span class="warn-icon" title="${esc(why)}">⚠</span>` : '';
   const masters = D.missing.has(m.id) ? '<span class="pill bad" title="One of its plugins needs masters that aren’t loaded before it">Masters</span>' : '';
   const note = m.notes ? `<span class="note-icon" title="${esc(m.notes)}">✎</span>` : '';
-  const up = updates.get(m.id);
-  const upd = up ? `<span class="pill win" title="Nexus has ${esc(up.file_name)}${up.latest ? ` (version ${esc(up.latest)})` : ''}">Update${up.latest ? ' ' + esc(up.latest) : ''}</span>` : '';
+  const up = m.update;
+  const upd = up ? `<span class="pill win" title="Nexus has ${esc(up.file_name)}${up.latest ? ` (version ${esc(up.latest)})` : ''}">Update${up.latest ? ' ' + esc(up.latest) : ''}</span>`
+    : m.pinned ? '<span class="pill plain" title="Held at this version: update checks don’t offer newer ones (the mod’s panel releases it)">Held</span>' : '';
   const cell = {
     conflicts: () => `<td class="conf">${relTag}${conflictPills(D.C[m.id])}${masters}</td>`,
     category: () => `<td class="cats" title="${esc(m.categories?.join(', '))}">${(m.categories ?? []).map(c => `<span class="cat" data-cat="${esc(c)}">${esc(c)}</span>`).join('')}</td>`,
     tags: () => `<td class="muted small" title="${esc(m.tags?.join(', '))}">${esc(m.tags?.join(', '))}</td>`,
     notes: () => `<td class="muted" title="${esc(m.notes)}">${esc(m.notes)}</td>`,
     installed: () => `<td class="muted small">${m.installed ? new Date(m.installed * 1000).toLocaleDateString() : ''}</td>`,
+    version: () => `<td class="muted small" title="${esc(m.version)}">${esc(m.version)}</td>`,
     files: () => `<td class="num">${m.files.toLocaleString()}</td>`,
     priority: () => `<td class="num">${m.priority}</td>`,
   };
@@ -484,6 +487,19 @@ function modRow(m, i) {
 }
 
 /** The mod list's header: the chosen columns, with remembered widths and resize handles. */
+/** A Nexus mod's version, the update the last check found, and what holds its updates back. */
+function updatesBlock(m, meta) {
+  const u = m.update;
+  return `<h3>Updates</h3>
+    <div class="row">
+      <span>${m.version ? `Version ${esc(m.version)}` : 'Version not known'}${u ? `; Nexus has <b>${esc(u.latest ?? u.file_name)}</b>` : ''}</span>
+      <div class="spacer"></div>
+      ${u ? '<button data-act="skip-update" title="Don’t offer this file; a later one is offered">Skip this version</button>' : ''}
+    </div>
+    <label class="row" style="margin:0"><input type="checkbox" data-act="pin" ${m.pinned ? 'checked' : ''}> Hold at this version (update checks don’t offer newer ones)</label>
+    ${meta.skip_file && !u && !m.pinned ? '<div class="row"><span class="muted small">A newer file is skipped.</span><button class="link" data-act="unskip">Offer it again</button></div>' : ''}`;
+}
+
 function renderModHead() {
   const w = k => prefs.widths[k] ? ` style="width:${prefs.widths[k]}px"` : '';
   const rs = '<span class="rs" title="Drag to resize"></span>';
@@ -694,6 +710,7 @@ function renderDetails() {
       ${m.color ? '<button data-act="mod-nocolor" title="Remove the row colour">No colour</button>' : ''}
     </div>
     ${m.tags?.length ? `<div class="tagline">${m.tags.map(t => `<span class="pill plain">${esc(t)}</span>`).join('')}</div>` : ''}
+    ${d?.meta?.nexus ? updatesBlock(m, d.meta) : ''}
     <h3>Categories</h3>
     <div class="chips">${(m.categories ?? []).map(c => `<span class="chip">${esc(c)}<button data-uncat="${esc(c)}" title="Remove the category" aria-label="Remove ${esc(c)}">×</button></span>`).join('') || '<span class="muted">None.</span>'}</div>
     <div class="row"><input class="cat-add" list="cat-names" placeholder="Add a category…" aria-label="Add a category" spellcheck="false"></div>
@@ -1529,6 +1546,11 @@ $('#details').addEventListener('click', async e => {
     }
     case 'nocolor': return act('Changing the colour', () => call('edit_separator', { id, color: '' }));
     case 'mod-nocolor': return act('Changing the colour', () => call('set_color', { id, color: '' }));
+    case 'pin':
+      if (busy) { busyNote(); return e.preventDefault(); }
+      return act(t.checked ? 'Holding its updates' : 'Offering its updates again', () => call('hold_updates', { ids: [id], hold: t.checked ? 'pin' : 'release' }));
+    case 'skip-update': return act('Skipping the update', () => call('hold_updates', { ids: [id], hold: 'skip' }));
+    case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
     case 'cat-clear': {
       const ids = selIds().filter(i => !isSep(i));
@@ -1894,15 +1916,29 @@ $('#updates').onclick = () => checkUpdates(false);
 /** Ask Nexus for newer files; quietly (at start) only says so when there are some. */
 async function checkUpdates(quiet) {
   if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) return;
-  const r = quiet ? await call('check_updates').catch(() => null) : await act('Checking for updates', () => call('check_updates'), { reload: false });
+  // The mod list's Update tags come with the reload.
+  const r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
   if (!Array.isArray(r)) return;
-  updates = new Map(r.map(u => [u.id, u]));
-  paint(lists.mods);
   if (quiet) return r.length && toast(`${plural(r.length, 'update')} on Nexus; Check for updates lists them.`);
-  if (!r.length) return toast('Every mod with Nexus ids is up to date.');
-  const rows = r.map(u => `<tr><td>${esc(nameOf(u.id))}</td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td><td><span class="small">${esc(u.url)}</span></td></tr>`).join('');
-  dialog({ title: `${plural(r.length, 'update')} on Nexus`, body: `<table class="fc">${rows}</table><p class="muted small">Download a new file with its “Mod manager download” button (once nxm links open rmm), or use From Nexus…, or download it and drop it on the mod’s row.</p>`, actions: [['cancel', 'Close']] });
+  const held = S.mods.filter(m => m.pinned).length;
+  if (!r.length) return toast(`Every mod with Nexus ids is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.`);
+  const rows = r.map(u => `<tr data-id="${esc(u.id)}"><td>${esc(nameOf(u.id))}</td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td><td><span class="small">${esc(u.url)}</span></td>
+    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button></td></tr>`).join('');
+  const done = dialog({ title: `${plural(r.length, 'update')} on Nexus`, body: `<table class="fc">${rows}</table><p class="muted small">Download a new file with its “Mod manager download” button (once nxm links open rmm), or use From Nexus…, or download it and drop it on the mod’s row. Skip passes over this file; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close']] });
   $('#dlg').classList.add('wide');
+  let changed = false;
+  $('#dlg').onclick = async e => {
+    const b = e.target.closest('button[data-hold]');
+    if (!b) return;
+    try {
+      await call('hold_updates', { ids: [b.closest('tr').dataset.id], hold: b.dataset.hold });
+      changed = true;
+      b.parentElement.textContent = b.dataset.hold === 'pin' ? 'Held' : 'Skipped';
+    } catch (err) { toast(`Holding the update failed.\n${err}`, 'error'); }
+  };
+  await done;
+  $('#dlg').onclick = null;
+  if (changed) load();
 }
 
 // ---- Add-ons ----------------------------------------------------------------------------------

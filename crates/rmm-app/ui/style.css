@@ -131,6 +131,7 @@ main { display: flex; min-height: 0; }
 .list .tags-col { width: 160px; }
 .list .notes-col { width: 200px; }
 .list .date-col { width: 96px; }
+.list .ver-col { width: 90px; }
 .list .when-col { width: 170px; }
 .list .size-col { width: 90px; text-align: right; }
 .list tr.dir td { cursor: pointer; }

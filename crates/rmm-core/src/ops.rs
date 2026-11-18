@@ -34,6 +34,15 @@ pub struct ModRow {
     pub categories: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// The installed version, as Nexus names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// A newer file the last update check found (`check_mod_updates`), unless held back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::nexus::Update>,
+    /// The user keeps the mod at its version (`hold_updates`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// A mod's categories: the ones set on it, else the name of its Nexus category.
@@ -114,6 +123,7 @@ pub fn instance_info(inst: &Instance) -> Result<Value> {
 pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
     let p = inst.profile()?;
     let nexus = crate::nexus::category_names(inst);
+    let mut found = crate::nexus::saved_updates(inst);
     p.mods
         .iter()
         .enumerate()
@@ -126,6 +136,9 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
                 tags: if separator { vec![] } else { tags(&files, &meta) },
                 categories: categories(&meta, &nexus),
                 notes: meta.notes.clone(),
+                version: meta.nexus.as_ref().and_then(|n| n.version.clone()),
+                update: found.remove(&m.id).filter(|u| crate::nexus::offered(u, &meta)),
+                pinned: meta.pinned,
                 name: if separator { m.id[4..].to_string() } else { meta.name },
                 enabled: m.enabled,
                 plugins: files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect(),
