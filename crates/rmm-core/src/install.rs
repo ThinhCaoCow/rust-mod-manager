@@ -167,14 +167,28 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
 /// (`None` keeps the stored ones). It keeps its id, name, place and enabled state; plugins the
 /// new files add join the plugin list. The old files go to trash/; this isn't in the undo history.
 pub fn reinstall(inst: &Instance, id: &str, choices: Option<&Choices>) -> Result<InstallReport> {
-    if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE {
+    replace(inst, id, None, choices)
+}
+
+/// Update a mod in place from another archive or folder (a newer version): it keeps its id, name,
+/// place, enabled state, notes, categories, colour, rules and Nexus ids. Without `choices` a
+/// FOMOD installer takes the stored ones. The old files go to trash/; undo swaps them back.
+pub fn update(inst: &Instance, id: &str, source: &Path, choices: Option<&Choices>) -> Result<InstallReport> {
+    replace(inst, id, Some(source), choices)
+}
+
+/// Reinstall (`new_source` None) or update a mod, as one undoable step.
+fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option<&Choices>) -> Result<InstallReport> {
+    if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE || !inst.mod_dir(id).is_dir() {
         bail!("'{id}' is not an installed mod");
     }
     let meta = inst.mod_meta(id);
-    let Some(source) = meta.source.clone().filter(|s| !s.starts_with("tool:")) else {
-        bail!("{id} wasn't installed from an archive or folder rmm can read again; tool output is rebuilt by running its tool");
+    let source = match new_source {
+        Some(s) => s.to_path_buf(),
+        None => PathBuf::from(meta.source.clone().filter(|s| !s.starts_with("tool:")).with_context(|| {
+            format!("{id} wasn't installed from an archive or folder rmm can read again; tool output is rebuilt by running its tool")
+        })?),
     };
-    let source = PathBuf::from(source);
     if !source.exists() {
         bail!("{} is gone; install the new download instead", source.display());
     }
@@ -188,16 +202,25 @@ pub fn reinstall(inst: &Instance, id: &str, choices: Option<&Choices>) -> Result
         fs::create_dir_all(&staging)?;
         let fresh = staging.join("mod");
         let (files, fomod, warnings) = build(inst, &source, &staging, &fresh, Some(&choices))?;
+        // The old files stay in trash/.replaced/ for undo to swap back.
+        let kept = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !inst.root.join("trash").join(f).exists()).expect("a free name");
         inst.locked(|| {
-            inst.trash_mod(id)?;
+            let old = inst.root.join("trash").join(&kept);
+            fs::create_dir_all(old.parent().expect("under trash/"))?;
+            fs::rename(inst.mod_dir(id), &old)?;
             if let Err(e) = fs::rename(&fresh, inst.mod_dir(id)) {
-                fs::rename(inst.root.join("trash").join(id), inst.mod_dir(id))?;
+                fs::rename(&old, inst.mod_dir(id))?;
                 return Err(e.into());
             }
-            inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ..meta.clone() })
+            let updated = new_source.map(|s| -> Result<ModMeta> {
+                let sha256 = if s.is_file() { Some(crate::lockfile::sha256_file(s)?) } else { None };
+                Ok(ModMeta { source: Some(s.display().to_string()), sha256, ..meta.clone() })
+            });
+            inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ..updated.transpose()?.unwrap_or_else(|| meta.clone()) })
         })?;
         let plugins = top_plugins(&files);
-        inst.edit(&format!("reinstall {id}"), |p| {
+        let label = if new_source.is_some() { format!("update {id}") } else { format!("reinstall {id}") };
+        inst.edit_swapping(&label, Some((id, &kept)), |p| {
             add_plugins(p, &plugins, enabled);
             Ok(())
         })?;
@@ -208,6 +231,39 @@ pub fn reinstall(inst: &Instance, id: &str, choices: Option<&Choices>) -> Result
         let _ = fs::remove_dir_all(preview_dir(inst));
     }
     result
+}
+
+/// The Nexus mod id in a file name as Nexus serves it: `<name>-<mod id>-<version>-<upload time>`.
+pub fn nexus_id_in_name(file: &str) -> Option<u64> {
+    let stem = Path::new(file).file_stem()?.to_str()?;
+    let parts: Vec<&str> = stem.split('-').collect();
+    // The first number after the name; the version and the upload time follow it.
+    let number = |p: &str| !p.is_empty() && !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit());
+    parts.iter().skip(1).take(parts.len().saturating_sub(2)).find(|p| number(p))?.parse().ok()
+}
+
+/// The installed mod `source` is another version of: the same Nexus mod (`nexus_mod`, else the
+/// id in the file name), going by each mod's recorded Nexus id or its archive's name. (id, name).
+pub fn same_mod(inst: &Instance, source: &Path, nexus_mod: Option<u64>) -> Result<Option<(String, String)>> {
+    let Some(want) = nexus_mod.or_else(|| nexus_id_in_name(&source.file_name()?.to_string_lossy())) else { return Ok(None) };
+    Ok(inst.profile()?.mods.iter().filter(|m| !crate::instance::is_separator(&m.id)).find_map(|m| {
+        let meta = inst.mod_meta(&m.id);
+        let have = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| nexus_id_in_name(meta.source.as_deref()?));
+        (have == Some(want)).then(|| (m.id.clone(), meta.name))
+    }))
+}
+
+#[cfg(test)]
+mod nexus_name_tests {
+    #[test]
+    fn reads_the_mod_id_from_nexus_file_names() {
+        let id = super::nexus_id_in_name;
+        assert_eq!(id("Address Library for SKSE Plugins-32444-11-1710536800.zip"), Some(32444));
+        assert_eq!(id("Unofficial Skyrim Special Edition Patch-266-4-2-9a-1693919367.7z"), Some(266));
+        assert_eq!(id(r"D:\Downloads\SkyUI_5_2_SE-12604-5-2SE.7z"), Some(12604));
+        assert_eq!(id("Address Library All in One (1.7.104.0) v13 32444 13 2026-08-27T15-29Z Ae46W7Fw2.zip"), None);
+        assert_eq!((id("Snow.zip"), id("tool:xedit"), id("Name-123.zip")), (None, None, None));
+    }
 }
 
 fn top_plugins(files: &[String]) -> Vec<String> {

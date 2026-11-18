@@ -72,6 +72,15 @@ enum Cmd {
         #[arg(long)]
         choices: Option<String>,
     },
+    /// Update a mod in place from a newer archive or folder: it keeps its id, place, notes,
+    /// categories, colour and rules. The old files go to trash/; undo swaps them back.
+    Update {
+        id: String,
+        path: PathBuf,
+        /// FOMOD choices as JSON (default: the stored ones).
+        #[arg(long)]
+        choices: Option<String>,
+    },
     /// Rename a mod (its id and folder stay). Prints the previous name.
     Rename { id: String, name: String },
     /// Uninstall mods (undoable) or remove separators.
@@ -661,6 +670,10 @@ fn run() -> Result<()> {
         Cmd::Reinstall { id, choices } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
             print(&install::reinstall(&open()?, &id, choices.as_ref())?)
+        }
+        Cmd::Update { id, path, choices } => {
+            let choices = choices.as_deref().map(parse_choices).transpose()?;
+            print(&install::update(&open()?, &id, &path, choices.as_ref())?)
         }
         Cmd::Rename { id, name } => print(&serde_json::json!({ "previous": ops::rename_mod(&open()?, &id, &name)? })),
         Cmd::Uninstall { ids } => done(install::uninstall_mods(&open()?, &ids)),

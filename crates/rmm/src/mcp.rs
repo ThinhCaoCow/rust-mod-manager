@@ -162,6 +162,16 @@ struct ReinstallArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct UpdateArgs {
+    /// The installed mod to update.
+    id: String,
+    /// The new version: a mod folder, .zip, .7z or .rar on this machine.
+    path: String,
+    /// FOMOD choices for the new file; omit to keep the stored ones.
+    choices: Option<Choices>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct RenameArgs {
     id: String,
     name: String,
@@ -684,9 +694,14 @@ impl Rmm {
         out(self.inst().and_then(|i| install::fomod_options(&i, a.path.as_ref(), a.choices.as_ref())))
     }
 
-    #[tool(description = "Install a mod again from the archive or folder it came from (mod_details shows meta.source and meta.fomod), optionally with new FOMOD choices. It keeps its id, name, place and enabled state; the old files go to trash. Not undoable.")]
+    #[tool(description = "Install a mod again from the archive or folder it came from (mod_details shows meta.source and meta.fomod), optionally with new FOMOD choices. It keeps its id, name, place and enabled state; the old files go to trash, and undo swaps them back.")]
     async fn reinstall_mod(&self, Parameters(a): Parameters<ReinstallArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| install::reinstall(&i, &a.id, a.choices.as_ref())))
+    }
+
+    #[tool(description = "Update an installed mod in place from a newer archive or folder (a new download of the same mod): it keeps its id, name, place, enabled state, notes, categories, colour, rules and Nexus ids. A FOMOD installer takes the stored choices unless new ones are given (fomod_options on the new file). The old files go to trash, and undo swaps them back.")]
+    async fn update_mod(&self, Parameters(a): Parameters<UpdateArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| install::update(&i, &a.id, std::path::Path::new(&a.path), a.choices.as_ref())))
     }
 
     #[tool(description = "Rename a mod (its display name; the id stays). Returns the previous name. Not undoable.")]

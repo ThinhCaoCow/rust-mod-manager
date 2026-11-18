@@ -486,7 +486,13 @@ fn ours(inst: &Instance, e: &Deployed, path: &Path) -> Option<bool> {
             return (stat(path).map(|f| f.id) == Some(e.id)).then_some(false);
         }
         if src.exists() {
-            return same(&inst.root.join("trash").join(&e.mod_id).join(&e.src)).then_some(false);
+            // The old files of an uninstalled mod, or of an updated or reinstalled one.
+            let trash = inst.root.join("trash");
+            let replaced = fs::read_dir(trash.join(".replaced")).into_iter().flatten().flatten().map(|d| d.path());
+            let old = std::iter::once(trash.join(&e.mod_id)).chain(replaced.filter(|d| {
+                d.file_name().and_then(|n| n.to_str()?.strip_prefix(e.mod_id.as_str())?.strip_prefix('-')).is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            }));
+            return old.into_iter().any(|d| same(&d.join(&e.src))).then_some(false);
         }
     }
     (state(path) == Some((e.size, e.mtime))).then_some(true)

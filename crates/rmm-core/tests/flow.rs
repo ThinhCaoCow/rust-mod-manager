@@ -243,6 +243,64 @@ fn changes_are_detected_by_file_identity() {
 }
 
 #[test]
+fn updates_a_mod_in_place() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write(&tmp.path().join("game/SkyrimSE.exe"), "exe");
+    write(&tmp.path().join("game/Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&src.join("Snow Plus-4567-1-0-1700000000/Snow.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Snow Plus-4567-1-0-1700000000/textures/snow.dds"), "v1");
+    write(&src.join("Snow Plus-4567-2-0-1710000000/Snow.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Snow Plus-4567-2-0-1710000000/SnowExtra.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Snow Plus-4567-2-0-1710000000/textures/snow.dds"), "v2");
+    write(&src.join("Other/textures/o.dds"), "o");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &tmp.path().join("game"), &tmp.path().join("local")).unwrap();
+    let (v1, v2) = (src.join("Snow Plus-4567-1-0-1700000000"), src.join("Snow Plus-4567-2-0-1710000000"));
+    let snow = install::install(&inst, &v1, Some("Snow Plus"), true, None).unwrap().id;
+    install::install(&inst, &src.join("Other"), None, true, None).unwrap();
+    ops::move_mods(&inst, &["Other".into()], 0).unwrap();
+    ops::set_mod_note(&inst, &snow, "keep the 2K textures").unwrap();
+    ops::set_color(&inst, &snow, "#336699").unwrap();
+    let order = inst.profile().unwrap().mods;
+
+    // The new download is recognised as the same Nexus mod, by its file name.
+    assert_eq!(install::same_mod(&inst, &v2, None).unwrap(), Some((snow.clone(), "Snow Plus".to_string())));
+    assert_eq!(install::same_mod(&inst, &src.join("Other"), None).unwrap(), None);
+    assert_eq!(install::same_mod(&inst, &src.join("Other"), Some(4567)).unwrap().map(|m| m.0), Some(snow.clone()), "a Nexus download names its mod");
+
+    let r = install::update(&inst, &snow, &v2, None).unwrap();
+    assert_eq!((r.id.as_str(), r.name.as_str(), r.plugins.len()), (snow.as_str(), "Snow Plus", 2));
+    let p = inst.profile().unwrap();
+    assert_eq!((p.mods, p.colors.get(&snow).map(String::as_str)), (order.clone(), Some("#336699")));
+    assert!(p.plugins.iter().any(|e| e.name == "SnowExtra.esp" && e.enabled), "the new plugin comes enabled like the mod");
+    let meta = inst.mod_meta(&snow);
+    assert_eq!(meta.notes.as_deref(), Some("keep the 2K textures"));
+    assert!(meta.source.unwrap().ends_with("Snow Plus-4567-2-0-1710000000"));
+    assert_eq!(read(&inst.mod_dir(&snow).join("textures/snow.dds")), "v2");
+    assert_eq!(inst.history().unwrap()[0], format!("update {snow}"));
+
+    // Undo swaps the old files back; redo brings the update again. A note written in between
+    // stays, and the source goes back with the files.
+    ops::set_mod_note(&inst, &snow, "v2 is better").unwrap();
+    inst.undo().unwrap();
+    assert_eq!(read(&inst.mod_dir(&snow).join("textures/snow.dds")), "v1");
+    let meta = inst.mod_meta(&snow);
+    assert_eq!(meta.notes.as_deref(), Some("v2 is better"));
+    assert!(meta.source.unwrap().ends_with("Snow Plus-4567-1-0-1700000000"));
+    assert!(!inst.mod_dir(&snow).join("SnowExtra.esp").exists());
+    assert_eq!(inst.profile().unwrap().mods, order);
+    inst.redo().unwrap();
+    assert_eq!(read(&inst.mod_dir(&snow).join("textures/snow.dds")), "v2");
+    // Once the trash is emptied, undo can't swap: the new files stay.
+    install::empty_trash(&inst).unwrap();
+    inst.undo().unwrap();
+    assert_eq!(read(&inst.mod_dir(&snow).join("textures/snow.dds")), "v2");
+    assert!(install::update(&inst, "sep:Nope", &v2, None).is_err());
+    assert!(install::update(&inst, &snow, &src.join("Gone"), None).unwrap_err().to_string().contains("is gone"));
+}
+
+#[test]
 fn reinstall_relinks_without_external_changes() {
     isolate();
     let tmp = tempfile::tempdir().unwrap();
@@ -702,7 +760,8 @@ fn fomod_installers() {
     assert_eq!(read(&inst.mod_dir(&r.id).join("textures/sub/r.dds")), "r");
     assert!(!inst.root.join(".staging/preview").exists());
 
-    // Reinstall with other choices: same id, place and name; the old files go to trash/.
+    // Reinstall with other choices: same id, place and name; the old files go to trash/, and
+    // undo swaps them back.
     ops::set_mods_enabled(&inst, std::slice::from_ref(&r.id), false).unwrap();
     assert_eq!(ops::rename_mod(&inst, &r.id, " Red armour ").unwrap(), "Red");
     let order = inst.profile().unwrap().mods;
@@ -711,7 +770,12 @@ fn fomod_installers() {
     assert_eq!(inst.profile().unwrap().mods, order);
     assert_eq!(inst.mod_files(&r.id).unwrap(), files);
     assert_eq!(inst.mod_meta(&r.id).fomod.unwrap().options[1].groups[0].choices[0].name, "Glow");
-    assert!(inst.root.join("trash").join(&r.id).join("RedPatch.esp").is_file());
+    assert!(inst.root.join("trash/.replaced").join(format!("{}-1", r.id)).join("RedPatch.esp").is_file());
+    let now = inst.mod_files(&r.id).unwrap();
+    assert_eq!(inst.undo().unwrap().as_deref(), Some(format!("reinstall {}", r.id).as_str()));
+    assert!(inst.mod_dir(&r.id).join("RedPatch.esp").is_file(), "the old files are back");
+    inst.redo().unwrap();
+    assert_eq!(inst.mod_files(&r.id).unwrap(), now);
     // Without choices it keeps the stored ones.
     assert_eq!(install::reinstall(&inst, &r.id, None).unwrap().files, 5);
     assert_eq!(ops::list_mods(&inst).unwrap().iter().find(|m| m.id == r.id).unwrap().name, "Red armour");

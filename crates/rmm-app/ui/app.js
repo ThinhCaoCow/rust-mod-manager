@@ -688,6 +688,7 @@ function renderDetails() {
     <div class="row">
       <button data-act="rename-mod" title="F2">Rename…</button>
       <button data-act="reinstall" ${d && d.meta?.source && !d.meta.source.startsWith('tool:') ? '' : 'disabled title="Only mods installed from an archive or folder"'}>Reinstall…</button>
+      <button data-act="update-mod" title="Replace its files with a newer download, keeping its place, notes, categories, colour and rules">Update…</button>
       <input type="color" data-act="mod-color" value="${esc(m.color ?? '#808080')}" title="Row colour" aria-label="Row colour">
       ${m.color ? '<button data-act="mod-nocolor" title="Remove the row colour">No colour</button>' : ''}
     </div>
@@ -1024,13 +1025,31 @@ async function reinstall(id) {
   }, { reload: false });
   if (!walk) return;
   if (walk === true) {
-    if (!await confirmBox(`Reinstall ${nameOf(id)}?`, `Its files are read again from ${path}. The old files go to the instance's trash folder; this can't be undone.`, 'Reinstall')) return;
+    if (!await confirmBox(`Reinstall ${nameOf(id)}?`, `Its files are read again from ${path}. The old files go to the instance's trash folder, and Undo puts them back.`, 'Reinstall', 'primary')) return;
   } else {
     choices = await fomodWizard(path, walk);
     if (!choices) return;
   }
   const r = await act(`Reinstalling ${nameOf(id)}`, () => call('reinstall', { id, choices }));
   if (r) toast(`Reinstalled ${r.name} (${plural(r.files, 'file')}).${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
+}
+
+/** Replace a mod's files with a newer version; a FOMOD installer opens with the choices it was
+ *  installed with. */
+async function updateMod(id, path, nx = null) {
+  const d = await call('details', { id }).catch(() => null);
+  const walk = await act(`Reading ${basename(path)}`, async () => {
+    try { return await call('fomod', { path, choices: d?.meta?.fomod ?? null }); }
+    catch { return call('fomod', { path }); } // the stored choices don't fit the new installer
+  }, { reload: false, problem: true });
+  if (!walk) return;
+  let choices;
+  if (walk !== true) {
+    choices = walk.steps.length ? await fomodWizard(path, walk) : walk.choices;
+    if (!choices) return;
+  }
+  const r = await act(`Updating ${nameOf(id)}`, () => call('update_mod', { id, path, choices, nexus: nx?.nexus }), { problem: true });
+  if (r && r !== true) toast(`Updated ${r.name} from ${basename(path)} (${plural(r.files, 'file')}). Undo puts the old files back.${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
 }
 
 async function renameSep(id) {
@@ -1487,6 +1506,10 @@ $('#details').addEventListener('click', async e => {
     case 'rename': return renameSep(id);
     case 'rename-mod': return renameMod(id);
     case 'reinstall': return reinstall(id);
+    case 'update-mod': {
+      const path = await T.dialog.open({ title: `The new version of ${nameOf(id)}`, filters: [{ name: 'Mod archives', extensions: ['zip', '7z', 'rar'] }] });
+      return path && updateMod(id, path);
+    }
     case 'nocolor': return act('Changing the colour', () => call('edit_separator', { id, color: '' }));
     case 'mod-nocolor': return act('Changing the colour', () => call('set_color', { id, color: '' }));
     case 'files': return fileConflicts(id);
@@ -2274,6 +2297,15 @@ function slotAfter(id) {
 /** `nx`: what nexus_fetch found about a downloaded file, recorded on the new mod. */
 async function install(paths, at = null, nx = null) {
   for (const path of paths) {
+    // Another version of an installed mod (the same Nexus mod): offer to update it in place.
+    const same = await call('same_mod', { path, mod_id: nx?.nexus?.mod_id ?? null }).catch(() => null);
+    if (same) {
+      const [id, name] = same;
+      const v = await dialog({ title: `Update ${name}?`, body: `<p><b>${esc(basename(path))}</b> looks like another version of <b>${esc(name)}</b>: the same Nexus mod.</p><p class="muted small">Update replaces its files and keeps its place, notes, categories, colour and rules; Undo puts the old files back. Install as a new mod keeps both.</p>`,
+        actions: [['cancel', 'Cancel'], ['new', 'Install as a new mod'], ['ok', 'Update', 'primary']] });
+      if (v === 'ok') await updateMod(id, path, nx);
+      if (v !== 'new') continue;
+    }
     // Unpacks the archive once; the install below reuses it.
     const walk = await act(`Reading ${basename(path)}`, () => call('fomod', { path }), { reload: false, problem: true });
     if (!walk) continue;

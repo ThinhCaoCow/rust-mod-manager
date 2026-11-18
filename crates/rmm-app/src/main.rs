@@ -335,6 +335,15 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(r)
         }
         "reinstall" => json!(install::reinstall(&inst, &s("id")?, choices()?.as_ref())?),
+        "update_mod" => {
+            let r = install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref())?;
+            if let Ok(n) = serde_json::from_value(a["nexus"].clone()) {
+                nexus::remember(&inst, &r.id, n)?;
+            }
+            json!(r)
+        }
+        // The installed mod a download is another version of, if any: [id, name].
+        "same_mod" => json!(install::same_mod(&inst, Path::new(&s("path")?), a["mod_id"].as_u64())?),
         "rename_mod" => json!(ops::rename_mod(&inst, &s("id")?, &s("name")?)?),
         "overwrite_files" => json!(inst.mod_files(OVERWRITE)?),
         "mod_from_overwrite" => json!(install::mod_from_overwrite(&inst, &s("name")?)?),

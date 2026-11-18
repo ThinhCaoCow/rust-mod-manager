@@ -467,13 +467,20 @@ impl Instance {
 
     /// Mutate the active profile. The previous state is pushed onto the undo stack.
     pub fn edit<R>(&self, label: &str, f: impl FnOnce(&mut Profile) -> Result<R>) -> Result<R> {
+        self.edit_swapping(label, None, f)
+    }
+
+    /// `edit` for a step that also put a mod's old files in `trash/<folder>` (an update or a
+    /// reinstall): undo and redo swap the folders back, so the step is recorded even when the
+    /// profile doesn't change. `swap` is (mod id, folder under trash/).
+    pub(crate) fn edit_swapping<R>(&self, label: &str, swap: Option<(&str, &str)>, f: impl FnOnce(&mut Profile) -> Result<R>) -> Result<R> {
         self.locked(|| {
             let before = self.profile()?;
             let mut after = before.clone();
             let r = f(&mut after)?;
             after.apply_locks();
-            if after != before {
-                self.push("undo", label, &before)?;
+            if after != before || swap.is_some() {
+                self.push("undo", label, swap, &before)?;
                 let _ = fs::remove_dir_all(self.stack_dir("redo"));
                 write_atomic(&self.profile_file(), &toml::to_string_pretty(&after)?)?;
             }
@@ -559,10 +566,15 @@ impl Instance {
 
     fn shift(&self, from: &str, to: &str) -> Result<Option<String>> {
         let Some((path, label)) = self.stack(from)?.pop() else { return Ok(None) };
-        let mut snapshot: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
+        let text = fs::read_to_string(&path)?;
+        let mut snapshot: Profile = toml::from_str(&text)?;
+        let swap = text.lines().nth(1).and_then(|l| l.strip_prefix("# swap ")?.split_once('\t'));
         let current = self.profile()?;
-        self.push(to, &label, &current)?;
+        self.push(to, &label, swap, &current)?;
         fs::remove_file(&path)?;
+        if let Some((id, folder)) = swap {
+            self.swap_folder(id, folder)?;
+        }
         for m in &snapshot.mods {
             let trashed = self.root.join("trash").join(&m.id);
             if !self.mod_dir(&m.id).exists() && trashed.exists() {
@@ -589,6 +601,24 @@ impl Instance {
         Ok(Some(label))
     }
 
+    /// Trade a mod's files with its copy in `trash/<folder>`: the same call undoes and redoes an
+    /// update. Nothing happens once the trash was emptied.
+    fn swap_folder(&self, id: &str, folder: &str) -> Result<()> {
+        let (live, kept) = (self.mod_dir(id), self.root.join("trash").join(folder));
+        if !live.is_dir() || !kept.is_dir() {
+            return Ok(());
+        }
+        let now = self.mod_meta(id);
+        let tmp = self.root.join("trash").join(format!("{folder}~"));
+        fs::rename(&live, &tmp)?;
+        fs::rename(&kept, &live)?;
+        fs::rename(&tmp, &kept)?;
+        // The source, FOMOD choices, Nexus ids and review go with the files; the name, notes and
+        // categories stay as the user last set them.
+        let back = self.mod_meta(id);
+        self.write_mod_meta(id, &ModMeta { name: now.name, notes: now.notes, categories: now.categories, ..back })
+    }
+
     fn stack_dir(&self, name: &str) -> PathBuf {
         self.profile_dir().join("history").join(name)
     }
@@ -610,7 +640,7 @@ impl Instance {
             .collect())
     }
 
-    fn push(&self, name: &str, label: &str, p: &Profile) -> Result<()> {
+    fn push(&self, name: &str, label: &str, swap: Option<(&str, &str)>, p: &Profile) -> Result<()> {
         let dir = self.stack_dir(name);
         fs::create_dir_all(&dir)?;
         let existing = self.stack(name)?;
@@ -618,7 +648,8 @@ impl Instance {
             .last()
             .and_then(|(f, _)| f.file_stem()?.to_str()?.parse::<u64>().ok())
             .map_or(0, |n| n + 1);
-        let body = format!("# {}\n{}", label.replace('\n', " "), toml::to_string_pretty(p)?);
+        let swap = swap.map(|(id, folder)| format!("# swap {id}\t{folder}\n")).unwrap_or_default();
+        let body = format!("# {}\n{swap}{}", label.replace('\n', " "), toml::to_string_pretty(p)?);
         fs::write(dir.join(format!("{next:010}.toml")), body)?;
         for (old, _) in existing.iter().take((existing.len() + 1).saturating_sub(crate::settings::get().history.limit)) {
             fs::remove_file(old)?;
