@@ -429,6 +429,7 @@ input[type=radio] { accent-color: var(--accent); width: 15px; height: 15px; marg
 /* Toasts, drop zone */
 #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 60; max-width: min(440px, 90vw); }
 .toast { background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow); user-select: text; white-space: pre-wrap; }
+.toast button { margin-top: 8px; }
 .toast.error { background: var(--bad-bg); border-color: var(--bad); }
 .toast.warn { background: var(--lose-bg); border-color: var(--lose); }
 #dropzone { position: fixed; inset: 0; z-index: 40; pointer-events: none; display: grid; place-items: center; background: rgb(23 143 114 / 0.12); border: 3px dashed var(--accent); }

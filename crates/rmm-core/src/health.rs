@@ -99,7 +99,7 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
             add("warning", "plugin_unreadable", &p.name, format!("could not read plugin header: {e}"));
         }
         if p.enabled && !p.missing_masters.is_empty() {
-            add("error", "missing_masters", &p.name, format!("needs {} enabled and loaded earlier", p.missing_masters.join(", ")));
+            add("error", "missing_masters", &p.name, format!("needs {} turned on and loaded before it: its masters, the plugins it's built on; the game crashes at start without them", p.missing_masters.join(", ")));
         }
     }
     let full = plugins.iter().filter(|p| p.enabled && !p.light).count();
@@ -203,7 +203,7 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
                 add("info", "not_deployed", "deploy", format!("{} files to link and {} to remove since the last deploy", plan.link.len(), plan.remove.len()));
             }
             for f in plan.external_changes {
-                add("warning", "external_change", &f, "changed outside rmm; deploy copies it to overwrite/, which then wins over every mod".into());
+                add("warning", "external_change", &f, "changed outside rmm; deploy keeps it in Overwrite (the files that belong to no mod), which wins over every mod".into());
             }
         }
     }

@@ -501,7 +501,7 @@ function modRow(m, i) {
     b.unmet?.clashes.length ? `Incompatible with ${b.unmet.clashes.map(nameOf).join(', ')}, enabled too` : '',
   ].filter(Boolean).join('. ') + ' (mod rules)';
   const warn = b ? `<span class="warn-icon" title="${esc(why)}">⚠</span>` : '';
-  const masters = D.missing.has(m.id) ? '<span class="pill bad" title="One of its plugins needs masters that aren’t loaded before it">Masters</span>' : '';
+  const masters = D.missing.has(m.id) ? '<span class="pill bad" title="One of its plugins needs a master that’s off or loads after it. A master is a plugin another is built on; without it the game crashes at start.">Masters</span>' : '';
   const note = m.notes ? `<span class="note-icon" title="${esc(m.notes)}">✎</span>` : '';
   const up = m.update;
   const upd = up ? `<span class="pill win" title="Nexus has ${esc(up.file_name)}${up.latest ? ` (version ${esc(up.latest)})` : ''}">Update${up.latest ? ' ' + esc(up.latest) : ''}</span>`
@@ -589,7 +589,7 @@ function renderMods() {
   $('#mods-empty').textContent = S.mods.length ? 'No mods match the filter.' : 'No mods yet. Drop a .zip, .7z or .rar here, or use Install mod.';
   const ow = S.overwrite;
   $('#overwrite-bar').hidden = !ow;
-  $('#overwrite-bar').innerHTML = ow ? `<b>Overwrite</b><span class="muted small">${plural(ow, 'file')} that tools, the game or changes outside rmm left. They win over every mod.</span><span class="spacer"></span>
+  $('#overwrite-bar').innerHTML = ow ? `<b title="Files in the game’s Data folder that belong to no mod: what the game, tools or other programs wrote there. rmm keeps them here so they aren’t lost.">Overwrite</b><span class="muted small">${plural(ow, 'file')} that tools, the game or changes outside rmm left. They win over every mod.</span><span class="spacer"></span>
     <button data-ow="show">Show files</button><button data-ow="mod">Create mod…</button><button data-ow="clear" class="danger">Clear…</button>` : '';
   const nb = S.broken.length;
   $('#rules-notice').hidden = !nb;
@@ -617,7 +617,7 @@ function pluginRow(p, i) {
   const type = p.master ? (p.light ? 'ESL' : 'ESM') : p.light ? 'ESP · light' : 'ESP';
   const from = p.implicit ? 'Base game' : p.mod_id ? nameOf(p.mod_id) : 'Data folder';
   const issue = p.error ? `<span class="pill bad" title="${esc(p.error)}">Unreadable</span>`
-    : p.enabled && p.missing_masters.length ? `<span class="pill bad" title="Needs ${esc(p.missing_masters.join(', '))} enabled and loaded earlier">Missing masters</span>` : '';
+    : p.enabled && p.missing_masters.length ? `<span class="pill bad" title="Needs ${esc(p.missing_masters.join(', '))} turned on and loaded before it: masters are the plugins this one is built on, and the game crashes at start without them.">Missing masters</span>` : '';
   const sp = selPlugin && S.plugins.find(x => x.name === selPlugin), om = oneMod();
   const rel = sp ? sp.masters.some(m => m.toLowerCase() === p.name.toLowerCase()) : !!om && p.mod_id === om.id;
   const cls = [p.implicit ? 'locked' : '', p.enabled ? '' : 'off', plugSel.has(p.name) ? 'sel' : '', rel ? 'rel' : '', ...dragCls(lists.plugins, p.name, i)];
@@ -638,7 +638,7 @@ function renderPlugins() {
   $('#plugins').classList.toggle('filtering', !!f);
   $('#plugins-note').textContent = f
     ? `${lists.plugins.items.length.toLocaleString()} of ${plural(S.plugins.length, 'plugin')}`
-    : 'Masters always load before other plugins. Drag to reorder; Ctrl+↑/↓ moves the selected ones, Space turns them on or off, right-click for more.';
+    : 'Masters (ESM and ESL plugins, which others are built on) always load first. Drag to reorder; Ctrl+↑/↓ moves the selected ones, Space turns them on or off, right-click for more.';
   paint(lists.plugins);
 }
 
@@ -839,6 +839,7 @@ function renderPluginDetails(box) {
     ${p.mod_id ? `<p>From <button class="link" data-goto="${esc(p.mod_id)}">${esc(nameOf(p.mod_id))}</button></p>` : `<p class="muted">${p.implicit ? 'Base game' : 'In the Data folder, not from a mod'}</p>`}
     ${p.error ? `<p><span class="pill bad">Unreadable</span> ${esc(p.error)}</p>` : ''}
     <h3>Masters (${p.masters.length})</h3>
+    ${p.masters.length ? '<p class="muted small">The plugins this one is built on. They have to be on and load before it.</p>' : ''}
     ${p.masters.length ? `<ul>${p.masters.map(m => `<li>${lower.has(m.toLowerCase()) ? '<span class="pill bad">Missing</span>' : ''}<button class="link" data-plugin="${esc(m)}">${esc(m)}</button></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
     ${loaders.length ? `<h3>Needed by (${loaders.length})</h3><ul>${loaders.slice(0, 50).map(x => `<li><button class="link" data-plugin="${esc(x.name)}">${esc(x.name)}</button></li>`).join('')}</ul>` : ''}
     <h3>LOOT rule</h3>
@@ -1153,10 +1154,10 @@ $('#overwrite-bar').onclick = async e => {
     const files = await act('Reading overwrite', () => call('overwrite_files'), { reload: false });
     if (files) dialog({ title: 'Overwrite', body: `<p class="muted small">Deployed on top of every mod. Create a mod from them to give them a place in the list.</p><pre>${esc(files.join('\n'))}</pre>`, actions: [['cancel', 'Close']] });
   } else if (what === 'mod') {
-    const name = await ask('Create a mod from overwrite', 'Everything in overwrite becomes a new mod at the end of the list.', 'Overwrite output');
+    const name = await ask('Create a mod from Overwrite', 'Everything in Overwrite becomes a new mod at the end of the list.', 'Overwrite output');
     if (name) act('Creating the mod', async () => { const r = await call('mod_from_overwrite', { name }); toast(`Created ${r.name} (${plural(r.files, 'file')}).`); });
   } else if (what === 'clear') {
-    if (await confirmBox('Clear overwrite?', `Moves ${plural(S.overwrite, 'file')} to the instance's trash; the next deploy removes them from the game folder. They are often settings the game saved (MCM menus, for example) or a tool's output: Create mod… keeps them instead. Undo brings them back as a mod named “Cleared overwrite”.`, 'Clear')) {
+    if (await confirmBox('Clear Overwrite?', `Moves ${plural(S.overwrite, 'file')} to the instance's trash; the next deploy removes them from the game folder. They are often settings the game saved (MCM menus, for example) or a tool's output: Create mod… keeps them instead. Undo brings them back as a mod named “Cleared overwrite”.`, 'Clear')) {
       act('Clearing overwrite', () => call('clear_overwrite'));
     }
   }
@@ -1993,12 +1994,12 @@ $('#deploy').onclick = async () => {
   const body = n
     ? part('to link', plan.link)
       + part('to remove', plan.remove)
-      + part('original files to back up', plan.backup, 'Restored when the mod goes away, or on purge.')
-      + part('changed outside rmm', plan.external_changes, 'Copied to overwrite/, where they keep winning over every mod.')
-      + part('written by the game during play', plan.played ?? [], 'Moved to overwrite/ and linked back.')
+      + part('original files to back up', plan.backup, 'The game’s own files a mod replaces. They come back when the mod goes away, or on Purge.')
+      + part('changed outside rmm', plan.external_changes, 'Kept in Overwrite (the bar above the mod list), where they keep winning over every mod.')
+      + part('written by the game during play', plan.played ?? [], 'Moved to Overwrite and linked back.')
       + `<p class="muted small" style="margin-top:10px">${plural(plan.unchanged, 'file')} already in place.</p>`
     : `<p>The game folder already matches this profile (${plural(plan.unchanged, 'file')}).</p>`;
-  const r = n && !W.deployPreview ? 'apply' : await dialog({ title: 'Deploy to the game folder', body, actions: [['purge', 'Purge…'], ...(n ? [['cancel', 'Cancel'], ['apply', 'Deploy', 'primary']] : [['cancel', 'Close']])] });
+  const r = n && !W.deployPreview ? 'apply' : await dialog({ title: 'Deploy to the game folder', body: body + '<p class="muted small">Purge… takes every mod rmm put in the game folder out again and puts the game’s own files back.</p>', actions: [['purge', 'Purge…'], ...(n ? [['cancel', 'Cancel'], ['apply', 'Deploy', 'primary']] : [['cancel', 'Close']])] });
   if (r === 'purge') return purge();
   if (r !== 'apply') return;
   const res = await act('Deploying', () => call('deploy'));
@@ -2013,7 +2014,7 @@ async function purge() {
   if (!files) return dialog({ title: 'Purge', body: '<p>Nothing rmm deployed is in the game folder.</p>', actions: [['cancel', 'Close']] });
   const part = (label, list) => list?.length ? `<details><summary><b>${list.length.toLocaleString()}</b> ${label}</summary><pre>${fileList(list)}</pre></details>` : '';
   const body = `<p>The game folder goes back to how it was before rmm: deployed files are removed and backed-up originals restored. Your mods and profiles stay; Deploy puts everything back.</p>`
-    + part('to remove', p.remove) + part('changed outside rmm, copied to overwrite first', p.external_changes) + part('originals to restore', p.backup);
+    + part('to remove', p.remove) + part('changed outside rmm, copied to Overwrite first', p.external_changes) + part('originals to restore', p.backup);
   if (await dialog({ title: 'Purge the game folder', body, actions: [['cancel', 'Cancel'], ['apply', 'Purge', 'danger']] }) !== 'apply') return;
   const r = await act('Purging', () => call('purge', { dry_run: false }));
   if (r) toast(`Purged: ${plural(r.remove.length, 'file')} removed.`);
@@ -2317,7 +2318,7 @@ async function checkUpdates(quiet) {
 
 // ---- Add-ons ----------------------------------------------------------------------------------
 
-const CAPS = { read_instance: 'read your setup', modify_profile: 'change mod and plugin order and what is enabled', mod_files: 'read mod files and write to overwrite/', run_tools: 'run your tools', network: 'reach the internet' };
+const CAPS = { read_instance: 'read your setup', modify_profile: 'change mod and plugin order and what is enabled', mod_files: 'read mod files and write to Overwrite', run_tools: 'run your tools', network: 'reach the internet' };
 const HOOK_TEXT = { after_install: 'after installs', before_deploy: 'before deploys (and can stop them)', after_deploy: 'after deploys', after_tool_run: 'after tool runs', health_check: 'in health checks' };
 const hookText = a => a.hooks.map(h => HOOK_TEXT[h] ?? h).join(', ');
 const capText = a => a.capabilities.length ? a.capabilities.map(c => CAPS[c] ?? c).join(', ') + (a.hosts.length ? ` (${a.hosts.join(', ')})` : '') : 'nothing beyond its own work';
@@ -2795,6 +2796,7 @@ function slotAfter(id) {
 
 /** `nx`: what nexus_fetch found about a downloaded file, recorded on the new mod. */
 async function install(paths, at = null, nx = null) {
+  let plugins = 0;
   for (const path of paths) {
     // Another version of an installed mod (the same Nexus mod): offer to update it in place.
     const same = await call('same_mod', { path, mod_id: nx?.nexus?.mod_id ?? null }).catch(() => null);
@@ -2817,9 +2819,17 @@ async function install(paths, at = null, nx = null) {
     const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus }), { problem: true });
     if (!r) continue;
     if (at !== null) at++;
+    plugins += r.plugins.length;
     const notes = [r.plugins.length ? `Plugins: ${r.plugins.join(', ')}` : '', ...r.warnings].filter(Boolean);
     toast(`Installed ${r.name} (${plural(r.files, 'file')}).${notes.length ? '\n' + notes.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
   }
+  if (plugins) offerLoot(plugins);
+}
+
+/** New plugins load last; offer LOOT's order, which shows what moves before anything changes. */
+function offerLoot(n) {
+  toast(`${n === 1 ? 'The new plugin loads' : `The ${n} new plugins load`} last. LOOT can put ${n === 1 ? 'it' : 'them'} where ${n === 1 ? 'it belongs' : 'they belong'}; you see what moves first.`,
+    'info', ['Sort with LOOT…', () => $('#loot').click()]);
 }
 
 T.webview.getCurrentWebview().onDragDropEvent(async e => {
@@ -3816,16 +3826,23 @@ function dialog({ title, body = '', actions, input }) {
 const ask = (title, text, value) => dialog({ title, body: `<p>${esc(text)}</p>`, input: value, actions: [['cancel', 'Cancel'], ['ok', 'OK', 'primary']] });
 const confirmBox = async (title, text, yes, kind = 'danger') => (await dialog({ title, body: `<p>${esc(text)}</p>`, actions: [['cancel', 'Cancel'], ['ok', yes, kind]] })) === 'ok';
 
-function toast(msg, kind = 'info') {
+/** `action`: [label, fn], a button on the toast. */
+function toast(msg, kind = 'info', action = null) {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
   el.textContent = msg;
+  if (action) {
+    const b = document.createElement('button');
+    b.textContent = action[0];
+    b.onclick = e => { e.stopPropagation(); el.remove(); action[1](); };
+    el.append(document.createElement('br'), b);
+  }
   el.title = 'Click to dismiss';
   el.onclick = () => el.remove();
   $('#toasts').append(el);
   // Errors stay until clicked (the newest five), so a refusal can be read twice.
   if (kind === 'error') $$('#toasts .toast.error').slice(0, -5).forEach(t => t.remove());
-  else setTimeout(() => el.remove(), W.toast * 1000);
+  else setTimeout(() => el.remove(), W.toast * (action ? 3000 : 1000)); // time to reach the button
 }
 
 applyWin();
