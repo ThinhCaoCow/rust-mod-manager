@@ -1984,11 +1984,39 @@ $('#nxm').onclick = async () => {
   const free = nexus.user && !nexus.user.is_premium;
   const link = await ask('Install from Nexus Mods', free
     ? 'Free accounts download from the website: on the mod’s Files tab, click “Mod manager download” (with rmm opening Nexus links, the file installs here). Or paste that button’s nxm:// link.'
-    : 'Paste a mod page link or a mod id (Premium: downloads its newest main file), or the nxm:// link of a file’s “Mod manager download” button.', '');
+    : 'Paste a mod page link or a mod id (Premium: downloads its newest main file), a collection’s link, or the nxm:// link of a file’s “Mod manager download” button.', '');
   if (!link || !await nexusReady('Downloads from Nexus Mods need your API key.')) return;
+  if (link.includes('/collections/')) return installCollection(link);
   const f = await act('Downloading from Nexus', () => call('nexus_fetch', { link }), { reload: false, problem: true });
   if (f && f !== true) install([f.path], slotAfter(selIds().length === 1 ? selIds()[0] : null), f);
 };
+
+/** A Nexus collection: what it would install, then install it into a new profile (as Vortex
+ *  does, so the user's setup stays as it was) or into this one. */
+async function installCollection(link) {
+  if (!nexus.user?.is_premium) return toast('Installing a collection downloads each of its files directly, which Nexus allows Premium accounts only. Its mods can still be installed one by one from the website.', 'error');
+  const r = await act('Reading the collection', () => call('install_collection', { link, dry_run: true }), { reload: false, problem: true });
+  if (!r || r === true) return;
+  const list = (xs, n = 8) => xs.length ? `<ul class="small">${xs.slice(0, n).map(x => `<li>${esc(x)}</li>`).join('')}${xs.length > n ? `<li class="muted">and ${xs.length - n} more</li>` : ''}</ul>` : '';
+  const name = r.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').trim().replace(/^\.+|\.+$/g, '').slice(0, 64) || 'Collection';
+  const body = `<p>${plural(r.install.length, 'mod')} to download and install (${bytes(r.download_size)})${r.installed.length ? `; ${plural(r.installed.length, 'mod')} you have already are turned on` : ''}. Its mod rules, plugin list and tools come too, then LOOT sorts the plugins.</p>
+    ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}
+    ${r.game_folder.length ? `<p class="muted small">The collection puts these in the game folder: ${esc(r.game_folder.join(', '))}.</p>` : ''}
+    ${r.optional.length ? `<label class="row"><input id="co-opt" type="checkbox"> Also its ${plural(r.optional.length, 'optional mod')}</label>${list(r.optional)}` : ''}
+    <label class="row" style="margin-top:12px"><input id="co-new" type="checkbox" checked> Into a new profile, so your current setup stays as it is</label>
+    <label class="field">New profile’s name <input id="co-name" type="text" value="${esc(name)}" spellcheck="false"></label>`;
+  if (await dialog({ title: `Install ${r.name} (revision ${r.revision})`, body, actions: [['cancel', 'Cancel'], ['go', 'Install', 'primary']] }) !== 'go') return;
+  const args = { link, revision: r.revision, optional: $('#co-opt')?.checked ?? false, profile: $('#co-new').checked ? $('#co-name').value.trim() : null };
+  const done = await act(`Installing ${r.name}`, () => call('install_collection', args), { problem: true });
+  if (!done || done === true) return;
+  const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p>${list(xs, 20)}` : '';
+  await dialog({
+    title: `${done.name} is installed`,
+    body: `<p>${plural(done.install.length - done.failed.length, 'mod')} installed${done.profile ? `, in the profile “${esc(done.profile)}”, now the active one` : ''}. Deploy or Play applies it to the game folder.</p>
+      ${part('Couldn’t install', done.failed)}${part('The curator’s notes (each is also on its mod)', done.instructions)}${part('Tools added', done.tools)}${part('Warnings', done.warnings)}`,
+    actions: [['ok', 'OK', 'primary']],
+  });
+}
 
 $('#updates').onclick = () => checkUpdates(false);
 /** Ask Nexus for newer files; quietly (at start) only says so when there are some. */

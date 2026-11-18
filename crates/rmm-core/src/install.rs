@@ -202,6 +202,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
         fs::create_dir_all(&staging)?;
         let fresh = staging.join("mod");
         let (files, fomod, warnings) = build(inst, &source, &staging, &fresh, Some(&choices))?;
+        let files = if meta.game_folder { to_game_folder(&fresh)? } else { files };
         // The old files stay in trash/.replaced/ for undo to swap back.
         let kept = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !inst.root.join("trash").join(f).exists()).expect("a free name");
         inst.locked(|| {
@@ -615,6 +616,35 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// For a mod of Vortex's "dinput" or "enb" type, which Vortex deploys to the game folder: move
+/// what sits at the top of the mod and isn't Data content into `root/`. Data content (the Data
+/// folders rmm knows, plugins and archives, a plugin's own INI) stays, since it only works in
+/// Data. A name `root/` has already stays too. Rewrites the index; returns the files.
+pub(crate) fn to_game_folder(dir: &Path) -> Result<Vec<String>> {
+    let entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    let names: Vec<String> = entries.iter().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
+    let plugins: Vec<&str> = names.iter().filter(|n| is_plugin(n)).filter_map(|n| Some(n.rsplit_once('.')?.0)).collect();
+    let root = dir.join("root");
+    for (e, n) in entries.iter().zip(&names) {
+        let data = if e.file_type()?.is_dir() {
+            n == "root" || DATA_DIRS.contains(&n.as_str())
+        } else {
+            [crate::instance::MOD_META, ".rmm-index"].contains(&n.as_str())
+                || ext_of(n).is_some_and(|x| DATA_EXTS.contains(&x.as_str()))
+                || n.strip_suffix(".ini").is_some_and(|s| plugins.contains(&s))
+        };
+        let to = root.join(e.file_name());
+        if !data && !to.exists() {
+            fs::create_dir_all(&root)?;
+            fs::rename(e.path(), to)?;
+        }
+    }
+    let files = index_dir(dir)?;
+    fs::write(dir.join(".rmm-index"), files.join("
+"))?;
+    Ok(files)
 }
 
 enum Layout {

@@ -3,7 +3,10 @@
 //! file, with each one's FOMOD choices and whether it is optional, the rules between them and the
 //! plugins. rmm downloads each file (Premium accounts), installs it with those choices, adds the
 //! rules as mod rules, sorts the mods by them, applies the plugin list and sorts the plugins
-//! with LOOT, as Vortex does. Mods already installed from the same Nexus file are kept.
+//! with LOOT, as Vortex does. Mods already installed from the same Nexus file are kept and
+//! turned on. Like Vortex it can install into a new profile, so the user's own setup stays as it
+//! was. Mods of Vortex's "dinput" and "enb" types go to the game folder (see
+//! `install::to_game_folder`).
 use crate::Instance;
 use crate::instance::NexusRef;
 use crate::nexus::Client;
@@ -19,6 +22,9 @@ use std::path::PathBuf;
 pub struct Report {
     pub dry_run: bool,
     pub name: String,
+    /// The new profile it went into, when it went into one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub revision: u64,
     /// The game versions the collection was made for.
     pub game_versions: Vec<String>,
@@ -30,6 +36,8 @@ pub struct Report {
     pub installed: Vec<String>,
     /// Optional mods left out.
     pub optional: Vec<String>,
+    /// Mods of Vortex's "dinput" or "enb" type: what isn't Data content goes to the game folder.
+    pub game_folder: Vec<String>,
     /// Mods that couldn't be downloaded or installed, and why.
     pub failed: Vec<String>,
     /// The curator's notes on mods ("name: note"); each also becomes that mod's note.
@@ -42,10 +50,17 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// Install a collection's revision (default: the newest) into the active profile: its required
-/// mods, and with `optional` its optional ones too. A dry run downloads only the bundle and
-/// says what would be installed.
-pub fn install(inst: &Instance, client: &Client, link: &str, number: Option<u64>, optional: bool, dry_run: bool) -> Result<Report> {
+/// Install a collection's revision (default: the newest) into the active profile, or into a new
+/// empty profile `new_profile` that becomes the active one: its required mods, and with
+/// `optional` its optional ones too. A dry run downloads only the bundle and says what would be
+/// installed.
+pub fn install(inst: &mut Instance, client: &Client, link: &str, number: Option<u64>, optional: bool, new_profile: Option<&str>, dry_run: bool) -> Result<Report> {
+    if let Some(name) = new_profile {
+        crate::instance::check_profile_name(name)?;
+        if inst.find_profile(name).is_ok() {
+            bail!("profile '{name}' already exists; pick another name, or switch to it and install without a new profile");
+        }
+    }
     let slug = slug(link)?;
     let rev = revision(inst, client, &slug, number)?;
     let c = read(&bundle(inst, client, &slug, &rev)?)?;
@@ -54,7 +69,7 @@ pub fn install(inst: &Instance, client: &Client, link: &str, number: Option<u64>
         bail!("this collection is for {d}, the instance for {domain}");
     }
     let strings = |v: &Value| v.as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect::<Vec<_>>();
-    let mut r = Report { dry_run, name: rev.name.clone(), revision: rev.number, game_versions: strings(&c["info"]["gameVersions"]), ..Default::default() };
+    let mut r = Report { dry_run, name: rev.name.clone(), profile: new_profile.map(str::to_owned), revision: rev.number, game_versions: strings(&c["info"]["gameVersions"]), ..Default::default() };
     if let Ok(v) = crate::launch::game_version(&inst.config.game_path, inst.config.game) {
         let have = v.map(|n| n.to_string()).join(".");
         if !r.game_versions.is_empty() && !r.game_versions.contains(&have) {
@@ -78,6 +93,9 @@ pub fn install(inst: &Instance, client: &Client, link: &str, number: Option<u64>
         }
         if let Some(t) = m["instructions"].as_str().filter(|t| !t.trim().is_empty()) {
             r.instructions.push(format!("{name}: {}", t.trim()));
+        }
+        if game_folder(m) {
+            r.game_folder.push(name.clone());
         }
         let (Some(mod_id), Some(file_id), true) = (src["modId"].as_u64(), src["fileId"].as_u64(), src["type"] == "nexus") else {
             r.failed.push(format!("{name}: comes from {}, not a Nexus file; install it yourself", src["type"].as_str().unwrap_or("somewhere else")));
@@ -104,6 +122,16 @@ pub fn install(inst: &Instance, client: &Client, link: &str, number: Option<u64>
     if !todo.is_empty() && client.validate()?["is_premium"] != true {
         bail!("installing a collection needs a Nexus Premium account: rmm downloads each of its files directly");
     }
+    if let Some(name) = new_profile {
+        // Empty: switching adds every installed mod, turned off; the collection turns its own on,
+        // and the script extender stays on, as in a new empty profile in the window.
+        inst.create_profile(name, false)?;
+        inst.switch_profile(name)?;
+        let se = crate::launch::script_extender_mods(inst)?;
+        if !se.is_empty() {
+            crate::ops::set_enabled_as(inst, &se, true, "turn the script extender on")?;
+        }
+    }
     for (i, (m, mod_id, file_id)) in todo.iter().enumerate() {
         let name = m["name"].as_str().unwrap_or("?");
         crate::progress::report(&format!("installing {name}"), i, todo.len());
@@ -113,6 +141,10 @@ pub fn install(inst: &Instance, client: &Client, link: &str, number: Option<u64>
         }
     }
 
+    let on: Vec<String> = ids.iter().map(|(_, id)| id.clone()).collect();
+    if !on.is_empty() {
+        crate::ops::set_enabled_as(inst, &on, true, &format!("collection {}: turn its mods on", rev.name))?;
+    }
     r.rules = add_rules(inst, &c, &ids, &mut r.warnings)?;
     let want: HashMap<String, bool> = c["plugins"].as_array().into_iter().flatten().filter_map(|x| Some((x["name"].as_str()?.to_lowercase(), x["enabled"].as_bool().unwrap_or(true)))).collect();
     inst.edit(&format!("collection {}: plugins", rev.name), |p| {
@@ -138,12 +170,22 @@ fn install_one(inst: &Instance, client: &Client, m: &Value, mod_id: u64, file_id
     let choices: crate::fomod::Choices = serde_json::from_value(m["choices"].clone()).unwrap_or_default();
     let done = crate::install::install(inst, &path, m["name"].as_str(), true, Some(&choices))?;
     let mut meta = inst.mod_meta(&done.id);
+    if game_folder(m) {
+        crate::install::to_game_folder(&inst.mod_dir(&done.id))?;
+        meta.game_folder = true;
+    }
     meta.nexus = Some(NexusRef { mod_id, file_id: Some(file_id), version: m["version"].as_str().map(str::to_owned), category: None });
     if let Some(t) = m["instructions"].as_str().filter(|t| !t.trim().is_empty()) {
         meta.notes = Some(t.trim().into());
     }
     inst.write_mod_meta(&done.id, &meta)?;
     Ok(done.id)
+}
+
+/// Whether the collection gives the mod Vortex's "dinput" or "enb" type, which Vortex deploys to
+/// the game folder instead of Data.
+fn game_folder(m: &Value) -> bool {
+    matches!(m["details"]["type"].as_str(), Some("dinput" | "enb"))
 }
 
 /// The collection's mod rules as rmm mod rules, then the mods sorted by them. Rules name mods by

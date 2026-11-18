@@ -134,6 +134,26 @@ enum Cmd {
         /// instance). Files already downloaded stay where they are.
         #[arg(long)]
         folder: Option<String>,
+        /// Delete this download (its file name) for good. Mods installed from it stay, but
+        /// can't be reinstalled from it.
+        #[arg(long, conflicts_with = "folder")]
+        delete: Option<String>,
+    },
+    /// Files in overwrite/: what the game and tools wrote that no mod holds.
+    Overwrite {
+        /// Turn them into a new mod with this name, at the end of the list.
+        #[arg(long)]
+        to_mod: Option<String>,
+        /// Clear overwrite/ (undo brings the files back, as a mod).
+        #[arg(long, conflicts_with = "to_mod")]
+        clear: bool,
+    },
+    /// Edits made to mod files, overwrite/ and INIs through rmm (the window's IDE and AI
+    /// tools), newest first.
+    Edits {
+        /// Put back the file as it was before edit N.
+        #[arg(long)]
+        revert: Option<usize>,
     },
     /// rmm's settings, shared by the window and the MCP server: all of them, one by its name
     /// (deploy.method), or set one (`rmm settings loot.language de`; lists take commas or JSON).
@@ -180,6 +200,13 @@ enum Cmd {
         enable: Vec<String>,
         #[arg(long)]
         disable: Vec<String>,
+        /// Move this plugin, to just after --after or just before --before.
+        #[arg(long = "move", requires = "place")]
+        moving: Option<String>,
+        #[arg(long, group = "place")]
+        after: Option<String>,
+        #[arg(long, group = "place")]
+        before: Option<String>,
     },
     /// Pairs of enabled plugins that change the same records, and which wins.
     PluginConflicts { plugin: Option<String> },
@@ -591,6 +618,10 @@ enum NexusCmd {
         /// Its optional mods too.
         #[arg(long)]
         optional: bool,
+        /// Install into a new profile with this name, which becomes the active one (the mods
+        /// already installed are in it, turned off). Default: the active profile.
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         apply: bool,
     },
@@ -811,8 +842,9 @@ fn run() -> Result<()> {
         }
         Cmd::Saves { fix: None } => print(&saves::list(&open()?)?),
         Cmd::Saves { fix: Some(file) } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
-        Cmd::Downloads { folder: None } => print(&install::downloads(&open()?)?),
-        Cmd::Downloads { folder: Some(f) } => {
+        Cmd::Downloads { delete: Some(name), .. } => done(install::delete_download(&open()?, &name)),
+        Cmd::Downloads { folder: None, .. } => print(&install::downloads(&open()?)?),
+        Cmd::Downloads { folder: Some(f), .. } => {
             let mut inst = open()?;
             inst.set_downloads_dir((!f.is_empty()).then(|| PathBuf::from(&f)))?;
             print(&serde_json::json!({ "downloads": inst.downloads_dir() }))
@@ -830,6 +862,11 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Cmd::Overwrite { to_mod: Some(name), .. } => print(&install::mod_from_overwrite(&open()?, &name)?),
+        Cmd::Overwrite { clear: true, .. } => print(&serde_json::json!({ "cleared": install::clear_overwrite(&open()?)? })),
+        Cmd::Overwrite { .. } => print(&open()?.mod_files(rmm_core::instance::OVERWRITE)?),
+        Cmd::Edits { revert: Some(n) } => print(&rmm_core::workspace::revert(&open()?, n)?),
+        Cmd::Edits { revert: None } => print(&rmm_core::workspace::edits(&open()?)?),
         Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),
         Cmd::Trash { empty: true } => print(&install::empty_trash(&open()?)?),
         Cmd::Note { id, text } => print(&serde_json::json!({ "previous": ops::set_mod_note(&open()?, &id, &text)? })),
@@ -859,12 +896,21 @@ fn run() -> Result<()> {
                 None => print(&v),
             }
         }
-        Cmd::Plugins { enable, disable } => {
+        Cmd::Plugins { enable, disable, moving, after, before } => {
             let inst = open()?;
             for (names, on) in [(enable, true), (disable, false)] {
                 for n in names {
                     ops::set_plugin_enabled(&inst, &n, on)?;
                 }
+            }
+            if let Some(m) = moving {
+                let all = inst.profile()?.plugins;
+                let m = all.iter().find(|p| p.name.eq_ignore_ascii_case(&m)).with_context(|| format!("no plugin {m} in the profile"))?.name.clone();
+                let mut order: Vec<String> = all.into_iter().map(|p| p.name).filter(|n| *n != m).collect();
+                let (other, past) = after.map(|a| (a, 1)).or(before.map(|b| (b, 0))).context("--move needs --after or --before")?;
+                let at = order.iter().position(|n| n.eq_ignore_ascii_case(&other)).with_context(|| format!("no plugin {other} in the profile"))?;
+                order.insert(at + past, m);
+                ops::set_plugin_order(&inst, &order)?;
             }
             print(&plugins::list(&inst, &inst.profile()?)?)
         }
@@ -1005,8 +1051,8 @@ fn run() -> Result<()> {
             let link = nexus::resolve(&inst, &client, &what)?;
             print(&nexus::install(&inst, &client, &link, None)?)
         }
-        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, apply }) => {
-            print(&rmm_core::collection::install(&open()?, &nexus::Client::from_env()?, &link, revision, optional, !apply)?)
+        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, apply }) => {
+            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link, revision, optional, profile.as_deref(), !apply)?)
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;

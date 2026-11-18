@@ -2446,6 +2446,93 @@ fn mock_nexus(routes: impl FnOnce(&str) -> std::collections::HashMap<String, Vec
     (base, hits)
 }
 
+/// A collection from a stand-in Nexus: a dry run, then an install into a new profile. A mod
+/// already installed from the same file is turned on there, a "dinput" mod's non-Data files go
+/// to the game folder (and stay there on reinstall), and the user's own profile is left alone.
+#[test]
+fn collection_into_a_new_profile() {
+    isolate();
+    use rmm_core::{collection, nexus};
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let zip_of = |files: &[(&str, &[u8])]| {
+        let mut bytes = Vec::new();
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        for (name, data) in files {
+            z.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(data).unwrap();
+        }
+        z.finish().unwrap();
+        bytes
+    };
+    let source = |id: u64, file: u64, logical: &str| serde_json::json!({ "type": "nexus", "modId": id, "fileId": file, "logicalFilename": logical });
+    let manifest = serde_json::json!({
+        "info": { "name": "Test Pack", "domainName": "skyrimspecialedition", "gameVersions": [] },
+        "mods": [
+            { "name": "Have", "optional": false, "phase": 0, "source": source(1, 11, "Have"), "details": {} },
+            { "name": "Enb Stuff", "optional": false, "phase": 1, "source": source(2, 21, "Enb"), "details": { "type": "dinput" }, "instructions": "Use the high preset." },
+            { "name": "Optional One", "optional": true, "phase": 1, "source": source(3, 31, "Opt"), "details": {} },
+        ],
+        "modRules": [{ "type": "after", "source": { "logicalFileName": "Enb" }, "reference": { "logicalFileName": "Have" } }],
+        "plugins": [{ "name": "Enb.esp", "enabled": false }],
+    });
+    let bundle = zip_of(&[("collection.json", manifest.to_string().as_bytes())]);
+    let esp = plugin_bytes(&[], false);
+    let enb = zip_of(&[("enbseries/a.fx", b"fx"), ("enblocal.ini", b"[GLOBAL]"), ("SKSE/Plugins/x.dll", b"dll"), ("Enb.esp", &esp), ("Enb.ini", b"[x]")]);
+    let json = |v: serde_json::Value| v.to_string().into_bytes();
+    let d = "/v1/games/skyrimspecialedition/mods";
+    let (base, _) = mock_nexus(|base| {
+        std::collections::HashMap::from([
+            ("/v1/users/validate.json".to_string(), json(serde_json::json!({ "user_id": 1, "name": "tester", "is_premium": true }))),
+            ("/v2/graphql".to_string(), json(serde_json::json!({ "data": { "collectionRevision": {
+                "revisionNumber": 3, "downloadLink": "/v1/collections/abc/revisions/3/download_link.json", "collection": { "name": "Test Pack" },
+                "modFiles": [{ "fileId": 11, "optional": false, "file": { "sizeInBytes": "10" } }, { "fileId": 21, "optional": false, "file": { "sizeInBytes": "500" } }, { "fileId": 31, "optional": true, "file": { "sizeInBytes": "7" } }]
+            } } }))),
+            ("/v1/collections/abc/revisions/3/download_link.json".to_string(), json(serde_json::json!({ "download_links": [{ "URI": format!("{base}/cdn/bundle.zip") }] }))),
+            ("/cdn/bundle.zip".to_string(), bundle),
+            (format!("{d}/2/files/21.json"), json(serde_json::json!({ "file_id": 21, "file_name": "Enb Stuff-2-1-0-1700000000.zip" }))),
+            (format!("{d}/2/files/21/download_link.json"), json(serde_json::json!([{ "URI": format!("{base}/cdn/enb.zip") }]))),
+            ("/cdn/enb.zip".to_string(), enb),
+        ])
+    });
+    let mut client = nexus::Client::new("test-key").unwrap();
+    client.base = base;
+
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    write(&tmp.path().join("src/Have/Have.esp"), plugin_bytes(&[], false));
+    install::install(&inst, &tmp.path().join("src/Have"), None, false, None).unwrap();
+    nexus::remember(&inst, "Have", rmm_core::instance::NexusRef { mod_id: 1, file_id: Some(11), ..Default::default() }).unwrap();
+    let link = "https://www.nexusmods.com/games/skyrimspecialedition/collections/abc";
+
+    let plan = collection::install(&mut inst, &client, link, None, false, Some("Pack"), true).unwrap();
+    assert_eq!((plan.install.clone(), plan.installed.clone(), plan.optional.clone()), (vec!["Enb Stuff".to_string()], vec!["Have".to_string()], vec!["Optional One".to_string()]));
+    assert_eq!((plan.game_folder.clone(), plan.download_size, plan.revision), (vec!["Enb Stuff".to_string()], 500, 3));
+    assert_eq!(inst.config.profile, "default", "a dry run makes no profile");
+
+    let r = collection::install(&mut inst, &client, link, None, false, Some("Pack"), false).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert_eq!((r.profile.as_deref(), r.rules, r.instructions.clone()), (Some("Pack"), 1, vec!["Enb Stuff: Use the high preset.".to_string()]));
+    assert_eq!(inst.config.profile, "Pack");
+    assert_eq!(Instance::open(&inst.root).unwrap().config.profile, "Pack", "the new profile is the active one");
+    let p = inst.profile().unwrap();
+    let mods: Vec<(&str, bool)> = p.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
+    assert_eq!(mods, [("Have", true), ("Enb Stuff", true)], "the mod already installed is turned on, and the rule orders them");
+    let plugin = |p: &rmm_core::Profile, n: &str| p.plugins.iter().find(|e| e.name == n).map(|e| e.enabled);
+    assert_eq!((plugin(&p, "Have.esp"), plugin(&p, "Enb.esp")), (Some(true), Some(false)), "the collection's plugin list");
+    let files = ["Enb.esp", "Enb.ini", "SKSE/Plugins/x.dll", "root/enblocal.ini", "root/enbseries/a.fx"];
+    assert_eq!(inst.mod_files("Enb Stuff").unwrap(), files, "dinput: what isn't Data content goes to the game folder");
+    assert!(inst.mod_meta("Enb Stuff").game_folder);
+    install::reinstall(&inst, "Enb Stuff", None).unwrap();
+    assert_eq!(inst.mod_files("Enb Stuff").unwrap(), files, "a reinstall keeps it there");
+
+    inst.switch_profile("default").unwrap();
+    assert_eq!(inst.profile().unwrap().mods.iter().find(|m| m.id == "Have").map(|m| m.enabled), Some(false), "the user's own profile is as it was");
+    let again = collection::install(&mut inst, &client, link, None, false, Some("Pack"), true);
+    assert!(format!("{:#}", again.unwrap_err()).contains("already exists"));
+}
+
 #[test]
 fn nexus_updates_and_downloads() {
     isolate();

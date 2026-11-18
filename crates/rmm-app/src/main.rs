@@ -440,6 +440,10 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let client = nexus::Client::from_env()?;
             json!(nexus::fetch(&inst, &client, &nexus::resolve(&inst, &client, &s("link")?)?)?)
         }
+        "install_collection" => {
+            let client = nexus::Client::from_env()?;
+            json!(rmm_core::collection::install(&mut inst, &client, &s("link")?, a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"))?)
+        }
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
         "nexus_handler" => {

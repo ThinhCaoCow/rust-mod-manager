@@ -195,6 +195,10 @@ pub struct ModMeta {
     /// A newer version the user skipped (MO2's ignoredVersion); a later one is offered again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_version: Option<String>,
+    /// Vortex's "dinput" or "enb" mod type (a collection says so): what isn't Data content goes
+    /// to the game folder (`root/`), now and on every reinstall or update.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub game_folder: bool,
 }
 
 /// A mod's page and file on Nexus Mods (the game comes from the instance).
@@ -316,7 +320,7 @@ impl Instance {
     }
 
     /// The stored spelling of a profile name (folder names are case-insensitive on Windows).
-    fn find_profile(&self, name: &str) -> Result<String> {
+    pub(crate) fn find_profile(&self, name: &str) -> Result<String> {
         let want = name.to_lowercase();
         self.profiles()?.into_iter().find(|n| n.to_lowercase() == want).with_context(|| format!("no profile '{name}'"))
     }
@@ -695,7 +699,7 @@ impl Instance {
 }
 
 /// Profile names are folder names: no path characters, no leading dot (`.deleted` is rmm's).
-fn check_profile_name(name: &str) -> Result<()> {
+pub(crate) fn check_profile_name(name: &str) -> Result<()> {
     let bad = name.is_empty()
         || name.len() > 64
         || name.trim() != name

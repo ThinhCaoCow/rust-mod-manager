@@ -56,8 +56,11 @@ rmm read "Some Mod" scripts/foo.pex                 # a file inside a mod; Papyr
 rmm plugin-conflicts                                # plugins that change the same records, and which wins
 rmm records "Some Mod.esp"                          # what a plugin adds (quests, NPCs, items, cells) with console ids
 rmm review "Some Mod" --verdict clean --notes "..." # keep a review with the mod; `rmm reviews` shows if the files changed since
-rmm nexus collection https://www.nexusmods.com/games/skyrimspecialedition/collections/h2uqa3 --apply   # Premium: a whole collection
+rmm nexus collection https://www.nexusmods.com/games/skyrimspecialedition/collections/h2uqa3 --profile "My Pack" --apply   # Premium: a whole collection, in a new profile
 rmm plugins --disable "Some Plugin.esp"              # plugins in load order; --enable / --disable turn them on or off
+rmm plugins --move "Patch.esp" --after "Some Plugin.esp"   # or --before
+rmm overwrite | rmm overwrite --to-mod "Tool Output" | rmm overwrite --clear   # what the game and tools wrote
+rmm edits | rmm edits --revert 3                  # file edits made through rmm (the IDE, AI apps); undo one
 rmm nexus search frost survival --category Immersion   # search Nexus (no key needed); `rmm nexus info 671` reads a mod's page
 rmm test-run --save MySave --cell Riverwood --screenshots --apply   # scripted with the harness plugin, in a small window behind the others (harness/README.md)
 rmm test-run --cell Riverwood --steps "[{\"console\":\"tgm\"},{\"wait\":10},{\"screenshot\":\"after\"}]" --apply   # a test plan
@@ -83,6 +86,7 @@ rmm settings deploy.exclude "*.txt, fomod/*"
 rmm settings deploy.method copy      # copies instead of hard links
 rmm settings --reset deploy.exclude  # back to the default (--reset alone: all of them)
 rmm downloads --folder E:\Downloads\Skyrim   # this instance's downloads folder ("" for downloads/)
+rmm downloads --delete "Some Mod-123-1-0-1700000000.zip"   # delete a download for good
 ```
 
 | Setting | Default | What it does |

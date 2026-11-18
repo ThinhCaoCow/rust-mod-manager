@@ -59,6 +59,11 @@ struct ProfileName {
     name: String,
 }
 #[derive(Deserialize, JsonSchema)]
+struct NewModName {
+    /// The new mod's name.
+    name: String,
+}
+#[derive(Deserialize, JsonSchema)]
 struct CreateProfileArgs {
     /// Folder name: up to 64 characters, no <>:"/\|?* and no leading dot.
     name: String,
@@ -238,6 +243,20 @@ struct NexusInstallArgs {
     mod_id: Option<u64>,
     file_id: Option<u64>,
     /// Default true: show the file without downloading it.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CollectionArgs {
+    /// The collection's link (nexusmods.com/games/<game>/collections/<id>) or id.
+    link: String,
+    /// A revision number; default: the newest.
+    revision: Option<u64>,
+    /// Its optional mods too; default false.
+    optional: Option<bool>,
+    /// Install into a new profile with this name, which becomes the active one; default: the
+    /// active profile.
+    new_profile: Option<String>,
+    /// Default true: download only the collection's list and say what would be installed.
     dry_run: Option<bool>,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -732,6 +751,16 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| install::uninstall_mods(&i, &a.ids)))
     }
 
+    #[tool(description = "Turn everything in overwrite/ (what the game and tools wrote that no mod holds; list_files with path overwrite/ shows it) into a new mod at the end of the list, enabled. Undoable; overwrite/ starts empty again.")]
+    async fn overwrite_to_mod(&self, Parameters(a): Parameters<NewModName>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| install::mod_from_overwrite(&i, &a.name)))
+    }
+
+    #[tool(description = "Empty overwrite/ in one undo step: its files go to trash/ as a mod, and undo brings them back as a mod at the end of the list. Returns how many files went.")]
+    async fn clear_overwrite(&self) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| install::clear_overwrite(&i)))
+    }
+
     #[tool(description = "Enable or disable mods (their plugins follow) in one undo step.")]
     async fn set_mods_enabled(&self, Parameters(a): Parameters<EnableArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| ops::set_mods_enabled(&i, &a.ids, a.enabled)))
@@ -1062,6 +1091,14 @@ impl Rmm {
                 return client.get(&format!("/v1/games/{}/mods/{}/files/{}.json", inst.config.game.nexus_domain(), link.mod_id, link.file_id));
             }
             Ok(serde_json::to_value(nexus::install(&inst, &client, &link, None)?)?)
+        }))
+    }
+
+    #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. A big collection takes a long time. dry_run defaults to true: lists what would be installed, the download size, optional mods left out and the curator's notes.")]
+    async fn install_collection(&self, Parameters(a): Parameters<CollectionArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|mut i| {
+            let client = nexus::Client::from_env()?;
+            rmm_core::collection::install(&mut i, &client, &a.link, a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true))
         }))
     }
 
