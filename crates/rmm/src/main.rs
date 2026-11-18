@@ -797,7 +797,12 @@ fn run() -> Result<()> {
             }
             print(&ops::instance_info(&inst)?)
         }
-        Cmd::Info => print(&ops::instance_info(&open()?)?),
+        Cmd::Info => {
+            let inst = open()?;
+            let mut v = ops::instance_info(&inst)?;
+            v["essentials"] = serde_json::to_value(rmm_core::launch::essentials(&inst)?)?;
+            print(&v)
+        }
         Cmd::Mods => print(&ops::list_mods(&open()?)?),
         Cmd::Show { id } => print(&ops::mod_details(&open()?, &id, usize::MAX)?),
         Cmd::Install { path, name, at, disabled, choices } => {

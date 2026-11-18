@@ -49,7 +49,7 @@ prefs.cols ??= { conflicts: true, tags: false, notes: false, installed: false, f
 prefs.cols.category ??= true;
 prefs.widths ??= {};
 // This window's look and habits (Settings, "This window").
-const WIN = { theme: 'system', density: 'comfortable', zoom: 1, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true, tabSize: 4, spaces: false, wrap: false, enterSends: true };
+const WIN = { theme: 'system', density: 'comfortable', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true, tabSize: 4, spaces: false, wrap: false, enterSends: true };
 const W = prefs.win = { ...WIN, ...prefs.win };
 function applyWin() {
   if (W.theme === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = W.theme;
@@ -58,7 +58,12 @@ function applyWin() {
   for (const el of [$('#ide-text'), $('#ide-gutter')]) el.style.tabSize = W.tabSize;
   $('#ide-text').wrap = W.wrap ? 'soft' : 'off';
   $('#ide-gutter').style.display = W.wrap ? 'none' : ''; // its numbers count unwrapped lines
+  // Simple view: the tabs a beginner doesn't need yet (AI access is on Tools, the editor on AI).
+  for (const t of SIMPLE_HIDES) $(`.tabs [data-tab="${t}"]`).hidden = W.simple;
+  if (W.simple && SIMPLE_HIDES.includes(tab)) { tab = 'mods'; if (!$('#app').hidden) showTab('mods'); }
+  if (S) renderStart();
 }
+const SIMPLE_HIDES = ['data', 'tools', 'ai'];
 // `w`: the default width in pixels, as style.css sets it for `cls`.
 const COLS = {
   conflicts: { title: 'Conflicts', cls: 'conf-col', w: 200 },
@@ -164,6 +169,7 @@ async function load() {
   if (tab === 'downloads' || downloadsData) loadDownloads();
   render();
   refreshPlan();
+  renderStart();
   // The health check reads every plugin; re-run it once a burst of changes settles.
   clearTimeout(healthTimer);
   healthTimer = setTimeout(runHealth, tab === 'problems' ? 0 : 800);
@@ -296,16 +302,41 @@ $('#open-instance').onclick = async () => {
   if (path) enter('Opening the instance', () => call('open', { path }));
 };
 
-$('#create-games').onclick = async e => {
+$('#create-games').onclick = e => {
   const b = e.target.closest('[data-game]');
-  if (!b) return;
-  const path = await T.dialog.open({ directory: true, title: 'Choose a folder for the new instance' });
-  if (!path) return;
-  const [here, there] = [path, b.dataset.path].map(p => p.slice(0, 2).toUpperCase());
-  const drive = d => `drive ${d.replace(':', '')}`;
-  if (here !== there && !await confirmBox('Another drive', `The game is on ${drive(there)} and this folder on ${drive(here)}. Deploys would then copy mod files into the game folder instead of linking them, which takes as much space again. A folder on ${drive(there)} avoids that.`, 'Use this folder', 'primary')) return;
-  enter('Creating the instance', () => call('create', { game: b.dataset.game, game_path: b.dataset.path, path }));
+  if (b) newInstance(b.dataset.game, b.dataset.path);
 };
+
+$('#pick-game').onclick = async () => {
+  const path = await T.dialog.open({ directory: true, title: 'The game’s folder, with SkyrimSE.exe or Fallout4.exe in it' });
+  if (!path) return;
+  const d = await call('identify_game', { path }).catch(() => null);
+  if (!d) return toast('There’s no SkyrimSE.exe or Fallout4.exe in that folder. Pick the folder the game’s exe is in.', 'error');
+  if (!gamesFound.some(g => samePath(g.game_path, d.game_path))) { gamesFound.push(d); drawGames(); }
+  newInstance(d.game, d.game_path);
+};
+
+/** A new instance for the game in `gamePath`: a folder on the game's drive is suggested, since
+ *  deploys link files there instead of copying them; Program Files is warned about. The first
+ *  instance ever starts in the Simple view. */
+async function newInstance(game, gamePath) {
+  const first = !recall(), name = GAMES[game] ?? game, there = gamePath.slice(0, 2).toUpperCase();
+  const suggested = `${there}\\rmm\\${name}`;
+  const how = await dialog({
+    title: `New instance for ${name}`,
+    body: `<p>The instance folder holds your mods, profiles and undo history. On the game’s drive, deploys link mod files into the game folder instead of copying them.</p><p><b>${esc(suggested)}</b></p>`,
+    actions: [['cancel', 'Cancel'], ['pick', 'Choose another folder…'], ['ok', 'Use this folder', 'primary']],
+  });
+  if (!how) return;
+  const path = how === 'ok' ? suggested : await T.dialog.open({ directory: true, title: 'Choose a folder for the new instance', defaultPath: `${there}\\` });
+  if (!path) return;
+  const here = path.slice(0, 2).toUpperCase(), drive = d => `drive ${d.replace(':', '')}`;
+  if (here !== there && !await confirmBox('Another drive', `The game is on ${drive(there)} and this folder on ${drive(here)}. Deploys would then copy mod files into the game folder instead of linking them, which takes as much space again. A folder on ${drive(there)} avoids that.`, 'Use this folder', 'primary')) return;
+  if (/^[a-z]:\\program files( \(x86\))?(\\|$)/i.test(path) && !await confirmBox('Program Files', `Windows protects Program Files: programs can be stopped from writing there, or have what they write moved somewhere else without a word. A folder outside it, such as ${suggested}, avoids that.`, 'Use this folder', 'primary')) return;
+  if (!await act('Creating the instance', () => call('create', { game, game_path: gamePath, path }))) return;
+  if (first) { W.simple = true; savePrefs(); applyWin(); }
+  showApp();
+}
 
 // ---- Virtual lists: only the rows on screen are in the DOM -------------------------------------
 
@@ -1878,6 +1909,52 @@ $('#profile-pop').onclick = async e => {
   }
 };
 
+// ---- Getting started: what a new setup needs before its first game ---------------------------
+
+const WHY = {
+  script_extender: 'Most mods need it.',
+  address_library: 'Script extender plugins need it to work with your game version.',
+  crash_logger: 'When the game crashes, it writes a log that names the mods behind it.',
+};
+let startRun = 0, gameVersion = null;
+async function renderStart() {
+  const card = $('#start-card'), run = ++startRun;
+  const e = W.gettingStarted ? await call('essentials').catch(() => null) : null;
+  if (run !== startRun) return;
+  if (!e) return void (card.hidden = true);
+  gameVersion = e.game_version;
+  const u = nexus.user;
+  // [done, what, a note, [action, button]]
+  const steps = [
+    [!!u, 'Sign in to Nexus Mods', u ? `as ${u.name}` : 'so rmm can download mods and check for updates.', !u && ['login', 'Sign in…']],
+    [!!nexus.handler_here, 'Let the website’s “Mod manager download” buttons install here', nexus.handler_here ? '' : handlerNow(), !nexus.handler_here && ['handler', 'Set it up']],
+    ...e.items.map(i => [!!i.have, i.name, i.have ? `in ${i.have}` : WHY[i.what], !i.have && i.nexus_id && [`get:${i.nexus_id}`, 'Get it…']]),
+    [e.played, 'Start the game with ▶ Play', 'Play deploys your changes and starts the script extender; starting from Steam skips both.', false],
+  ];
+  const done = steps.filter(s => s[0]).length;
+  card.hidden = done === steps.length;
+  if (card.hidden) return;
+  card.innerHTML = `<div class="start-head"><b>Getting started</b><span class="muted small">${done} of ${steps.length} done${W.simple ? ' · The Simple view hides the Data, Tools and AI tabs until you turn it off in Settings.' : ''}</span><div class="spacer"></div><button class="link" data-start="hide">Hide</button></div>
+    <ul>${steps.map(([ok, what, note, b]) => `<li class="${ok ? 'ok' : ''}"><span class="tick">${ok ? '✓' : '○'}</span><span>${esc(what)} <span class="muted small">${esc(note)}</span></span>${b ? `<button data-start="${b[0]}">${esc(b[1])}</button>` : ''}</li>`).join('')}</ul>`;
+}
+$('#start-card').onclick = async e => {
+  const act = e.target.closest('[data-start]')?.dataset.start;
+  if (act === 'hide') {
+    W.gettingStarted = false;
+    savePrefs();
+    $('#start-card').hidden = true;
+    toast('Settings, under This window, shows the list again.');
+  } else if (act === 'login') {
+    nexusLogin('Sign in so rmm can download mods and check for updates with your account.', nexus.sso);
+  } else if (act === 'handler') {
+    await setHandler();
+  } else if (act?.startsWith('get:')) {
+    try { await call('open_nexus_mod', { mod_id: Number(act.slice(4)) }); } catch (err) { return toast(String(err), 'error'); }
+    const pick = gameVersion ? `the file for game version ${gameVersion}` : 'the file for your game version';
+    toast(`On its Files tab, click “Mod manager download” on ${pick}. ${nexus.handler_here ? 'It installs here.' : 'Set up the download buttons first, or download it and drop it on this window.'}`);
+  }
+};
+
 // ---- Nexus ----------------------------------------------------------------------------------
 
 /** Ask for the API key (the user pastes it; it is checked with Nexus and kept in their config
@@ -1939,6 +2016,7 @@ async function nexusShow() {
   const u = nexus.user;
   $('#nexus-btn').textContent = u ? `Nexus: ${u.name}${u.is_premium ? ' · Premium' : ''}` : nexus.key ? 'Nexus: sign in again' : 'Sign in to Nexus';
   $('#nexus-btn').classList.toggle('warn', nexus.key && !u);
+  renderStart();
 }
 
 $('#nexus-btn').onclick = async () => {
@@ -2836,6 +2914,8 @@ const SETTINGS = [
     ['win.theme', 'Theme', 'select', [['system', 'Follow Windows'], ['light', 'Light'], ['dark', 'Dark']]],
     ['win.density', 'Rows', 'select', [['comfortable', 'Comfortable'], ['compact', 'Compact']]],
     ['win.zoom', 'Size', 'select', [[0.8, '80%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.25, '125%'], [1.5, '150%']]],
+    ['win.simple', 'Simple view', 'bool', null, 'Hides the Data, Tools and AI tabs, and with them AI access and the file editor.'],
+    ['win.gettingStarted', 'Show the getting-started list on the Mods tab until it’s all done', 'bool'],
     ['win.startTab', 'Open on', 'select', [['last', 'The last tab'], ...TABS]],
     ['win.poll', 'Look for changes made by the CLI or AI apps', 'select', [[1.5, 'Every 1.5 seconds'], [5, 'Every 5 seconds'], [15, 'Every 15 seconds'], [0, 'Never']]],
     ['win.toast', 'Seconds a message stays', 'num', [2, 60], 'Errors stay until you click them.'],

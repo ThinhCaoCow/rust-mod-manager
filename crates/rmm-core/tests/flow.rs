@@ -2533,6 +2533,41 @@ fn collection_into_a_new_profile() {
     assert!(format!("{:#}", again.unwrap_err()).contains("already exists"));
 }
 
+/// The getting-started list's essentials: found in an enabled mod or the game folder, gone with
+/// a disabled mod; and a game folder picked by hand (or its Data folder) is recognised.
+#[test]
+fn essentials_and_a_chosen_game_folder() {
+    isolate();
+    use rmm_core::{game, launch};
+    let tmp = tempfile::tempdir().unwrap();
+    let g = tmp.path().join("game");
+    write(&g.join("SkyrimSE.exe"), "exe");
+    write(&g.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    assert_eq!(game::identify(&g).map(|d| (d.game, d.game_path)), Some((Game::SkyrimSe, g.clone())));
+    assert_eq!(game::identify(&g.join("Data")).map(|d| d.game_path), Some(g.clone()), "its Data folder counts");
+    assert!(game::identify(tmp.path()).is_none());
+
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &g, &tmp.path().join("local")).unwrap();
+    let have = |inst: &Instance| launch::essentials(inst).unwrap().items.into_iter().map(|i| (i.what, i.have, i.nexus_id)).collect::<Vec<_>>();
+    assert_eq!(have(&inst), [("script_extender", None, Some(30379)), ("address_library", None, Some(32444)), ("crash_logger", None, Some(59818))]);
+    assert!(!launch::essentials(&inst).unwrap().played);
+
+    let src = tmp.path().join("src");
+    write(&src.join("SKSE/skse64_loader.exe"), "loader");
+    write(&src.join("SKSE/Data/Scripts/a.pex"), "pex");
+    write(&src.join("AL/SKSE/Plugins/versionlib-1-6-1170-0.bin"), "bin");
+    for m in ["SKSE", "AL"] {
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    write(&g.join("Data/SKSE/Plugins/CrashLogger.dll"), "dll"); // put in by hand
+    let some = |s: &str| Some(s.to_string());
+    assert_eq!(have(&inst).into_iter().map(|x| x.1).collect::<Vec<_>>(), [some("SKSE"), some("AL"), some("the game folder")]);
+    ops::set_mods_enabled(&inst, &["AL".into()], false).unwrap();
+    assert_eq!(have(&inst)[1].1, None, "a disabled mod doesn't count");
+    write(&inst.root.join("game-version.txt"), "1.6.1170.0");
+    assert!(launch::essentials(&inst).unwrap().played);
+}
+
 #[test]
 fn nexus_updates_and_downloads() {
     isolate();

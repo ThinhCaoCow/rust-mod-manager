@@ -23,6 +23,83 @@ pub struct LaunchReport {
     pub deploy: DeployPlan,
 }
 
+/// One of the mods nearly every setup starts with, and where this one has it.
+#[derive(Debug, Serialize)]
+pub struct Essential {
+    /// script_extender, address_library or crash_logger.
+    pub what: &'static str,
+    pub name: &'static str,
+    /// The enabled mod that has it, or "the game folder".
+    pub have: Option<String>,
+    /// Its Nexus mod id (none for a game an add-on defines).
+    pub nexus_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Essentials {
+    pub items: Vec<Essential>,
+    /// The game's version, to pick each file by (unknown when the exe can't be read).
+    pub game_version: Option<String>,
+    /// Whether Play (or a test run) has started the game from this instance.
+    pub played: bool,
+}
+
+/// What a new setup needs before its first game, for the window's getting-started list: the
+/// script extender, Address Library and a crash logger, each found in an enabled mod or the game
+/// folder, and whether Play has started the game yet.
+pub fn essentials(inst: &Instance) -> Result<Essentials> {
+    let game = inst.config.game;
+    let skyrim = game.base() == Game::SkyrimSe;
+    let plugins = if skyrim { "skse/plugins/" } else { "f4se/plugins/" };
+    let loader = format!("root/{}", game.loader().to_lowercase());
+    // Which essential a file (mod-relative, lowercase) is.
+    let kind = |f: &str| -> Option<usize> {
+        if f == loader {
+            return Some(0);
+        }
+        let name = f.strip_prefix(plugins)?;
+        if name.ends_with(".bin") && (name.starts_with("versionlib-") || name.starts_with("version-")) {
+            Some(1)
+        } else {
+            ["crashlogger.dll", "trainwreck.dll", "buffout4.dll"].contains(&name).then_some(2)
+        }
+    };
+    let version = game_version(&inst.config.game_path, game).ok();
+    let new_gen = version.is_some_and(|v| v >= [1, 10, 980, 0]);
+    let list: [(&str, &str, u64); 3] = if skyrim {
+        [("script_extender", "Skyrim Script Extender (SKSE64)", 30379), ("address_library", "Address Library for SKSE Plugins", 32444), ("crash_logger", "Crash Logger SSE AE VR", 59818)]
+    } else {
+        let buffout = if new_gen { ("crash_logger", "Buffout 4 NG", 64880) } else { ("crash_logger", "Buffout 4", 47359) };
+        [("script_extender", "Fallout 4 Script Extender (F4SE)", 42147), ("address_library", "Address Library for F4SE Plugins", 47327), buffout]
+    };
+    let mut have: [Option<String>; 3] = Default::default();
+    for m in inst.profile()?.mods.iter().filter(|m| m.enabled && !crate::instance::is_separator(&m.id)) {
+        for f in inst.mod_files(&m.id).unwrap_or_default() {
+            if let Some(k) = kind(&f.to_lowercase()) {
+                have[k].get_or_insert_with(|| inst.mod_meta(&m.id).name);
+            }
+        }
+    }
+    // Put in by hand, or by another manager.
+    let mut in_game: Vec<String> = fs::read_dir(inst.data_dir().join(if skyrim { "SKSE" } else { "F4SE" }).join("Plugins"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| format!("{plugins}{}", e.file_name().to_string_lossy().to_lowercase()))
+        .collect();
+    if inst.config.game_path.join(game.loader()).is_file() {
+        in_game.push(loader.clone());
+    }
+    for f in in_game {
+        if let Some(k) = kind(&f) {
+            have[k].get_or_insert_with(|| "the game folder".into());
+        }
+    }
+    let builtin = matches!(game, Game::SkyrimSe | Game::Fallout4);
+    let items = list.into_iter().zip(have).map(|((what, name, id), have)| Essential { what, name, have, nexus_id: builtin.then_some(id) }).collect();
+    Ok(Essentials { items, game_version: version.map(|v| v.map(|n| n.to_string()).join(".")), played: inst.root.join(PLAYED).is_file() })
+}
+
 /// Installed mods with the script extender's loader in root/ (the game folder).
 pub fn script_extender_mods(inst: &Instance) -> Result<Vec<String>> {
     let loader = format!("root/{}", inst.config.game.loader()).to_lowercase();

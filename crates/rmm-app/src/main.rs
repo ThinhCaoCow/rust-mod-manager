@@ -220,6 +220,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
     match name {
         "detect" => return Ok((json!(Game::ALL.iter().filter_map(|g| game::detect(*g)).collect::<Vec<_>>()), root)),
         "search_drives" => return Ok((json!(game::search_drives()), root)),
+        // A game folder the user picked by hand.
+        "identify_game" => return Ok((json!(game::identify(Path::new(&s("path")?))), root)),
         "open" => {
             let inst = Instance::open(Path::new(&s("path")?))?;
             return Ok((ops::instance_info(&inst)?, Some(inst.root)));
@@ -444,6 +446,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let client = nexus::Client::from_env()?;
             json!(rmm_core::collection::install(&mut inst, &client, &s("link")?, a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"))?)
         }
+        "essentials" => json!(launch::essentials(&inst)?),
+        // A mod's Files tab, for the getting-started list (Nexus mod pages only).
+        "open_nexus_mod" => json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}?tab=files", inst.config.game.nexus_domain(), n("mod_id")?))?),
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
         "nexus_handler" => {

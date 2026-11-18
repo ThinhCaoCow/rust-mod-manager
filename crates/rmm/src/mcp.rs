@@ -549,9 +549,13 @@ impl Rmm {
         if dry_run { self.inst() } else { self.inst_mut() }
     }
 
-    #[tool(description = "Game, paths, profile and mod counts for this instance.", annotations(read_only_hint = true))]
+    #[tool(description = "Game, paths, profile and mod counts for this instance, and its essentials: the script extender, Address Library and a crash logger (the enabled mod or the game folder that has each, and its Nexus id), and whether Play has started the game yet.", annotations(read_only_hint = true))]
     async fn instance_info(&self) -> Result<String, String> {
-        out(self.inst().and_then(|i| ops::instance_info(&i)))
+        out(self.inst().and_then(|i| {
+            let mut v = ops::instance_info(&i)?;
+            v["essentials"] = serde_json::to_value(rmm_core::launch::essentials(&i)?)?;
+            Ok(v)
+        }))
     }
 
     #[tool(description = "All mods in priority order (later wins conflicts) with enabled state, file and plugin counts.", annotations(read_only_hint = true))]

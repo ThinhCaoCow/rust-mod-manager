@@ -237,6 +237,13 @@ pub fn detect(game: Game) -> Option<Detected> {
     })
 }
 
+/// The game in a folder the user picked: the one whose exe is there. Picking its Data folder
+/// counts as picking the game folder.
+pub fn identify(dir: &Path) -> Option<Detected> {
+    let dir = if dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case("data")) { dir.parent()? } else { dir };
+    Game::ALL.into_iter().find(|g| dir.join(g.exe()).is_file()).map(|game| Detected { game, local_path: local_path(game, dir), game_path: dir.to_path_buf(), source: "chosen" })
+}
+
 /// What a search of every drive found.
 #[derive(Debug, Default, Serialize)]
 pub struct Search {
