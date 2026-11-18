@@ -325,8 +325,8 @@ impl Instance {
         self.profiles()?.into_iter().find(|n| n.to_lowercase() == want).with_context(|| format!("no profile '{name}'"))
     }
 
-    /// A new profile: a copy of the active one, or empty (every mod is added, disabled, when it
-    /// is first switched to).
+    /// A new profile: a copy of the active one (its own INIs too), or empty (every mod is added,
+    /// disabled, when it is first switched to).
     pub fn create_profile(&self, name: &str, copy: bool) -> Result<()> {
         check_profile_name(name)?;
         self.locked(|| {
@@ -336,6 +336,11 @@ impl Instance {
             let p = if copy { self.profile()? } else { Profile::default() };
             let dir = self.root.join("profiles").join(name);
             fs::create_dir_all(&dir)?;
+            let ini = crate::profile_ini::profile_ini_dir(self, &self.config.profile);
+            if copy && ini.is_dir() {
+                fs::create_dir_all(dir.join("ini"))?;
+                crate::install::copy_dir(&ini, &dir.join("ini"))?;
+            }
             write_atomic(&dir.join("profile.toml"), &toml::to_string_pretty(&p)?)
         })
     }

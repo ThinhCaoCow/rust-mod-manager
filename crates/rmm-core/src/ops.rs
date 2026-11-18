@@ -337,6 +337,14 @@ pub fn set_profile_options(inst: &Instance, local_inis: Option<bool>, local_save
     })
 }
 
+/// A new playthrough: a copy of the active profile (its own INIs too) with its own saves, made
+/// active. From the next deploy the game saves in `Saves/<name>/`, apart from other profiles' saves.
+pub fn new_playthrough(inst: &mut Instance, name: &str) -> Result<()> {
+    inst.create_profile(name, true)?;
+    inst.switch_profile(name)?;
+    set_profile_options(inst, None, Some(true))
+}
+
 /// Rename a separator and/or set its colour (`#rrggbb`; an empty string removes it).
 /// Returns its id, which follows the name.
 pub fn edit_separator(inst: &Instance, id: &str, name: Option<&str>, color: Option<&str>) -> Result<String> {

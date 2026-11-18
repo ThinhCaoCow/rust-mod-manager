@@ -588,6 +588,50 @@ fn fallout4_ini_checks() {
     assert!(message.starts_with("257 general BA2 archives"), "{message}");
 }
 
+/// A new playthrough copies the profile and its INIs, with saves of its own; saves are copied and
+/// moved between profiles with their co-saves.
+#[test]
+fn playthrough_and_moving_saves() {
+    isolate();
+    use rmm_core::saves;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, ini) = (tmp.path().join("game"), tmp.path().join("My Games/Skyrim Special Edition"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&tmp.path().join("M/M.esp"), plugin_bytes(&[], false));
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    inst.config.ini_path = Some(ini.clone());
+    install::install(&inst, &tmp.path().join("M"), None, true, None).unwrap();
+    ops::set_profile_options(&inst, Some(true), None).unwrap();
+    write(&inst.root.join("profiles/default/ini/Skyrim.ini"), "[General]\r\nsLanguage=ENGLISH\r\n");
+    for f in ["a.ess", "a.skse", "b.ess", "notes.txt"] {
+        write(&ini.join("Saves").join(f), f);
+    }
+
+    ops::new_playthrough(&mut inst, "Run 2").unwrap();
+    let p = inst.profile().unwrap();
+    assert_eq!((inst.config.profile.as_str(), p.local_inis, p.local_saves), ("Run 2", true, true));
+    assert!(p.mods.len() == 1 && p.mods[0].enabled, "the same mods: {:?}", p.mods);
+    assert_eq!(read(&inst.root.join("profiles/Run 2/ini/Skyrim.ini")), "[General]\r\nsLanguage=ENGLISH\r\n");
+    let l = saves::list(&inst).unwrap();
+    assert_eq!((l.dir, l.saves.len()), (Some(ini.join("Saves/Run 2")), 0), "its own, empty save folder");
+    assert!(ops::new_playthrough(&mut inst, "run 2").is_err());
+
+    inst.switch_profile("default").unwrap();
+    let t = saves::transfer(&inst, &["a.ess".into()], "run 2", true).unwrap();
+    assert_eq!((t.to, t.files), (ini.join("Saves/Run 2"), vec!["a.ess".to_string(), "a.skse".into()]));
+    assert!(ini.join("Saves/a.ess").is_file() && ini.join("Saves/Run 2/a.skse").is_file(), "copied");
+    assert!(saves::transfer(&inst, &["a.ess".into()], "Run 2", false).unwrap_err().to_string().contains("already has a.ess"));
+    saves::transfer(&inst, &["b.ess".into()], "Run 2", false).unwrap();
+    assert!(!ini.join("Saves/b.ess").exists() && ini.join("Saves/Run 2/b.ess").is_file(), "moved");
+    for bad in ["../a.ess", "notes.txt", "gone.ess"] {
+        assert!(saves::transfer(&inst, &[bad.into()], "Run 2", true).is_err(), "{bad}");
+    }
+    assert!(saves::transfer(&inst, &["a.ess".into()], "default", true).is_err(), "the active profile");
+    inst.create_profile("Shared", true).unwrap();
+    assert!(saves::transfer(&inst, &["a.ess".into()], "Shared", true).unwrap_err().to_string().contains("share one save folder"));
+}
+
 /// A full plugin whose new records fit a light plugin is an ESL candidate.
 #[test]
 fn profile_inis_and_saves() {

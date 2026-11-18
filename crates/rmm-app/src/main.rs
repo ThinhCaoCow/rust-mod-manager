@@ -405,6 +405,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "script_extender_mods" => json!(launch::script_extender_mods(&inst)?),
         "create_profile" => json!(inst.create_profile(&s("name")?, flag("copy"))?),
         "switch_profile" => json!(inst.switch_profile(&s("name")?)?),
+        "new_playthrough" => json!(ops::new_playthrough(&mut inst, &s("name")?)?),
         "rename_profile" => json!(inst.rename_profile(&s("from")?, &s("to")?)?),
         "set_profile_options" => json!(ops::set_profile_options(&inst, a["local_inis"].as_bool(), a["local_saves"].as_bool())?),
         "delete_profile" => json!(inst.delete_profile(&s("name")?)?),
@@ -477,6 +478,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "saves" => json!(saves::list(&inst)?),
         "newest_save_using" => json!(saves::newest_using(&inst, &serde_json::from_value::<Vec<String>>(a["plugins"].clone())?)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
+        "transfer_saves" => json!(saves::transfer(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?, &s("profile")?, !flag("move"))?),
         "downloads" => json!(install::downloads(&inst)?),
         "downloads_dir" => json!({ "path": inst.downloads_dir(), "custom": inst.config.downloads_path.is_some() }),
         "set_downloads_dir" => {

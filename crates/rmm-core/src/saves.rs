@@ -1,7 +1,7 @@
 //! The game's saves for the active profile: who, where, and the plugins each one was made with
 //! that the profile doesn't load now (MO2's Saves tab). Only the start of each file is read.
 use crate::install::is_plugin;
-use crate::instance::{Instance, PluginEntry, Profile};
+use crate::instance::{Instance, InstanceConfig, PluginEntry, Profile};
 use crate::{Game, plugins};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -133,6 +133,65 @@ pub fn enable_missing(inst: &Instance, file: &str) -> Result<Vec<String>> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct Transfer {
+    /// The other profile's save folder.
+    pub to: PathBuf,
+    /// The files copied or moved: each save, and its script extender co-save.
+    pub files: Vec<String>,
+}
+
+/// Copy, or move (`keep` false), saves of the active profile to `profile`'s save folder, each
+/// with its co-save. A file of that name already there stops it before anything is done.
+pub fn transfer(inst: &Instance, files: &[String], profile: &str, keep: bool) -> Result<Transfer> {
+    let name = inst.find_profile(profile)?;
+    let cur = &inst.config.profile;
+    if name == *cur {
+        bail!("'{name}' is the active profile");
+    }
+    let (from, to) = (save_dir_of(inst, cur)?, save_dir_of(inst, &name)?);
+    if from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase() {
+        bail!("{cur} and {name} share one save folder; turn on Own saves for one of them");
+    }
+    if files.is_empty() {
+        bail!("no saves given");
+    }
+    let (ext, co) = (ext(inst.config.game), cosave(inst.config.game));
+    let mut names: Vec<String> = Vec::new();
+    for f in files {
+        if f.contains(['/', '\\']) || !Path::new(f).extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)) {
+            bail!("not a save file name: {f}");
+        }
+        if !from.join(f).is_file() {
+            bail!("no save '{f}' in {}", from.display());
+        }
+        let c = Path::new(f).with_extension(co).to_string_lossy().into_owned();
+        for f in [f.clone(), c] {
+            if from.join(&f).is_file() && !names.contains(&f) {
+                names.push(f);
+            }
+        }
+    }
+    if let Some(f) = names.iter().find(|f| to.join(f).exists()) {
+        bail!("{name}'s save folder already has {f}");
+    }
+    fs::create_dir_all(&to)?;
+    for f in &names {
+        if keep {
+            fs::copy(from.join(f), to.join(f))?;
+        } else {
+            fs::rename(from.join(f), to.join(f))?; // ponytail: both are in My Games; copy and delete if a profile's folder can be elsewhere
+        }
+    }
+    Ok(Transfer { to, files: names })
+}
+
+/// The folder `profile`'s saves go to once it is deployed.
+fn save_dir_of(inst: &Instance, profile: &str) -> Result<PathBuf> {
+    let at = Instance { root: inst.root.clone(), config: InstanceConfig { profile: profile.into(), ..inst.config.clone() } };
+    crate::profile_ini::save_dir(&at, &at.profile()?).context("the game's My Games folder isn't known for this instance")
+}
+
 /// The profile's loaded plugins, and which mod has each plugin it could load.
 struct Needs {
     loaded: HashSet<String>,
@@ -165,6 +224,14 @@ fn ext(game: Game) -> &'static str {
     match game.base() {
         Game::Fallout4 => "fos",
         _ => "ess",
+    }
+}
+
+/// The script extender's co-save beside each save.
+fn cosave(game: Game) -> &'static str {
+    match game.base() {
+        Game::Fallout4 => "f4se",
+        _ => "skse",
     }
 }
 

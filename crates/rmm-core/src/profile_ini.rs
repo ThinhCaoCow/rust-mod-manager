@@ -182,8 +182,8 @@ pub fn save_dir(inst: &Instance, p: &Profile) -> Option<PathBuf> {
     } else {
         fs::read(my_games(inst, inst.config.game.ini_name())).ok().and_then(|t| ini_get(&String::from_utf8_lossy(&t), "General", "sLocalSavePath"))
     };
-    let rel = rel.filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "Saves\\".into()).replace('\\', "/");
-    Some(dir.join(rel.trim_end_matches('/')))
+    let rel = rel.filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "Saves\\".into());
+    Some(rel.split(['\\', '/']).filter(|s| !s.is_empty()).fold(dir, |d, s| d.join(s)))
 }
 
 pub fn profile_ini_dir(inst: &Instance, profile: &str) -> PathBuf {

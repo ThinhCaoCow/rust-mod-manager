@@ -306,6 +306,16 @@ struct ConflictArgs {
     id: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct TransferSavesArgs {
+    /// Save file names, as list_saves gives them.
+    files: Vec<String>,
+    /// The profile whose save folder they go to.
+    profile: String,
+    /// Move them (default false: copy).
+    #[serde(default)]
+    move_them: bool,
+}
+#[derive(Deserialize, JsonSchema)]
 struct SaveArgs {
     /// The save's file name, as list_saves gives it.
     file: String,
@@ -589,6 +599,11 @@ impl Rmm {
     #[tool(description = "Enable the installed mods and plugins a save needs (those list_saves names with a mod), as one undoable change. Returns the plugins enabled. Deploy afterwards.")]
     async fn enable_save_plugins(&self, Parameters(a): Parameters<SaveArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| saves::enable_missing(&i, &a.file)))
+    }
+
+    #[tool(description = "Copy or move saves of the active profile into another profile's save folder, each with its script extender co-save. Profiles share one save folder unless they have their own saves (set_profile_options, new_playthrough); a save of that name already there stops it. Returns the folder and the files.")]
+    async fn transfer_saves(&self, Parameters(a): Parameters<TransferSavesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| saves::transfer(&i, &a.files, &a.profile, !a.move_them)))
     }
 
     #[tool(description = "Archives in the instance's downloads folder (where Nexus downloads go), newest first, with the mods installed from each.", annotations(read_only_hint = true))]
@@ -927,6 +942,14 @@ impl Rmm {
     async fn switch_profile(&self, Parameters(a): Parameters<ProfileName>) -> Result<String, String> {
         out(self.inst_mut().and_then(|mut i| {
             i.switch_profile(&a.name)?;
+            deploy::deploy(&i, true)
+        }))
+    }
+
+    #[tool(description = "Start a new playthrough: a copy of the active profile (mods, order, plugins, its own INIs) with its own saves, made active. From the next deploy the game saves in Saves/<name>/, apart from other profiles' saves, which stay where they are. Returns the deploy plan (dry run).")]
+    async fn new_playthrough(&self, Parameters(a): Parameters<ProfileName>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|mut i| {
+            ops::new_playthrough(&mut i, &a.name)?;
             deploy::deploy(&i, true)
         }))
     }

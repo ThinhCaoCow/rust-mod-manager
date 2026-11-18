@@ -127,6 +127,14 @@ enum Cmd {
         /// Enable the installed mods and plugins this save (file name) needs.
         #[arg(long)]
         fix: Option<String>,
+        /// Copy the saves named (file names) to this profile's save folder, with their co-saves.
+        #[arg(long, value_name = "PROFILE", conflicts_with_all = ["fix", "move_to"], requires = "files")]
+        copy_to: Option<String>,
+        /// Move them instead.
+        #[arg(long, value_name = "PROFILE", conflicts_with = "fix", requires = "files")]
+        move_to: Option<String>,
+        /// Save file names, for --copy-to and --move-to.
+        files: Vec<String>,
     },
     /// Archives in the instance's downloads folder and the mods installed from them.
     Downloads {
@@ -749,6 +757,9 @@ enum ProfileCmd {
     },
     /// Make a profile active and show the deploy that would apply it.
     Switch { name: String },
+    /// A new playthrough: a copy of the active profile with its own saves (Saves/<name>/), made
+    /// active. Shows the deploy that would apply it.
+    Playthrough { name: String },
     Rename { from: String, to: String },
     /// Delete a profile other than the active one (kept in profiles/.deleted/).
     Delete { name: String },
@@ -845,8 +856,10 @@ fn run() -> Result<()> {
             let q = conflicts::DataQuery { dir: dir.unwrap_or_default(), find: find.unwrap_or_default(), conflicts_only: conflicts, archives };
             print(&conflicts::data_view(&inst, &inst.profile()?, &q)?)
         }
-        Cmd::Saves { fix: None } => print(&saves::list(&open()?)?),
-        Cmd::Saves { fix: Some(file) } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
+        Cmd::Saves { fix: Some(file), .. } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
+        Cmd::Saves { copy_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, true)?),
+        Cmd::Saves { move_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, false)?),
+        Cmd::Saves { .. } => print(&saves::list(&open()?)?),
         Cmd::Downloads { delete: Some(name), .. } => done(install::delete_download(&open()?, &name)),
         Cmd::Downloads { folder: None, .. } => print(&install::downloads(&open()?)?),
         Cmd::Downloads { folder: Some(f), .. } => {
@@ -990,6 +1003,11 @@ fn run() -> Result<()> {
         Cmd::Profile(ProfileCmd::Switch { name }) => {
             let mut inst = open()?;
             inst.switch_profile(&name)?;
+            print(&deploy::deploy(&inst, true)?)
+        }
+        Cmd::Profile(ProfileCmd::Playthrough { name }) => {
+            let mut inst = open()?;
+            ops::new_playthrough(&mut inst, &name)?;
             print(&deploy::deploy(&inst, true)?)
         }
         Cmd::Profile(ProfileCmd::Rename { from, to }) => done(open()?.rename_profile(&from, &to)),

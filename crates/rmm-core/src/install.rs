@@ -605,7 +605,7 @@ fn extract_rar(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
     for e in walkdir::WalkDir::new(src).min_depth(1) {
         let e = e?;
         let target = dest.join(e.path().strip_prefix(src)?);

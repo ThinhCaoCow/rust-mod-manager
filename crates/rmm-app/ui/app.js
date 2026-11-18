@@ -1855,7 +1855,8 @@ $('#profile-btn').onclick = e => {
   if (!pop.hidden) { pop.hidden = true; return; }
   const cur = S.info.profile;
   pop.innerHTML = S.profiles.map(p => `<button class="item" data-switch="${esc(p)}"><span class="check">${p === cur ? '✓' : ''}</span>${esc(p)}${p === cur ? '' : `<span class="x" data-delete="${esc(p)}" title="Delete this profile">×</span>`}</button>`).join('')
-    + '<hr><button class="item" data-new="copy"><span class="check"></span>Copy this profile…</button>'
+    + '<hr><button class="item" data-new="playthrough" title="A copy of this profile with its own saves, for a new character"><span class="check"></span>New playthrough…</button>'
+    + '<button class="item" data-new="copy"><span class="check"></span>Copy this profile…</button>'
     + '<button class="item" data-new="empty"><span class="check"></span>New empty profile…</button>'
     + '<button class="item" data-rename="1"><span class="check"></span>Rename this profile…</button>'
     + `<hr><button class="item" data-opt="local_inis" title="Deploy puts this profile's copies of the game's INI files in My Games; what the game changes there comes back to the profile. Purge puts yours back."><span class="check">${S.options?.local_inis ? '✓' : ''}</span>Own INI files</button>`
@@ -1890,6 +1891,11 @@ $('#profile-pop').onclick = async e => {
     const name = t.dataset.switch;
     if (await act('Switching profile', () => call('switch_profile', { name }))) {
       toast(`Switched to ${name}. Deploy or Play applies it to the game folder.`);
+    }
+  } else if (t.dataset.new === 'playthrough') {
+    const name = await ask('New playthrough', `A copy of “${cur}”: the same mods, order and plugins, with saves of its own. From the next Play the game saves in Saves\\<name>\\, so this character’s saves don’t mix with the others. Your saves so far stay with “${cur}”; the Saves tab copies or moves saves between profiles.`, 'New playthrough');
+    if (name && await act('Starting the playthrough', () => call('new_playthrough', { name }))) {
+      toast(`Switched to ${name}. Play starts the game with its own saves.`);
     }
   } else if (t.dataset.new) {
     const copy = t.dataset.new === 'copy';
@@ -2535,6 +2541,27 @@ $('#saves tbody').addEventListener('click', e => {
   if (file && e.target.closest('[data-missing]')) savePlugins(file);
 });
 $('#saves-reload').onclick = loadSaves;
+
+$('#saves-transfer').onclick = async () => {
+  const cur = S.info.profile, others = S.profiles.filter(p => p !== cur), saves = savesData?.saves ?? [];
+  if (!others.length) return toast('There’s no other profile yet. New playthrough… in the profile menu makes one with saves of its own.');
+  if (!saves.length) return toast('This profile has no saves to copy or move.');
+  const row = s => `<label class="row" style="margin:0" title="${esc(s.file)}"><input type="checkbox" value="${esc(s.file)}"> ${esc(s.player || s.file)}${s.level ? `, level ${s.level}` : ''}${s.location ? `, ${esc(s.location)}` : ''} <span class="muted small">${esc(when(s.modified))}</span></label>`;
+  const body = `<label class="field">To the profile<select id="st-to">${others.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select></label>
+    <label class="row" style="margin:12px 0 4px"><input type="checkbox" id="st-all"> All ${plural(saves.length, 'save')}</label>
+    <div class="stack" id="st-saves" style="max-height:40vh;overflow:auto">${saves.map(row).join('')}</div>
+    <p class="muted small" style="margin-top:10px">Each save goes with its script extender co-save. A save the other profile already has stops it.</p>`;
+  const done = dialog({ title: 'Copy or move saves', body, actions: [['cancel', 'Cancel'], ['move', 'Move'], ['copy', 'Copy', 'primary']] });
+  $('#st-all').onchange = e => $$('#st-saves input').forEach(c => { c.checked = e.target.checked; });
+  const how = await done;
+  const files = $$('#st-saves input:checked').map(c => c.value), profile = $('#st-to').value;
+  if (!how) return;
+  if (!files.length) return toast('No saves were ticked.');
+  const r = await act(how === 'move' ? 'Moving the saves' : 'Copying the saves', () => call('transfer_saves', { files, profile, move: how === 'move' }), { reload: false });
+  if (!r) return;
+  toast(`${how === 'move' ? 'Moved' : 'Copied'} ${plural(files.length, 'save')} to ${profile} (${r.to}).`);
+  loadSaves();
+};
 
 async function loadDownloads() {
   try { downloadsData = await call('downloads'); } catch (e) { downloadsData = []; toast(`Couldn’t read the downloads.\n${e}`, 'error'); }
