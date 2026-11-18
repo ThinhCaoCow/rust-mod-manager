@@ -253,8 +253,9 @@ struct NexusInstallArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct CollectionArgs {
-    /// The collection's link (nexusmods.com/games/<game>/collections/<id>) or id.
-    link: String,
+    /// The collection's link (nexusmods.com/games/<game>/collections/<id>) or id; default: the
+    /// active profile's collection.
+    link: Option<String>,
     /// A revision number; default: the newest.
     revision: Option<u64>,
     /// Its optional mods too; default false.
@@ -1183,11 +1184,11 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. A big collection takes a long time. dry_run defaults to true: lists what would be installed, the download size, optional mods left out and the curator's notes.")]
+    #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. Into a profile that has an earlier revision (update_from in the result) it is an update: mods with a newer file are updated in place (or installed beside the old one when another profile has that on), mods the revision dropped are turned off (turned_off, still installed), and the user's own mods (yours), the collection's mods they turned off (kept_off) and plugins they changed stay as they are. Without a link it updates the active profile's collection. A big collection takes a long time. dry_run defaults to true: lists what would be installed or updated, the download size, optional mods left out and the curator's notes.")]
     async fn install_collection(&self, Parameters(a): Parameters<CollectionArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|mut i| {
             let client = nexus::Client::from_env()?;
-            rmm_core::collection::install(&mut i, &client, &a.link, a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true))
+            rmm_core::collection::install(&mut i, &client, a.link.as_deref().unwrap_or(""), a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true))
         }))
     }
 

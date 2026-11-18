@@ -59,7 +59,7 @@ rmm read "Some Mod" scripts/foo.pex                 # a file inside a mod; Papyr
 rmm plugin-conflicts                                # plugins that change the same records, and which wins
 rmm records "Some Mod.esp"                          # what a plugin adds (quests, NPCs, items, cells) with console ids
 rmm review "Some Mod" --verdict clean --notes "..." # keep a review with the mod; `rmm reviews` shows if the files changed since
-rmm nexus collection https://www.nexusmods.com/games/skyrimspecialedition/collections/h2uqa3 --profile "My Pack" --apply   # Premium: a whole collection, in a new profile
+rmm nexus collection https://www.nexusmods.com/games/skyrimspecialedition/collections/h2uqa3 --profile "My Pack" --apply   # Premium: a whole collection, in a new profile; later `rmm nexus collection --apply` updates it to the newest revision, keeping your own mods
 rmm plugins --disable "Some Plugin.esp"              # plugins in load order; --enable / --disable turn them on or off
 rmm plugins --move "Patch.esp" --after "Some Plugin.esp"   # or --before
 rmm overwrite | rmm overwrite --to-mod "Tool Output" | rmm overwrite --clear   # what the game and tools wrote

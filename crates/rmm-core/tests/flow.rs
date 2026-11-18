@@ -2679,6 +2679,98 @@ fn identifies_downloads_and_downloads_again() {
     assert_eq!(hits.lock().unwrap()["/cdn/big.zip"], 3, "once to try to resume, once whole, once whole");
 }
 
+/// A zip of (path, bytes).
+fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+    for (name, data) in files {
+        z.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(data).unwrap();
+    }
+    z.finish().unwrap();
+    bytes
+}
+
+/// A collection's newer revision updates its profile: a newer file in place (beside the old one
+/// when another profile has that on), dropped mods turned off, new ones installed. The user's own
+/// mods, and the collection's mods and plugins they turned off, stay as they are.
+#[test]
+fn collection_update_keeps_your_changes() {
+    isolate();
+    use rmm_core::{collection, nexus};
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let esp = plugin_bytes(&[], false);
+    let json = |v: serde_json::Value| v.to_string().into_bytes();
+    // A stand-in Nexus serving one revision; each mod's archive has <name>.esp and <name>-<file>.txt.
+    let serve = |rev: u64, mods: &[(&str, u64, u64)], plugins: serde_json::Value| {
+        let list: Vec<_> = mods.iter().map(|(n, id, file)| serde_json::json!({ "name": n, "optional": false, "phase": 0, "source": { "type": "nexus", "modId": id, "fileId": file }, "details": {} })).collect();
+        let manifest = serde_json::json!({ "info": { "name": "Pack", "domainName": "skyrimspecialedition", "gameVersions": [] }, "mods": list, "modRules": [], "plugins": plugins });
+        let (base, _) = mock_nexus(|base| {
+            let link = format!("/v1/collections/pk/revisions/{rev}/download_link.json");
+            let mut routes = std::collections::HashMap::from([
+                ("/v1/users/validate.json".to_string(), json(serde_json::json!({ "user_id": 1, "name": "tester", "is_premium": true }))),
+                ("/v2/graphql".to_string(), json(serde_json::json!({ "data": { "collectionRevision": { "revisionNumber": rev, "downloadLink": link, "collection": { "name": "Pack" }, "modFiles": [] } } }))),
+                (link.clone(), json(serde_json::json!({ "download_links": [{ "URI": format!("{base}/cdn/bundle.zip") }] }))),
+                ("/cdn/bundle.zip".to_string(), zip_of(&[("collection.json", manifest.to_string().as_bytes())])),
+            ]);
+            for (n, id, file) in mods {
+                let d = format!("/v1/games/skyrimspecialedition/mods/{id}/files/{file}");
+                routes.insert(format!("{d}.json"), json(serde_json::json!({ "file_id": file, "file_name": format!("{n}-{id}-{file}-0-1700000000.zip") })));
+                routes.insert(format!("{d}/download_link.json"), json(serde_json::json!([{ "URI": format!("{base}/cdn/{file}.zip") }])));
+                routes.insert(format!("/cdn/{file}.zip"), zip_of(&[(&format!("{n}.esp"), &esp), (&format!("{n}-{file}.txt"), b"x")]));
+            }
+            routes
+        });
+        let mut client = nexus::Client::new("test-key").unwrap();
+        client.base = base;
+        client
+    };
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    let on = serde_json::json!([{ "name": "A.esp", "enabled": true }, { "name": "B.esp", "enabled": true }]);
+    let first = serve(1, &[("A", 1, 11), ("B", 2, 21), ("C", 3, 31), ("E", 5, 51)], on);
+    let link = "https://www.nexusmods.com/games/skyrimspecialedition/collections/pk";
+    let r = collection::install(&mut inst, &first, link, None, false, Some("Pack"), false).unwrap();
+    assert!(r.failed.is_empty() && r.update_from.is_none(), "{r:?}");
+    assert_eq!(inst.profile().unwrap().collection.map(|c| (c.revision, c.mods)), Some((1, ["A", "B", "C", "E"].map(String::from).to_vec())));
+
+    // Another profile uses E; here the user adds a mod, turns A off and B's plugin off.
+    inst.switch_profile("default").unwrap();
+    ops::set_mods_enabled(&inst, &["E".into()], true).unwrap();
+    inst.switch_profile("Pack").unwrap();
+    write(&tmp.path().join("src/Mine/Mine.esp"), plugin_bytes(&[], false));
+    install::install(&inst, &tmp.path().join("src/Mine"), None, true, None).unwrap();
+    ops::set_mods_enabled(&inst, &["A".into()], false).unwrap();
+    ops::set_plugins_enabled(&inst, &["B.esp".into()], false).unwrap();
+
+    let plugins2 = serde_json::json!([{ "name": "A.esp", "enabled": true }, { "name": "B.esp", "enabled": true }, { "name": "D.esp", "enabled": false }]);
+    let second = serve(2, &[("A", 1, 11), ("B", 2, 22), ("D", 4, 41), ("E", 5, 52)], plugins2);
+    let plan = collection::install(&mut inst, &second, "", None, false, None, true).unwrap();
+    let strs = |v: &[String]| v.to_vec();
+    assert_eq!(plan.update_from, Some(1), "an empty link is the profile's collection");
+    assert_eq!((strs(&plan.installed), strs(&plan.updated), strs(&plan.install)), (vec!["A".into()], vec!["B".into(), "E".into()], vec!["D".into()]));
+    assert_eq!((strs(&plan.kept_off), strs(&plan.turned_off), strs(&plan.yours)), (vec!["A".into()], vec!["C".into(), "E".into()], vec!["Mine".into()]));
+
+    let r = collection::install(&mut inst, &second, "", None, false, None, false).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    let p = inst.profile().unwrap();
+    let mods: Vec<(&str, bool)> = p.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
+    assert_eq!(mods, [("A", false), ("B", true), ("C", false), ("E", false), ("E (2)", true), ("Mine", true), ("D", true)]);
+    assert!(inst.mod_files("B").unwrap().contains(&"B-22.txt".to_string()) && !inst.mod_files("B").unwrap().contains(&"B-21.txt".to_string()), "B is updated in place");
+    assert!(inst.mod_files("E (2)").unwrap().contains(&"E-52.txt".to_string()) && inst.mod_files("E").unwrap().contains(&"E-51.txt".to_string()), "E's new file goes beside the old one");
+    assert!(inst.mod_dir("C").is_dir(), "a dropped mod stays installed");
+    let plugin = |n: &str| p.plugins.iter().find(|e| e.name == n).map(|e| e.enabled);
+    assert_eq!((plugin("B.esp"), plugin("D.esp"), plugin("Mine.esp")), (Some(false), Some(false), Some(true)), "the user's plugin choice and the curator's new one");
+    assert_eq!(p.collection.map(|c| (c.revision, c.mods)), Some((2, ["A", "B", "D", "E (2)"].map(String::from).to_vec())));
+
+    let again = collection::install(&mut inst, &second, "", None, false, None, true).unwrap();
+    assert_eq!((again.update_from, again.install.len(), again.updated.len(), again.turned_off.len()), (Some(2), 0, 0, 0), "{again:?}");
+    inst.switch_profile("default").unwrap();
+    assert_eq!(inst.profile().unwrap().mods.iter().find(|m| m.id == "E").map(|m| m.enabled), Some(true), "the other profile keeps its E");
+}
+
 /// A collection from a stand-in Nexus: a dry run, then an install into a new profile. A mod
 /// already installed from the same file is turned on there, a "dinput" mod's non-Data files go
 /// to the game folder (and stay there on reinstall), and the user's own profile is left alone.
@@ -2690,16 +2782,6 @@ fn collection_into_a_new_profile() {
     let game = tmp.path().join("game");
     write(&game.join("SkyrimSE.exe"), "exe");
     write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
-    let zip_of = |files: &[(&str, &[u8])]| {
-        let mut bytes = Vec::new();
-        let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
-        for (name, data) in files {
-            z.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
-            z.write_all(data).unwrap();
-        }
-        z.finish().unwrap();
-        bytes
-    };
     let source = |id: u64, file: u64, logical: &str| serde_json::json!({ "type": "nexus", "modId": id, "fileId": file, "logicalFilename": logical });
     let manifest = serde_json::json!({
         "info": { "name": "Test Pack", "domainName": "skyrimspecialedition", "gameVersions": [] },

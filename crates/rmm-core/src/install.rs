@@ -645,8 +645,7 @@ pub(crate) fn to_game_folder(dir: &Path) -> Result<Vec<String>> {
         }
     }
     let files = index_dir(dir)?;
-    fs::write(dir.join(".rmm-index"), files.join("
-"))?;
+    fs::write(dir.join(".rmm-index"), files.join("\n"))?;
     Ok(files)
 }
 

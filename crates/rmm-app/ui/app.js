@@ -2373,6 +2373,7 @@ async function installCollection(link) {
   const r = await act('Reading the collection', () => call('install_collection', { link, dry_run: true }), { reload: false, problem: true });
   if (!r || r === true) return;
   const list = (xs, n = 8) => xs.length ? `<ul class="small">${xs.slice(0, n).map(x => `<li>${esc(x)}</li>`).join('')}${xs.length > n ? `<li class="muted">and ${xs.length - n} more</li>` : ''}</ul>` : '';
+  if (r.update_from != null) return updateCollection(link, r, list);
   const name = r.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').trim().replace(/^\.+|\.+$/g, '').slice(0, 64) || 'Collection';
   const body = `<p>${plural(r.install.length, 'mod')} to download and install (${bytes(r.download_size)})${r.installed.length ? `; ${plural(r.installed.length, 'mod')} you have already are turned on` : ''}. Its mod rules, plugin list and tools come too, then LOOT sorts the plugins.</p>
     ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}
@@ -2393,10 +2394,38 @@ async function installCollection(link) {
   });
 }
 
+/** The profile already has an earlier revision: update it, keeping the user's own changes. */
+async function updateCollection(link, r, list) {
+  if (r.revision === r.update_from && !r.install.length && !r.updated.length && !r.turned_off.length) return toast(`${r.name} is up to date (revision ${r.revision}).`);
+  const body = `<p>${plural(r.updated.length, 'mod')} to update and ${plural(r.install.length, 'new mod')} to install (${bytes(r.download_size)}). Its mod rules and plugin list come too, then LOOT sorts the plugins.</p>
+    ${r.turned_off.length ? `<p>To turn off, still installed: the revision dropped them, or has a newer file of them that goes in beside (another profile uses these).</p>${list(r.turned_off.map(nameOf))}` : ''}
+    ${r.kept_off.length ? `<p class="muted small">You turned these off; they stay off: ${esc(r.kept_off.join(', '))}.</p>` : ''}
+    ${r.yours.length ? `<p class="muted small">Your own ${plural(r.yours.length, 'mod')} stay as they are, and so do plugins you turned on or off.</p>` : ''}
+    ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}`;
+  if (await dialog({ title: `Update ${r.name} from revision ${r.update_from} to ${r.revision}`, body, actions: [['cancel', 'Cancel'], ['go', 'Update', 'primary']] }) !== 'go') return;
+  const done = await act(`Updating ${r.name}`, () => call('install_collection', { link, revision: r.revision }), { problem: true });
+  if (!done || done === true) return;
+  const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p>${list(xs, 20)}` : '';
+  await dialog({
+    title: `${done.name} is at revision ${done.revision}`,
+    body: `<p>Deploy or Play applies it to the game folder.</p>${part('Updated', done.updated)}${part('Installed', done.install)}${part('Turned off', done.turned_off.map(nameOf))}${part('Couldn’t install', done.failed)}${part('Warnings', done.warnings)}`,
+    actions: [['ok', 'OK', 'primary']],
+  });
+}
+
+/** A newer revision of the profile's collection: offer the update. */
+async function checkCollection() {
+  const c = S.collection;
+  if (!c) return;
+  const n = await call('collection_newest').catch(() => null);
+  if (n > c.revision) toast(`${c.name} has a newer revision: ${n} (this profile has ${c.revision}).`, 'info', ['Update…', () => installCollection(c.slug)]);
+}
+
 $('#updates').onclick = () => checkUpdates(false);
 /** Ask Nexus for newer files; quietly (at start) only says so when there are some. */
 async function checkUpdates(quiet) {
   if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) return;
+  checkCollection();
   // The mod list's Update tags come with the reload.
   const r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
   if (!Array.isArray(r)) return;

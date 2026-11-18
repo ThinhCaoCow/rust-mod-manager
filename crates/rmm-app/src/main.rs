@@ -277,6 +277,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
                 "unmet": rules::unmet(&inst, &p)?,
                 "locks": p.locks.keys().collect::<Vec<_>>(),
                 "options": { "local_inis": p.local_inis, "local_saves": p.local_saves },
+                "collection": p.collection.as_ref().map(|c| json!({ "slug": c.slug, "name": c.name, "revision": c.revision })),
                 "history": inst.history()?,
                 "mods": mods,
                 "conflicts": conflicts,
@@ -453,7 +454,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "install_collection" => {
             let client = nexus::Client::from_env()?;
-            json!(rmm_core::collection::install(&mut inst, &client, &s("link")?, a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"))?)
+            json!(rmm_core::collection::install(&mut inst, &client, a["link"].as_str().unwrap_or(""), a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"))?)
+        }
+        // The newest revision of the profile's collection.
+        "collection_newest" => {
+            let slug = p.collection.as_ref().map(|c| c.slug.clone()).context("this profile wasn't installed from a collection")?;
+            json!(rmm_core::collection::revision(&inst, &nexus::Client::from_env()?, &slug, None)?.number)
         }
         "essentials" => json!(launch::essentials(&inst)?),
         // A mod's Files tab, for the getting-started list (Nexus mod pages only).

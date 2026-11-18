@@ -69,6 +69,10 @@ pub struct Profile {
     /// The profile's saves go to `Saves/<name>/`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_saves: bool,
+    /// The Nexus collection installed into this profile, so updating it to a newer revision
+    /// tells its mods from the user's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<crate::collection::Installed>,
 }
 
 impl Profile {

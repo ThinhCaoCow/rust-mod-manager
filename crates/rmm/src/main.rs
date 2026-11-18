@@ -639,10 +639,12 @@ enum NexusCmd {
         what: String,
     },
     /// Install a collection (Premium accounts): its mods with the curator's installer choices,
-    /// its mod rules, plugin list and tools. Shows what it would install; --apply installs.
+    /// its mod rules, plugin list and tools. Shows what it would install; --apply installs. In a
+    /// profile with an earlier revision it updates: newer files in, dropped mods off, your own
+    /// mods and the ones you turned off as they are.
     Collection {
-        /// The collection's link or id.
-        link: String,
+        /// The collection's link or id; default: the active profile's collection.
+        link: Option<String>,
         /// A revision number (default: the newest).
         #[arg(long)]
         revision: Option<u64>,
@@ -1126,7 +1128,7 @@ fn run() -> Result<()> {
             print(&nexus::install(&inst, &client, &link, None)?)
         }
         Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, apply }) => {
-            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link, revision, optional, profile.as_deref(), !apply)?)
+            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link.unwrap_or_default(), revision, optional, profile.as_deref(), !apply)?)
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;
