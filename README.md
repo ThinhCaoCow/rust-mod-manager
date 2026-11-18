@@ -1,6 +1,6 @@
 # rmm: Rust Mod Manager
 
-A mod manager for Skyrim SE/AE and Fallout 4 on Windows that an AI can drive over MCP. The design is in [SPEC.md](SPEC.md). The research behind it is in [reports/](reports/).
+A mod manager for Skyrim SE/AE and Fallout 4 on Windows that an AI can drive over MCP.
 
 **Status: Windows only for now, with milestones 1 to 6 done for it.** The core library, CLI, MCP server (stdio and HTTP), desktop app, FOMOD installers, LOOT sorting and rules, archive conflicts, profiles, mod rules, tool runs, launching through the script extender, Nexus downloads and update checks, add-ons, MO2 and Vortex import, lockfiles and test runs work. The test harness has run in Skyrim and Fallout 4 (in a small window behind the others, with screenshots). Nexus single sign-on is built and tested, and switches on once Nexus registers rmm and issues its application name.
 
