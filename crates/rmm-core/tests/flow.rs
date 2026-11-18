@@ -3047,10 +3047,15 @@ fn reports_missing_nexus_requirements() {
         install::install(&inst, &src.join(m), None, true, None).unwrap();
     }
     nexus::remember(&inst, "SkyUI", rmm_core::instance::NexusRef { mod_id: 12604, ..Default::default() }).unwrap();
+    // Pandora stands in for Nemesis, and a note can say a requirement isn't one.
+    write(&src.join("Pandora/Pandora Behaviour Engine+.exe"), "x");
+    install::install(&inst, &src.join("Pandora"), None, true, None).unwrap();
+    nexus::remember(&inst, "Pandora", rmm_core::instance::NexusRef { mod_id: 133232, ..Default::default() }).unwrap();
     fs::write(
         inst.root.join("nexus-requirements.json"),
         r#"{"12604": [{"name": "SKSE64", "url": "https://skse.silverlock.org/"}, {"mod_id": 32444, "name": "Address Library for SKSE Plugins"},
-            {"mod_id": 555, "name": "PapyrusUtil SE"}, {"name": "A tool", "url": "https://example.com/tool"}, {"mod_id": 12604, "name": "SkyUI"}]}"#,
+            {"mod_id": 555, "name": "PapyrusUtil SE"}, {"name": "A tool", "url": "https://example.com/tool"}, {"mod_id": 12604, "name": "SkyUI"},
+            {"mod_id": 60033, "name": "Nemesis Unlimited Behavior Engine"}, {"mod_id": 69980, "name": "QuickLoot EE", "notes": "NOT REQUIRED, simply here for visibility"}]}"#,
     )
     .unwrap();
     let needs = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "nexus_requirement").map(|i| (i.subject, i.message)).collect::<Vec<_>>();

@@ -1203,16 +1203,63 @@ pub fn refresh_requirements(inst: &Instance, client: &Client, mod_ids: &[u64]) -
     Ok(())
 }
 
+/// Nexus mods that do another's job, by game: (domain, the mod, its stand-ins).
+const STAND_INS: &[(&str, u64, &[u64])] = &[
+    // Pandora runs Nemesis's and FNIS's behaviour patches; Nemesis runs FNIS's.
+    ("skyrimspecialedition", 60033, &[133232]),
+    ("skyrimspecialedition", 3038, &[60033, 133232]),
+];
+
+/// Whether a requirement's note (or its name) says this setup can do without it: the note calls
+/// it optional or not required, or it is only for other game versions ("older than 1.6.1130",
+/// "1.6.640+", "if you're on 1.5", "for Skyrim 1.5"). `game` is the game's version and the
+/// major.minor pairs its versions have had; other numbers (a mod's own version) aren't read as one.
+fn waived(r: &Needed, game: Option<([u32; 4], &[[u32; 2]])>) -> bool {
+    use std::cmp::Ordering;
+    let notes = r.notes.to_lowercase();
+    let optional = regex::Regex::new(r"\b(optional|not (required|needed|necessary|mandatory)|no longer (required|needed)|if you want)\b").unwrap();
+    if optional.is_match(&notes) && !notes.contains("not optional") {
+        return true;
+    }
+    let Some((have, eras)) = game else { return false };
+    let text = format!("{} {notes}", r.name.to_lowercase());
+    const V: &str = r"v?(\d+(?:\.\d+)+)";
+    // The phrase, and whether the game needs the requirement given how its version compares.
+    let rules = [
+        (format!(r"{V}\s*(?:\+|or (?:newer|later|higher|above))"), Ordering::is_ge as fn(Ordering) -> bool),
+        (format!(r"{V}\s*(?:or|and) (?:older|earlier|lower|below)"), Ordering::is_le),
+        (format!(r"\b(?:newer|later|higher) than\s*{V}"), Ordering::is_gt),
+        (format!(r"\b(?:older than|earlier than|lower than|below|before|prior to|pre-?)\s*{V}"), Ordering::is_lt),
+        (format!(r"\b(?:on|for)\s+(?:skyrim\s+|fallout 4\s+)?(?:se\s+|ae\s+)?{V}"), Ordering::is_eq),
+    ];
+    for (phrase, needs) in rules {
+        for c in regex::Regex::new(&phrase).unwrap().captures_iter(&text) {
+            let v: Vec<u32> = c[1].split('.').filter_map(|p| p.parse().ok()).take(4).collect();
+            if v.len() >= 2 && eras.contains(&[v[0], v[1]]) {
+                return !needs(have[..v.len()].cmp(&v[..]));
+            }
+        }
+    }
+    false
+}
+
 /// Enabled mods whose Nexus page lists a requirement that isn't installed, or is but is disabled:
 /// (mod id, message). A mod's Nexus id is the recorded one or the one in its archive's name, and a
-/// requirement also counts as installed when a mod has its name. The script extender counts when
-/// its loader is in the game folder or an enabled mod. Other sites' requirements aren't checked.
+/// requirement also counts as installed when a mod has its name or is a stand-in for it. The script
+/// extender counts when its loader is in the game folder or an enabled mod. Other sites'
+/// requirements aren't checked, nor ones their note waives for this game (see `waived`).
 pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile) -> Vec<(String, String)> {
     let all = requirements(inst);
     if all.is_empty() {
         return vec![];
     }
     let domain = inst.config.game.nexus_domain();
+    let eras: &[[u32; 2]] = match inst.config.game {
+        crate::game::Game::SkyrimSe => &[[1, 5], [1, 6], [1, 7]],
+        crate::game::Game::Fallout4 => &[[1, 10], [1, 11]],
+        crate::game::Game::Addon(_) => &[],
+    };
+    let game = crate::launch::game_version(&inst.config.game_path, inst.config.game).ok().map(|v| (v, eras));
     let mods: Vec<(&crate::ModEntry, Option<u64>, String)> = profile
         .mods
         .iter()
@@ -1234,7 +1281,7 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
     for (m, nx, _) in mods.iter().filter(|x| x.0.enabled) {
         let Some(reqs) = nx.and_then(|n| all.get(&n)) else { continue };
         let mut lacking = Vec::new();
-        for r in reqs.iter().filter(|r| r.mod_id.is_none_or(|id| Some(id) != *nx)) {
+        for r in reqs.iter().filter(|r| r.mod_id.is_none_or(|id| Some(id) != *nx) && !waived(r, game)) {
             let page = match r.mod_id {
                 Some(id) => format!("nexusmods.com/{domain}/mods/{id}"),
                 None => r.url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
@@ -1248,7 +1295,9 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
             if r.mod_id.is_none() {
                 continue; // another site's download; rmm can't tell whether it's there
             }
-            let same: Vec<&(&crate::ModEntry, Option<u64>, String)> = mods.iter().filter(|x| x.1 == r.mod_id || x.2.eq_ignore_ascii_case(&r.name)).collect();
+            let stand_ins = STAND_INS.iter().find(|s| s.0 == domain && Some(s.1) == r.mod_id).map_or(&[][..], |s| s.2);
+            let same: Vec<&(&crate::ModEntry, Option<u64>, String)> =
+                mods.iter().filter(|x| x.1 == r.mod_id || x.1.is_some_and(|id| stand_ins.contains(&id)) || x.2.eq_ignore_ascii_case(&r.name)).collect();
             match same.iter().find(|x| x.0.enabled).or(same.first()) {
                 None => lacking.push(format!("{} ({page}), not installed", r.name)),
                 Some(x) if !x.0.enabled && x.2.eq_ignore_ascii_case(&r.name) => lacking.push(format!("{}, installed but disabled", r.name)),
@@ -1291,5 +1340,29 @@ mod text_tests {
     fn bbcode_to_text() {
         let bb = "[center][size=5]Frostfall [SE][/size][/center]\r<br />[img]http://x/y.png[/img]<br /><br /><br />Needs [url=https://nexusmods.com/skyrimspecialedition/mods/667]Campfire[/url] &amp; more[list][*]one[/list]";
         assert_eq!(super::plain_text(bb), "Frostfall [SE]\n\nNeeds https://nexusmods.com/skyrimspecialedition/mods/667 Campfire & more\n- one");
+    }
+
+    /// Notes from real Nexus pages (QuickLoot IE, Precision), on Skyrim 1.6.1170 and on 1.5.97.
+    #[test]
+    fn notes_that_waive_a_requirement() {
+        let eras: &[[u32; 2]] = &[[1, 5], [1, 6], [1, 7]];
+        let waived = |name: &str, notes: &str, v: [u32; 4]| super::waived(&super::Needed { mod_id: Some(1), name: name.into(), notes: notes.into(), url: String::new() }, Some((v, eras)));
+        let (ae, se) = ([1, 6, 1170, 0], [1, 5, 97, 0]);
+        for (name, notes, on_ae, on_se) in [
+            ("Nemesis", "Technically optional but very strongly recommended.", true, true),
+            ("QuickLoot EE", "NOT REQUIRED, simply here for visibility. Go endorse it!", true, true),
+            ("I4", "OPTIONAL - Only required if you want fancy icons to show up", true, true),
+            ("BEES", "Only required if you are on a version older than 1.6.1130", true, false),
+            ("I4 for Skyrim 1.5", "", true, false),
+            ("X", "Only for 1.6.640+", false, true),
+            ("X", "Needed on 1.5.97 or older", true, false),
+            ("SkyUI", "MANDATORY", false, false),
+            ("MCM Helper", "Required for the MCM to work.", false, false),
+            ("X", "Needs version 2.0.1 or older of this", false, false),
+            ("X", "Not optional.", false, false),
+        ] {
+            assert_eq!((waived(name, notes, ae), waived(name, notes, se)), (on_ae, on_se), "{name}: {notes}");
+        }
+        assert!(!super::waived(&super::Needed { mod_id: Some(1), name: "BEES".into(), notes: "older than 1.6.1130".into(), url: String::new() }, None), "no game version: keep it");
     }
 }
