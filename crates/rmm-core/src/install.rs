@@ -220,7 +220,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
         })?;
         let plugins = top_plugins(&files);
         let label = if new_source.is_some() { format!("update {id}") } else { format!("reinstall {id}") };
-        inst.edit_swapping(&label, Some((id, &kept)), |p| {
+        inst.edit_swapping(&label, &[(id, &kept)], |p| {
             add_plugins(p, &plugins, enabled);
             Ok(())
         })?;

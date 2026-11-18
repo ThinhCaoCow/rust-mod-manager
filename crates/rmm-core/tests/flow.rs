@@ -1147,6 +1147,83 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert!(!game.join("enblocal.ini").exists());
 }
 
+/// xEdit-style patching: the output mod stays deployed while the tool runs, a plugin it saves (a
+/// new file renamed over the deployed link, as xEdit does) goes back to its mod, new files go into
+/// the chosen mod, and undo and redo swap the mods' files.
+#[cfg(windows)]
+#[test]
+fn tool_edits_go_back_to_their_mods() {
+    isolate();
+    use rmm_core::tools::{self, ToolSpec};
+    use std::collections::BTreeMap;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, local, src, root) = (tmp.path().join("game"), tmp.path().join("local"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let (v1, v2) = (plugin_bytes(&[], false), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Patches/Patch.esp"), &v1);
+    write(&src.join("Big/meshes/x.nif"), "x");
+    write(&src.join("files/Patch2.esp"), &v2);
+    write(&src.join("files/New.esp"), &v1);
+    write(
+        &src.join("tool.bat"),
+        [
+            r"@echo off",
+            r#"if exist "%~2\Patch.esp" echo seen> "%~1\seen.txt""#,
+            r#"copy /y "%~3\Patch2.esp" "%~2\Patch.esp.tmp" >nul"#,
+            r#"move /y "%~2\Patch.esp.tmp" "%~2\Patch.esp" >nul"#,
+            r#"if not exist "%~2\New.esp" copy /y "%~3\New.esp" "%~2\New.esp" >nul"#,
+            r"echo done",
+        ]
+        .join("\r\n"),
+    );
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &local).unwrap();
+    install::install(&inst, &src.join("Patches"), None, true, None).unwrap();
+    install::install(&inst, &src.join("Big"), None, true, None).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    let spec = |out: &str| ToolSpec {
+        exe: src.join("tool.bat"),
+        args: Some(vec!["{output}".into(), "{data}".into(), "{files}".into()]),
+        vars: BTreeMap::from([("files".to_string(), src.join("files").display().to_string())]),
+        output_mod: Some(out.into()),
+        edit_in_place: Some(true),
+        ..Default::default()
+    };
+    tools::add(&inst, "xe", spec("Patches")).unwrap();
+
+    let plan = tools::run(&inst, "xe", &BTreeMap::new(), true, None).unwrap();
+    assert!(plan.edit_in_place && plan.previous.as_deref() == Some("Patches") && plan.warnings.is_empty(), "{plan:?}");
+    let r = tools::run(&inst, "xe", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!((r.into_mods.join(" "), r.mod_id.as_deref()), ("Patches: Patch.esp".into(), Some("Patches")), "{r:?}");
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let patches = root.join("mods/Patches");
+    assert_eq!(fs::read(patches.join("Patch.esp")).unwrap(), v2);
+    assert_eq!(fs::read(patches.join("New.esp")).unwrap(), v1);
+    assert!(patches.join("seen.txt").is_file(), "the output mod stayed deployed while the tool ran");
+    assert!(same_file::is_same_file(game.join("Data/Patch.esp"), patches.join("Patch.esp")).unwrap());
+    assert_eq!(order(&inst), "Patches+ Big+", "no mod added or disabled");
+    assert!(inst.profile().unwrap().plugins.iter().any(|e| e.name == "New.esp" && e.enabled));
+
+    // Undo puts the mod's files back as they were; redo brings the edits back.
+    inst.undo().unwrap();
+    assert_eq!(fs::read(patches.join("Patch.esp")).unwrap(), v1);
+    assert!(!patches.join("New.esp").exists() && !inst.mod_files("Patches").unwrap().contains(&"New.esp".to_string()));
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(fs::read(game.join("Data/Patch.esp")).unwrap(), v1);
+    assert!(!game.join("Data/New.esp").exists());
+    inst.redo().unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(fs::read(game.join("Data/Patch.esp")).unwrap(), v2);
+    assert!(inst.mod_files("Patches").unwrap().contains(&"New.esp".to_string()));
+
+    // A name no mod has: new files make that mod, at the end of the list.
+    tools::add(&inst, "xe", spec("Fresh")).unwrap();
+    let r = tools::run(&inst, "xe", &BTreeMap::new(), false, None).unwrap();
+    assert_eq!(r.mod_id.as_deref(), Some("Fresh"), "{r:?}");
+    assert!(root.join("mods/Fresh/seen.txt").is_file());
+    assert_eq!(order(&inst), "Patches+ Big+ Fresh+");
+}
+
 /// A JSON settings file is merged before the run (other keys and a BOM survive), kept files carry
 /// over from the previous output, and a run that adds a plugin is sorted with the cached masterlist.
 #[cfg(windows)]

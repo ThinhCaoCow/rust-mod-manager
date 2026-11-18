@@ -6,6 +6,10 @@
 //! store isn't written through. rmm snapshots Data, runs the tool and diffs Data. The generated
 //! mod is built from the staging folder (`{output}`) and the diff. It replaces the previous output
 //! (which goes to trash/ so undo restores it), and a final deploy links it in.
+//!
+//! A tool set to edit in place (xEdit) instead works like MO2's "create files in mod": nothing is
+//! disabled, files it changes go back to the mods they came from, and new files go into the
+//! output mod, added to rather than replaced. Each mod changed is kept as it was for undo.
 use crate::deploy::{self, Deployed, DeployPlan};
 use crate::instance::{ModMeta, index_dir, write_atomic};
 use crate::install::{is_plugin, sanitize, unique_id};
@@ -56,6 +60,11 @@ pub struct Tool {
     /// starts before exiting, e.g. SkyrimSE.exe behind skse64_loader.exe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_for: Option<String>,
+    /// xEdit-style patching: the previous output stays enabled, files the tool changes go back to
+    /// the mods they come from, and new files go into `output_mod` (an installed mod's id or name,
+    /// or a new mod by that name), added to rather than replaced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edit_in_place: bool,
 }
 
 /// Keys rmm sets in a tool's JSON settings file before each run. Everything else in it stays.
@@ -103,6 +112,11 @@ pub struct ToolSpec {
     /// starts it and exits (SkyrimSE.exe behind skse64_loader.exe, CreationKit.exe behind ckpe_loader.exe).
     #[serde(default)]
     pub wait_for: Option<String>,
+    /// xEdit-style: changed files go back to the mods they come from, new files into output_mod
+    /// (an installed mod's id or name, or a new mod), and the previous output stays enabled.
+    /// The xedit preset does this.
+    #[serde(default)]
+    pub edit_in_place: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -113,8 +127,15 @@ pub struct RunReport {
     pub command: Vec<String>,
     /// Name of the generated mod this run fills.
     pub output_mod: String,
-    /// The tool's previous generated mod: disabled for the run, then replaced.
+    /// The tool's previous generated mod: disabled for the run, then replaced. Editing in place,
+    /// the installed mod new files go into, which stays enabled.
     pub previous: Option<String>,
+    /// Changed files go back to their mods, new files into the output mod.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub edit_in_place: bool,
+    /// Editing in place: the mod files the tool's changes went back to, as "mod: path".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub into_mods: Vec<String>,
     /// Deployed files whose hard links are swapped for copies while the tool runs.
     pub swapped: Vec<String>,
     /// The settings file rmm edits before the run.
@@ -184,6 +205,9 @@ pub fn add(inst: &Instance, id: &str, spec: ToolSpec) -> Result<Tool> {
     if spec.wait_for.is_some() {
         tool.wait_for = spec.wait_for;
     }
+    if let Some(e) = spec.edit_in_place {
+        tool.edit_in_place = e;
+    }
     inst.locked(|| {
         let mut tools = list(inst)?;
         tools.insert(id.into(), tool.clone());
@@ -220,8 +244,9 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
     let settings = |file: &str, set: &[(&str, Value)]| Some(Settings { file: file.into(), set: set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect() });
     let skyrim = game.base() == Game::SkyrimSe;
     Some(match name {
-        // Saves by writing a new file and renaming it over the plugin, so links are safe.
-        "xedit" => tool(xedit, s(&xedit_args)),
+        // Saves by writing a new file and renaming it over the plugin, so links are safe. Edits go
+        // back to the plugins' mods, as patching sessions want.
+        "xedit" => Tool { edit_in_place: true, ..tool(xedit, s(&xedit_args)) },
         "xedit-qac" => Tool {
             rewrites: s(&["{plugin}"]),
             output_mod: Some("Cleaned {plugin}".into()),
@@ -289,9 +314,16 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         bail!("{} not found", tool.exe.display());
     }
     let source = format!("tool:{id}");
+    let in_place = tool.edit_in_place;
     let previous = inst.profile()?.mods.into_iter().find(|m| {
+        if crate::instance::is_separator(&m.id) {
+            return false;
+        }
         let meta = inst.mod_meta(&m.id);
-        meta.source.as_deref() == Some(source.as_str()) && meta.name == output_mod
+        match in_place {
+            true => m.id == output_mod || meta.name == output_mod,
+            false => meta.source.as_deref() == Some(source.as_str()) && meta.name == output_mod,
+        }
     });
     let mut r = RunReport {
         tool: id.into(),
@@ -299,10 +331,14 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         command: std::iter::once(tool.exe.display().to_string()).chain(args.iter().cloned()).collect(),
         output_mod: output_mod.clone(),
         previous: previous.as_ref().map(|m| m.id.clone()),
+        edit_in_place: in_place,
         ..Default::default()
     };
-    let disable_previous = previous.as_ref().filter(|m| m.enabled).map(|m| m.id.clone());
+    let disable_previous = previous.as_ref().filter(|m| m.enabled && !in_place).map(|m| m.id.clone());
     r.settings_file = tool.settings.as_ref().map(|s| tool.exe.parent().unwrap_or(Path::new("")).join(&s.file));
+    if let Some(m) = previous.as_ref().filter(|m| in_place && !m.enabled) {
+        r.warnings.push(format!("{} is disabled: the tool doesn't see it, and new files go into it all the same", m.id));
+    }
 
     if dry_run {
         r.swapped = swaps(&deploy::manifest_files(inst)?, &rewrites).into_iter().map(|e| e.target).collect();
@@ -326,7 +362,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
     let kept = |f: &str| tool.keep.iter().any(|g| glob(g, f));
-    if let Some(old) = &previous {
+    if let Some(old) = previous.as_ref().filter(|_| !in_place) {
         let dir = inst.mod_dir(&old.id);
         for f in index_dir(&dir)?.into_iter().filter(|f| kept(f)) {
             copy_file(&dir.join(&f), &staging.join(&f))?;
@@ -393,9 +429,29 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
 
     let after = snapshot(game)?;
     let mut added_plugins: Vec<String> = vec![];
-    let new_id = unique_id(inst, &sanitize(&output_mod));
+    // Editing in place, new files join the output mod if it's installed; mods rmm changes are
+    // kept as they were first (mod id -> folder under trash/), so undo can swap them back.
+    let target = previous.as_ref().filter(|_| in_place).map(|m| m.id.clone());
+    let new_id = target.clone().unwrap_or_else(|| unique_id(inst, &sanitize(&output_mod)));
     let dest = inst.mod_dir(&new_id);
-    fs::rename(&staging, &dest)?;
+    let mut kept_as: BTreeMap<String, String> = BTreeMap::new();
+    let mut keep_old = |id: &str| -> Result<()> {
+        if !kept_as.contains_key(id) {
+            kept_as.insert(id.into(), inst.keep_files(id)?);
+        }
+        Ok(())
+    };
+    match &target {
+        Some(t) => {
+            for f in index_dir(&staging)? {
+                keep_old(t)?;
+                r.new.push(f.clone());
+                move_file(&staging.join(&f), &dest.join(&f), &staging)?;
+            }
+            fs::remove_dir_all(&staging)?;
+        }
+        None => fs::rename(&staging, &dest)?,
+    }
     // Keys and paths are game-relative; Data files go to the mod's top level, others to root/.
     for (key, (rel, size, mtime)) in &after {
         let path = game.join(rel);
@@ -411,20 +467,37 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
                 match man.get(key) {
                     Some(e) if !e.copied && same_file::is_same_file(&path, inst.mod_dir(&e.mod_id).join(&e.src)).unwrap_or(false) => {
                         r.modified_in_place.push(format!("{}: {}", e.mod_id, e.src));
-                        copy_file(&path, &to)?;
+                        if !in_place {
+                            copy_file(&path, &to)?;
+                        }
+                    }
+                    // The tool saved a mod's file: it goes back into that mod.
+                    Some(e) if in_place => {
+                        keep_old(&e.mod_id)?;
+                        move_file(&path, &inst.mod_dir(&e.mod_id).join(&e.src), game)?;
+                        r.into_mods.push(format!("{}: {}", e.mod_id, e.src));
                     }
                     Some(_) => move_file(&path, &to, game)?,
                     None if stash.join(rel).is_file() => {
+                        if target.is_some() {
+                            keep_old(&new_id)?;
+                        }
                         move_file(&path, &to, game)?;
                         move_file(&stash.join(rel), &path, game)?;
                     }
                     None => {
+                        if target.is_some() {
+                            keep_old(&new_id)?;
+                        }
                         copy_file(&path, &to)?;
                         r.warnings.push(format!("{rel} changed but isn't in the tool's rewrites, so its original wasn't kept; purge leaves the tool's version"));
                     }
                 }
             }
             None => {
+                if target.is_some() {
+                    keep_old(&new_id)?;
+                }
                 r.new.push(rel.clone());
                 move_file(&path, &to, game)?;
             }
@@ -453,23 +526,38 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         r.warnings.push(format!("exited with code {c}"));
     }
     let files = index_dir(&dest)?;
-    r.files = files.len();
-    if files.iter().all(|f| kept(f)) {
+    // A new output mod, unless the tool wrote nothing for one.
+    let made = target.is_none() && !files.iter().all(|f| kept(f));
+    if target.is_none() && !made {
         fs::remove_dir_all(&dest)?;
+    }
+    r.files = if in_place { r.new.len() + r.changed.len() } else { files.len() }; // editing in place: the files it put into mods
+    if !made && kept_as.is_empty() {
         r.warnings.push("the tool wrote nothing to the game folder or {output}".into());
         if let Some(p) = &disable_previous {
             ops::set_mod_enabled(inst, p, true)?;
         }
     } else {
-        inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), ..Default::default() })?;
-        let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect();
+        if made {
+            inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), ..Default::default() })?;
+        }
+        for id in kept_as.keys() {
+            inst.forget_index(id);
+        }
+        let files = if dest.is_dir() { inst.mod_files(&new_id)? } else { vec![] };
         let known = inst.profile()?.plugins;
-        added_plugins = plugins.iter().filter(|pl| !known.iter().any(|e| e.name.eq_ignore_ascii_case(pl))).cloned().collect();
-        inst.edit(&format!("run {id}"), |p| {
-            let entry = ModEntry { id: new_id.clone(), enabled: true };
-            match previous.as_ref().and_then(|old| p.mods.iter().position(|m| m.id == old.id)) {
-                Some(i) => p.mods[i] = entry,
-                None => p.mods.push(entry),
+        let is_new = |pl: &String| !known.iter().any(|e| e.name.eq_ignore_ascii_case(pl));
+        // Editing in place, the output mod's own plugins keep the state the user gave them.
+        let plugins: Vec<String> = files.iter().filter(|f| !f.contains('/') && is_plugin(f) && (!in_place || is_new(f))).cloned().collect();
+        added_plugins = plugins.iter().filter(|pl| is_new(pl)).cloned().collect();
+        let swaps: Vec<(&str, &str)> = kept_as.iter().map(|(m, f)| (m.as_str(), f.as_str())).collect();
+        inst.edit_swapping(&format!("run {id}"), &swaps, |p| {
+            if made {
+                let entry = ModEntry { id: new_id.clone(), enabled: true };
+                match previous.as_ref().and_then(|old| p.mods.iter().position(|m| m.id == old.id)) {
+                    Some(i) => p.mods[i] = entry,
+                    None => p.mods.push(entry),
+                }
             }
             for pl in &plugins {
                 match p.plugins.iter_mut().find(|e| e.name.eq_ignore_ascii_case(pl)) {
@@ -479,11 +567,11 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
             }
             Ok(())
         })?;
-        if let Some(old) = &previous {
+        if let Some(old) = previous.as_ref().filter(|_| made) {
             inst.trash_mod(&old.id)?;
             crate::rules::rename(inst, &old.id, &new_id)?;
         }
-        r.mod_id = Some(new_id);
+        r.mod_id = (made || kept_as.contains_key(&new_id)).then_some(new_id);
     }
     r.deploy = Some(deploy::deploy(inst, false)?);
     // New plugins land at the end of the list. Place them where LOOT would if the user sorts with
@@ -500,7 +588,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
             Err(e) => r.warnings.push(format!("LOOT couldn't place the new plugins: {e:#}")),
         }
     }
-    for v in [&mut r.new, &mut r.changed, &mut r.deleted] {
+    for v in [&mut r.new, &mut r.changed, &mut r.deleted, &mut r.into_mods] {
         if v.len() > LIST_CAP {
             let more = v.len() - LIST_CAP;
             v.truncate(LIST_CAP);

@@ -473,20 +473,20 @@ impl Instance {
 
     /// Mutate the active profile. The previous state is pushed onto the undo stack.
     pub fn edit<R>(&self, label: &str, f: impl FnOnce(&mut Profile) -> Result<R>) -> Result<R> {
-        self.edit_swapping(label, None, f)
+        self.edit_swapping(label, &[], f)
     }
 
-    /// `edit` for a step that also put a mod's old files in `trash/<folder>` (an update or a
-    /// reinstall): undo and redo swap the folders back, so the step is recorded even when the
-    /// profile doesn't change. `swap` is (mod id, folder under trash/).
-    pub(crate) fn edit_swapping<R>(&self, label: &str, swap: Option<(&str, &str)>, f: impl FnOnce(&mut Profile) -> Result<R>) -> Result<R> {
+    /// `edit` for a step that also put mods' old files in `trash/<folder>` (an update, a
+    /// reinstall, a tool's edits): undo and redo swap the folders back, so the step is recorded
+    /// even when the profile doesn't change. `swaps` are (mod id, folder under trash/).
+    pub(crate) fn edit_swapping<R>(&self, label: &str, swaps: &[(&str, &str)], f: impl FnOnce(&mut Profile) -> Result<R>) -> Result<R> {
         self.locked(|| {
             let before = self.profile()?;
             let mut after = before.clone();
             let r = f(&mut after)?;
             after.apply_locks();
-            if after != before || swap.is_some() {
-                self.push("undo", label, swap, &before)?;
+            if after != before || !swaps.is_empty() {
+                self.push("undo", label, swaps, &before)?;
                 let _ = fs::remove_dir_all(self.stack_dir("redo"));
                 write_atomic(&self.profile_file(), &toml::to_string_pretty(&after)?)?;
             }
@@ -574,11 +574,11 @@ impl Instance {
         let Some((path, label)) = self.stack(from)?.pop() else { return Ok(None) };
         let text = fs::read_to_string(&path)?;
         let mut snapshot: Profile = toml::from_str(&text)?;
-        let swap = text.lines().nth(1).and_then(|l| l.strip_prefix("# swap ")?.split_once('\t'));
+        let swaps: Vec<(&str, &str)> = text.lines().skip(1).map_while(|l| l.strip_prefix("# swap ")?.split_once('\t')).collect();
         let current = self.profile()?;
-        self.push(to, &label, swap, &current)?;
+        self.push(to, &label, &swaps, &current)?;
         fs::remove_file(&path)?;
-        if let Some((id, folder)) = swap {
+        for (id, folder) in swaps {
             self.swap_folder(id, folder)?;
         }
         for m in &snapshot.mods {
@@ -619,6 +619,9 @@ impl Instance {
         fs::rename(&live, &tmp)?;
         fs::rename(&kept, &live)?;
         fs::rename(&tmp, &kept)?;
+        if id == OVERWRITE {
+            return Ok(()); // no metadata
+        }
         // The source, FOMOD choices, Nexus ids and review go with the files; the name, notes,
         // categories and update holds stay as the user last set them.
         let back = self.mod_meta(id);
@@ -646,7 +649,31 @@ impl Instance {
             .collect())
     }
 
-    fn push(&self, name: &str, label: &str, swap: Option<(&str, &str)>, p: &Profile) -> Result<()> {
+    /// Keep a mod's files as they are now in `trash/.replaced/<id>-<n>`, for undo to swap back
+    /// (`edit_swapping`): hard links, so it costs no space, and rmm replaces files rather than
+    /// writing into them. Returns the folder under trash/.
+    pub(crate) fn keep_files(&self, id: &str) -> Result<String> {
+        let folder = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !self.root.join("trash").join(f).exists()).expect("a free name");
+        let (from, to) = (self.mod_dir(id), self.root.join("trash").join(&folder));
+        fs::create_dir_all(&to)?;
+        for e in walkdir::WalkDir::new(&from).min_depth(1) {
+            let e = e?;
+            let dst = to.join(e.path().strip_prefix(&from)?);
+            if e.file_type().is_dir() {
+                fs::create_dir_all(&dst)?;
+            } else if fs::hard_link(e.path(), &dst).is_err() {
+                fs::copy(e.path(), &dst)?;
+            }
+        }
+        Ok(folder)
+    }
+
+    /// After changing a mod's files: its file list is read again.
+    pub(crate) fn forget_index(&self, id: &str) {
+        let _ = fs::remove_file(self.mod_dir(id).join(MOD_INDEX));
+    }
+
+    fn push(&self, name: &str, label: &str, swaps: &[(&str, &str)], p: &Profile) -> Result<()> {
         let dir = self.stack_dir(name);
         fs::create_dir_all(&dir)?;
         let existing = self.stack(name)?;
@@ -654,7 +681,7 @@ impl Instance {
             .last()
             .and_then(|(f, _)| f.file_stem()?.to_str()?.parse::<u64>().ok())
             .map_or(0, |n| n + 1);
-        let swap = swap.map(|(id, folder)| format!("# swap {id}\t{folder}\n")).unwrap_or_default();
+        let swap: String = swaps.iter().map(|(id, folder)| format!("# swap {id}\t{folder}\n")).collect();
         let body = format!("# {}\n{swap}{}", label.replace('\n', " "), toml::to_string_pretty(p)?);
         fs::write(dir.join(format!("{next:010}.toml")), body)?;
         for (old, _) in existing.iter().take((existing.len() + 1).saturating_sub(crate::settings::get().history.limit)) {

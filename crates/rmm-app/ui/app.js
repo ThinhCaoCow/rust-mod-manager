@@ -2125,12 +2125,13 @@ function renderTools() {
   $('#tools tbody').innerHTML = t.tools.map(({ id, tool, last }) => {
     const out = tool.output_mod ?? `${tool.name} Output`;
     const how = !last ? '<span class="muted">Never run</span>'
-      : (last.mod_id ? `${plural(last.files, 'file')} captured` : 'Captured nothing')
+      : (last.edit_in_place ? (last.files ? `${plural(last.files, 'file')} saved into mods` : 'Changed nothing')
+        : last.mod_id ? `${plural(last.files, 'file')} captured` : 'Captured nothing')
         + (last.timed_out ? ' · timed out' : last.exit_code ? ` · exit code ${last.exit_code}` : '')
         + (last.warnings?.length ? ` · <span title="${esc(last.warnings.join('\n'))}">⚠ ${last.warnings.length}</span>` : '');
     return `<tr data-tool="${esc(id)}">
       <td class="name"><b>${esc(tool.name)}</b> <span class="muted small">${esc(id)}</span><div class="muted small" title="${esc(tool.exe)}">${esc(tool.exe)}</div></td>
-      <td>${esc(out)}</td><td>${how}</td>
+      <td>${tool.edit_in_place ? `<span title="Files it changes go back to the mods they came from; new files go to ${esc(out)}">Edits in place · ${esc(out)}</span>` : esc(out)}</td><td>${how}</td>
       <td class="run-col"><button data-run class="primary">Run…</button> <button data-remove class="link">Remove</button></td></tr>`;
   }).join('');
   $('#tools-empty').hidden = t.tools.length > 0;
@@ -2144,17 +2145,23 @@ $('#add-tool').onclick = async () => {
     <label class="field">Id<input id="t-id" spellcheck="false" placeholder="A short name, such as xedit"></label>
     <label class="field">Name<input id="t-name" spellcheck="false" placeholder="Shown in the list (optional)"></label>
     <label class="field" id="t-args-f">Arguments, one per line<textarea id="t-args" rows="4" spellcheck="false" placeholder="-o:{output}"></textarea></label>
+    <label class="field">Output mod<input id="t-out" list="mod-names" spellcheck="false" placeholder="Where new files go (default: “Name Output”)"></label>
+    <label class="row" style="margin:0"><input type="checkbox" id="t-inplace"> Save edits into the mods they change, like xEdit patching (new files go to the output mod, which can be one you have)</label>
     <p class="muted small">Placeholders: {data} {game} {plugins} {ini} {ini_dir} {output} {state}; Run asks for any other name in braces. A preset fills in its own arguments.</p>`;
   const d = $('#dlg');
   const wait = dialog({ title: 'Add a tool', body, actions: [['cancel', 'Cancel'], ['ok', 'Add', 'primary']] });
   const preset = $('#t-preset', d), id = $('#t-id', d);
-  preset.onchange = () => { $('#t-args-f', d).hidden = !!preset.value; if (preset.value && !id.value) id.value = preset.value; };
+  preset.onchange = () => {
+    $('#t-args-f', d).hidden = !!preset.value;
+    $('#t-inplace', d).checked = preset.value === 'xedit';
+    if (preset.value && !id.value) id.value = preset.value;
+  };
   $('#t-browse', d).onclick = async () => {
     const exe = await T.dialog.open({ title: 'Choose the program' });
     if (exe) { $('#t-exe', d).value = exe; if (!id.value) id.value = basename(exe).replace(/\.[^.]+$/, '').toLowerCase().replace(/[^a-z0-9-]+/g, '-'); }
   };
   if (await wait !== 'ok') return;
-  const spec = { exe: $('#t-exe', d).value.trim(), preset: preset.value || null, name: $('#t-name', d).value.trim() || null };
+  const spec = { exe: $('#t-exe', d).value.trim(), preset: preset.value || null, name: $('#t-name', d).value.trim() || null, output_mod: $('#t-out', d).value.trim() || null, edit_in_place: $('#t-inplace', d).checked };
   const args = $('#t-args', d).value.split('\n').map(s => s.trim()).filter(Boolean);
   if (!preset.value) spec.args = args;
   const tid = id.value.trim();
@@ -2187,7 +2194,10 @@ async function runTool(id) {
   const plan = await act(`Preparing ${tool.name}`, () => call('run_tool', { id, vars, dry_run: true }), { reload: false });
   if (!plan) return;
   const list = (label, l) => l?.length ? `<details><summary><b>${l.length}</b> ${label}</summary><pre>${esc(l.join('\n'))}</pre></details>` : '';
-  const body = `<div class="report"><p>rmm deploys, runs the tool, and captures what it writes into <b>${esc(plan.output_mod)}</b>${plan.previous ? `, replacing ${esc(nameOf(plan.previous))}` : ''}. Then it deploys again. Undo brings the previous output back.</p>
+  const what = plan.edit_in_place
+    ? `rmm deploys and runs the tool. Files it changes go back into the mods they came from, and new files into <b>${esc(plan.previous ? nameOf(plan.previous) : plan.output_mod)}</b>${plan.previous ? '' : ' (a new mod)'}. Then it deploys again. Undo puts those mods back as they were.`
+    : `rmm deploys, runs the tool, and captures what it writes into <b>${esc(plan.output_mod)}</b>${plan.previous ? `, replacing ${esc(nameOf(plan.previous))}` : ''}. Then it deploys again. Undo brings the previous output back.`;
+  const body = `<div class="report"><p>${what}</p>
     <pre>${esc(plan.command.join(' '))}</pre>
     ${list('deployed files swapped for copies while it runs', plan.swapped)}
     ${plan.deploy ? `<p class="muted small">The first deploy: ${plural(plan.deploy.link.length, 'file')} to link, ${plural(plan.deploy.remove.length, 'file')} to remove.</p>` : ''}
@@ -2197,10 +2207,16 @@ async function runTool(id) {
   const r = await act(`Running ${tool.name}`, () => call('run_tool', { id, vars, dry_run: false }));
   if (!r) return;
   loadTools();
-  const out = `<div class="report"><p>${r.mod_id ? `Captured ${plural(r.files, 'file')} into <b>${esc(nameOf(r.mod_id))}</b>.` : 'The tool wrote nothing rmm could capture.'}
+  const head = r.edit_in_place
+    ? (r.files ? `Saved ${plural(r.files, 'file')} into mods${r.mod_id ? `; new files are in <b>${esc(nameOf(r.mod_id))}</b>` : ''}.` : 'The tool changed nothing.')
+    : r.mod_id ? `Captured ${plural(r.files, 'file')} into <b>${esc(nameOf(r.mod_id))}</b>.` : 'The tool wrote nothing rmm could capture.';
+  const through = r.edit_in_place
+    ? `It wrote straight into mod files through their links: ${esc(r.modified_in_place.join(', '))}. Undo can’t bring back their old contents.`
+    : `It rewrote mod files through their links: ${esc(r.modified_in_place.join(', '))}. Reinstall those mods.`;
+  const out = `<div class="report"><p>${head}
     ${r.timed_out ? ' It timed out.' : r.exit_code ? ` It exited with code ${r.exit_code}.` : ''}</p>
-    ${list('new', r.new)}${list('changed', r.changed)}${list('deleted', r.deleted)}
-    ${r.modified_in_place.length ? `<p>⚠ It rewrote mod files through their links: ${esc(r.modified_in_place.join(', '))}. Reinstall those mods.</p>` : ''}
+    ${list('saved back into their mods', r.into_mods)}${list('new', r.new)}${list('changed', r.changed)}${list('deleted', r.deleted)}
+    ${r.modified_in_place.length ? `<p>⚠ ${through}</p>` : ''}
     ${r.warnings.length ? `<p>⚠ ${esc(r.warnings.join(' · '))}</p>` : ''}
     ${r.log_tail ? `<details><summary>Log</summary><pre>${esc(r.log_tail)}</pre></details>` : ''}</div>`;
   dialog({ title: `${tool.name} finished`, body: out, actions: [['cancel', 'Close']] });

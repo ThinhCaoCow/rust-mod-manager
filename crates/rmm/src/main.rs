@@ -464,6 +464,11 @@ enum ToolCmd {
         /// Program (relative to the game folder) a launcher starts; the run waits for it too.
         #[arg(long)]
         wait_for: Option<String>,
+        /// xEdit-style: files the tool changes go back to the mods they come from, and new files
+        /// into the output mod (an installed mod's id or name, or a new one), which stays enabled.
+        /// The xedit preset does this; --edit-in-place=false turns it off.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        edit_in_place: Option<bool>,
         /// Arguments after --, replacing the preset's. Placeholders: {data} {game} {plugins} {ini}
         /// {ini_dir} {output} {state} and any --var.
         #[arg(last = true)]
@@ -788,7 +793,7 @@ fn run() -> Result<()> {
         Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
         Cmd::Tool(ToolCmd::List) => print(&serde_json::json!({ "tools": tools::list(&open()?)?, "presets": tools::PRESETS })),
-        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, wait_for, args }) => {
+        Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, wait_for, edit_in_place, args }) => {
             let spec = tools::ToolSpec {
                 exe,
                 preset,
@@ -800,6 +805,7 @@ fn run() -> Result<()> {
                 keep: (!keep.is_empty()).then_some(keep),
                 settings: None, // JSON settings: presets, MCP, or tools.toml
                 wait_for,
+                edit_in_place,
             };
             print(&tools::add(&open()?, &id, spec)?)
         }

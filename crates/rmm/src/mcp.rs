@@ -832,12 +832,12 @@ impl Rmm {
         out(self.inst().and_then(|i| Ok(serde_json::json!({ "tools": tools::list(&i)?, "presets": tools::PRESETS }))))
     }
 
-    #[tool(description = "Register or replace a tool. Give the exe path; a preset fills in the arguments, which args, vars and rewrites override.")]
+    #[tool(description = "Register or replace a tool. Give the exe path; a preset fills in the arguments, which args, vars and rewrites override. edit_in_place (the xedit preset's default) suits patching: edits go back to the mods they change.")]
     async fn add_tool(&self, Parameters(a): Parameters<AddToolArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| tools::add(&i, &a.id, a.spec)))
     }
 
-    #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). dry_run defaults to true and returns the command and plan. Blocks until the tool exits, unless background is true: then it returns at once and tool_job reports progress and the result.")]
+    #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). A tool that edits in place (xEdit) instead saves changed files back into the mods they come from and new files into its output mod, kept enabled; undo puts those mods back. dry_run defaults to true and returns the command and plan. Blocks until the tool exits, unless background is true: then it returns at once and tool_job reports progress and the result.")]
     async fn run_tool(&self, Parameters(a): Parameters<RunToolArgs>) -> Result<String, String> {
         let timeout = a.timeout_secs.map(std::time::Duration::from_secs);
         let dry_run = a.dry_run.unwrap_or(true);
