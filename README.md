@@ -103,7 +103,7 @@ rmm downloads --delete "Some Mod-123-1-0-1700000000.zip"   # delete a download f
 | `test.window`, `test.dwell`, `test.timeout`, `test.screenshots`, `test.keep_runs` | 960x540, 10, 180, on, 0 | Test run defaults; screenshots of the last N runs kept (0: all) |
 | `nexus.recheck_days`, `nexus.check_on_start` | 30, off | When to ask Nexus about a mod again; check for updates when the window opens |
 | `tools.timeout_mins` | 0 | Stop a tool run from the window after this long (0: never) |
-| `ai.max_steps`, `ai.budget`, `ai.auto_allow`, `ai.role_instructions` | 60, 0, none, none | rmm's AI: steps per turn, the most a chat may cost (US$), tools it runs without asking, your instructions per role (also for AI apps over MCP) |
+| `ai.max_steps`, `ai.budget`, `ai.auto_allow`, `ai.role_instructions` | 60, 2, none, none | rmm's AI: steps per turn, the most a chat may cost (US$, 0: no limit), tools it runs without asking, your instructions per role (also for AI apps over MCP) |
 | `mcp.port`, `mcp.record_sessions` | 47823, on | The window's AI access port; keep AI apps' sessions as chats |
 
 The window keeps its own look too: theme (follow Windows, light, dark), compact rows, size, the tab it opens on, how often it looks for outside changes, how long messages stay, the Recent filter's days, asking before installing dropped files, skipping the deploy preview, the editor's tab width, spaces and wrapping, and whether Enter or Ctrl+Enter sends an AI message.

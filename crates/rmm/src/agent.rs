@@ -1166,7 +1166,7 @@ impl Agent {
                 return Ok(());
             }
             if let Some(cost) = self.chat.usage.cost.filter(|&c| cfg.budget > 0.0 && c >= cfg.budget) {
-                self.show(ui, notice(format!("Stopped: this chat has cost ${cost:.2}, your budget is ${:.2} (Settings).", cfg.budget)));
+                self.show(ui, notice(format!("Stopped: this chat has cost ${cost:.2}, which reaches your limit of ${:.2}. Raise or remove the limit in Settings, under AI, then say \"go on\".", cfg.budget)));
                 return Ok(());
             }
             let calls = match self.conn.provider.api {

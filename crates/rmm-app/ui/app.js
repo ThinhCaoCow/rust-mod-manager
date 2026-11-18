@@ -1235,7 +1235,7 @@ async function crashLog(path) {
     ${rows ? `<p>Named in the log, most likely first:</p><table class="fc">${rows}</table>` : '<p class="muted">The log names nothing that mods provide.</p>'}
     ${r.next_steps.length ? `<h3>What to try</h3><ul>${r.next_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
     ${r.call_stack.length ? `<details><summary>Call stack</summary><pre>${esc(r.call_stack.join('\n'))}</pre></details>` : ''}
-    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><button type="button" id="find-culprit" title="Turn off half of the mods at a time and play, until one is left">Find the culprit…</button><span class="muted small" id="crash-note" role="status"></span></div>
+    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><button type="button" id="find-culprit" title="Turn off half of the mods at a time and play, until one is left">Find the culprit…</button>${W.simple ? '' : '<button type="button" id="ask-ai" title="rmm’s AI reads the log and your setup, and says what it thinks and what to try; it changes nothing without asking">Ask AI about it</button>'}<span class="muted small" id="crash-note" role="status"></span></div>
     ${others.length ? `<label class="field">Older crash logs<select id="older"><option value="">Choose…</option>${others.map(o => `<option value="${esc(o.path)}">${esc(basename(o.path))} · ${esc(when(o.modified))}</option>`).join('')}</select></label>` : ''}
     <p class="muted small" style="margin-top:10px">A name in a crash log is a lead, not a verdict: the mod that crashed often isn't the one at fault.</p>`;
   const done = dialog({ title: 'Crash log', body, actions: [['cancel', 'Close']] });
@@ -1250,6 +1250,10 @@ async function crashLog(path) {
     if (b) note(`Saved ${b.path}`);
   };
   $('#find-culprit').onclick = () => { $('#dlg').close(); setTimeout(() => startBisect(r)); };
+  $('#ask-ai')?.addEventListener('click', () => {
+    $('#dlg').close();
+    setTimeout(() => askAi(`My game crashed. Read the crash log ${r.path} with read_crash_log, then tell me in plain words what most likely caused it and what I should try first. Change nothing until I say so.`));
+  });
   await done;
   $('#dlg').onclick = null;
 }
@@ -1258,6 +1262,16 @@ $('#support-bundle').onclick = async () => {
   const b = await saveBundle(null, t => toast(t, 'error'));
   if (b) toast(`Saved ${b.path}. Your Windows user name is taken out; look inside before you share it.`);
 };
+
+/** Start a new chat with rmm's AI about `text` (on the AI tab, which says what's missing to set up). */
+async function askAi(text) {
+  showTab('ai');
+  if (aiRunning) return toast('The AI is still busy; stop it or wait, then ask again.');
+  if (!aiProviders) await aiLoad();
+  if (aiChat) aiNewChat();
+  $('#ai-text').value = text;
+  $('#ai-form').requestSubmit();
+}
 
 /** Copy text; the fallback selects it in a text box inside `box` (an open dialog stays modal). */
 async function copyText(text, box = document.body) {
@@ -2991,7 +3005,7 @@ const SETTINGS = [
   ['Tools', '', [['tools.timeout_mins', 'Stop a tool run from the window after', 'num', [0, 1440], 'minutes; 0: never.']]],
   ['rmm’s AI', '', [
     ['ai.max_steps', 'Steps in one turn before it pauses', 'num', [1, 500]],
-    ['ai.budget', 'Stop a chat once it has cost', 'num', [0, 100000, 0.5], 'US dollars; 0: no limit. Claude and OpenRouter report costs.'],
+    ['ai.budget', 'Stop a chat once it has cost', 'num', [0, 100000, 0.5], 'US dollars; 0: no limit. Only Claude and OpenRouter report costs, so chats with other AIs aren’t limited.'],
     ['ai.auto_allow', 'Tools it may run without asking', 'lines', null, 'One tool name a line (deploy, sort_plugins…), on top of reads and previews.'],
     ['ai.role_instructions.lead', 'Your instructions for the Lead', 'area'],
     ['ai.role_instructions.researcher', 'For the Researcher', 'area'],
@@ -3425,11 +3439,77 @@ function aiEvent(e, replay = false) {
   }
 }
 
+// What a change the AI asks to make does, in plain words, and how it's undone. The tool and its
+// arguments fold away under Details.
+const UNDO = 'You can undo this.';
+const modName = id => byId?.get(id) ? nameOf(id) : String(id ?? '');
+const someMods = (ids = []) => ids.length > 3 ? `${ids.slice(0, 3).map(modName).join(', ')} and ${ids.length - 3} more` : ids.map(modName).join(', ');
+const PLAIN = {
+  install_mod: a => [`Install ${basename(String(a.path ?? ''))}`, UNDO],
+  reinstall_mod: a => [`Reinstall ${modName(a.id)}`, UNDO],
+  update_mod: a => [`Update ${modName(a.id)}`, 'Undo puts the old files back.'],
+  rename_mod: a => [`Rename ${modName(a.id)} to “${a.name}”`, UNDO],
+  uninstall_mods: a => [`Uninstall ${someMods(a.ids)}`, 'Their files go to the trash; Undo brings them back.'],
+  overwrite_to_mod: a => [`Make the files in Overwrite into the mod “${a.name}”`, UNDO],
+  clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
+  set_mods_enabled: a => [`${a.enabled ? 'Turn on' : 'Turn off'} ${someMods(a.ids)}`, UNDO],
+  move_mods: a => [`Move ${someMods(a.ids)} in the mod list`, UNDO],
+  set_mod_order: () => ['Reorder the mod list', UNDO],
+  add_separator: a => [`Add the separator “${a.name}”`, UNDO],
+  edit_separator: a => [`Change the separator ${modName(a.id)}`, UNDO],
+  set_mod_note: a => [`Change ${modName(a.id)}’s notes`, ''],
+  set_mod_categories: a => [`Change ${modName(a.id)}’s categories`, ''],
+  set_color: () => ['Change a row’s colour', UNDO],
+  set_plugin_enabled: a => [`${a.enabled ? 'Turn on' : 'Turn off'} ${(a.names ?? [a.name]).filter(Boolean).join(', ')}`, UNDO],
+  lock_plugin: a => [`${a.lock === false ? 'Unlock' : 'Lock'} ${a.name} at its place in the load order`, UNDO],
+  set_plugin_order: () => ['Reorder your plugins', UNDO],
+  sort_plugins: () => ['Sort your plugins with LOOT', UNDO],
+  sort_mods: () => ['Reorder your mods by the mod rules', UNDO],
+  set_loot_rule: a => [`Change LOOT’s rules for ${a.plugin}`, ''],
+  set_mod_rule: a => [`Change the mod rules for ${modName(a.id)}`, ''],
+  update_masterlist: () => ['Download LOOT’s newest masterlist', ''],
+  deploy: () => ['Deploy: put your mods into the game folder', 'Purge takes them out again.'],
+  purge: () => ['Purge: take the mods out of the game folder', 'Deploy puts them back.'],
+  launch_game: () => ['Start the game', 'It deploys your changes first.'],
+  add_tool: a => [`Add the tool ${a.id}`, ''],
+  run_tool: a => [`Run ${a.id}`, 'What it makes becomes a mod; Undo takes it out.'],
+  create_profile: a => [`Make the profile “${a.name}”`, ''],
+  new_playthrough: a => [`Start a new playthrough, “${a.name}”`, 'Your current profile and its saves stay as they are.'],
+  switch_profile: a => [`Switch to the profile “${a.name}”`, ''],
+  rename_profile: a => [`Rename the profile “${a.from}” to “${a.to}”`, ''],
+  delete_profile: a => [`Delete the profile “${a.name}”`, 'It’s kept in profiles\\.deleted.'],
+  set_profile_options: () => ['Change whether this profile has its own INIs or saves', UNDO],
+  transfer_saves: a => [`${a.move_them ? 'Move' : 'Copy'} ${plural(a.files?.length ?? 0, 'save')} to “${a.profile}”`, ''],
+  enable_save_plugins: a => [`Turn on the plugins ${a.file} needs`, UNDO],
+  test_run: () => ['Start the game for a test run', ''],
+  test_session_start: () => ['Start the game to test it step by step', ''],
+  bisect: () => ['Turn off half of the suspects to find the culprit', UNDO],
+  hold_updates: a => [`${a.hold === false ? 'Stop holding back' : 'Hold back'} updates for ${someMods(a.ids)}`, ''],
+  install_from_nexus: () => ['Download a mod from Nexus and install it', UNDO],
+  install_collection: () => ['Install a Nexus collection', ''],
+  import_mo2: () => ['Import your setup from MO2', UNDO],
+  import_vortex: () => ['Import your setup from Vortex', UNDO],
+  apply_lockfile: () => ['Apply a lockfile to this profile', UNDO],
+  undo: () => ['Undo the last change', 'Redo brings it back.'],
+  redo: () => ['Redo the change you undid', ''],
+  restore: () => ['Go back to an earlier point in History', UNDO],
+  revert_edit: () => ['Put an edited file back as it was', ''],
+  support_bundle: () => ['Save a support bundle', ''],
+  export_lockfile: () => ['Save a lockfile', ''],
+  call_addon: a => [`Run the add-on ${a.addon}`, ''],
+};
+function plainCall(name, args) {
+  try { const p = PLAIN[name]?.(args ?? {}); if (p) return p; } catch { /* the fallback */ }
+  const words = name.replace(/_/g, ' ');
+  return [words[0].toUpperCase() + words.slice(1), 'It changes your setup or starts something.'];
+}
+
 T.event.listen('ai', async ({ payload: e }) => {
   if (e.kind === 'approve') {
     const edit = e.name === 'edit_file';
-    const el = aiAdd('ask', `<p><b>Allow ${edit ? `the edit to ${esc(e.args?.path)}` : esc(e.name)}?</b> <span class="muted small">${edit ? '' : 'It changes your setup or starts something.'}</span></p>
-      <div class="ai-body">${edit ? '<p class="muted small">Reading the file…</p>' : `<pre class="sel">${esc(JSON.stringify(e.args, null, 2))}</pre>`}</div>
+    const [what, undo] = edit ? [`Edit ${e.args?.path}`, 'Edits…, by the file editor, puts it back.'] : plainCall(e.name, e.args);
+    const el = aiAdd('ask', `<p><b>${esc(what)}?</b> <span class="muted small">${esc(undo)}</span></p>
+      <div class="ai-body">${edit ? '<p class="muted small">Reading the file…</p>' : `<details><summary class="muted small">Details: ${esc(e.name)}</summary><pre class="sel">${esc(JSON.stringify(e.args, null, 2))}</pre></details>`}</div>
       <div class="row">${edit ? '<button type="button" class="link" data-open>Open the file</button><span class="spacer"></span>' : ''}<button data-a="no">Decline</button><button data-a="always" title="Allow every change for the rest of this chat">Allow all in this chat</button><button data-a="yes" class="primary">Allow</button></div>`);
     $$('.row [data-a]', el).forEach(b => {
       b.onclick = () => {

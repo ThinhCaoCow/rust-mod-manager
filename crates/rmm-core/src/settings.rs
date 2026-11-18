@@ -153,6 +153,7 @@ pub struct Ai {
     /// Model calls in one turn before rmm's AI pauses and asks to go on.
     pub max_steps: usize,
     /// US dollars a chat may cost before it stops (Claude and OpenRouter report costs); 0: no limit.
+    /// A few dollars by default, so a first try can't run up a bill.
     pub budget: f64,
     /// Tools rmm's AI may run without asking, on top of reads and dry runs.
     pub auto_allow: Vec<String>,
@@ -162,7 +163,7 @@ pub struct Ai {
 }
 impl Default for Ai {
     fn default() -> Self {
-        Ai { max_steps: 60, budget: 0.0, auto_allow: vec![], role_instructions: BTreeMap::new() }
+        Ai { max_steps: 60, budget: 2.0, auto_allow: vec![], role_instructions: BTreeMap::new() }
     }
 }
 
