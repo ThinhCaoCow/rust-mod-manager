@@ -185,7 +185,8 @@ table.fc b { color: var(--win); }
 .history li .what span { overflow-wrap: anywhere; }
 .history li button { flex: none; font-weight: 400; }
 .issues li.link { cursor: pointer; }
-.issues li .ign { grid-column: 2; justify-self: start; font-size: 12px; }
+.issues li .acts { grid-column: 2; justify-self: start; display: flex; gap: 16px; }
+.issues li .ign { font-size: 12px; }
 .issues li.ignored { opacity: 0.55; }
 textarea { font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: inherit; resize: vertical; }
 select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: inherit; }
@@ -377,7 +378,11 @@ pre.diff .del { background: var(--bad-bg); color: var(--bad); }
 .issues .subject { font-weight: 600; }
 .issues .message { grid-column: 2; color: var(--muted); }
 .history li { padding: 8px 14px; border-bottom: 1px solid var(--line); counter-increment: none; }
-.history li:first-child { font-weight: 600; }
+.history li.cur { font-weight: 600; }
+.history li.mark { padding: 4px 14px; color: var(--muted); font-size: 12px; }
+.history li.redo { color: var(--muted); }
+.not-yours { background: var(--lose-bg); color: var(--lose); padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; }
+.not-yours ul { margin: 4px 0 0; padding-left: 18px; }
 
 /* Popover menu */
 .menu { position: relative; }

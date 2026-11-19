@@ -1242,6 +1242,20 @@ pub struct ModInfo {
 
 const MOD_FIELDS: &str = "modId name summary category author version endorsements downloads updatedAt pictureUrl";
 
+/// A mod's Nexus mod id: the one rmm recorded, or the one in its archive's file name.
+pub fn nexus_id_of(meta: &crate::instance::ModMeta) -> Option<u64> {
+    meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| crate::install::nexus_id_in_name(meta.source.as_deref()?))
+}
+
+/// What a mod's Nexus page lists as required, as last read, each with the installed mod that is
+/// it. None until its requirements have been read (`refresh_requirements`).
+pub fn needs(inst: &Instance, id: &str) -> Option<Vec<Requirement>> {
+    let nx = nexus_id_of(&inst.mod_meta(id))?;
+    let reqs = requirements(inst).remove(&nx)?;
+    let installed = installed_by_nexus(inst);
+    Some(reqs.into_iter().filter(|r| r.mod_id != Some(nx)).map(|n| Requirement { installed: n.mod_id.and_then(|i| installed.get(&i).cloned()), needed: n }).collect())
+}
+
 /// Installed mods by their Nexus mod id.
 fn installed_by_nexus(inst: &Instance) -> BTreeMap<u64, String> {
     inst.profile().map(|p| p.mods.iter().filter_map(|m| Some((inst.mod_meta(&m.id).nexus?.mod_id, m.id.clone()))).collect()).unwrap_or_default()
@@ -1527,8 +1541,7 @@ pub fn lacking_requirements(inst: &Instance, profile: &crate::instance::Profile)
         .filter(|m| !crate::instance::is_separator(&m.id))
         .map(|m| {
             let meta = inst.mod_meta(&m.id);
-            let nx = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| crate::install::nexus_id_in_name(meta.source.as_deref()?));
-            (m, nx, meta.name)
+            (m, nexus_id_of(&meta), meta.name)
         })
         .collect();
     let loader = inst.config.game.loader();

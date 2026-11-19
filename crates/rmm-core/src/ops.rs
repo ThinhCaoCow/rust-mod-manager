@@ -106,6 +106,20 @@ pub fn tags(files: &[String], meta: &crate::instance::ModMeta) -> Vec<&'static s
     t
 }
 
+/// The History tab: undoable changes, newest first, each with when it was made; what Redo brings
+/// back, the next first; when this instance last deployed and started the game; and how many
+/// steps are kept (older ones are dropped).
+pub fn history(inst: &Instance) -> Result<Value> {
+    let when = |f: &str| std::fs::metadata(inst.root.join(f)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    Ok(json!({
+        "entries": inst.history_details()?,
+        "redo": inst.redo_labels()?,
+        "deployed": when(crate::deploy::MANIFEST),
+        "played": when(crate::launch::PLAYED),
+        "limit": crate::settings::get().history.limit,
+    }))
+}
+
 pub fn instance_info(inst: &Instance) -> Result<Value> {
     let p = inst.profile()?;
     Ok(json!({
@@ -118,6 +132,8 @@ pub fn instance_info(inst: &Instance) -> Result<Value> {
         "enabled_mods": p.mods.iter().filter(|m| m.enabled).count(),
         "undo_steps": inst.history()?.len(),
         "redo_steps": inst.redo_steps()?,
+        "redo_next": inst.redo_labels()?.into_iter().next(),
+        "masterlist": crate::loot::has_masterlist(inst),
     }))
 }
 
@@ -175,6 +191,9 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
         "docs": files.iter().filter(|f| ext(f, &["txt", "md", "ini"]) && !f.to_lowercase().starts_with("interface/translations/")).take(50).collect::<Vec<_>>(),
         "images": files.iter().filter(|f| ext(f, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])).take(50).collect::<Vec<_>>(),
         "conflicts": conflict,
+        // What its Nexus page lists as required (null until read), and the id to read it by.
+        "nexus_id": crate::nexus::nexus_id_of(&inst.mod_meta(id)),
+        "needs": crate::nexus::needs(inst, id),
         // The saved review with whether the files are still the ones reviewed.
         "review": crate::inspect::reviews(inst, Some(id))?.pop(),
     }))

@@ -130,7 +130,7 @@ pub fn diff(a: &Profile, b: &Profile) -> Diff {
 }
 
 /// Indices (into `v`) of one longest strictly increasing subsequence. O(n log n).
-fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
+pub(crate) fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
     let (mut tails, mut prev): (Vec<usize>, Vec<Option<usize>>) = (Vec::new(), vec![None; v.len()]);
     for i in 0..v.len() {
         let k = tails.partition_point(|&t| v[t] < v[i]);
@@ -151,6 +151,8 @@ fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
 pub struct HistoryEntry {
     pub label: String,
     pub change: Diff,
+    /// When the change was made (or last undone and redone), seconds since 1970.
+    pub time: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -522,7 +524,17 @@ impl Instance {
             let r = f(&mut after)?;
             after.apply_locks();
             if after != before || !swaps.is_empty() {
-                self.push("undo", label, swaps, &before)?;
+                // A run of moves of the same mods (Ctrl+Down held, say) is one step: the newest
+                // entry keeps the state before the first move and takes this label.
+                let undo = self.stack("undo")?;
+                let last = undo.last().filter(|(_, l)| swaps.is_empty() && move_key(label).is_some() && move_key(l) == move_key(label));
+                match last {
+                    Some((path, _)) if self.stack("redo")?.is_empty() => {
+                        let text = fs::read_to_string(path)?;
+                        fs::write(path, format!("# {}\n{}", label.replace('\n', " "), text.split_once('\n').map_or("", |(_, rest)| rest)))?;
+                    }
+                    _ => self.push("undo", label, swaps, &before)?,
+                }
                 let _ = fs::remove_dir_all(self.stack_dir("redo"));
                 write_atomic(&self.profile_file(), &toml::to_string_pretty(&after)?)?;
             }
@@ -550,13 +562,18 @@ impl Instance {
         Ok(self.stack("redo")?.len())
     }
 
+    /// Labels of the changes Redo brings back, the next first.
+    pub fn redo_labels(&self) -> Result<Vec<String>> {
+        Ok(self.stack("redo")?.into_iter().rev().map(|(_, label)| label).collect())
+    }
+
     /// Undoable changes, newest first, each with the mods it touched.
     pub fn history_details(&self) -> Result<Vec<HistoryEntry>> {
         let snaps = self.snapshots()?;
         let mut after = self.profile()?;
         let mut out = Vec::new();
-        for (label, before) in snaps.into_iter().rev() {
-            out.push(HistoryEntry { label, change: diff(&before, &after) });
+        for (label, before, time) in snaps.into_iter().rev() {
+            out.push(HistoryEntry { label, change: diff(&before, &after), time });
             after = before;
         }
         Ok(out)
@@ -565,7 +582,7 @@ impl Instance {
     /// What restoring the state before history entry `n` (0 = the newest) would change.
     pub fn restore_preview(&self, n: usize) -> Result<Diff> {
         let snaps = self.snapshots()?;
-        let (_, target) = snaps.len().checked_sub(n + 1).and_then(|i| snaps.into_iter().nth(i)).context("no such history entry")?;
+        let (_, target, _) = snaps.len().checked_sub(n + 1).and_then(|i| snaps.into_iter().nth(i)).context("no such history entry")?;
         Ok(diff(&self.profile()?, &target))
     }
 
@@ -580,17 +597,18 @@ impl Instance {
         })
     }
 
-    /// (label, profile before the change) for every undo entry, oldest first. Mods deleted for good
+    /// (label, profile before the change, when) for every undo entry, oldest first. Mods deleted for good
     /// (the trash emptied) are left out: going back can't bring them, and undo drops them too.
-    fn snapshots(&self) -> Result<Vec<(String, Profile)>> {
+    fn snapshots(&self) -> Result<Vec<(String, Profile, u64)>> {
         let names = |dir: PathBuf| -> std::collections::HashSet<String> { fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect() };
         let kept: std::collections::HashSet<String> = names(self.mods_dir()).into_iter().chain(names(self.root.join("trash"))).collect();
         self.stack("undo")?
             .into_iter()
             .map(|(path, label)| {
-                let mut p: Profile = toml::from_str(&fs::read_to_string(path)?)?;
+                let mut p: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
                 p.mods.retain(|m| is_separator(&m.id) || kept.contains(&m.id));
-                Ok((label, p))
+                let time = fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                Ok((label, p, time))
             })
             .collect()
     }
@@ -734,6 +752,11 @@ impl Instance {
         }
         Ok(())
     }
+}
+
+/// What a run of moves shares: "move X to 5" and "move X to 6" are both "X".
+fn move_key(label: &str) -> Option<&str> {
+    label.strip_prefix("move ")?.rsplit_once(" to ").map(|(what, _)| what)
 }
 
 /// Profile names are folder names: no path characters, no leading dot (`.deleted` is rmm's).

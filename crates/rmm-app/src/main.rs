@@ -349,6 +349,11 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             anyhow::ensure!(Path::new(&path).components().all(|c| matches!(c, std::path::Component::Normal(_))), "a path inside the mod");
             json!(data_url(&inst.mod_dir(&s("id")?).join(path))?)
         }
+        // Read what a mod's Nexus page lists as required, for its panel and Problems (no key needed).
+        "read_requirements" => {
+            nexus::refresh_requirements(&inst, &nexus::Client::any(), &[n("mod_id")? as u64])?;
+            Value::Null
+        }
         // What a mod's Nexus page says, for its panel (no key needed).
         "nexus_mod_info" => json!(nexus::mod_info(&inst, &nexus::Client::any(), n("mod_id")? as u64)?),
         // Without choices a FOMOD installer takes its defaults; the name defaults to the file's.
@@ -357,9 +362,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let at = a["priority"].as_u64().map(|n| n as usize);
             let r = install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at)?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
-                let id = n.mod_id;
                 nexus::remember(&inst, &r.id, n)?;
-                let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]); // for Problems; the install stands without
+            }
+            // For Problems and the panel, also when the id comes from the file name (no key
+            // needed); the install stands without.
+            if let Some(id) = nexus::nexus_id_of(&inst.mod_meta(&r.id)) {
+                let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]);
             }
             json!(r)
         }
@@ -367,8 +375,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "update_mod" => {
             let r = install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref())?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
-                let id = n.mod_id;
                 nexus::remember(&inst, &r.id, n)?;
+            }
+            if let Some(id) = nexus::nexus_id_of(&inst.mod_meta(&r.id)) {
                 let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]); // a new version can need new mods
             }
             json!(r)
@@ -461,7 +470,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "install_collection" => {
             let client = nexus::Client::from_env()?;
-            json!(rmm_core::collection::install(&mut inst, &client, a["link"].as_str().unwrap_or(""), a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"))?)
+            json!(rmm_core::collection::install(&mut inst, &client, a["link"].as_str().unwrap_or(""), a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"), a["sort"].as_bool().unwrap_or(true))?)
         }
         // The newest revision of the profile's collection.
         "collection_newest" => {
@@ -519,7 +528,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "delete_download" => json!(install::delete_download(&inst, &s("name")?)?),
         "trash" => json!(install::trash(&inst)?),
         "empty_trash" => json!(install::empty_trash(&inst)?),
-        "history_details" => json!(inst.history_details()?),
+        "history_details" => ops::history(&inst)?,
         "restore_preview" => json!(inst.restore_preview(n("n")?)?),
         "restore" => json!(inst.restore(n("n")?)?),
         "set_note" => json!(ops::set_mod_note(&inst, &s("id")?, &s("note")?)?),

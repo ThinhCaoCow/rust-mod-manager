@@ -1099,7 +1099,8 @@ fn loot_sorts_and_reports() {
     let plan = loot::sort(&inst, true).unwrap();
     let pos = |order: &[String], n: &str| order.iter().position(|x| x == n).unwrap();
     assert!(pos(&plan.order, "Second.esp") < pos(&plan.order, "First.esp"), "{plan:?}");
-    assert!(!plan.moved.is_empty() && plan.warnings.is_empty(), "{plan:?}");
+    assert!(plan.warnings.is_empty() && plan.undeployed == 0, "{plan:?}");
+    assert_eq!(plan.moved.len(), 1, "one plugin moves, not both of the pair: {plan:?}");
     let names = |inst: &Instance| inst.profile().unwrap().plugins.into_iter().map(|p| p.name).collect::<Vec<_>>();
     assert_eq!(names(&inst), ["First.esp", "Second.esp", "Dirty.esp"], "a dry run changes nothing");
 
@@ -2407,6 +2408,10 @@ fn downloads_list_and_delete() {
     let mut list: Vec<(String, Vec<String>)> = install::downloads(&inst).unwrap().into_iter().map(|d| (d.name, d.mods)).collect();
     list.sort();
     assert_eq!(list, [("A-1.zip".to_string(), vec![a]), ("B-2.zip".to_string(), vec![])]);
+    // A file Nexus named carries its mod, shown before it's identified (no file id yet).
+    write(&dl.join("SkyUI-12604-5-2SE-1600000000.7z"), "x");
+    let named = install::downloads(&inst).unwrap().into_iter().find(|d| d.name.starts_with("SkyUI")).and_then(|d| d.nexus).unwrap();
+    assert_eq!((named.name.as_deref(), named.nexus.mod_id, named.nexus.file_id, named.nexus.version.as_deref()), (Some("SkyUI"), 12604, None, Some("5.2SE")));
     install::delete_download(&inst, "B-2.zip").unwrap();
     assert!(!dl.join("B-2.zip").exists());
     assert!(install::delete_download(&inst, "../instance.toml").is_err());
@@ -2990,7 +2995,7 @@ fn collection_update_keeps_your_changes() {
     let on = serde_json::json!([{ "name": "A.esp", "enabled": true }, { "name": "B.esp", "enabled": true }]);
     let first = serve(1, &[("A", 1, 11), ("B", 2, 21), ("C", 3, 31), ("E", 5, 51)], on);
     let link = "https://www.nexusmods.com/games/skyrimspecialedition/collections/pk";
-    let r = collection::install(&mut inst, &first, link, None, false, Some("Pack"), false).unwrap();
+    let r = collection::install(&mut inst, &first, link, None, false, Some("Pack"), false, true).unwrap();
     assert!(r.failed.is_empty() && r.update_from.is_none(), "{r:?}");
     assert_eq!(inst.profile().unwrap().collection.map(|c| (c.revision, c.mods)), Some((1, ["A", "B", "C", "E"].map(String::from).to_vec())));
 
@@ -3005,13 +3010,13 @@ fn collection_update_keeps_your_changes() {
 
     let plugins2 = serde_json::json!([{ "name": "A.esp", "enabled": true }, { "name": "B.esp", "enabled": true }, { "name": "D.esp", "enabled": false }]);
     let second = serve(2, &[("A", 1, 11), ("B", 2, 22), ("D", 4, 41), ("E", 5, 52)], plugins2);
-    let plan = collection::install(&mut inst, &second, "", None, false, None, true).unwrap();
+    let plan = collection::install(&mut inst, &second, "", None, false, None, true, true).unwrap();
     let strs = |v: &[String]| v.to_vec();
     assert_eq!(plan.update_from, Some(1), "an empty link is the profile's collection");
     assert_eq!((strs(&plan.installed), strs(&plan.updated), strs(&plan.install)), (vec!["A".into()], vec!["B".into(), "E".into()], vec!["D".into()]));
     assert_eq!((strs(&plan.kept_off), strs(&plan.turned_off), strs(&plan.yours)), (vec!["A".into()], vec!["C".into(), "E".into()], vec!["Mine".into()]));
 
-    let r = collection::install(&mut inst, &second, "", None, false, None, false).unwrap();
+    let r = collection::install(&mut inst, &second, "", None, false, None, false, true).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);
     let p = inst.profile().unwrap();
     let mods: Vec<(&str, bool)> = p.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
@@ -3023,7 +3028,7 @@ fn collection_update_keeps_your_changes() {
     assert_eq!((plugin("B.esp"), plugin("D.esp"), plugin("Mine.esp")), (Some(false), Some(false), Some(true)), "the user's plugin choice and the curator's new one");
     assert_eq!(p.collection.map(|c| (c.revision, c.mods)), Some((2, ["A", "B", "D", "E (2)"].map(String::from).to_vec())));
 
-    let again = collection::install(&mut inst, &second, "", None, false, None, true).unwrap();
+    let again = collection::install(&mut inst, &second, "", None, false, None, true, true).unwrap();
     assert_eq!((again.update_from, again.install.len(), again.updated.len(), again.turned_off.len()), (Some(2), 0, 0, 0), "{again:?}");
     inst.switch_profile("default").unwrap();
     assert_eq!(inst.profile().unwrap().mods.iter().find(|m| m.id == "E").map(|m| m.enabled), Some(true), "the other profile keeps its E");
@@ -3079,12 +3084,12 @@ fn collection_into_a_new_profile() {
     nexus::remember(&inst, "Have", rmm_core::instance::NexusRef { mod_id: 1, file_id: Some(11), ..Default::default() }).unwrap();
     let link = "https://www.nexusmods.com/games/skyrimspecialedition/collections/abc";
 
-    let plan = collection::install(&mut inst, &client, link, None, false, Some("Pack"), true).unwrap();
+    let plan = collection::install(&mut inst, &client, link, None, false, Some("Pack"), true, true).unwrap();
     assert_eq!((plan.install.clone(), plan.installed.clone(), plan.optional.clone()), (vec!["Enb Stuff".to_string()], vec!["Have".to_string()], vec!["Optional One".to_string()]));
     assert_eq!((plan.game_folder.clone(), plan.download_size, plan.revision), (vec!["Enb Stuff".to_string()], 500, 3));
     assert_eq!(inst.config.profile, "default", "a dry run makes no profile");
 
-    let r = collection::install(&mut inst, &client, link, None, false, Some("Pack"), false).unwrap();
+    let r = collection::install(&mut inst, &client, link, None, false, Some("Pack"), false, true).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);
     assert_eq!((r.profile.as_deref(), r.rules, r.instructions.clone()), (Some("Pack"), 1, vec!["Enb Stuff: Use the high preset.".to_string()]));
     assert_eq!(inst.config.profile, "Pack");
@@ -3102,7 +3107,7 @@ fn collection_into_a_new_profile() {
 
     inst.switch_profile("default").unwrap();
     assert_eq!(inst.profile().unwrap().mods.iter().find(|m| m.id == "Have").map(|m| m.enabled), Some(false), "the user's own profile is as it was");
-    let again = collection::install(&mut inst, &client, link, None, false, Some("Pack"), true);
+    let again = collection::install(&mut inst, &client, link, None, false, Some("Pack"), true, true);
     assert!(format!("{:#}", again.unwrap_err()).contains("already exists"));
 }
 
@@ -3755,6 +3760,13 @@ fn reports_missing_nexus_requirements() {
     .unwrap();
     let needs = |inst: &Instance| health::check(inst).unwrap().into_iter().filter(|i| i.kind == "nexus_requirement").map(|i| (i.subject, i.message)).collect::<Vec<_>>();
     let id = "Address Library for SKSE Plugins";
+    // The panel's list: all the page lists but the mod itself, with the installed mod that is each;
+    // none for a mod whose requirements were never read.
+    let listed = nexus::needs(&inst, "SkyUI").unwrap();
+    assert_eq!(listed.len(), 6, "{listed:?}");
+    assert!(listed.iter().any(|r| r.needed.mod_id == Some(32444) && r.installed.as_deref() == Some(id)), "{listed:?}");
+    assert!(listed.iter().any(|r| r.needed.mod_id == Some(555) && r.installed.is_none()), "{listed:?}");
+    assert!(nexus::needs(&inst, "Pandora").is_none() && nexus::needs(&inst, id).is_none());
     assert_eq!(
         needs(&inst),
         [("SkyUI".into(), "its Nexus page lists as required: SKSE64 (skse.silverlock.org), not installed; PapyrusUtil SE (nexusmods.com/skyrimspecialedition/mods/555), not installed. Ignore this if you have them another way".into())]
@@ -4067,4 +4079,58 @@ fn update_offer_tells_files_of_one_page_apart() {
     let mcm = install::install(&inst, &src.join("MfgFix MCM-11669-1-0-1700000000"), None, true, None).unwrap().id;
     assert_eq!(install::same_mod(&inst, &new_mcm, Some(11669)).unwrap().map(|m| m.0), Some(mcm));
     assert_eq!(install::same_mod(&inst, &src.join("Extra-11669-1-0-1710000000"), None).unwrap(), None);
+}
+
+/// A crash log from before rmm ever started the game, naming a DLL no mod provides, says it may
+/// not be this setup's and where the DLL sits, not that the save is to blame. Find the culprit
+/// leaves Address Library and the crash logger on. A run of moves of one mod is one undo step.
+#[test]
+fn a_crash_log_from_another_setup_says_so() {
+    isolate();
+    use rmm_core::{bisect, logs};
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut inst, game) = deployed_setup(tmp.path());
+    let my = tmp.path().join("My Games");
+    inst.config.ini_path = Some(my.clone());
+    write(&tmp.path().join("AddrLib/SKSE/Plugins/versionlib-1-6-1170-0.bin"), "bin");
+    write(&tmp.path().join("Logger/SKSE/Plugins/CrashLogger.dll"), "dll");
+    for m in ["AddrLib", "Logger"] {
+        install::install(&inst, &tmp.path().join(m), None, true, None).unwrap();
+    }
+    write(&game.join("Data/SKSE/Plugins/Stray.dll"), "put there by hand");
+    write(&my.join("SKSE/crash-2026-11-01-10-00-00.log"), "Skyrim SSE v1.6.1170
+CrashLoggerSSE v1-15-0-0
+
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x1
+
+CALL STACK ([P]robable / [S]tack scan):
+	[ 0] 0x1 Stray.dll+0001
+
+PLUGINS:
+	[ 0] Skyrim.esm
+");
+    let r = logs::read_crash_log(&inst, None).unwrap();
+    assert_eq!(r.plugin_count, Some(1));
+    assert!(r.not_yours.iter().any(|s| s.starts_with("rmm hasn't started the game")), "{:?}", r.not_yours);
+    assert!(r.next_steps[0].starts_with("This log may not be from this setup"), "{:?}", r.next_steps);
+    assert!(r.next_steps.iter().any(|s| s.starts_with("Stray.dll isn't from any mod rmm manages: it sits in")), "{:?}", r.next_steps);
+    assert!(!r.next_steps.iter().any(|s| s.contains("save")), "{:?}", r.next_steps);
+
+    assert_eq!(bisect::suspects(&inst, true).unwrap(), ["A"]);
+
+    let order = || inst.profile().unwrap().mods.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+    let before = inst.history().unwrap().len();
+    ops::move_mods(&inst, &["A".to_string()], 1).unwrap();
+    ops::move_mods(&inst, &["A".to_string()], 2).unwrap();
+    assert_eq!(inst.history().unwrap().len(), before + 1);
+    let h = inst.history_details().unwrap();
+    assert_eq!(h[0].label, "move A to 2");
+    assert!(h[0].time > 0);
+    inst.undo().unwrap();
+    assert_eq!(order(), ["A", "AddrLib", "Logger"]);
+    assert_eq!(inst.redo_labels().unwrap(), ["move A to 2"]);
+    inst.redo().unwrap();
+    ops::move_mods(&inst, &["Logger".to_string()], 0).unwrap();
+    assert_eq!(inst.history().unwrap().len(), before + 2);
+    assert_eq!(order(), ["Logger", "AddrLib", "A"]);
 }

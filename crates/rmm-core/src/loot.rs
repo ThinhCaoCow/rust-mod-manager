@@ -26,8 +26,13 @@ pub struct SortReport {
     pub dry_run: bool,
     /// Every plugin in LOOT's order.
     pub order: Vec<String>,
-    /// Plugins whose position changes, with old and new index.
+    /// The plugins that really move: the fewest whose moving explains the new order (the rest
+    /// keep their order among themselves, even when their numbers shift), with old and new index.
     pub moved: Vec<Moved>,
+    /// Plugins on in the profile but off in the game folder's plugins.txt, or the other way round.
+    /// LOOT reads which plugins are on from there, so a deploy first lets its conditions see the
+    /// profile.
+    pub undeployed: usize,
     pub warnings: Vec<String>,
 }
 
@@ -36,10 +41,17 @@ pub struct Moved {
     pub name: String,
     pub from: usize,
     pub to: usize,
+    /// The plugin it then loads right after; none when it goes first.
+    pub after: Option<String>,
 }
 
 fn dir(inst: &Instance) -> PathBuf {
     inst.root.join("loot")
+}
+
+/// Whether LOOT's masterlist was downloaded, so its messages can show in Problems.
+pub fn has_masterlist(inst: &Instance) -> bool {
+    dir(inst).join("masterlist.yaml").is_file()
 }
 
 /// Download the masterlist and prelude if the cached copies are missing, older than a day, or
@@ -150,7 +162,14 @@ pub fn place(inst: &Instance, new: &[String]) -> Result<SortReport> {
         let before = p.plugins.clone();
         p.plugins = placed(&before, &r.order, new);
         let at = |list: &[PluginEntry], n: &str| list.iter().position(|e| e.name.eq_ignore_ascii_case(n));
-        moved = new.iter().filter_map(|n| Some(Moved { name: n.clone(), from: at(&before, n)?, to: at(&p.plugins, n)? })).filter(|m| m.from != m.to).collect();
+        moved = new
+            .iter()
+            .filter_map(|n| {
+                let to = at(&p.plugins, n)?;
+                Some(Moved { name: n.clone(), from: at(&before, n)?, to, after: to.checked_sub(1).map(|i| p.plugins[i].name.clone()) })
+            })
+            .filter(|m| m.from != m.to)
+            .collect();
         Ok(())
     })?;
     r.order = inst.profile()?.plugins.into_iter().map(|e| e.name).collect();
@@ -185,18 +204,11 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
     let names: Vec<&str> = current.iter().map(|p| p.name.as_str()).collect();
     let order = game.sort_plugins(&names)?;
 
-    let deployed_active = current.iter().filter(|p| game.is_plugin_active(&p.name) != p.enabled).count();
-    if deployed_active > 0 {
-        warnings.push(format!("plugins.txt differs from the profile for {deployed_active} plugins; deploy, then sort again, so LOOT's conditions on active plugins see the profile"));
+    let undeployed = current.iter().filter(|p| game.is_plugin_active(&p.name) != p.enabled).count();
+    if undeployed > 0 {
+        warnings.push(format!("LOOT reads which plugins are on from the game folder, where {undeployed} differ from this profile: deploy, then sort again"));
     }
-    let moved: Vec<Moved> = order
-        .iter()
-        .enumerate()
-        .filter_map(|(to, name)| {
-            let from = names.iter().position(|n| n.eq_ignore_ascii_case(name))?;
-            (from != to).then(|| Moved { name: name.clone(), from, to })
-        })
-        .collect();
+    let moved = moves(&names, &order);
 
     if !dry_run && !moved.is_empty() {
         inst.edit("sort plugins (LOOT)", |p| {
@@ -218,7 +230,35 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
             Ok(())
         })?;
     }
-    Ok(SortReport { dry_run, order, moved, warnings })
+    Ok(SortReport { dry_run, order, moved, undeployed, warnings })
+}
+
+/// The plugins that move from `old` to `new`: all but one longest run that keeps its order, so
+/// one plugin moved up counts once, not with every plugin that shifts along.
+fn moves(old: &[&str], new: &[String]) -> Vec<Moved> {
+    let at: std::collections::HashMap<String, usize> = old.iter().enumerate().map(|(i, n)| (n.to_lowercase(), i)).collect();
+    let both: Vec<(usize, usize)> = new.iter().enumerate().filter_map(|(to, n)| Some((to, *at.get(&n.to_lowercase())?))).collect();
+    let keep = crate::instance::longest_increasing(&both.iter().map(|b| b.1).collect::<Vec<_>>());
+    both.iter()
+        .enumerate()
+        .filter(|(k, _)| !keep.contains(k))
+        .map(|(_, &(to, from))| Moved { name: new[to].clone(), from, to, after: to.checked_sub(1).map(|i| new[i].clone()) })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one_move_counts_once() {
+        let old = ["A", "B", "C", "D", "E"];
+        let new: Vec<String> = ["E", "A", "B", "C", "D"].map(String::from).into();
+        let m = super::moves(&old, &new);
+        assert_eq!((m.len(), m[0].name.as_str(), m[0].after.as_deref()), (1, "E", None));
+        let new: Vec<String> = ["A", "C", "D", "B", "E"].map(String::from).into();
+        let m = super::moves(&old, &new);
+        assert_eq!((m.len(), m[0].name.as_str(), m[0].after.as_deref(), m[0].from, m[0].to), (1, "B", Some("D"), 1, 3));
+        assert!(super::moves(&old, &old.map(String::from)).is_empty());
+    }
 }
 
 /// A plugin LOOT's masterlist knows as dirty, in this very version (by its CRC).

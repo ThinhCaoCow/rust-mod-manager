@@ -52,18 +52,7 @@ pub fn essentials(inst: &Instance) -> Result<Essentials> {
     let skyrim = game.base() == Game::SkyrimSe;
     let plugins = if skyrim { "skse/plugins/" } else { "f4se/plugins/" };
     let loader = format!("root/{}", game.loader().to_lowercase());
-    // Which essential a file (mod-relative, lowercase) is.
-    let kind = |f: &str| -> Option<usize> {
-        if f == loader {
-            return Some(0);
-        }
-        let name = f.strip_prefix(plugins)?;
-        if name.ends_with(".bin") && (name.starts_with("versionlib-") || name.starts_with("version-")) {
-            Some(1)
-        } else {
-            ["crashlogger.dll", "trainwreck.dll", "buffout4.dll"].contains(&name).then_some(2)
-        }
-    };
+    let kind = |f: &str| essential_kind(game, f);
     let version = game_version(&inst.config.game_path, game).ok();
     let new_gen = version.is_some_and(|v| v >= [1, 10, 980, 0]);
     let list: [(&str, &str, u64); 3] = if skyrim {
@@ -98,6 +87,28 @@ pub fn essentials(inst: &Instance) -> Result<Essentials> {
     let builtin = matches!(game, Game::SkyrimSe | Game::Fallout4);
     let items = list.into_iter().zip(have).map(|((what, name, id), have)| Essential { what, name, have, nexus_id: builtin.then_some(id) }).collect();
     Ok(Essentials { items, game_version: version.map(|v| v.map(|n| n.to_string()).join(".")), played: inst.root.join(PLAYED).is_file() })
+}
+
+/// Which essential a file (mod-relative, lowercase) is: 0 the script extender's loader, 1
+/// Address Library, 2 a crash logger.
+fn essential_kind(game: Game, f: &str) -> Option<usize> {
+    if f == format!("root/{}", game.loader().to_lowercase()) {
+        return Some(0);
+    }
+    let name = f.strip_prefix(if game.base() == Game::SkyrimSe { "skse/plugins/" } else { "f4se/plugins/" })?;
+    if name.ends_with(".bin") && (name.starts_with("versionlib-") || name.starts_with("version-")) {
+        Some(1)
+    } else {
+        ["crashlogger.dll", "trainwreck.dll", "buffout4.dll"].contains(&name).then_some(2)
+    }
+}
+
+/// Installed mods with the script extender, Address Library or a crash logger: Find the culprit
+/// keeps them on, as without them nothing else loads, or no crash log is written.
+pub fn essential_mods(inst: &Instance) -> Result<Vec<String>> {
+    let game = inst.config.game;
+    let has = |id: &str| inst.mod_files(id).is_ok_and(|f| f.iter().any(|f| essential_kind(game, &f.to_lowercase()).is_some()));
+    Ok(inst.profile()?.mods.into_iter().map(|m| m.id).filter(|id| !crate::instance::is_separator(id) && has(id)).collect())
 }
 
 /// Installed mods with the script extender's loader in root/ (the game folder).
@@ -293,7 +304,7 @@ pub fn hold_steam_updates(inst: &Instance, hold: bool) -> Result<SteamUpdates> {
 }
 
 /// The game version at the last Play, to notice a game update.
-const PLAYED: &str = "game-version.txt";
+pub(crate) const PLAYED: &str = "game-version.txt";
 
 /// Says so when the game's version changed since the last Play (a Steam update, say).
 pub(crate) fn game_updated(inst: &Instance, now: &str) -> Option<String> {
@@ -378,7 +389,7 @@ pub(crate) fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
 
 /// The file version in an exe's VS_FIXEDFILEINFO: the signature 0xFEEF04BD, struct version 1.0,
 /// then the version as two u32s. The resource section is at the end, so search backwards.
-fn exe_version(exe: &Path) -> Result<[u32; 4]> {
+pub(crate) fn exe_version(exe: &Path) -> Result<[u32; 4]> {
     let b = fs::read(exe)?;
     let at = b.windows(8).rposition(|w| w == [0xBD, 0x04, 0xEF, 0xFE, 0, 0, 1, 0]).context("no version resource")?;
     let ms = u32::from_le_bytes(b.get(at + 8..at + 12).context("truncated version resource")?.try_into()?);

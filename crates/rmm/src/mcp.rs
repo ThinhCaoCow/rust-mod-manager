@@ -263,6 +263,9 @@ struct CollectionArgs {
     /// Install into a new profile with this name, which becomes the active one; default: the
     /// active profile.
     new_profile: Option<String>,
+    /// Default true: LOOT sorts the plugins at the end. False leaves them for sort_plugins, whose
+    /// dry run shows the user what moves first.
+    sort: Option<bool>,
     /// Default true: download only the collection's list and say what would be installed.
     dry_run: Option<bool>,
 }
@@ -1230,7 +1233,7 @@ impl Rmm {
     async fn install_collection(&self, Parameters(a): Parameters<CollectionArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|mut i| {
             let client = nexus::Client::from_env()?;
-            rmm_core::collection::install(&mut i, &client, a.link.as_deref().unwrap_or(""), a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true))
+            rmm_core::collection::install(&mut i, &client, a.link.as_deref().unwrap_or(""), a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true), a.sort.unwrap_or(true))
         }))
     }
 
@@ -1326,9 +1329,9 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| i.redo()))
     }
 
-    #[tool(description = "Undoable changes, newest first, each with what it did: mods enabled, disabled, added, removed or moved, and how many plugins changed.", annotations(read_only_hint = true))]
+    #[tool(description = "Undoable changes (entries), newest first, each with what it did (mods enabled, disabled, added, removed or moved, how many plugins changed) and when; what redo brings back, the next first; when this instance last deployed and played; and how many steps are kept.", annotations(read_only_hint = true))]
     async fn history(&self) -> Result<String, String> {
-        out(self.inst().and_then(|i| i.history_details()))
+        out(self.inst().and_then(|i| ops::history(&i)))
     }
 
     #[tool(description = "Go back to the state before history entry n (0 = the newest): n + 1 undos at once, so redo can step forward again. dry_run (default true) shows what would change.")]

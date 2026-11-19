@@ -91,7 +91,8 @@ pub struct Installed {
 /// `optional` its optional ones too. Into a profile that has an earlier revision it is an update
 /// (see the module docs); an empty `link` means the profile's collection. A dry run downloads
 /// only the bundle and says what would be installed.
-pub fn install(inst: &mut Instance, client: &Client, link: &str, number: Option<u64>, optional: bool, new_profile: Option<&str>, dry_run: bool) -> Result<Report> {
+#[allow(clippy::too_many_arguments)]
+pub fn install(inst: &mut Instance, client: &Client, link: &str, number: Option<u64>, optional: bool, new_profile: Option<&str>, dry_run: bool, sort: bool) -> Result<Report> {
     if let Some(name) = new_profile {
         crate::instance::check_profile_name(name)?;
         if inst.find_profile(name).is_ok() {
@@ -248,9 +249,12 @@ pub fn install(inst: &mut Instance, client: &Client, link: &str, number: Option<
         p.collection = Some(record.clone());
         Ok(())
     })?;
-    match crate::loot::sort(inst, false) {
-        Ok(s) => r.warnings.extend(s.warnings),
-        Err(e) => r.warnings.push(format!("the plugins aren't sorted yet: {e:#}")),
+    // `sort` off: the caller shows LOOT's order first (the window does), so hand-placed
+    // plugins don't move unseen.
+    match sort.then(|| crate::loot::sort(inst, false)) {
+        Some(Ok(s)) => r.warnings.extend(s.warnings),
+        Some(Err(e)) => r.warnings.push(format!("the plugins aren't sorted yet: {e:#}")),
+        None => {}
     }
     r.tools = add_tools(inst, &c)?;
     Ok(r)

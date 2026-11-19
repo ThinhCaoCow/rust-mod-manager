@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MANIFEST: &str = "deploy.json";
+pub(crate) const MANIFEST: &str = "deploy.json";
 const OWNER: &str = ".rmm-owner";
 /// Unmanaged Data files when the game was last launched, one path key per line.
 const LAUNCHED: &str = "launched.txt";

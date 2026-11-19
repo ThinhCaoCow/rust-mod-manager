@@ -714,6 +714,10 @@ enum NexusCmd {
         /// already installed are in it, turned off). Default: the active profile.
         #[arg(long)]
         profile: Option<String>,
+        /// Leave the plugins as the collection's list put them, for `rmm sort` to show LOOT's
+        /// order first. Default: LOOT sorts them at the end.
+        #[arg(long)]
+        no_sort: bool,
         #[arg(long)]
         apply: bool,
     },
@@ -1223,8 +1227,8 @@ fn run() -> Result<()> {
             let link = nexus::resolve(&inst, &client, &what)?;
             print(&nexus::install(&inst, &client, &link, None)?)
         }
-        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, apply }) => {
-            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link.unwrap_or_default(), revision, optional, profile.as_deref(), !apply)?)
+        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, no_sort, apply }) => {
+            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link.unwrap_or_default(), revision, optional, profile.as_deref(), !apply, !no_sort)?)
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;
@@ -1313,7 +1317,7 @@ fn run() -> Result<()> {
         }
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
-        Cmd::History => print(&open()?.history_details()?),
+        Cmd::History => print(&ops::history(&open()?)?),
         Cmd::Mcp { http: addr } => {
             let dir = match cli.instance {
                 Some(d) => d,

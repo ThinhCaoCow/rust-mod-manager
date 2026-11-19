@@ -40,7 +40,7 @@ let toolsData = null;       // { tools, presets }
 let ignored = new Set();    // health findings ignored in this instance ("kind|subject")
 let busy = false;
 let healthTimer = 0, healthRun = 0, filterTimer = 0;
-let historyData = null;     // history_details, loaded when the History tab shows
+let historyData = null;     // ops::history, loaded when the History tab shows
 let side = 'mods';          // which list was clicked last, when both show
 let selPluginMod = null;    // the mod providing the selected plugin
 let dropAt = null;          // { id, priority } while a file is dragged over a mod row
@@ -409,6 +409,8 @@ function render() {
   $('#profile-name').textContent = i.profile;
   $('#undo').disabled = !S.history.length;
   $('#redo').disabled = !i.redo_steps;
+  $('#undo').title = S.history.length ? `Undo: ${S.history[0]} (Ctrl+Z)` : 'Undo (Ctrl+Z)';
+  $('#redo').title = i.redo_next ? `Redo: ${i.redo_next} (Ctrl+Y)` : 'Redo (Ctrl+Y)';
   $('#n-mods').textContent = i.mods ? `${i.enabled_mods}/${i.mods}` : '';
   $('#n-plugins').textContent = S.plugins.length ? S.plugins.filter(p => p.enabled).length : '';
   renderMods();
@@ -652,10 +654,19 @@ function renderPlugins() {
 }
 
 function renderHistory() {
-  if (!S.history.length) return $('#history').innerHTML = '<li class="muted">No changes to this profile yet.</li>';
-  const list = historyData ?? S.history.map(label => ({ label }));
-  $('#history').innerHTML = list.map((h, i) => `<li><div class="what"><span>${esc(h.label)}</span>${h.change ? `<span class="muted small">${esc(changeText(h.change)) || 'No change to the lists.'}</span>` : ''}</div>
+  const h = historyData;
+  const list = h?.entries ?? S.history.map(label => ({ label }));
+  const redo = h?.redo ?? [];
+  if (!list.length && !redo.length) return $('#history').innerHTML = '<li class="muted">No changes to this profile yet.</li>';
+  // Deployed and Played go where they happened among the changes, newest first.
+  const marks = [['deployed', 'Deployed'], ['played', 'Played']].filter(([k]) => h?.[k]).map(([k, text]) => ({ time: h[k], text })).sort((a, b) => b.time - a.time);
+  const mark = m => `<li class="mark">${m.text} · ${esc(when(m.time))}</li>`;
+  const marksBefore = t => { let out = ''; while (marks.length && marks[0].time >= t) out += mark(marks.shift()); return out; };
+  const undone = redo.map((label, j) => `<li class="redo"><div class="what"><span>↷ ${esc(label)}</span><span class="muted small">Undone. Redo brings it back ${j ? `after ${plural(j, 'other')}` : 'next'}.</span></div></li>`).reverse().join('');
+  const rows = list.map((e, i) => `${e.time ? marksBefore(e.time) : ''}<li${i ? '' : ' class="cur"'}><div class="what"><span>${esc(e.label)}</span>${e.change ? `<span class="muted small">${esc(changeText(e.change)) || 'No change to the lists.'}</span>` : ''}${e.time ? `<span class="muted small">${esc(when(e.time))}</span>` : ''}</div>
     <button data-restore="${i}" title="Undo this change and every later one">Restore to before…</button></li>`).join('');
+  const full = h && list.length >= h.limit ? `<li class="mark">History keeps the last ${h.limit} changes, so older ones were dropped. Settings › Undo steps kept per profile.</li>` : '';
+  $('#history').innerHTML = undone + rows + marks.map(mark).join('') + full;
 }
 
 /** "disabled A, B; moved C; 2 plugins" */
@@ -692,8 +703,8 @@ $('#history').onclick = async e => {
   const d = await act('Checking', () => call('restore_preview', { n: +n }), { reload: false });
   if (!d || d === true) return;
   const part = (label, ids) => ids.length ? `<details><summary><b>${ids.length}</b> ${label}</summary><pre>${esc(ids.map(nameOf).join('\n'))}</pre></details>` : '';
-  const body = `<p>Goes back ${plural(+n + 1, 'change')}, to before “${esc((historyData ?? [])[n]?.label ?? S.history[n])}”. Redo steps forward again.</p>`
-    + part('to enable', d.enabled) + part('to disable', d.disabled) + part('to add back', d.added) + part('to remove from the list', d.removed) + part('to move', d.moved)
+  const body = `<p>Goes back ${plural(+n + 1, 'change')}, to before “${esc(historyData?.entries[n]?.label ?? S.history[n])}”. Redo steps forward again.</p>`
+    + part('to enable', d.enabled) + part('to disable', d.disabled) + part('to add back', d.added) + part('to put in the trash', d.removed) + part('to move', d.moved)
     + (d.plugins ? `<p class="muted small">${plural(d.plugins, 'plugin')} change state or place.</p>` : '');
   if (await dialog({ title: 'Restore', body, actions: [['cancel', 'Cancel'], ['ok', 'Restore', 'primary']] }) !== 'ok') return;
   const r = await act('Restoring', () => call('restore', { n: +n }));
@@ -794,8 +805,8 @@ function renderDetails() {
   if (m.separator) return renderSep(box, m);
   const c = D.C[m.id];
   const R = S.rules.find(r => r.id === m.id) ?? {};
-  const ruleList = (key, title, placeholder) => `<h3>${title}</h3>
-    <div class="chips">${(R[key] ?? []).map(id => `<span class="chip">${esc(nameOf(id))}<button data-unrule="${esc(id)}" data-key="${key}" title="Remove from the rule" aria-label="Remove ${esc(nameOf(id))}">×</button></span>`).join('') || '<span class="muted">None.</span>'}</div>
+  const ruleList = (key, title, placeholder) => `<h3>${title} (your rule)</h3>
+    <div class="chips">${(R[key] ?? []).map(id => `<span class="chip">${esc(nameOf(id))}<button data-unrule="${esc(id)}" data-key="${key}" title="Remove from the rule" aria-label="Remove ${esc(nameOf(id))}">×</button></span>`).join('') || '<span class="muted">No rule.</span>'}</div>
     <div class="row"><input class="rule-add" data-key="${key}" list="mod-names" placeholder="${placeholder}" aria-label="${placeholder}" spellcheck="false"></div>`;
   const people = (title, ids) => ids.length
     ? `<div class="small muted">${title}</div><ul>${ids.map(id => `<li><button class="link" data-goto="${esc(id)}">${esc(nameOf(id))}</button></li>`).join('')}</ul>` : '';
@@ -825,6 +836,7 @@ function renderDetails() {
     <h3>Categories</h3>
     <div class="chips">${(m.categories ?? []).map(c => `<span class="chip">${esc(c)}<button data-uncat="${esc(c)}" title="Remove the category" aria-label="Remove ${esc(c)}">×</button></span>`).join('') || '<span class="muted">None.</span>'}</div>
     <div class="row"><input class="cat-add" list="cat-names" placeholder="Add a category…" aria-label="Add a category" spellcheck="false"></div>
+    ${d?.nexus_id ? needsBlock(d.needs) : ''}
     ${d?.meta?.nexus ? nexusBlock(d.meta.nexus.mod_id) : ''}
     ${d?.docs?.length ? `<h3>Read me and settings</h3><div class="files">${d.docs.map(f => `<button class="link" data-doc="${esc(f)}" title="Open in the editor (AI tab)">${esc(f)}</button>`).join('<br>')}</div>` : ''}
     ${d?.images?.length ? `<h3>Pictures (${d.images.length})</h3>${modPics.has(m.id)
@@ -858,6 +870,18 @@ function renderDetails() {
     n.focus();
     n.setSelectionRange(draft[1], draft[2]);
   }
+}
+
+/** What the mod's Nexus page lists as required, and whether this setup has each. */
+function needsBlock(needs) {
+  if (!needs) return '<h3>Needs</h3><p class="muted small">What its Nexus page lists as required hasn’t been read yet.</p><div class="row"><button data-act="read-needs" title="No sign-in needed">Read it from Nexus</button></div>';
+  if (!needs.length) return '<h3>Needs</h3><p class="muted small">Its Nexus page lists nothing it needs.</p>';
+  const state = r => r.installed ? (S.mods.find(x => x.id === r.installed)?.enabled ? 'installed' : 'installed, turned off')
+    : r.dlc ? 'a DLC' : r.mod_id ? 'not installed' : 'from another site';
+  const name = r => r.installed ? `<button class="link" data-goto="${esc(r.installed)}">${esc(r.name)}</button>`
+    : r.mod_id ? `<button class="link" data-page="${r.mod_id}" title="Open its Files tab on Nexus">${esc(r.name)}</button>` : esc(r.name);
+  return `<h3>Needs</h3><ul class="small">${needs.map(r => `<li>${name(r)} <span class="muted">· ${state(r)}${r.notes ? ` · ${esc(r.notes)}` : ''}</span></li>`).join('')}</ul>
+    <p class="muted small">From its Nexus page. Problems says when one is missing for this game version.</p>`;
 }
 
 /** What the mod's Nexus page says, read when asked: summary, picture, description. */
@@ -1299,9 +1323,12 @@ function renderProblems() {
   $('#issues').innerHTML = list.length
     ? list.map(i => {
       const k = keyOf(i), ign = ignored.has(k), to = i.kind && targetOf(i);
+      const acts = (i.kind === 'missing_masters' && !ign ? (i.message.startsWith('loads before') ? '<button class="link ign" data-sort>Sort with LOOT…</button>' : `<button class="link ign" data-off="${esc(i.subject)}">Turn it off</button>`) : '')
+        + (i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : '')
+        + (failures.includes(i) ? `<button class="link ign" data-dismiss="${failures.indexOf(i)}">Dismiss</button>` : '');
       return `<li class="${esc(i.severity)}${to ? ' link' : ''}${ign ? ' ignored' : ''}" data-key="${esc(k)}" ${to ? `data-mod="${esc(to.mod ?? '')}" data-plugin="${esc(to.plugin ?? '')}" title="Show it in the list"` : ''}>
         <span class="sev">${esc(i.severity)}</span><span class="subject">${esc(to?.mod ? nameOf(to.mod) : i.subject)}</span><span class="message">${i.kind === 'loot_message' ? markdown(i.message) : esc(i.message)}</span>
-        ${i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : ''}${failures.includes(i) ? `<button class="link ign" data-dismiss="${failures.indexOf(i)}">Dismiss</button>` : ''}</li>`;
+        ${acts ? `<span class="acts">${acts}</span>` : ''}</li>`;
     }).join('')
     : `<li class="info"><span class="sev">ok</span><span class="subject">No problems found${hidden ? ' apart from ignored ones' : ''}.</span></li>`;
   $('#show-ignored').hidden = !hidden;
@@ -1316,7 +1343,7 @@ function renderProblems() {
   $('#n-problems').textContent = serious || '';
   $('#n-problems').classList.toggle('bad', shown.some(i => i.severity === 'error'));
   if (filters.has('problems')) renderMods();
-  const info = shown.length - serious, lootRan = all.some(i => i.kind === 'loot_message');
+  const info = shown.length - serious, lootRan = S.info.masterlist || all.some(i => i.kind === 'loot_message');
   $('#problems-note').textContent = [serious ? `${serious} to look at` : 'Nothing to look at', info ? `${info} for information` : '', hidden ? `${hidden} ignored` : ''].filter(Boolean).join(', ') + '.'
     + (lootRan ? '' : ' LOOT’s messages show here once its masterlist is downloaded (Sort with LOOT downloads it).');
 }
@@ -1447,6 +1474,7 @@ async function crashLog(path) {
   const rows = r.suspects.map(s => `<tr><td>${esc(s.name)}${s.in_call_stack ? ' <span class="pill lose" title="Named in the call stack">stack</span>' : ''}</td><td>${modLink(s.mod_id)}</td></tr>`).join('');
   const others = r.others.filter(o => o.path !== r.path);
   const body = `<p class="muted small">${esc(basename(r.path))} · ${esc(when(r.modified))}${r.logger ? ` · ${esc(r.logger)}` : ''}${r.game_version ? ` · game ${esc(r.game_version)}` : ''}</p>
+    ${r.not_yours?.length ? `<div class="not-yours"><b>This log may not be from this setup.</b><ul>${r.not_yours.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
     ${r.error ? `<p><b>${esc(r.error)}</b></p>` : ''}
     ${rows ? `<p>Named in the log, most likely first:</p><table class="fc">${rows}</table>` : '<p class="muted">The log names nothing that mods provide.</p>'}
     ${r.next_steps.length ? `<h3>What to try</h3><ul>${r.next_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
@@ -1639,6 +1667,9 @@ $('#issues').onclick = e => {
   }
   const link = e.target.closest('[data-link]')?.dataset.link;
   if (link) return void act('Opening the page', () => call('open_link', { url: link }), { reload: false });
+  if (e.target.closest('[data-sort]')) return void lootSort();
+  const off = e.target.closest('[data-off]')?.dataset.off;
+  if (off) return void setPluginsEnabled([off], false);
   const ign = e.target.closest('[data-ignore]')?.dataset.ignore;
   if (ign) {
     if (!ignored.delete(ign)) ignored.add(ign);
@@ -1886,6 +1917,8 @@ $('#details').addEventListener('click', async e => {
   } else if (t.dataset.pic) {
     const url = t.src;
     dialog({ title: t.dataset.pic, body: `<img src="${url}" alt="" style="max-width:100%">`, actions: [['ok', 'Close', 'primary']] });
+  } else if (t.dataset.page) {
+    call('open_nexus_mod', { mod_id: Number(t.dataset.page) }).catch(err => toast(String(err), 'error'));
   } else if (t.dataset.uncat) {
     editCategories([id], [], [t.dataset.uncat]);
   } else if (t.dataset.unrule) {
@@ -1915,6 +1948,7 @@ $('#details').addEventListener('click', async e => {
     case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
     case 'nexus-page': return call('open_nexus_mod', { mod_id: details.meta.nexus.mod_id, page: true }).catch(err => toast(String(err), 'error'));
+    case 'read-needs': return act('Reading its requirements on Nexus', () => call('read_requirements', { mod_id: details.nexus_id }));
     case 'nexus-info': {
       const modId = details.meta.nexus.mod_id;
       nexusPages.set(modId, 'loading');
@@ -2010,7 +2044,7 @@ function setPluginsEnabled(names, enabled) {
   if (busy) return busyNote();
   for (const p of S.plugins) if (names.includes(p.name)) p.enabled = enabled;
   paint(lists.plugins);
-  act(names.length > 1 ? (enabled ? 'Enabling the plugins' : 'Disabling the plugins') : 'Changing the plugin', () => call('enable_plugins', { names, enabled }));
+  return act(names.length > 1 ? (enabled ? 'Enabling the plugins' : 'Disabling the plugins') : 'Changing the plugin', () => call('enable_plugins', { names, enabled }));
 }
 
 /** Put `names`, in their order, at `at` in the load order without them. */
@@ -2140,20 +2174,30 @@ function setAllGroups(open) {
   renderDetails();
 }
 
-$('#loot').onclick = async () => {
+$('#loot').onclick = () => lootSort();
+
+/** LOOT's order as a preview: only the plugins that really move, each with the plugin it then
+ *  loads after; Apply saves it (one undo step). True once the order matches LOOT. */
+async function lootSort(title = 'Sort with LOOT', intro = '') {
   toast('Sorting with LOOT. The first sort downloads LOOT’s masterlist.');
   const r = await act('Sorting with LOOT', () => call('sort_plugins', { dry_run: true }), { reload: false });
-  if (!r) return;
-  const warnings = r.warnings.length ? `<details><summary>${plural(r.warnings.length, 'warning')}</summary><pre>${esc(r.warnings.join('\n'))}</pre></details>` : '';
+  if (!r) return false;
+  const rest = r.warnings.filter(w => !w.startsWith('LOOT reads which plugins are on'));
+  const warnings = rest.length ? `<details><summary>${plural(rest.length, 'warning')}</summary><pre>${esc(rest.join('\n'))}</pre></details>` : '';
+  const stale = r.undeployed ? `<p class="small">LOOT reads which plugins are on from the game folder, where ${plural(r.undeployed, 'plugin')} ${r.undeployed === 1 ? 'differs' : 'differ'} from this profile, so its rules about other plugins may be off. <b>Deploy, then sort again</b> fixes that.</p>` : '';
+  const again = r.undeployed ? [['deploy', 'Deploy, then sort again']] : [];
+  let choice;
   if (!r.moved.length) {
-    return dialog({ title: 'Sort with LOOT', body: `<p>The load order already matches LOOT.</p>${warnings}`, actions: [['cancel', 'Close']] });
+    choice = await dialog({ title, body: `${intro}<p>The load order already matches LOOT.</p>${stale}${warnings}`, actions: [...again, ['cancel', 'Close']] });
+  } else {
+    const line = m => `${esc(m.name)} <span class="muted">${m.after ? 'moves after' : 'moves to the top'}</span> ${esc(m.after ?? '')}`;
+    const body = `${intro}<p>${plural(r.moved.length, 'plugin')} ${r.moved.length === 1 ? 'moves' : 'move'}; the others keep their order.</p><pre>${r.moved.map(line).join('\n')}</pre>${stale}${warnings}`;
+    choice = await dialog({ title, body, actions: [['cancel', 'Cancel'], ...again, ['apply', 'Apply order', 'primary']] });
   }
-  const moved = r.moved.map(m => `${String(m.from).padStart(4)} → ${String(m.to).padEnd(4)} ${m.name}`).join('\n');
-  const body = `<p>${plural(r.moved.length, 'plugin')} move:</p><pre>${esc(moved)}</pre>${warnings}`;
-  if (await dialog({ title: 'Sort with LOOT', body, actions: [['cancel', 'Cancel'], ['apply', 'Apply order', 'primary']] }) === 'apply') {
-    act('Saving the LOOT order', () => call('sort_plugins', { dry_run: false }));
-  }
-};
+  if (choice === 'deploy') return !!await act('Deploying', () => call('deploy')) && lootSort(title, intro);
+  if (choice === 'apply') return !!await act('Saving the LOOT order', () => call('sort_plugins', { dry_run: false }));
+  return !r.moved.length;
+}
 
 // ---- Drag to reorder (pointer events: HTML drag and drop is off so files can be dropped) ----
 
@@ -2248,7 +2292,32 @@ async function purge() {
   if (r) toast(`Purged: ${plural(r.remove.length, 'file')} removed.`);
 }
 
-$('#play').onclick = async () => {
+$('#play').onclick = () => play();
+
+/** Enabled plugins whose masters are missing or load later, which crash the game at start (the
+ *  ones Problems lists, less those ignored there). */
+const crashers = () => S.plugins.filter(p => p.enabled && p.missing_masters.length && !ignored.has(`missing_masters|${p.name}`));
+
+async function play() {
+  const bad = crashers();
+  if (bad.length) {
+    const fixable = bad.filter(p => p.missing_masters.every(loadsLater));
+    const why = p => {
+      const absent = p.missing_masters.filter(m => !loadsLater(m));
+      return absent.length ? `needs ${absent.join(', ')}, which ${absent.length === 1 ? 'isn’t' : 'aren’t'} on` : `loads before ${p.missing_masters.join(', ')}`;
+    };
+    const one = bad.length === 1;
+    const v = await dialog({
+      title: 'The game would crash at start',
+      body: `<p>${one ? 'This plugin needs' : 'These plugins need'} other plugins (${one ? 'its' : 'their'} masters) on and loaded before ${one ? 'it' : 'them'}:</p>
+        <ul class="small">${bad.map(p => `<li><b>${esc(p.name)}</b> <span class="muted">${esc(why(p))}</span></li>`).join('')}</ul>
+        <p class="muted small">${fixable.length ? 'Sort with LOOT puts masters first. ' : ''}Turning ${one ? 'it' : 'them'} off is one undo step.</p>`,
+      actions: [['cancel', 'Cancel'], ['anyway', 'Play anyway'], ['off', one ? 'Turn it off' : 'Turn them off', fixable.length ? '' : 'primary'], ...(fixable.length ? [['sort', 'Sort with LOOT…', 'primary']] : [])],
+    });
+    if (v === 'sort') return await lootSort() && play();
+    if (v === 'off') return await setPluginsEnabled(bad.map(p => p.name), false) && play();
+    if (v !== 'anyway') return;
+  }
   let error = '';
   const r = await act('Starting the game', () => call('launch').catch(e => { error = String(e); throw e; }), { problem: true });
   if (/script extender is built for game version/.test(error)) {
@@ -2266,7 +2335,7 @@ $('#play').onclick = async () => {
     savePrefs();
     toast('Start the game with Play from now on: starting it from Steam or a desktop shortcut skips the script extender and any changes not deployed yet.');
   }
-};
+}
 
 /** Purge and start the game's own exe; `asked`: the user already chose it in a dialog. */
 async function playVanilla(asked = false) {
@@ -2588,7 +2657,7 @@ async function installCollection(link) {
   const list = (xs, n = 8) => xs.length ? `<ul class="small">${xs.slice(0, n).map(x => `<li>${esc(x)}</li>`).join('')}${xs.length > n ? `<li class="muted">and ${xs.length - n} more</li>` : ''}</ul>` : '';
   if (r.update_from != null) return updateCollection(link, r, list);
   const name = r.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').trim().replace(/^\.+|\.+$/g, '').slice(0, 64) || 'Collection';
-  const body = `<p>${plural(r.install.length, 'mod')} to download and install (${bytes(r.download_size)})${r.installed.length ? `; ${plural(r.installed.length, 'mod')} you have already are turned on` : ''}. Its mod rules, plugin list and tools come too, then LOOT sorts the plugins.</p>
+  const body = `<p>${plural(r.install.length, 'mod')} to download and install (${bytes(r.download_size)})${r.installed.length ? `; ${plural(r.installed.length, 'mod')} you have already are turned on` : ''}. Its mod rules, plugin list and tools come too. Then LOOT’s order for the plugins, which you see before it applies.</p>
     ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}
     ${r.game_folder.length ? `<p class="muted small">The collection puts these in the game folder: ${esc(r.game_folder.join(', '))}.</p>` : ''}
     ${r.optional.length ? `<label class="row"><input id="co-opt" type="checkbox"> Also its ${plural(r.optional.length, 'optional mod')}</label>${list(r.optional)}` : ''}
@@ -2596,32 +2665,36 @@ async function installCollection(link) {
     <label class="field">New profile’s name <input id="co-name" type="text" value="${esc(name)}" spellcheck="false"></label>`;
   if (await dialog({ title: `Install ${r.name} (revision ${r.revision})`, body, actions: [['cancel', 'Cancel'], ['go', 'Install', 'primary']] }) !== 'go') return;
   const args = { link, revision: r.revision, optional: $('#co-opt')?.checked ?? false, profile: $('#co-new').checked ? $('#co-name').value.trim() : null };
-  const done = await act(`Installing ${r.name}`, () => call('install_collection', args), { problem: true });
+  const done = await act(`Installing ${r.name}`, () => call('install_collection', { ...args, sort: false }), { problem: true });
   if (!done || done === true) return;
+  const sorted = await lootSort(`Sort ${done.name}’s plugins with LOOT`, '<p>The mods are in. This is the order LOOT gives the plugins.</p>');
   const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p>${list(xs, 20)}` : '';
   await dialog({
     title: `${done.name} is installed`,
     body: `<p>${plural(done.install.length - done.failed.length, 'mod')} installed${done.profile ? `, in the profile “${esc(done.profile)}”, now the active one` : ''}. Deploy or Play applies it to the game folder.</p>
-      ${part('Couldn’t install', done.failed)}${part('The curator’s notes (each is also on its mod)', done.instructions)}${part('Tools added', done.tools)}${part('Warnings', done.warnings)}`,
+      ${sorted ? '' : unsorted}${part('Couldn’t install', done.failed)}${part('The curator’s notes (each is also on its mod)', done.instructions)}${part('Tools added', done.tools)}${part('Warnings', done.warnings)}`,
     actions: [['ok', 'OK', 'primary']],
   });
 }
 
+const unsorted = '<p class="muted small">The plugins aren’t in LOOT’s order: new ones load last. Sort with LOOT… on the Plugins tab sorts them, showing what moves first.</p>';
+
 /** The profile already has an earlier revision: update it, keeping the user's own changes. */
 async function updateCollection(link, r, list) {
   if (r.revision === r.update_from && !r.install.length && !r.updated.length && !r.turned_off.length) return toast(`${r.name} is up to date (revision ${r.revision}).`);
-  const body = `<p>${plural(r.updated.length, 'mod')} to update and ${plural(r.install.length, 'new mod')} to install (${bytes(r.download_size)}). Its mod rules and plugin list come too, then LOOT sorts the plugins.</p>
+  const body = `<p>${plural(r.updated.length, 'mod')} to update and ${plural(r.install.length, 'new mod')} to install (${bytes(r.download_size)}). Its mod rules and plugin list come too. Then LOOT’s order for the plugins, which you see before it applies.</p>
     ${r.turned_off.length ? `<p>To turn off, still installed: the revision dropped them, or has a newer file of them that goes in beside (another profile uses these).</p>${list(r.turned_off.map(nameOf))}` : ''}
     ${r.kept_off.length ? `<p class="muted small">You turned these off; they stay off: ${esc(r.kept_off.join(', '))}.</p>` : ''}
     ${r.yours.length ? `<p class="muted small">Your own ${plural(r.yours.length, 'mod')} stay as they are, and so do plugins you turned on or off.</p>` : ''}
     ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}`;
   if (await dialog({ title: `Update ${r.name} from revision ${r.update_from} to ${r.revision}`, body, actions: [['cancel', 'Cancel'], ['go', 'Update', 'primary']] }) !== 'go') return;
-  const done = await act(`Updating ${r.name}`, () => call('install_collection', { link, revision: r.revision }), { problem: true });
+  const done = await act(`Updating ${r.name}`, () => call('install_collection', { link, revision: r.revision, sort: false }), { problem: true });
   if (!done || done === true) return;
+  const sorted = await lootSort(`Sort ${done.name}’s plugins with LOOT`, '<p>The revision is in. This is what LOOT would move; Cancel keeps your order.</p>');
   const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p>${list(xs, 20)}` : '';
   await dialog({
     title: `${done.name} is at revision ${done.revision}`,
-    body: `<p>Deploy or Play applies it to the game folder.</p>${part('Updated', done.updated)}${part('Installed', done.install)}${part('Turned off', done.turned_off.map(nameOf))}${part('Couldn’t install', done.failed)}${part('Warnings', done.warnings)}`,
+    body: `<p>Deploy or Play applies it to the game folder.</p>${sorted ? '' : unsorted}${part('Updated', done.updated)}${part('Installed', done.install)}${part('Turned off', done.turned_off.map(nameOf))}${part('Couldn’t install', done.failed)}${part('Warnings', done.warnings)}`,
     actions: [['ok', 'OK', 'primary']],
   });
 }
@@ -3139,7 +3212,7 @@ function renderDownloads() {
   $('#dl-install').hidden = $('#dl-delete').hidden = !sel.length;
   $('#dl-install').textContent = `Install ${plural(sel.length, 'file')}`;
   $('#dl-delete').textContent = `Delete ${plural(sel.length, 'file')}…`;
-  const unknown = (sel.length ? sel : l).filter(d => !d.nexus).length;
+  const unknown = (sel.length ? sel : l).filter(d => !d.nexus?.nexus.file_id).length; // a name's mod id isn't the file
   $('#dl-identify').disabled = !unknown;
   $('#dl-identify').textContent = unknown ? `Identify ${plural(unknown, 'file')} on Nexus` : 'Identify on Nexus';
 }
@@ -3188,7 +3261,7 @@ $('#dl-delete').onclick = async () => {
 };
 $('#dl-identify').onclick = async () => {
   const sel = selDownloads();
-  const names = (sel.length ? sel : downloadsData ?? []).filter(d => !d.nexus).map(d => d.name);
+  const names = (sel.length ? sel : downloadsData ?? []).filter(d => !d.nexus?.nexus.file_id).map(d => d.name);
   if (!names.length || !await nexusReady('Identifying files on Nexus needs your API key.')) return;
   const r = await act('Identifying downloads on Nexus', () => call('identify_downloads', { names }), { reload: false });
   if (!r || r === true) return;

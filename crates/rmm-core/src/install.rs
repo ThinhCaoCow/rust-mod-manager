@@ -710,7 +710,8 @@ pub struct Download {
     pub modified: u64,
     /// Mods installed from a file of this name.
     pub mods: Vec<String>,
-    /// Its mod and file on Nexus, when rmm downloaded it or `nexus::identify` found it.
+    /// Its mod and file on Nexus, when rmm downloaded it or `nexus::identify` found it; otherwise
+    /// the mod its file name carries (no `file_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexus: Option<crate::nexus::Identified>,
 }
@@ -733,7 +734,10 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
         }
         let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         let lower = name.to_lowercase();
-        out.push(Download { mods: from.remove(&lower).unwrap_or_default(), nexus: known.remove(&lower), path: e.path(), size: m.len(), modified, name });
+        // Not identified: the mod and version a Nexus download's name carries.
+        let named = || Path::new(&name).file_stem()?.to_str().and_then(nexus_name).map(|(n, nexus)| crate::nexus::Identified { name: Some(n), nexus });
+        let nexus = known.remove(&lower).or_else(named);
+        out.push(Download { mods: from.remove(&lower).unwrap_or_default(), nexus, path: e.path(), size: m.len(), modified, name });
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
