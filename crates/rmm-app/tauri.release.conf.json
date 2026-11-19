@@ -2,11 +2,13 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "externalBin": ["binaries/rmm"]
+    "externalBin": [
+      "binaries/rmm"
+    ]
   },
   "plugins": {
     "updater": {
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlBOEEyRjIzOEQwQjhGQjQKUldTMGp3dU5JeStLbXZ1Q2J2WWp3NGJteThtY0JIdy9CTXRER3ovNG03MjlOWmc3U1hqeVFBTnAK"
     }
   }
 }

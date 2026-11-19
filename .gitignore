@@ -8,3 +8,7 @@
 
 # The CLI the installer bundles, copied in by the release workflow.
 /crates/rmm-app/binaries/
+
+# The updater key pair (cargo tauri signer generate): the private half goes in repository secrets only.
+/rmm-updater.key
+/rmm-updater.key.pub
