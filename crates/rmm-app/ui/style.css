@@ -348,6 +348,10 @@ pre.diff .del { background: var(--bad-bg); color: var(--bad); }
 #details h3 { margin: 18px 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
 #details ul { margin: 0; padding: 0; list-style: none; }
 #details li { padding: 2px 0; }
+#details .nexus-pic { display: block; max-width: 100%; max-height: 180px; margin: 4px 0 8px; border-radius: 6px; }
+#details .desc { max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin-top: 6px; }
+#details .pics { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; }
+#details .pics img { width: 100%; border-radius: 4px; cursor: zoom-in; }
 #details .files { max-height: 220px; overflow: auto; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; color: var(--muted); }
 .pick { max-height: 50vh; overflow: auto; margin: 8px 0; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; font: 12px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace; }
 .pick label.row { margin: 0; gap: 6px; }

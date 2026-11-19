@@ -2865,6 +2865,23 @@ fn makes_a_profile_shortcut() {
     assert!(plan.path.is_file());
 }
 
+/// The panel's read-me's, settings and pictures come from the mod's files.
+#[test]
+fn mod_details_lists_docs_and_pictures() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src/Docs"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    for f in ["Readme.TXT", "SKSE/Plugins/docs.ini", "Interface/Translations/docs_english.txt", "shot.JPG", "textures/a.dds", "meshes/b.nif"] {
+        write(&src.join(f), "x");
+    }
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    install::install(&inst, &src, None, true, None).unwrap();
+    let d = rmm_core::ops::mod_details(&inst, "Docs", 300).unwrap();
+    assert_eq!(d["docs"], serde_json::json!(["Readme.TXT", "SKSE/Plugins/docs.ini"]));
+    assert_eq!(d["images"], serde_json::json!(["shot.JPG"]));
+}
+
 /// A zip of (path, bytes).
 fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();

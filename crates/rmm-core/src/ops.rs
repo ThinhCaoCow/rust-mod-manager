@@ -161,6 +161,7 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
     let Some(entry) = p.mods.iter().find(|m| m.id == id) else { bail!("no mod '{id}'") };
     let files = inst.mod_files(id)?;
     let conflict = conflicts::conflicts(inst, &p)?.into_iter().find(|c| c.id == id);
+    let ext = |f: &str, exts: &[&str]| f.rsplit_once('.').is_some_and(|(_, e)| exts.iter().any(|x| e.eq_ignore_ascii_case(x)));
     Ok(json!({
         "id": id,
         "meta": inst.mod_meta(id),
@@ -168,6 +169,10 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
         "file_count": files.len(),
         "files": files.iter().take(max_files).collect::<Vec<_>>(),
         "files_truncated": files.len() > max_files,
+        // Its read-me's and settings, and its pictures, as MO2's information dialog lists them
+        // (the strings of Interface/Translations aren't read-me's).
+        "docs": files.iter().filter(|f| ext(f, &["txt", "md", "ini"]) && !f.to_lowercase().starts_with("interface/translations/")).take(50).collect::<Vec<_>>(),
+        "images": files.iter().filter(|f| ext(f, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])).take(50).collect::<Vec<_>>(),
         "conflicts": conflict,
         // The saved review with whether the files are still the ones reviewed.
         "review": crate::inspect::reviews(inst, Some(id))?.pop(),

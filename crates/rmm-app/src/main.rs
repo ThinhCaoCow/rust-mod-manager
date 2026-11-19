@@ -342,18 +342,15 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             }
         }
         // An option's picture, as a data: URL the window can show.
-        "fomod_image" => {
-            let file = install::fomod_image(&inst, Path::new(&s("path")?), &s("image")?)?;
-            let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let mime = match ext.as_str() {
-                "jpg" | "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "bmp" => "image/bmp",
-                "webp" => "image/webp",
-                _ => "image/png",
-            };
-            json!(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(fs::read(file)?)))
+        "fomod_image" => json!(data_url(&install::fomod_image(&inst, Path::new(&s("path")?), &s("image")?)?)?),
+        // A picture in a mod's folder, for its panel.
+        "mod_image" => {
+            let path = s("path")?;
+            anyhow::ensure!(Path::new(&path).components().all(|c| matches!(c, std::path::Component::Normal(_))), "a path inside the mod");
+            json!(data_url(&inst.mod_dir(&s("id")?).join(path))?)
         }
+        // What a mod's Nexus page says, for its panel (no key needed).
+        "nexus_mod_info" => json!(nexus::mod_info(&inst, &nexus::Client::any(), n("mod_id")? as u64)?),
         // Without choices a FOMOD installer takes its defaults; the name defaults to the file's.
         "install" => {
             let name = a["name"].as_str().map(str::trim).filter(|n| !n.is_empty());
@@ -469,7 +466,10 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "essentials" => json!(launch::essentials(&inst)?),
         // A mod's Files tab, for the getting-started list (Nexus mod pages only).
-        "open_nexus_mod" => json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}?tab=files", inst.config.game.nexus_domain(), n("mod_id")?))?),
+        "open_nexus_mod" => {
+            let tab = if flag("page") { "" } else { "?tab=files" };
+            json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}{tab}", inst.config.game.nexus_domain(), n("mod_id")?))?)
+        }
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
         "nexus_handler" => json!(nexus::register_handler(&cli_exe()?, &inst.root)?),
@@ -541,6 +541,20 @@ fn stamp(inst: &Instance) -> String {
         r.join("mods"),
     ];
     format!("{:?}", files.map(|f| fs::metadata(f).and_then(|m| m.modified()).ok()))
+}
+
+/// A picture as a data: URL the window can show (its CSP allows no file URLs).
+fn data_url(file: &Path) -> Result<String> {
+    anyhow::ensure!(fs::metadata(file)?.len() <= 8 << 20, "{} is too large to show", file.display());
+    let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    Ok(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(fs::read(file)?)))
 }
 
 /// rmm's command-line program, shipped next to the app.

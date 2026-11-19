@@ -22,6 +22,8 @@ let issues = null;          // health check findings
 let issuesStale = true;
 let failures = [];          // failed installs, Plays and downloads in this window, until dismissed
 let details = null;         // mod_details of the selected mod
+const nexusPages = new Map(); // Nexus mod id -> what its page says ('loading', the info, or { error })
+const modPics = new Map();    // mod id -> its pictures as data: URLs, once asked for
 let stamp = '';
 let selected = new Set();   // selected mod and separator ids
 let anchor = null;          // where Shift-selection starts
@@ -797,6 +799,7 @@ function renderDetails() {
   box.innerHTML = `
     <h2>${esc(m.name)}</h2>
     ${m.id !== m.name ? `<div class="muted small">id: ${esc(m.id)}</div>` : ''}
+    ${m.version || d?.meta?.nexus ? `<div class="row small">${m.version && !d?.meta?.nexus ? `<span class="muted">Version ${esc(m.version)}</span>` : ''}${d?.meta?.nexus ? '<button class="link" data-act="nexus-page" title="Open its page on Nexus Mods in your browser">Nexus page ↗</button>' : ''}</div>` : ''}
     <div class="row">
       <label class="row" style="margin:0"><input type="checkbox" data-act="enable" ${m.enabled ? 'checked' : ''}> Enabled</label>
       <div class="spacer"></div>
@@ -815,6 +818,11 @@ function renderDetails() {
     <h3>Categories</h3>
     <div class="chips">${(m.categories ?? []).map(c => `<span class="chip">${esc(c)}<button data-uncat="${esc(c)}" title="Remove the category" aria-label="Remove ${esc(c)}">×</button></span>`).join('') || '<span class="muted">None.</span>'}</div>
     <div class="row"><input class="cat-add" list="cat-names" placeholder="Add a category…" aria-label="Add a category" spellcheck="false"></div>
+    ${d?.meta?.nexus ? nexusBlock(d.meta.nexus.mod_id) : ''}
+    ${d?.docs?.length ? `<h3>Read me and settings</h3><div class="files">${d.docs.map(f => `<button class="link" data-doc="${esc(f)}" title="Open in the editor (AI tab)">${esc(f)}</button>`).join('<br>')}</div>` : ''}
+    ${d?.images?.length ? `<h3>Pictures (${d.images.length})</h3>${modPics.has(m.id)
+      ? `<div class="pics">${modPics.get(m.id).map(([f, url]) => url ? `<img src="${url}" alt="${esc(f)}" title="${esc(f)}" data-pic="${esc(f)}">` : `<span class="muted small">${esc(f)}: can’t be shown</span>`).join('')}</div>`
+      : '<div class="row"><button data-act="mod-pics">Show them</button></div>'}` : ''}
     <h3>Notes</h3>
     <textarea id="mod-note" data-id="${esc(m.id)}" rows="2" placeholder="Notes for this mod…" spellcheck="true">${esc(m.notes ?? '')}</textarea>
     ${d?.review ? reviewBlock(d.review) : ''}
@@ -843,6 +851,19 @@ function renderDetails() {
     n.focus();
     n.setSelectionRange(draft[1], draft[2]);
   }
+}
+
+/** What the mod's Nexus page says, read when asked: summary, picture, description. */
+function nexusBlock(modId) {
+  const p = nexusPages.get(modId);
+  if (!p) return '<h3>On Nexus</h3><div class="row"><button data-act="nexus-info" title="Reads the mod’s Nexus page (no sign-in needed)">Show its description</button></div>';
+  if (p === 'loading') return '<h3>On Nexus</h3><p class="muted">Reading its page…</p>';
+  if (p.error) return `<h3>On Nexus</h3><p class="muted small">${esc(p.error)}</p><div class="row"><button data-act="nexus-info">Try again</button></div>`;
+  return `<h3>On Nexus</h3>
+    ${p.picture ? `<img class="nexus-pic" src="${esc(p.picture)}" alt="">` : ''}
+    <p>${esc(p.summary)}</p>
+    <div class="small muted">By ${esc(p.author)} · version ${esc(p.version)} · ${p.endorsements.toLocaleString()} endorsements${p.updated ? ` · updated ${new Date(p.updated).toLocaleDateString()}` : ''}</div>
+    ${p.description ? `<details><summary class="small">Description</summary><div class="desc small">${esc(p.description)}</div></details>` : ''}`;
 }
 
 // A review an AI (or the user) saved with the mod: its verdict, notes and place in the order.
@@ -1802,7 +1823,7 @@ $('#rules-notice').onclick = async e => {
 };
 
 $('#details').addEventListener('click', async e => {
-  const t = e.target.closest('button, input');
+  const t = e.target.closest('button, input, img[data-pic]');
   if (!t) return;
   const id = selIds()[0];
   if (t.dataset.goto) { if (tab !== 'mods') showTab('mods'); goTo(t.dataset.goto); }
@@ -1814,6 +1835,12 @@ $('#details').addEventListener('click', async e => {
     setLootRule({ after: (old?.after ?? []).filter(a => a !== t.dataset.unloot) });
   } else if (t.dataset.unhide) {
     hideFiles(id, [t.dataset.unhide], true);
+  } else if (t.dataset.doc) {
+    showTab('ai');
+    ideOpen(`mods/${id}/${t.dataset.doc}`);
+  } else if (t.dataset.pic) {
+    const url = t.src;
+    dialog({ title: t.dataset.pic, body: `<img src="${url}" alt="" style="max-width:100%">`, actions: [['ok', 'Close', 'primary']] });
   } else if (t.dataset.uncat) {
     editCategories([id], [], [t.dataset.uncat]);
   } else if (t.dataset.unrule) {
@@ -1842,6 +1869,19 @@ $('#details').addEventListener('click', async e => {
     case 'skip-update': return act('Skipping the update', () => call('hold_updates', { ids: [id], hold: 'skip' }));
     case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
+    case 'nexus-page': return call('open_nexus_mod', { mod_id: details.meta.nexus.mod_id, page: true }).catch(err => toast(String(err), 'error'));
+    case 'nexus-info': {
+      const modId = details.meta.nexus.mod_id;
+      nexusPages.set(modId, 'loading');
+      renderDetails();
+      nexusPages.set(modId, await call('nexus_mod_info', { mod_id: modId }).catch(err => ({ error: String(err) })));
+      return renderDetails();
+    }
+    case 'mod-pics': {
+      const files = details.images.slice(0, 24);
+      modPics.set(id, await Promise.all(files.map(async f => [f, await call('mod_image', { id, path: f }).catch(() => null)])));
+      return renderDetails();
+    }
     case 'hide-files': {
       const files = await call('mod_files', { id }).catch(err => { toast(String(err), 'error'); return null; });
       const paths = files && await pickFiles(`Hide files in ${nameOf(id)}`, files, '<p class="muted small">Ticked files leave the game at the next deploy and stay hidden through reinstalls and updates; the panel lists them to show again. A hidden plugin is like MO2’s optional ESP.</p>', 'Hide');
@@ -3761,10 +3801,10 @@ function ideShow(f) {
   const has = !!f;
   $('#ide-filebar').hidden = $('#ide-code').hidden = !has;
   $('#ide-empty').hidden = has;
+  const t = $('#ide-text');
+  if (f) t.value = f.text; // before the tabs, which compare it with the saved text
   ideTabs();
   if (!f) return;
-  const t = $('#ide-text');
-  t.value = f.text;
   t.readOnly = !f.editable;
   t.scrollTop = 0;
   $('#ide-path').textContent = f.path + (f.note ? ` · ${f.note}` : '');
@@ -3777,7 +3817,9 @@ async function ideOpen(path, reload = false) {
   if (!f || reload) {
     let d;
     try { d = await call('ide_read', { path }); } catch (e) { return toast(String(e), 'error'); }
-    const fresh = { path, text: d.text, saved: d.text, hash: d.hash, editable: d.editable, note: d.note };
+    // A textarea holds \n only: Windows' \r\n go back in on save, so the file keeps them.
+    const crlf = d.text.includes('\r\n'), text = d.text.replace(/\r\n/g, '\n');
+    const fresh = { path, text, saved: text, crlf, hash: d.hash, editable: d.editable, note: d.note };
     if (f) Object.assign(f, fresh); else ide.files.push(f = fresh);
     if (f === ide.cur) { ide.cur = null; } // shown again below without keeping the old text
   }
@@ -3795,13 +3837,13 @@ function ideChanged(path) {
 async function ideSave() {
   const f = ide.cur;
   if (!f?.editable) return;
-  const text = $('#ide-text').value;
+  const text = $('#ide-text').value, disk = f.crlf ? text.replace(/\n/g, '\r\n') : text;
   try {
-    await call('ide_write', { path: f.path, text, expect: f.hash });
+    await call('ide_write', { path: f.path, text: disk, expect: f.hash });
   } catch (e) {
     if (!String(e).includes('changed since')) return toast(String(e), 'error');
     if (!await confirmBox('The file changed', `${f.path} changed on disk since you opened it (an AI edit or another program?). Save yours over it? The other version is kept in Edits….`, 'Save over it')) return;
-    try { await call('ide_write', { path: f.path, text }); } catch (err) { return toast(String(err), 'error'); }
+    try { await call('ide_write', { path: f.path, text: disk }); } catch (err) { return toast(String(err), 'error'); }
   }
   try { f.hash = (await call('ide_read', { path: f.path })).hash; } catch {}
   f.saved = f.text = text;
