@@ -224,16 +224,55 @@ pub struct Detected {
     /// Folder holding plugins.txt (Windows %LOCALAPPDATA% or the Proton prefix equivalent).
     pub local_path: Option<PathBuf>,
     pub source: &'static str,
+    /// The exe's version ("1.6.1170.0"), to tell copies apart.
+    pub version: Option<String>,
+    /// In a Steam library (under `steamapps`).
+    pub steam: bool,
+    /// Free space on its drive, in bytes.
+    pub free: Option<u64>,
+}
+
+impl Detected {
+    fn new(game: Game, game_path: PathBuf, source: &'static str) -> Detected {
+        let version = crate::launch::game_version(&game_path, game).ok().map(|v| v.map(|n| n.to_string()).join("."));
+        let steam = game_path.components().any(|c| c.as_os_str().eq_ignore_ascii_case("steamapps"));
+        Detected { game, local_path: local_path(game, &game_path), free: free_space(&game_path), game_path, source, version, steam }
+    }
+}
+
+/// Free space on the drive holding `path` (or its nearest folder that exists), in bytes.
+pub fn free_space(path: &Path) -> Option<u64> {
+    let dir = path.ancestors().find(|p| p.is_dir())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0u64;
+        let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = dir;
+        None
+    }
 }
 
 pub fn detect(game: Game) -> Option<Detected> {
     #[cfg(windows)]
     if let Some(p) = registry_install_path(game).filter(|p| p.join(game.exe()).is_file()) {
-        return Some(Detected { game, local_path: local_path(game, &p), game_path: p, source: "registry" });
+        return Some(Detected::new(game, p, "registry"));
     }
     steam_libraries().into_iter().find_map(|lib| {
         let p = lib.join("steamapps").join("common").join(game.steam_dir());
-        p.join(game.exe()).is_file().then(|| Detected { game, local_path: local_path(game, &p), game_path: p, source: "steam" })
+        p.join(game.exe()).is_file().then(|| Detected::new(game, p, "steam"))
     })
 }
 
@@ -241,7 +280,7 @@ pub fn detect(game: Game) -> Option<Detected> {
 /// counts as picking the game folder.
 pub fn identify(dir: &Path) -> Option<Detected> {
     let dir = if dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case("data")) { dir.parent()? } else { dir };
-    Game::ALL.into_iter().find(|g| dir.join(g.exe()).is_file()).map(|game| Detected { game, local_path: local_path(game, dir), game_path: dir.to_path_buf(), source: "chosen" })
+    Game::ALL.into_iter().find(|g| dir.join(g.exe()).is_file()).map(|game| Detected::new(game, dir.to_path_buf(), "chosen"))
 }
 
 /// What a search of every drive found.
@@ -304,7 +343,7 @@ fn walk(dir: &Path, depth: usize, found: &mut Search, top: bool) {
     let mut hit = false;
     for game in Game::ALL {
         if has(game.exe()) && subdirs.iter().any(|(n, _)| n == "data") {
-            found.games.push(Detected { game, local_path: local_path(game, dir), game_path: dir.to_path_buf(), source: "search" });
+            found.games.push(Detected::new(game, dir.to_path_buf(), "search"));
             hit = true;
         }
     }

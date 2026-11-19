@@ -243,10 +243,15 @@ impl Installer {
     }
 
     /// Play the steps in order with `choices`. Groups the choices leave out take their defaults.
+    /// Steps and groups are matched by name, and ones sharing a name (often none at all) by order:
+    /// the second step called "" takes the second choice called "".
     pub fn walk(&self, choices: &Choices, env: &Env) -> Result<Walk> {
         for sc in &choices.options {
-            let step = self.steps.iter().find(|s| s.name == sc.name).ok_or_else(|| anyhow!("the installer has no step named '{}'", sc.name))?;
-            if let Some(gc) = sc.groups.iter().find(|gc| !step.groups.iter().any(|g| g.name == gc.name)) {
+            let steps: Vec<&Step> = self.steps.iter().filter(|s| s.name == sc.name).collect();
+            if steps.is_empty() {
+                bail!("the installer has no step named '{}'", sc.name);
+            }
+            if let Some(gc) = sc.groups.iter().find(|gc| !steps.iter().any(|s| s.groups.iter().any(|g| g.name == gc.name))) {
                 bail!("step '{}' has no group named '{}'", sc.name, gc.name);
             }
         }
@@ -256,11 +261,13 @@ impl Installer {
         }
         let mut flags = Flags::new();
         let mut picked = Vec::new();
+        let mut seen: HashMap<&str, usize> = HashMap::new();
         for step in &self.steps {
             if !step.visible.as_ref().is_none_or(|c| c.holds(&flags, env)) {
                 continue;
             }
-            let given = choices.options.iter().find(|c| c.name == step.name);
+            let given = nth_named(&choices.options, &step.name, &mut seen, |c| &c.name);
+            let mut seen_groups: HashMap<&str, usize> = HashMap::new();
             // Within a step the first selected option that sets a flag wins (MO2 scans backwards
             // through steps and forwards within one); later steps override earlier ones.
             let mut step_flags = Flags::new();
@@ -269,7 +276,7 @@ impl Installer {
             for g in &step.groups {
                 let kinds: Vec<Kind> = g.plugins.iter().map(|p| p.kind(&flags, env)).collect();
                 let kind = g.effective_kind();
-                let sel = match given.and_then(|sc| sc.groups.iter().find(|c| c.name == g.name)) {
+                let sel = match given.and_then(|sc| nth_named(&sc.groups, &g.name, &mut seen_groups, |c| &c.name)) {
                     Some(gc) => g.pick(kind, &kinds, gc).with_context(|| format!("step '{}'", step.name))?,
                     None => default_pick(kind, &kinds),
                 };
@@ -300,8 +307,13 @@ impl Installer {
             out.steps.push(view);
             out.choices.options.push(chosen);
         }
-        for sc in choices.options.iter().filter(|sc| !out.steps.iter().any(|s| s.name == sc.name)) {
-            out.warnings.push(format!("the choices for '{}' weren't used: the installer doesn't show that step with these choices", sc.name));
+        let mut unused: HashMap<&str, usize> = HashMap::new();
+        for sc in &choices.options {
+            let n = unused.entry(&sc.name).or_default();
+            *n += 1;
+            if *n > out.steps.iter().filter(|s| s.name == sc.name).count() {
+                out.warnings.push(format!("the choices for '{}' weren't used: the installer doesn't show that step with these choices", sc.name));
+            }
         }
         let mut install = self.required.clone();
         for (c, f) in &self.conditional {
@@ -314,6 +326,14 @@ impl Installer {
         out.install = install;
         Ok(out)
     }
+}
+
+/// The next of `items` called `name`: the first the first time, the second the second time.
+fn nth_named<'a, T>(items: &'a [T], name: &'a str, seen: &mut HashMap<&'a str, usize>, of: impl Fn(&T) -> &String) -> Option<&'a T> {
+    let n = seen.entry(name).or_default();
+    let r = items.iter().filter(|c| of(c) == name).nth(*n);
+    *n += 1;
+    r
 }
 
 /// Data-relative destination key -> (destination, source file).
@@ -384,7 +404,9 @@ impl Group {
         }
         let mut sel = vec![false; kinds.len()];
         for c in &given.choices {
-            let i = self.plugins.iter().position(|p| p.name == c.name).ok_or_else(|| anyhow!("group '{}' has no option '{}'", self.name, c.name))?;
+            // The position tells options of the same name apart; the name finds one that moved.
+            let at = c.idx.filter(|&i| self.plugins.get(i).is_some_and(|p| p.name == c.name));
+            let i = at.or_else(|| self.plugins.iter().position(|p| p.name == c.name)).ok_or_else(|| anyhow!("group '{}' has no option '{}'", self.name, c.name))?;
             if kinds[i] == Kind::NotUsable {
                 bail!("option '{}' in group '{}' can't be used with this setup", c.name, self.name);
             }

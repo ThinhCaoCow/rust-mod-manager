@@ -41,6 +41,27 @@ async fn mcp(current: tauri::State<'_, Current>, server: tauri::State<'_, Mcp>, 
     Ok(json!({ "on": true, "url": url, "token": token }))
 }
 
+/// Settings' "Check for updates": the newest signed release (`plugins.updater` in tauri.conf.json),
+/// and with `install` its installer, which closes this window and opens the new rmm.
+#[tauri::command]
+async fn app_update(app: tauri::AppHandle, install: bool) -> Result<Value, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let keyed = app.config().plugins.0.get("updater").and_then(|u| u["pubkey"].as_str()).is_some_and(|k| !k.is_empty());
+    if !keyed {
+        return Err("this rmm was built by hand, so it can't update itself. The installer from rmm's releases page on GitHub can".into());
+    }
+    let err = |e: tauri_plugin_updater::Error| e.to_string();
+    let current = app.package_info().version.to_string();
+    let Some(update) = app.updater().map_err(err)?.check().await.map_err(err)? else {
+        return Ok(json!({ "current": current, "newer": null }));
+    };
+    if install {
+        update.download_and_install(|_, _| {}, || {}).await.map_err(err)?;
+        app.restart(); // Windows: the installer has closed rmm already
+    }
+    Ok(json!({ "current": current, "newer": update.version, "notes": update.body }))
+}
+
 /// The AI tab's chat: the agent (for this instance folder), the window's answer to a change waiting
 /// for approval, and the Stop button.
 #[derive(Default)]
@@ -276,7 +297,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
                 "broken": rules::broken(&inst, &p)?,
                 "unmet": rules::unmet(&inst, &p)?,
                 "locks": p.locks.keys().collect::<Vec<_>>(),
-                "options": { "local_inis": p.local_inis, "local_saves": p.local_saves },
+                "options": { "local_inis": p.local_inis, "local_saves": p.local_saves, "shares_order_with": inst.order_sharers()? },
+                "collection": p.collection.as_ref().map(|c| json!({ "slug": c.slug, "name": c.name, "revision": c.revision })),
                 "history": inst.history()?,
                 "mods": mods,
                 "conflicts": conflicts,
@@ -294,7 +316,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "deploy" => json!(deploy::deploy(&inst, false)?),
         "purge" => json!(deploy::purge(&inst, flag("dry_run"))?),
+        "launch" if flag("without_mods") => json!(launch::launch_vanilla(&inst, false)?),
         "launch" => json!(launch::launch(&inst, false)?),
+        "steam_updates" => match a["hold"].as_bool() {
+            Some(hold) => json!(launch::hold_steam_updates(&inst, hold)?),
+            None => json!(launch::steam_updates(&inst)),
+        },
         "test_run" => json!(harness::test_run(&inst, &serde_json::from_value(a.clone())?)?),
         "bisect" => {
             use rmm_core::bisect;
@@ -325,37 +352,48 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(format!("data:image/png;base64,{}", BASE64_STANDARD.encode(fs::read(file)?)))
         }
         "health" => json!(health::check(&inst)?),
+        "lacking_requirements" => json!(nexus::lacking_requirements(&inst, &p)),
         "details" => ops::mod_details(&inst, &s("id")?, 300)?,
         // A mod's FOMOD installer as it plays out with the window's choices; null when it has none.
         "fomod" => {
             let path = s("path")?;
             match install::has_fomod(&inst, Path::new(&path))? {
-                true => json!(install::fomod_options(&inst, Path::new(&path), choices()?.as_ref())?),
+                true => {
+                    let mut v = json!(install::fomod_options(&inst, Path::new(&path), choices()?.as_ref())?);
+                    // For the wizard's hints: which option is for this game version.
+                    v["game_version"] = json!(rmm_core::launch::game_version(&inst.config.game_path, inst.config.game).ok().map(|v| v.map(|n| n.to_string()).join(".")));
+                    v
+                }
                 false => Value::Null,
             }
         }
         // An option's picture, as a data: URL the window can show.
-        "fomod_image" => {
-            let file = install::fomod_image(&inst, Path::new(&s("path")?), &s("image")?)?;
-            let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let mime = match ext.as_str() {
-                "jpg" | "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "bmp" => "image/bmp",
-                "webp" => "image/webp",
-                _ => "image/png",
-            };
-            json!(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(fs::read(file)?)))
+        "fomod_image" => json!(data_url(&install::fomod_image(&inst, Path::new(&s("path")?), &s("image")?)?)?),
+        // A picture in a mod's folder, for its panel.
+        "mod_image" => {
+            let path = s("path")?;
+            anyhow::ensure!(Path::new(&path).components().all(|c| matches!(c, std::path::Component::Normal(_))), "a path inside the mod");
+            json!(data_url(&inst.mod_dir(&s("id")?).join(path))?)
         }
+        // Read what a mod's Nexus page lists as required, for its panel and Problems (no key needed).
+        "read_requirements" => {
+            nexus::refresh_requirements(&inst, &nexus::Client::any(), &[n("mod_id")? as u64])?;
+            Value::Null
+        }
+        // What a mod's Nexus page says, for its panel (no key needed).
+        "nexus_mod_info" => json!(nexus::mod_info(&inst, &nexus::Client::any(), n("mod_id")? as u64)?),
         // Without choices a FOMOD installer takes its defaults; the name defaults to the file's.
         "install" => {
             let name = a["name"].as_str().map(str::trim).filter(|n| !n.is_empty());
             let at = a["priority"].as_u64().map(|n| n as usize);
             let r = install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at)?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
-                let id = n.mod_id;
                 nexus::remember(&inst, &r.id, n)?;
-                let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]); // for Problems; the install stands without
+            }
+            // For Problems and the panel, also when the id comes from the file name (no key
+            // needed); the install stands without.
+            if let Some(id) = nexus::nexus_id_of(&inst.mod_meta(&r.id)) {
+                let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]);
             }
             json!(r)
         }
@@ -363,8 +401,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "update_mod" => {
             let r = install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref())?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
-                let id = n.mod_id;
                 nexus::remember(&inst, &r.id, n)?;
+            }
+            if let Some(id) = nexus::nexus_id_of(&inst.mod_meta(&r.id)) {
                 let _ = nexus::refresh_requirements(&inst, &nexus::Client::any(), &[id]); // a new version can need new mods
             }
             json!(r)
@@ -373,12 +412,39 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "same_mod" => json!(install::same_mod(&inst, Path::new(&s("path")?), a["mod_id"].as_u64())?),
         "rename_mod" => json!(ops::rename_mod(&inst, &s("id")?, &s("name")?)?),
         "overwrite_files" => json!(inst.mod_files(OVERWRITE)?),
+        "mod_files" => json!(inst.mod_files(&s("id")?)?),
+        "rebuild_outputs" => {
+            let limit = Some(Duration::from_secs(settings::get().tools.timeout_mins * 60)).filter(|d| !d.is_zero());
+            json!(tools::rebuild(&inst, flag("dry_run"), limit)?)
+        }
+        "clean_dirty" => json!(tools::clean_dirty(&inst, flag("dry_run"), flag("one_mod"))?),
+        "hide_files" => json!(install::hide_files(&inst, &s("id")?, &serde_json::from_value::<Vec<String>>(a["paths"].clone())?, !flag("show"))?),
+        "move_files" => json!(install::move_files(&inst, &s("from")?, &serde_json::from_value::<Vec<String>>(a["paths"].clone())?, &s("to")?, flag("replace"))?),
+        "creations" if flag("restore") => json!(rmm_core::import::restore_creations(&inst, flag("dry_run"))?),
+        "creations" => json!(rmm_core::import::adopt_creations(&inst, flag("dry_run"))?),
         "mod_from_overwrite" => json!(install::mod_from_overwrite(&inst, &s("name")?)?),
         "clear_overwrite" => json!(install::clear_overwrite(&inst)?),
         "tools" => {
             // With each tool's last run, so the list can say how it went.
-            let last = |id: &str| fs::read_to_string(inst.root.join("tools").join(id).join("last-run.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-            let list: Vec<Value> = tools::list(&inst)?.into_iter().map(|(id, t)| json!({ "id": id, "last": last(&id), "tool": t })).collect();
+            let file = |id: &str| inst.root.join("tools").join(id).join("last-run.json");
+            let last = |id: &str| fs::read_to_string(file(id)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            let when = |id: &str| fs::metadata(file(id)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+            // Whole-setup generators: their output in this profile and whether it's up to date.
+            let (stale, p) = (tools::stale_outputs(&inst)?, inst.profile()?);
+            let output = |id: &str| p.mods.iter().find(|m| m.enabled && inst.mod_meta(&m.id).source.as_deref() == Some(&format!("tool:{id}"))).map(|m| m.id.clone());
+            let list: Vec<Value> = tools::list(&inst)?
+                .into_iter()
+                .map(|(id, t)| {
+                    let whole = tools::chain_preset(&inst, &id, &t).is_some();
+                    let out = output(&id).filter(|_| whole);
+                    let st = out.as_ref().and_then(|o| stale.iter().find(|s| &s.output == o));
+                    let status = out.as_ref().map(|_| match st {
+                        None => json!({ "state": "current" }),
+                        Some(s) => json!({ "state": if s.unknown { "unknown" } else { "stale" }, "why": s.summary() }),
+                    });
+                    json!({ "id": id, "last": last(&id), "when": when(&id), "tool": t, "output": out, "status": status })
+                })
+                .collect();
             json!({ "tools": list, "presets": tools::PRESETS })
         }
         "add_tool" => json!(tools::add(&inst, &s("id")?, serde_json::from_value(a["spec"].clone())?)?),
@@ -396,7 +462,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "add_separator" => json!(ops::add_separator(&inst, &s("name")?, a["priority"].as_u64().map(|n| n as usize))?),
         "edit_separator" => json!(ops::edit_separator(&inst, &s("id")?, a["name"].as_str(), a["color"].as_str())?),
         "enable_plugin" => json!(ops::set_plugin_enabled(&inst, &s("name")?, flag("enabled"))?),
-        "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?)?),
+        "enable_plugins" => json!(ops::set_plugins_enabled(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, flag("enabled"))?),
+        "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, &serde_json::from_value::<Vec<String>>(a["moved"].clone()).unwrap_or_default())?),
         "set_rule" => json!(rules::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
         "sort_mods" => json!(rules::sort(&inst, flag("dry_run"))?),
         "sort_plugins" => json!(loot::sort(&inst, flag("dry_run"))?),
@@ -408,6 +475,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "new_playthrough" => json!(ops::new_playthrough(&mut inst, &s("name")?)?),
         "rename_profile" => json!(inst.rename_profile(&s("from")?, &s("to")?)?),
         "set_profile_options" => json!(ops::set_profile_options(&inst, a["local_inis"].as_bool(), a["local_saves"].as_bool())?),
+        "share_order" => json!(inst.share_order(a["with"].as_str())?),
         "delete_profile" => json!(inst.delete_profile(&s("name")?)?),
         // With `text`, the report to paste into a post.
         "crash_log" => {
@@ -438,6 +506,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "nexus_sso" => nexus::sso(&nexus::open_in_browser)?,
         "nexus_forget_key" => json!(nexus::forget_key()?),
         "check_updates" => json!(nexus::check_updates(&inst, &nexus::Client::from_env()?, None)?),
+        "identify_downloads" => json!(nexus::identify(&inst, &nexus::Client::from_env()?, &serde_json::from_value::<Vec<String>>(a["names"].clone()).unwrap_or_default())?),
         "hold_updates" => json!(nexus::hold_updates(&inst, &serde_json::from_value::<Vec<String>>(a["ids"].clone())?, serde_json::from_value(a["hold"].clone())?)?),
         "nexus_fetch" => {
             let client = nexus::Client::from_env()?;
@@ -445,18 +514,51 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "install_collection" => {
             let client = nexus::Client::from_env()?;
-            json!(rmm_core::collection::install(&mut inst, &client, &s("link")?, a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"))?)
+            json!(rmm_core::collection::install(&mut inst, &client, a["link"].as_str().unwrap_or(""), a["revision"].as_u64(), flag("optional"), a["profile"].as_str(), flag("dry_run"), a["sort"].as_bool().unwrap_or(true))?)
+        }
+        // The newest revision of the profile's collection.
+        "collection_newest" => {
+            let slug = p.collection.as_ref().map(|c| c.slug.clone()).context("this profile wasn't installed from a collection")?;
+            json!(rmm_core::collection::revision(&inst, &nexus::Client::from_env()?, &slug, None)?.number)
         }
         "essentials" => json!(launch::essentials(&inst)?),
         // A mod's Files tab, for the getting-started list (Nexus mod pages only).
-        "open_nexus_mod" => json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}?tab=files", inst.config.game.nexus_domain(), n("mod_id")?))?),
-        "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
-        // Only on the user's click: it makes this rmm the system's program for nxm:// links.
-        "nexus_handler" => {
-            let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm.exe" } else { "rmm" });
-            anyhow::ensure!(cli.is_file(), "rmm's command-line program isn't next to the app ({})", cli.display());
-            json!(nexus::register_handler(&cli, &inst.root)?)
+        "open_nexus_mod" => {
+            // A file's id: its download prompt ("Mod manager download"), for free accounts.
+            let tab = match a["file_id"].as_u64() {
+                Some(f) => format!("?tab=files&file_id={f}&nmm=1"),
+                None if flag("page") => String::new(),
+                None => "?tab=files".into(),
+            };
+            json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}{tab}", inst.config.game.nexus_domain(), n("mod_id")?))?)
         }
+        "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
+        // Public actions on the user's Nexus account, only from the window's own buttons.
+        "nexus_endorse" => json!(nexus::endorse(&inst, &nexus::Client::from_env()?, &s("id")?, flag("yes"))?),
+        "nexus_track" => json!(nexus::track(&inst, &nexus::Client::from_env()?, &s("id")?, flag("yes"))?),
+        "nexus_account" => json!(nexus::refresh_account(&inst, &nexus::Client::from_env()?)?),
+        "nexus_changelog" => json!(nexus::changelog(&inst, &nexus::Client::any(), n("mod_id")? as u64, a["since"].as_str())?),
+        // A mod's folder (or Overwrite's) in Explorer.
+        "open_mod_folder" => {
+            let dir = inst.mod_dir(&s("id")?);
+            if !dir.is_dir() {
+                bail!("{} isn't there", dir.display());
+            }
+            std::process::Command::new("explorer").arg(dir.to_string_lossy().replace('/', "\\")).spawn()?;
+            json!(true)
+        }
+        // A web page a message links to (LOOT's): https only, so nothing else gets opened.
+        "open_link" => {
+            let url = s("url")?;
+            if !url.starts_with("https://") || url.contains(|c: char| c.is_whitespace() || c == '"') {
+                bail!("not a web link: {url}");
+            }
+            json!(nexus::open_in_browser(&url)?)
+        }
+        // Only on the user's click: it makes this rmm the system's program for nxm:// links.
+        "nexus_handler" => json!(nexus::register_handler(&cli_exe()?, &inst.root)?),
+        // Only on the user's click: a file on their Desktop.
+        "desktop_shortcut" => json!(launch::shortcut(&inst, &s("profile")?, &cli_exe()?, None, flag("dry_run"))?),
         "addons" => json!(addons::list(&inst)?),
         "addon_install" => json!(addons::install(&inst, Path::new(&s("path")?), flag("dry_run"))?),
         "addon_remove" => json!(addons::remove(&inst, &s("name")?)?),
@@ -468,7 +570,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "import_mo2" if flag("all") => json!(import::import_mo2_all(&inst, Path::new(&s("dir")?), flag("dry_run"))?),
         "import_mo2" => json!(import::import_mo2(&inst, Path::new(&s("dir")?), a["profile"].as_str(), flag("dry_run"))?),
         "import_vortex" => json!(import::import_vortex(&inst, Path::new(&s("path")?), a["staging"].as_str().map(Path::new), a["profile"].as_str(), flag("dry_run"))?),
-        "export_lockfile" => json!(lockfile::write(&inst, None)?),
+        "export_lockfile" => json!(lockfile::write(&inst, a["path"].as_str().map(Path::new), serde_json::from_value(a["format"].clone()).unwrap_or_default())?),
+        "diff_lockfile" => json!(lockfile::diff(&lockfile::read(Path::new(&s("path")?))?, &lockfile::export(&inst)?)),
         "apply_lockfile" => {
             let downloads: Vec<PathBuf> = serde_json::from_value(a["downloads"].clone()).unwrap_or_default();
             json!(lockfile::apply(&inst, &lockfile::read(Path::new(&s("path")?))?, &downloads, flag("dry_run"))?)
@@ -477,6 +580,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "data" => json!(conflicts::data_view(&inst, &p, &serde_json::from_value(a.clone())?)?),
         "saves" => json!(saves::list(&inst)?),
         "newest_save_using" => json!(saves::newest_using(&inst, &serde_json::from_value::<Vec<String>>(a["plugins"].clone())?)?),
+        "clean_cosaves" => json!(saves::clean_cosaves(&inst, false)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
         "transfer_saves" => json!(saves::transfer(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?, &s("profile")?, !flag("move"))?),
         "downloads" => json!(install::downloads(&inst)?),
@@ -488,7 +592,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "delete_download" => json!(install::delete_download(&inst, &s("name")?)?),
         "trash" => json!(install::trash(&inst)?),
         "empty_trash" => json!(install::empty_trash(&inst)?),
-        "history_details" => json!(inst.history_details()?),
+        "history_details" => ops::history(&inst)?,
+        "record_conflicts" => json!(plugins::record_conflicts(&inst, &inst.profile()?, &s("plugin")?)?),
         "restore_preview" => json!(inst.restore_preview(n("n")?)?),
         "restore" => json!(inst.restore(n("n")?)?),
         "set_note" => json!(ops::set_mod_note(&inst, &s("id")?, &s("note")?)?),
@@ -501,6 +606,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let list = |k: &str| serde_json::from_value::<Vec<String>>(a[k].clone()).unwrap_or_default();
             json!(ops::edit_categories(&inst, &ids()?, &list("add"), &list("remove"))?)
         }
+        "set_color" if a["ids"].is_array() => json!(ops::set_colors(&inst, &ids()?, &s("color")?)?),
         "set_color" => json!(ops::set_color(&inst, &s("id")?, &s("color")?)?),
         "lock_plugin" => json!(ops::lock_plugin(&inst, &s("name")?, flag("lock"))?),
         other => bail!("unknown call '{other}'"),
@@ -524,6 +630,27 @@ fn stamp(inst: &Instance) -> String {
     format!("{:?}", files.map(|f| fs::metadata(f).and_then(|m| m.modified()).ok()))
 }
 
+/// A picture as a data: URL the window can show (its CSP allows no file URLs).
+fn data_url(file: &Path) -> Result<String> {
+    anyhow::ensure!(fs::metadata(file)?.len() <= 8 << 20, "{} is too large to show", file.display());
+    let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    Ok(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(fs::read(file)?)))
+}
+
+/// rmm's command-line program, shipped next to the app.
+fn cli_exe() -> Result<PathBuf> {
+    let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm.exe" } else { "rmm" });
+    anyhow::ensure!(cli.is_file(), "rmm's command-line program isn't next to the app ({})", cli.display());
+    Ok(cli)
+}
+
 fn main() {
     // `rmm-app --instance <dir>`, then $RMM_INSTANCE; otherwise the window reopens the last one.
     let args: Vec<String> = std::env::args().collect();
@@ -535,6 +662,7 @@ fn main() {
         .map(PathBuf::from);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Current(Mutex::new(start)))
         .manage(Mcp(Mutex::new(None)))
         .manage(Ai::default())
@@ -577,7 +705,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![call, mcp, ai, ai_send, ai_answer, ai_stop])
+        .invoke_handler(tauri::generate_handler![call, mcp, ai, ai_send, ai_answer, ai_stop, app_update])
         .run(tauri::generate_context!())
         .expect("error while running rmm");
 }

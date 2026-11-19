@@ -204,6 +204,15 @@ impl Client {
     }
 
     fn request(&self, path: &str, body: Option<&str>) -> Result<Value> {
+        self.send("", path, body.map(|b| ("application/json", b)))
+    }
+
+    /// A v1 call that takes form data (endorse, track): POST or DELETE.
+    fn form(&self, method: &str, path: &str, form: &str) -> Result<Value> {
+        self.send(method, path, Some(("application/x-www-form-urlencoded", form)))
+    }
+
+    fn send(&self, method: &str, path: &str, body: Option<(&str, &str)>) -> Result<Value> {
         let url = format!("{}{path}", self.base);
         let version = env!("CARGO_PKG_VERSION");
         // The key goes to curl on stdin, never on its command line where other programs see it.
@@ -212,8 +221,12 @@ impl Client {
             config += &format!("header = \"apikey: {}\"\n", self.key);
         }
         let mut args = vec!["-sS", "--max-time", "60", "-w", "\n%{http_code}", "-K", "-"];
-        if let Some(b) = body {
-            args.extend(["-H", "Content-Type: application/json", "-H", "Expect:", "--data-binary", b]);
+        if !method.is_empty() {
+            args.extend(["-X", method]);
+        }
+        let content_type = body.map(|(t, _)| format!("Content-Type: {t}"));
+        if let (Some(t), Some((_, b))) = (&content_type, body) {
+            args.extend(["-H", t.as_str(), "-H", "Expect:", "--data-binary", b]);
         }
         args.extend(["--", &url]);
         let mut child = Command::new("curl").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("cannot run curl")?;
@@ -580,6 +593,32 @@ pub fn hold_updates(inst: &Instance, ids: &[String], hold: Hold) -> Result<()> {
     })
 }
 
+/// A version's numbers, for ordering: "1.10b" -> [1, 10]. Nexus versions are free text.
+fn ver_key(v: &str) -> Vec<u64> {
+    v.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse().unwrap_or(u64::MAX)).collect()
+}
+
+/// A mod's changelog on Nexus, newest first: the versions after `since` (the installed one), or
+/// the newest three when that's unknown.
+pub fn changelog(inst: &Instance, client: &Client, mod_id: u64, since: Option<&str>) -> Result<Vec<(String, Vec<String>)>> {
+    let v = client.get(&format!("/v1/games/{}/mods/{mod_id}/changelogs.json", inst.config.game.nexus_domain()))?;
+    Ok(changelog_after(&v, since))
+}
+
+fn changelog_after(v: &Value, since: Option<&str>) -> Vec<(String, Vec<String>)> {
+    let mut all: Vec<(String, Vec<String>)> = v
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, l)| (k.clone(), l.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(|s| s.trim().to_owned())).filter(|s| !s.is_empty()).collect()))
+        .collect();
+    all.sort_by_key(|(k, _)| std::cmp::Reverse(ver_key(k)));
+    match since.map(ver_key).filter(|k| !k.is_empty()) {
+        Some(have) => all.into_iter().take_while(|(k, _)| ver_key(k) > have).collect(),
+        None => all.into_iter().take(3).collect(),
+    }
+}
+
 /// Mods with a newer file on Nexus, leaving out the ones the user holds back (`hold_updates`).
 /// `ids` limits the check (default: every mod with Nexus ids).
 pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -> Result<Vec<Update>> {
@@ -715,33 +754,217 @@ fn download_info(inst: &Instance, client: &Client, link: &NxmLink) -> Result<(Pa
 /// newer uploads end in an id, not the file's name.)
 pub(crate) fn fetch_file(inst: &Instance, client: &Client, mod_id: u64, file_id: u64, query: &str) -> Result<(PathBuf, Value)> {
     let base = format!("/v1/games/{}/mods/{mod_id}/files/{file_id}", inst.config.game.nexus_domain());
-    let info = client.get(&format!("{base}.json"))?;
-    let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{mod_id}-{file_id}"));
-    let dest = inst.downloads_dir().join(&name);
-    if info["size_in_bytes"].as_u64().is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s)) {
+    let (dest, info, there) = downloaded(inst, client, mod_id, file_id)?;
+    if there {
         return Ok((dest, info));
     }
+    let name = dest.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let links = client.get(&format!("{base}/download_link.json{query}"))?;
     let uri = links.as_array().and_then(|l| l.first()).and_then(|l| l["URI"].as_str()).context("Nexus sent no download link")?;
     fs::create_dir_all(dest.parent().unwrap())?;
-    crate::progress::report(&format!("downloading {name}"), 0, 0);
-    fetch_url(uri, &dest)?;
+    fetch_sized(uri, &dest, info["size_in_bytes"].as_u64(), &format!("downloading {name} (MB)"))?;
     Ok((dest, info))
 }
 
+/// Where a Nexus file goes in the downloads folder, its details, and whether it's there already
+/// (by name and size). One request.
+pub(crate) fn downloaded(inst: &Instance, client: &Client, mod_id: u64, file_id: u64) -> Result<(PathBuf, Value, bool)> {
+    let info = client.get(&format!("/v1/games/{}/mods/{mod_id}/files/{file_id}.json", inst.config.game.nexus_domain()))?;
+    let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{mod_id}-{file_id}"));
+    let dest = inst.downloads_dir().join(&name);
+    let there = info["size_in_bytes"].as_u64().is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s));
+    Ok((dest, info, there))
+}
+
 pub(crate) fn fetch_url(url: &str, dest: &Path) -> Result<()> {
+    fetch_sized(url, dest, None, "downloading")
+}
+
+/// Download `url` to `dest` through `dest.part`, which a failed or stopped download leaves for
+/// the next try to carry on from. A known `size` shows progress (in MB) and checks the result.
+fn fetch_sized(url: &str, dest: &Path, size: Option<u64>, stage: &str) -> Result<()> {
     // curl rejects spaces and other raw bytes in a URL, and Nexus's CDN links carry file names.
     let url: String = url.bytes().map(|b| if b.is_ascii_graphic() { char::from(b).to_string() } else { format!("%{b:02X}") }).collect();
-    let url = url.as_str();
     let mut tmp = dest.as_os_str().to_owned();
     tmp.push(".part");
-    let out = Command::new("curl").args(["-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https", "--retry", "2", "-o"]).arg(&tmp).args(["--", url]).output().context("cannot run curl")?;
-    if !out.status.success() {
-        let _ = fs::remove_file(&tmp);
-        bail!("download failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let tmp = PathBuf::from(tmp);
+    if size.is_some_and(|s| fs::metadata(&tmp).is_ok_and(|m| m.len() > s)) {
+        fs::remove_file(&tmp)?; // another file's leftovers
+    }
+    let mb = |b: u64| (b >> 20) as usize;
+    let len = |p: &Path| fs::metadata(p).map_or(0, |m| m.len());
+    let mut resume = true;
+    loop {
+        if size.is_some_and(|s| len(&tmp) == s) {
+            break; // finished last time, short of the rename
+        }
+        let mut cmd = Command::new("curl");
+        cmd.args(["-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https", "--retry", "2"]);
+        if resume {
+            cmd.args(["-C", "-"]); // carry on from what .part has
+        }
+        cmd.arg("-o").arg(&tmp).args(["--", &url]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // no console window
+        let mut child = cmd.spawn().context("cannot run curl")?;
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            crate::progress::report(stage, mb(len(&tmp)), size.map_or(0, |s| mb(s).max(1)));
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        if status.success() {
+            break;
+        }
+        if resume && status.code() == Some(33) {
+            // The server can't send part of a file: start over.
+            let _ = fs::remove_file(&tmp);
+            resume = false;
+            continue;
+        }
+        let mut err = String::new();
+        let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err);
+        let kept = len(&tmp);
+        let more = if kept > 0 { format!(" ({} MB kept; trying again carries on from there)", mb(kept)) } else { String::new() };
+        bail!("download failed: {}{more}", err.trim());
+    }
+    if let Some(s) = size {
+        let got = fs::metadata(&tmp)?.len();
+        if got != s {
+            let _ = fs::remove_file(&tmp);
+            bail!("the download came out at {got} bytes, Nexus says {s}; try again");
+        }
     }
     fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+/// The downloads identified on Nexus, by file name (lowercase), in `downloads/.nexus.json`: what
+/// rmm downloaded itself and what `identify` found.
+pub fn identified(inst: &Instance) -> BTreeMap<String, Identified> {
+    fs::read_to_string(inst.downloads_dir().join(IDENTIFIED)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+const IDENTIFIED: &str = ".nexus.json";
+
+/// A download's mod and file on Nexus.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Identified {
+    /// The mod's name on Nexus.
+    pub name: Option<String>,
+    pub nexus: crate::instance::NexusRef,
+}
+
+fn remember_download(inst: &Instance, file: &str, id: Identified) -> Result<()> {
+    let mut all = identified(inst);
+    all.insert(file.to_lowercase(), id);
+    fs::write(inst.downloads_dir().join(IDENTIFIED), serde_json::to_string_pretty(&all)?)?;
+    Ok(())
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct IdentifyReport {
+    /// File name, then what it is.
+    pub found: Vec<(String, Identified)>,
+    /// Files Nexus doesn't know (not from Nexus, or changed since).
+    pub not_found: Vec<String>,
+    /// File name, then why.
+    pub failed: Vec<(String, String)>,
+    /// Installed mods that got their Nexus ids from these files.
+    pub mods: Vec<String>,
+}
+
+/// Look downloads up on Nexus by their MD5, many in one go (MO2's Query Info): `names` in the
+/// downloads folder, or every one not identified yet. What's found is kept for installs from the
+/// file, and installed mods made from one that have no Nexus ids get them, so update checks
+/// see them.
+pub fn identify(inst: &Instance, client: &Client, names: &[String]) -> Result<IdentifyReport> {
+    let known = identified(inst);
+    let names: Vec<String> = if names.is_empty() {
+        crate::install::downloads(inst)?.into_iter().map(|d| d.name).filter(|n| !known.contains_key(&n.to_lowercase())).collect()
+    } else {
+        names.to_vec()
+    };
+    let domain = inst.config.game.nexus_domain();
+    let mut r = IdentifyReport::default();
+    for (i, name) in names.iter().enumerate() {
+        crate::progress::report("identifying downloads", i, names.len());
+        let path = inst.downloads_dir().join(name);
+        if name.contains(['/', '\\']) || !path.is_file() {
+            r.failed.push((name.clone(), "no such download".into()));
+            continue;
+        }
+        let md5 = md5_file(&path)?;
+        let hits = match client.get(&format!("/v1/games/{domain}/mods/md5_search/{md5}.json")) {
+            Ok(v) => v,
+            Err(e) if format!("{e:#}").starts_with("Nexus has no ") => {
+                r.not_found.push(name.clone());
+                continue;
+            }
+            // A refused key or the day's requests used up: the rest would fail the same way.
+            Err(e) if ["refused the API key", "request limit"].iter().any(|m| format!("{e:#}").contains(m)) => {
+                r.failed.extend(names[i..].iter().map(|n| (n.clone(), format!("{e:#}"))));
+                break;
+            }
+            Err(e) => {
+                r.failed.push((name.clone(), format!("{e:#}")));
+                continue;
+            }
+        };
+        let hit = hits.as_array().and_then(|h| h.iter().find(|h| h["file_details"]["md5"].as_str().is_none_or(|m| m.eq_ignore_ascii_case(&md5))));
+        let Some(hit) = hit.filter(|h| h["mod"]["mod_id"].is_u64()) else {
+            r.not_found.push(name.clone());
+            continue;
+        };
+        let id = Identified {
+            name: hit["mod"]["name"].as_str().map(str::to_owned),
+            nexus: crate::instance::NexusRef {
+                mod_id: hit["mod"]["mod_id"].as_u64().unwrap_or_default(),
+                file_id: hit["file_details"]["file_id"].as_u64(),
+                version: hit["file_details"]["version"].as_str().map(str::to_owned),
+                category: hit["mod"]["category_id"].as_u64(),
+            },
+        };
+        remember_download(inst, name, id.clone())?;
+        r.found.push((name.clone(), id));
+    }
+    // Installed mods made from these files, without Nexus ids.
+    let found: BTreeMap<String, &Identified> = r.found.iter().map(|(n, id)| (n.to_lowercase(), id)).collect();
+    for d in crate::install::downloads(inst)? {
+        let Some(id) = found.get(&d.name.to_lowercase()) else { continue };
+        for m in d.mods {
+            if inst.mod_meta(&m).nexus.is_none() {
+                remember(inst, &m, id.nexus.clone())?;
+                r.mods.push(m);
+            }
+        }
+    }
+    if found.values().any(|id| id.nexus.category.is_some()) {
+        let _ = refresh_categories(inst, client);
+    }
+    Ok(r)
+}
+
+/// A file's MD5, which Nexus finds files by: certutil on Windows, md5sum elsewhere.
+fn md5_file(path: &Path) -> Result<String> {
+    let mut cmd = if cfg!(windows) { Command::new("certutil") } else { Command::new("md5sum") };
+    if cfg!(windows) {
+        cmd.arg("-hashfile").arg(path).arg("MD5");
+    } else {
+        cmd.arg(path);
+    }
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let out = cmd.output().context("cannot run certutil")?;
+    let hex = |w: &str| w.len() == 32 && w.bytes().all(|b| b.is_ascii_hexdigit());
+    // certutil: the hash on the second line (with spaces between bytes before Windows 10);
+    // md5sum: the first word.
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| [l.split_whitespace().next().unwrap_or("").to_string(), l.replace(' ', "")].into_iter().find(|w| hex(w)))
+        .map(|w| w.to_lowercase())
+        .with_context(|| format!("cannot read the MD5 of {}", path.display()))
 }
 
 /// A downloaded file and what to record about it.
@@ -767,6 +990,10 @@ pub fn fetch(inst: &Instance, client: &Client, link: &NxmLink) -> Result<Fetched
     };
     if nexus.category.is_some() {
         let _ = refresh_categories(inst, client); // the name is a nicety; the download stands without it
+    }
+    if let Some(file) = path.file_name() {
+        // So an install from the Downloads tab later records the ids too.
+        let _ = remember_download(inst, &file.to_string_lossy(), Identified { name: name.clone(), nexus: nexus.clone() });
     }
     Ok(Fetched { path, name, nexus })
 }
@@ -827,6 +1054,89 @@ pub fn resolve(inst: &Instance, client: &Client, what: &str) -> Result<NxmLink> 
     Ok(premium_link(inst, mod_id, file_id))
 }
 
+/// What the signed-in account has endorsed, abstained from and tracks on this game's Nexus, as
+/// last read (`refresh_account`), kept beside the key: it's the account's, not the instance's.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Account {
+    /// Nexus mod id -> "Endorsed" or "Abstained".
+    pub endorsements: BTreeMap<u64, String>,
+    pub tracked: std::collections::BTreeSet<u64>,
+    /// When it was read (seconds since 1970).
+    pub read: u64,
+}
+
+fn accounts() -> BTreeMap<String, Account> {
+    crate::config_file("nexus-account.json").and_then(|p| fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_account(domain: &str, a: &Account) -> Result<()> {
+    let path = crate::config_file("nexus-account.json").context("no config folder")?;
+    let mut all = accounts();
+    all.insert(domain.into(), a.clone());
+    if let Some(d) = path.parent() {
+        fs::create_dir_all(d)?;
+    }
+    crate::instance::write_atomic(&path, &serde_json::to_string_pretty(&all)?)
+}
+
+/// The account's endorsements and tracked mods for this game, as last read (no network).
+pub fn account(inst: &Instance) -> Account {
+    accounts().remove(inst.config.game.nexus_domain()).unwrap_or_default()
+}
+
+/// Read the account's endorsements and tracked mods from Nexus (two requests) and keep them.
+pub fn refresh_account(inst: &Instance, client: &Client) -> Result<Account> {
+    let domain = inst.config.game.nexus_domain();
+    let ours = |v: &Value| v["domain_name"].as_str() == Some(domain);
+    let mut a = Account { read: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()), ..Default::default() };
+    for e in client.get("/v1/user/endorsements.json")?.as_array().into_iter().flatten().filter(|e| ours(e)) {
+        if let (Some(id), Some(s)) = (e["mod_id"].as_u64(), e["status"].as_str()) {
+            a.endorsements.insert(id, s.into());
+        }
+    }
+    a.tracked = client.get("/v1/user/tracked_mods.json")?.as_array().into_iter().flatten().filter(|t| ours(t)).filter_map(|t| t["mod_id"].as_u64()).collect();
+    save_account(domain, &a)?;
+    Ok(a)
+}
+
+/// An installed mod's Nexus mod id and version, for endorsing and tracking.
+fn nexus_of(inst: &Instance, id: &str) -> Result<(u64, Option<String>)> {
+    let n = inst.mod_meta(id).nexus.with_context(|| format!("{id} has no Nexus id: Identify on Nexus (Downloads) or install it from Nexus first"))?;
+    Ok((n.mod_id, n.version))
+}
+
+/// Endorse an installed mod on Nexus, or abstain (Nexus's way to take an endorsement back, or to
+/// say you won't). Acts publicly on the account. Returns the account's state after.
+pub fn endorse(inst: &Instance, client: &Client, id: &str, yes: bool) -> Result<Account> {
+    let (mod_id, version) = nexus_of(inst, id)?;
+    let domain = inst.config.game.nexus_domain();
+    let what = if yes { "endorse" } else { "abstain" };
+    let r = client.form("POST", &format!("/v1/games/{domain}/mods/{mod_id}/{what}.json"), &format!("version={}", urlencode(version.as_deref().unwrap_or(""))))?;
+    let mut a = account(inst);
+    a.endorsements.insert(mod_id, r["status"].as_str().unwrap_or(if yes { "Endorsed" } else { "Abstained" }).into());
+    save_account(domain, &a)?;
+    Ok(a)
+}
+
+/// Track an installed mod on Nexus (its updates show in the account's tracking centre), or stop.
+pub fn track(inst: &Instance, client: &Client, id: &str, yes: bool) -> Result<Account> {
+    let (mod_id, _) = nexus_of(inst, id)?;
+    let domain = inst.config.game.nexus_domain();
+    client.form(if yes { "POST" } else { "DELETE" }, &format!("/v1/user/tracked_mods.json?domain_name={domain}"), &format!("mod_id={mod_id}"))?;
+    let mut a = account(inst);
+    if yes {
+        a.tracked.insert(mod_id);
+    } else {
+        a.tracked.remove(&mod_id);
+    }
+    save_account(domain, &a)?;
+    Ok(a)
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 /// The page where users make a personal API key.
 pub const KEYS_PAGE: &str = "https://next.nexusmods.com/settings/api-keys";
 
@@ -877,6 +1187,15 @@ pub fn handler_command() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changelog_after_the_installed_version() {
+        let v = serde_json::json!({ "1.9": ["nine"], "1.10": ["ten", " "], "2.0b": ["two"], "1.2": ["old"] });
+        let names = |l: Vec<(String, Vec<String>)>| l.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        assert_eq!(names(changelog_after(&v, Some("1.9"))), ["2.0b", "1.10"]);
+        assert_eq!(names(changelog_after(&v, None)), ["2.0b", "1.10", "1.9"]);
+        assert_eq!(changelog_after(&v, Some("1.9"))[1].1, ["ten"]);
+    }
 
     /// Single sign-on against a fake Nexus: rmm's id goes out, the approval page opens once the
     /// connection token arrives, a ping gets its pong, and the key comes back.
@@ -1032,6 +1351,9 @@ pub struct Needed {
     /// For requirements outside Nexus.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
+    /// A DLC (`name` is Nexus's name for it), checked by its master file in the game's Data folder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dlc: bool,
 }
 
 /// A mod another one needs, or one that needs it, and the installed mod that is it.
@@ -1059,6 +1381,20 @@ pub struct ModInfo {
 }
 
 const MOD_FIELDS: &str = "modId name summary category author version endorsements downloads updatedAt pictureUrl";
+
+/// A mod's Nexus mod id: the one rmm recorded, or the one in its archive's file name.
+pub fn nexus_id_of(meta: &crate::instance::ModMeta) -> Option<u64> {
+    meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| crate::install::nexus_id_in_name(meta.source.as_deref()?))
+}
+
+/// What a mod's Nexus page lists as required, as last read, each with the installed mod that is
+/// it. None until its requirements have been read (`refresh_requirements`).
+pub fn needs(inst: &Instance, id: &str) -> Option<Vec<Requirement>> {
+    let nx = nexus_id_of(&inst.mod_meta(id))?;
+    let reqs = requirements(inst).remove(&nx)?;
+    let installed = installed_by_nexus(inst);
+    Some(reqs.into_iter().filter(|r| r.mod_id != Some(nx)).map(|n| Requirement { installed: n.mod_id.and_then(|i| installed.get(&i).cloned()), needed: n }).collect())
+}
 
 /// Installed mods by their Nexus mod id.
 fn installed_by_nexus(inst: &Instance) -> BTreeMap<u64, String> {
@@ -1143,8 +1479,40 @@ fn needed(page: &Value, game: &Value) -> Vec<Needed> {
             name: n["modName"].as_str().unwrap_or_default().into(),
             notes: n["notes"].as_str().unwrap_or_default().into(),
             url: n["url"].as_str().unwrap_or_default().into(),
+            dlc: false,
         })
         .collect()
+}
+
+/// A mod page's DLC requirements.
+fn dlc_needed(requirements: &Value) -> Vec<Needed> {
+    requirements["dlcRequirements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["gameExpansion"]["name"].as_str())
+        .map(|name| Needed { mod_id: None, name: name.into(), notes: String::new(), url: String::new(), dlc: true })
+        .collect()
+}
+
+/// A DLC's master file, by Nexus's name for it. Others (Creation Club bundles) aren't checked.
+fn dlc_master(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    [
+        ("dawnguard", "Dawnguard.esm"),
+        ("hearthfire", "HearthFires.esm"),
+        ("dragonborn", "Dragonborn.esm"),
+        ("automatron", "DLCRobot.esm"),
+        ("wasteland workshop", "DLCworkshop01.esm"),
+        ("far harbor", "DLCCoast.esm"),
+        ("contraptions workshop", "DLCworkshop02.esm"),
+        ("vault-tec workshop", "DLCworkshop03.esm"),
+        ("nuka-world", "DLCNukaWorld.esm"),
+        ("nuka world", "DLCNukaWorld.esm"),
+    ]
+    .iter()
+    .find(|(k, _)| n.contains(k))
+    .map(|(_, f)| *f)
 }
 
 /// A mod's page on Nexus: description, tags, what it needs and what needs it, each marked when installed.
@@ -1189,14 +1557,15 @@ pub fn refresh_requirements(inst: &Instance, client: &Client, mod_ids: &[u64]) -
         return Ok(());
     }
     let game = game_number(inst, client)?;
-    let query = format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ gameId modRequirements {{ nexusRequirements(count: 100) {{ {REQ_NODES} }} }} }} }}");
+    let query = format!("query($m: ID!, $g: ID!) {{ mod(modId: $m, gameId: $g) {{ gameId modRequirements {{ dlcRequirements {{ gameExpansion {{ name }} }} nexusRequirements(count: 100) {{ {REQ_NODES} }} }} }} }}");
     let mut all = requirements(inst);
     for (i, &m) in mod_ids.iter().enumerate() {
         crate::progress::report("reading requirements on Nexus", i, mod_ids.len());
         let Ok(data) = client.graphql(&query, serde_json::json!({ "m": m, "g": game })) else { continue };
         let v = &data["mod"];
         if !v.is_null() {
-            all.insert(m, needed(&v["modRequirements"]["nexusRequirements"], &v["gameId"]));
+            let r = &v["modRequirements"];
+            all.insert(m, needed(&r["nexusRequirements"], &v["gameId"]).into_iter().chain(dlc_needed(r)).collect());
         }
     }
     fs::write(inst.root.join(REQUIREMENTS), serde_json::to_string(&all)?)?;
@@ -1243,12 +1612,58 @@ fn waived(r: &Needed, game: Option<([u32; 4], &[[u32; 2]])>) -> bool {
     false
 }
 
-/// Enabled mods whose Nexus page lists a requirement that isn't installed, or is but is disabled:
-/// (mod id, message). A mod's Nexus id is the recorded one or the one in its archive's name, and a
-/// requirement also counts as installed when a mod has its name or is a stand-in for it. The script
-/// extender counts when its loader is in the game folder or an enabled mod. Other sites'
-/// requirements aren't checked, nor ones their note waives for this game (see `waived`).
+/// A requirement an enabled mod's Nexus page lists that this setup lacks.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Lacking {
+    /// The mod whose page lists it.
+    pub for_mod: String,
+    pub name: String,
+    /// Its Nexus mod id; None for the script extender (another site) or a DLC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mod_id: Option<u64>,
+    /// Where to get it ("nexusmods.com/...", "skse.silverlock.org"); empty for a DLC.
+    pub page: String,
+    /// Installed but disabled: that mod's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dlc: bool,
+}
+
+/// Enabled mods' Nexus requirements that aren't installed, or are but are disabled, as Problems
+/// shows them: (mod id, message).
 pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile) -> Vec<(String, String)> {
+    let mut by_mod: Vec<(String, Vec<String>)> = Vec::new();
+    for l in lacking_requirements(inst, profile) {
+        let text = match &l.disabled {
+            _ if l.dlc => format!("the {} DLC, not in the game's Data folder", l.name),
+            Some(id) => match inst.mod_meta(id).name {
+                n if n.eq_ignore_ascii_case(&l.name) => format!("{}, installed but disabled", l.name),
+                n => format!("{}, installed as {n} but disabled", l.name),
+            },
+            None => format!("{} ({}), not installed", l.name, l.page),
+        };
+        match by_mod.last_mut() {
+            Some((m, v)) if *m == l.for_mod => v.push(text),
+            _ => by_mod.push((l.for_mod, vec![text])),
+        }
+    }
+    by_mod
+        .into_iter()
+        .map(|(m, lacking)| {
+            let it = if lacking.len() == 1 { "it" } else { "them" };
+            (m, format!("its Nexus page lists as required: {}. Ignore this if you have {it} another way", lacking.join("; ")))
+        })
+        .collect()
+}
+
+/// Enabled mods' Nexus requirements that aren't installed, or are but are disabled. A mod's Nexus
+/// id is the recorded one or the one in its archive's name, and a requirement also counts as
+/// installed when a mod has its name or is a stand-in for it. The script extender counts when its
+/// loader is in the game folder or an enabled mod, and a DLC when its master is in the game's Data
+/// folder. Other sites' requirements aren't checked, nor ones their note waives for this game (see
+/// `waived`).
+pub fn lacking_requirements(inst: &Instance, profile: &crate::instance::Profile) -> Vec<Lacking> {
     let all = requirements(inst);
     if all.is_empty() {
         return vec![];
@@ -1266,8 +1681,7 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
         .filter(|m| !crate::instance::is_separator(&m.id))
         .map(|m| {
             let meta = inst.mod_meta(&m.id);
-            let nx = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| crate::install::nexus_id_in_name(meta.source.as_deref()?));
-            (m, nx, meta.name)
+            (m, nexus_id_of(&meta), meta.name)
         })
         .collect();
     let loader = inst.config.game.loader();
@@ -1277,18 +1691,33 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
         let n = r.name.to_lowercase();
         r.url.contains("silverlock.org") || n.contains("script extender") || ["skse", "skse64", "sksevr", "f4se", "f4sevr"].contains(&n.as_str())
     };
+    let data_files: std::collections::HashSet<String> =
+        fs::read_dir(inst.data_dir()).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
     let mut out = Vec::new();
     for (m, nx, _) in mods.iter().filter(|x| x.0.enabled) {
         let Some(reqs) = nx.and_then(|n| all.get(&n)) else { continue };
-        let mut lacking = Vec::new();
+        let lack = |r: &Needed, page: &str, disabled: Option<String>| Lacking {
+            for_mod: m.id.clone(),
+            name: r.name.clone(),
+            mod_id: r.mod_id,
+            page: page.to_string(),
+            disabled,
+            dlc: r.dlc,
+        };
         for r in reqs.iter().filter(|r| r.mod_id.is_none_or(|id| Some(id) != *nx) && !waived(r, game)) {
             let page = match r.mod_id {
                 Some(id) => format!("nexusmods.com/{domain}/mods/{id}"),
                 None => r.url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string(),
             };
+            if r.dlc {
+                if dlc_master(&r.name).is_some_and(|f| !data_files.contains(&f.to_lowercase())) {
+                    out.push(lack(r, "", None));
+                }
+                continue;
+            }
             if is_se(r) {
                 if !se_on {
-                    lacking.push(format!("{} ({page}), not installed", r.name));
+                    out.push(lack(r, &page, None));
                 }
                 continue;
             }
@@ -1299,18 +1728,52 @@ pub fn missing_requirements(inst: &Instance, profile: &crate::instance::Profile)
             let same: Vec<&(&crate::ModEntry, Option<u64>, String)> =
                 mods.iter().filter(|x| x.1 == r.mod_id || x.1.is_some_and(|id| stand_ins.contains(&id)) || x.2.eq_ignore_ascii_case(&r.name)).collect();
             match same.iter().find(|x| x.0.enabled).or(same.first()) {
-                None => lacking.push(format!("{} ({page}), not installed", r.name)),
-                Some(x) if !x.0.enabled && x.2.eq_ignore_ascii_case(&r.name) => lacking.push(format!("{}, installed but disabled", r.name)),
-                Some(x) if !x.0.enabled => lacking.push(format!("{}, installed as {} but disabled", r.name, x.2)),
+                None => out.push(lack(r, &page, None)),
+                Some(x) if !x.0.enabled => out.push(lack(r, &page, Some(x.0.id.clone()))),
                 Some(_) => {}
             }
         }
-        if !lacking.is_empty() {
-            let it = if lacking.len() == 1 { "it" } else { "them" };
-            out.push((m.id.clone(), format!("its Nexus page lists as required: {}. Ignore this if you have {it} another way", lacking.join("; "))));
-        }
     }
     out
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct InstalledLacking {
+    pub installed: Vec<String>,
+    pub turned_on: Vec<String>,
+    /// Requirement, then why.
+    pub failed: Vec<(String, String)>,
+    /// The script extender, DLC and other sites' downloads: for the user to get.
+    pub left: Vec<Lacking>,
+}
+
+/// Install every lacking requirement that's on Nexus (its newest main file, with the installer's
+/// defaults: Premium only) and turn on the installed but disabled ones, in one undoable step.
+pub fn install_lacking(inst: &Instance, client: &Client) -> Result<InstalledLacking> {
+    let lacking = lacking_requirements(inst, &inst.profile()?);
+    let mut r = InstalledLacking::default();
+    let mut off: Vec<String> = lacking.iter().filter_map(|l| l.disabled.clone()).collect();
+    off.sort();
+    off.dedup();
+    if !off.is_empty() {
+        crate::ops::set_mods_enabled(inst, &off, true)?;
+        r.turned_on = off;
+    }
+    let mut done = std::collections::HashSet::new();
+    for l in lacking.into_iter().filter(|l| l.disabled.is_none()) {
+        let Some(id) = l.mod_id else {
+            r.left.push(l);
+            continue;
+        };
+        if !done.insert(id) {
+            continue;
+        }
+        match resolve(inst, client, &id.to_string()).and_then(|link| install(inst, client, &link, None)) {
+            Ok(i) => r.installed.push(i.id),
+            Err(e) => r.failed.push((l.name, format!("{e:#}"))),
+        }
+    }
+    Ok(r)
 }
 
 /// A mod page's BBCode as plain text: links keep their address, images go.
@@ -1346,7 +1809,7 @@ mod text_tests {
     #[test]
     fn notes_that_waive_a_requirement() {
         let eras: &[[u32; 2]] = &[[1, 5], [1, 6], [1, 7]];
-        let waived = |name: &str, notes: &str, v: [u32; 4]| super::waived(&super::Needed { mod_id: Some(1), name: name.into(), notes: notes.into(), url: String::new() }, Some((v, eras)));
+        let waived = |name: &str, notes: &str, v: [u32; 4]| super::waived(&super::Needed { mod_id: Some(1), name: name.into(), notes: notes.into(), url: String::new(), dlc: false }, Some((v, eras)));
         let (ae, se) = ([1, 6, 1170, 0], [1, 5, 97, 0]);
         for (name, notes, on_ae, on_se) in [
             ("Nemesis", "Technically optional but very strongly recommended.", true, true),
@@ -1363,6 +1826,6 @@ mod text_tests {
         ] {
             assert_eq!((waived(name, notes, ae), waived(name, notes, se)), (on_ae, on_se), "{name}: {notes}");
         }
-        assert!(!super::waived(&super::Needed { mod_id: Some(1), name: "BEES".into(), notes: "older than 1.6.1130".into(), url: String::new() }, None), "no game version: keep it");
+        assert!(!super::waived(&super::Needed { mod_id: Some(1), name: "BEES".into(), notes: "older than 1.6.1130".into(), url: String::new(), dlc: false }, None), "no game version: keep it");
     }
 }

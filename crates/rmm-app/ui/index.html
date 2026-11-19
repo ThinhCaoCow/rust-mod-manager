@@ -32,13 +32,14 @@
     <div class="menu">
       <button id="profile-btn" title="Profiles"><span class="muted">Profile</span> <b id="profile-name"></b> <span class="caret">▾</span></button>
       <div id="profile-pop" class="pop" hidden></div>
+      <div id="ctx" class="pop ctx" role="menu" hidden></div>
     </div>
     <div class="spacer"></div>
     <button id="nexus-btn" title="Your Nexus Mods account">Sign in to Nexus</button>
     <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
     <button id="redo" title="Redo (Ctrl+Y)">↷ Redo</button>
-    <button id="deploy" title="Preview and apply the changes to the game folder"></button>
-    <button id="play" class="primary" title="Deploy, check the script extender and start the game. Starting from Steam skips both.">▶ Play</button>
+    <button id="deploy" title="Put your mods into the game folder, after a preview of what changes (Ctrl+D). Purge, in the same dialog, takes them out again."></button>
+    <span class="split"><button id="play" class="primary" title="Deploy, check the script extender and start the game (Ctrl+P). Starting from Steam skips both.">▶ Play</button><button id="play-more" class="primary" title="Play without mods, and Steam's updates" aria-label="More ways to play">▾</button></span>
   </header>
 
   <nav class="tabs">
@@ -65,13 +66,15 @@
         <div class="fchips" id="fchips" role="group" aria-label="Show only">
           <button data-f="enabled">Enabled</button>
           <button data-f="disabled">Disabled</button>
-          <button data-f="conflicted">Conflicted</button>
-          <button data-f="overridden">Overridden</button>
-          <button data-f="rule">Broken rule</button>
-          <button data-f="masters">Missing masters</button>
-          <button data-f="plugins">Has plugins</button>
+          <button data-f="conflicted" class="adv">Conflicted</button>
+          <button data-f="overridden" class="adv">Overridden</button>
+          <button data-f="rule" class="adv">Broken rule</button>
+          <button data-f="masters" class="adv" title="Mods with a plugin whose masters (the plugins it's built on) are off or load after it">Missing masters</button>
+          <button data-f="plugins" class="adv">Has plugins</button>
           <button data-f="recent" title="Installed in the last 7 days">Recent</button>
           <button data-f="update" title="Mods the last update check found a newer file for (Check for updates)">Update available</button>
+          <button data-f="endorsed" class="adv" title="Mods your Nexus account has endorsed">Endorsed</button>
+          <button data-f="tracked" class="adv" title="Mods your Nexus account tracks">Tracked</button>
           <button data-f="problems" title="Mods the health check or the list flags">Problems</button>
         </div>
         <span id="match" class="match" hidden></span>
@@ -81,7 +84,7 @@
         <button id="disable-matching" hidden>Disable matching</button>
         <button id="updates" title="Check Nexus Mods for newer files">Check for updates</button>
         <button id="split" title="Show the plugins beside the mods" hidden>Plugins beside</button>
-        <button id="add-sep" title="Add a separator above the selected rows">＋ Separator</button>
+        <button id="add-sep" class="adv" title="Add a separator above the selected rows">＋ Separator</button>
       </div>
       <div class="start" id="start-card" hidden></div>
       <div class="notice" id="rules-notice" hidden></div>
@@ -99,7 +102,7 @@
       <div class="toolbar"><span class="muted small" id="plugins-note"></span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
       <div class="scroll">
         <table class="list" id="plugins">
-          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num">#</th></tr></thead>
+          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num idx-col" title="Load-order index: the first part of the form ids the plugin's records get in game (FE and three digits for light plugins), as xEdit and the console show them">Index</th><th class="num">#</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -121,7 +124,7 @@
       </div>
     </section>
     <section class="pane" id="pane-saves" hidden>
-      <div class="toolbar"><span class="muted small" id="saves-note"></span><div class="spacer"></div><button id="saves-transfer" title="Copy or move saves to another profile’s save folder">Copy or move…</button><button id="saves-reload">Refresh</button></div>
+      <div class="toolbar"><span class="muted small" id="saves-note"></span><div class="spacer"></div><button id="saves-cosaves" hidden title="Script extender co-saves whose save is gone: move them to the instance’s trash">Clean co-saves</button><button id="saves-transfer" title="Copy or move saves to another profile’s save folder">Copy or move…</button><button id="saves-reload">Refresh</button></div>
       <div class="scroll">
         <table class="list" id="saves">
           <thead><tr><th>Character</th><th class="num">Level</th><th>Location</th><th class="when-col">Saved</th><th class="issue-col">Plugins</th><th class="from-col">File</th></tr></thead>
@@ -131,21 +134,22 @@
       </div>
     </section>
     <section class="pane" id="pane-downloads" hidden>
-      <div class="toolbar"><span class="muted small">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="downloads-reload">Refresh</button></div>
+      <div class="toolbar"><input id="dl-find" type="search" placeholder="Find a download" spellcheck="false" aria-label="Find a download by its file, Nexus or mod name"><span class="muted small" id="downloads-note">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="dl-delete" class="link danger" hidden></button><button id="dl-install" class="primary" hidden></button><button id="dl-identify" title="Look the files up on Nexus by their contents, so installs from them and the mods made from them get update checks">Identify on Nexus</button><button id="downloads-reload">Refresh</button></div>
+      <div class="notice plain" id="dl-queue" hidden></div>
       <div class="scroll">
-        <table class="list tall" id="downloads">
-          <thead><tr><th>File</th><th class="from-col">Installed as</th><th class="size-col">Size</th><th class="when-col">Downloaded</th><th class="run-col"></th></tr></thead>
+        <table class="list" id="downloads">
+          <thead><tr><th class="check-col"><input type="checkbox" id="dl-all" title="Select every file"></th><th>File</th><th class="from-col">On Nexus</th><th class="from-col">Installed as</th><th class="size-col">Size</th><th class="when-col">Downloaded</th><th class="run-col"></th></tr></thead>
           <tbody></tbody>
         </table>
         <p class="empty" id="downloads-empty" hidden>No downloads yet.</p>
       </div>
     </section>
     <section class="pane" id="pane-problems" hidden>
-      <div class="toolbar"><span class="muted small" id="problems-note"></span><div class="spacer"></div><button id="show-ignored" class="link" hidden></button><button id="test-run" title="Start the game, go through a save or cells, and check it holds up">Test run…</button><button id="crash-log" title="Read the newest crash log and the mods it points at">Crash log…</button><button id="papyrus-log" title="Summarise the Papyrus script log">Papyrus log…</button><button id="se-log" title="Which script extender plugins loaded in the last game run">Script extender log…</button><button id="support-bundle" title="Save a zip of the setup and its logs to attach to a forum post or bug report, without your Windows user name">Support bundle…</button><button id="recheck">Check again</button></div>
+      <div class="toolbar"><span class="muted small" id="problems-note"></span><div class="spacer"></div><button id="show-ignored" class="link" hidden></button><button id="rebuild-stale" hidden title="Run again, in order, the tools whose output is out of date">Rebuild outputs…</button><button id="clean-dirty" hidden title="Clean the plugins LOOT knows as dirty with xEdit QuickAutoClean">Clean dirty plugins…</button><button id="install-missing" hidden title="Install or turn on what the mods’ Nexus pages list as required">Install what’s missing…</button><button id="test-run" title="Start the game, go through a save or cells, and check it holds up">Test run…</button><button id="crash-log" title="Read the newest crash log and the mods it points at">Crash log…</button><button id="papyrus-log" title="Summarise the Papyrus script log">Papyrus log…</button><button id="se-log" title="Which script extender plugins loaded in the last game run">Script extender log…</button><button id="support-bundle" title="Save a zip of the setup and its logs to attach to a forum post or bug report, without your Windows user name">Support bundle…</button><button id="recheck">Check again</button></div>
       <div class="scroll"><ul class="issues" id="issues"></ul></div>
     </section>
     <section class="pane" id="pane-tools" hidden>
-      <div class="toolbar"><span class="muted small">Programs rmm runs against the deployed setup. What a tool writes is captured into its own mod; a tool that edits in place saves into the mods it changes.</span><div class="spacer"></div><button id="addons" title="Sandboxed WebAssembly plugins: what they may do, their tools and panels">Add-ons…</button><button id="ai-access" title="Let AI clients use rmm's tools over HTTP while the window is open">AI access…</button><button id="add-tool">＋ Add tool…</button></div>
+      <div class="toolbar"><span class="muted small">Programs rmm runs against the deployed setup. What a tool writes is captured into its own mod; a tool that edits in place saves into the mods it changes.</span><div class="spacer"></div><button id="addons" title="Sandboxed WebAssembly plugins: what they may do, their tools and panels">Add-ons…</button><button id="ai-access" title="Let AI clients use rmm's tools over HTTP while the window is open">AI access…</button><button id="rebuild-outputs" title="Run again, in order, the tools whose output is out of date">Rebuild outputs…</button><button id="add-tool">＋ Add tool…</button></div>
       <div class="scroll">
         <table class="list tall" id="tools">
           <thead><tr><th>Tool</th><th class="from-col">Output mod</th><th class="from-col">Last run</th><th class="run-col"></th></tr></thead>
@@ -238,13 +242,17 @@
     <section class="pane" id="pane-settings" hidden>
       <div class="scroll"><div class="settings">
         <div id="set-more"></div>
+        <div class="adv">
         <h2>AI providers</h2>
         <p class="muted small">rmm's own AI runs on a provider you pay for, with your API key. Keys are kept in your user folder, never in the instance.</p>
         <table class="set" id="set-providers"></table>
         <h2>Mod team</h2>
         <p class="muted small">Who answers in the AI tab. A message with a role goes to that role's AI, and the Lead hands each step to the AI of its role. An AI app such as Claude can take a role over MCP (<button class="link small" id="set-access">AI access…</button> or <code>rmm mcp</code>): steps for it wait on the team board until you ask the app to do its rmm team tasks, and it can hand steps to the roles on a provider here.</p>
         <table class="set" id="set-team"></table>
+        </div>
         <div id="set-more-ai"></div>
+        <h2>rmm</h2>
+        <div class="row"><span class="small" id="set-version"></span><div class="spacer"></div><button id="set-update" title="Looks for a newer release of rmm on GitHub">Check for updates</button></div>
       </div></div>
     </section>
     <aside id="details" hidden></aside>

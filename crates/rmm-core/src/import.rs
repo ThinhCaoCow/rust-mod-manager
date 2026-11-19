@@ -41,12 +41,56 @@ pub struct ImportReport {
     /// The MO2 profile's own INIs and saves copied in (or that would be).
     pub inis: usize,
     pub saves: usize,
-    /// Files MO2 had hidden (`.mohidden`), left out.
+    /// Files MO2 had hidden (`.mohidden`), kept hidden in their mods.
     pub hidden: usize,
     /// Files hard-linked (sharing the source's disk space) and copied.
     pub linked: usize,
     pub copied: usize,
+    /// The files of the mods brought in, and the bytes of those copied rather than linked (on
+    /// another drive than the instance): new disk space.
+    pub files: usize,
+    pub copy_bytes: u64,
+    /// Files in MO2's overwrite folder, which go to rmm's overwrite/.
+    pub overwrite: usize,
+    /// Mods already installed under an imported mod's id, with both versions.
+    pub clashes: Vec<Clash>,
+    /// The profile's mods the import doesn't name: they stay, after the imported list, so they
+    /// win their file conflicts with it.
+    pub after: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// A mod being imported whose id is installed already: the installed one stays.
+#[derive(Serialize, Debug)]
+pub struct Clash {
+    pub id: String,
+    /// The installed mod's version and file count.
+    pub have: Option<String>,
+    pub have_files: usize,
+    /// The imported one's.
+    pub incoming: Option<String>,
+    pub incoming_files: usize,
+}
+
+/// What a folder would bring in: (files, bytes, hidden files), as `link_tree` counts them.
+fn count_tree(src: &Path) -> (usize, u64, usize) {
+    let (mut files, mut bytes, mut hidden) = (0, 0, 0);
+    for e in walkdir::WalkDir::new(src).min_depth(1).into_iter().flatten().filter(|e| e.file_type().is_file()) {
+        let low = e.path().strip_prefix(src).map(|p| p.to_string_lossy().to_lowercase().replace('\\', "/")).unwrap_or_default();
+        if matches!(low.as_str(), "meta.ini" | "__folder_managed_by_vortex" | "rmm-mod.toml" | ".rmm-index") {
+            continue;
+        }
+        files += 1;
+        bytes += e.metadata().map_or(0, |m| m.len());
+        hidden += usize::from(low.split('/').any(|c| c.ends_with(".mohidden")));
+    }
+    (files, bytes, hidden)
+}
+
+/// Whether two paths are on the same drive, so a hard link can join them.
+fn same_volume(a: &Path, b: &Path) -> bool {
+    let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
+    root(&fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf())) == root(&fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf()))
 }
 
 /// One row of the imported list: a mod folder to bring in, or a separator (`from` is None).
@@ -186,8 +230,12 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
             crate::tools::put(inst, id, t)?;
         }
     }
+    if overwrite_dir.is_dir() {
+        r.overwrite = count_tree(&overwrite_dir).0;
+    }
     if !dry_run && overwrite_dir.is_dir() {
         let (l, c, _) = link_tree(&overwrite_dir, &inst.mod_dir(OVERWRITE), false, true)?;
+        let _ = fs::remove_dir_all(inst.mod_dir(OVERWRITE).join(crate::install::HIDDEN_DIR)); // Overwrite hides nothing
         if l + c > 0 {
             r.warnings.push(format!("{} files from MO2's overwrite folder are now in overwrite/", l + c));
         }
@@ -416,7 +464,7 @@ fn game_of(ini: &HashMap<String, HashMap<String, String>>) -> Option<Game> {
 }
 
 fn mo2_ini(dir: &Path) -> Result<HashMap<String, HashMap<String, String>>> {
-    Ok(qt_ini(&fs::read_to_string(dir.join("ModOrganizer.ini")).with_context(|| format!("{} has no ModOrganizer.ini; pass the MO2 instance folder", dir.display()))?))
+    Ok(qt_ini(&fs::read_to_string(dir.join("ModOrganizer.ini")).with_context(|| format!("{} has no ModOrganizer.ini; pass the MO2 instance folder. A global instance keeps it in %LOCALAPPDATA%\\ModOrganizer\\<instance name>, and `rmm import sources` lists the ones found", dir.display()))?))
 }
 
 /// A folder ModOrganizer.ini sets (`%BASE_DIR%` filled in), or its default in the base folder.
@@ -841,25 +889,41 @@ fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<Pl
         };
         if inst.mod_dir(&m.id).exists() {
             r.existing.push(m.id.clone());
+            let have = inst.mod_meta(&m.id);
+            r.clashes.push(Clash {
+                id: m.id.clone(),
+                have: have.nexus.and_then(|n| n.version),
+                have_files: inst.mod_files(&m.id).map_or(0, |f| f.len()),
+                incoming: meta.nexus.as_ref().and_then(|n| n.version.clone()),
+                incoming_files: count_tree(dir).0,
+            });
             continue;
         }
         r.mods.push(m.id.clone());
         if r.dry_run {
+            let (files, bytes, hidden) = count_tree(dir);
+            r.files += files;
+            r.hidden += hidden;
+            if !same_volume(dir, &inst.root) {
+                r.copy_bytes += bytes;
+            }
             continue;
         }
         let tmp = inst.root.join(".staging").join(format!("import-{}", m.id));
         let _ = fs::remove_dir_all(&tmp);
         let (l, c, h) = link_tree(dir, &tmp, *root, false)?;
-        (r.linked, r.copied, r.hidden) = (r.linked + l, r.copied + c, r.hidden + h);
+        (r.linked, r.copied, r.hidden, r.files) = (r.linked + l, r.copied + c, r.hidden + h.len(), r.files + l + c);
         fs::write(tmp.join(".rmm-index"), index_dir(&tmp)?.join("\n"))?;
-        fs::write(tmp.join(crate::instance::MOD_META), toml::to_string_pretty(meta)?)?;
+        fs::write(tmp.join(crate::instance::MOD_META), toml::to_string_pretty(&ModMeta { hidden: h, ..meta.clone() })?)?;
         fs::rename(&tmp, inst.mod_dir(&m.id))?;
     }
     r.plugins = plugins.len();
+    let named: HashSet<&str> = incoming.iter().map(|m| m.id.as_str()).collect();
+    // A dry run into a profile not made yet: nothing there to keep.
+    r.after = inst.profile().map(|p| p.mods).unwrap_or_default().into_iter().map(|m| m.id).filter(|id| !named.contains(id.as_str()) && !crate::instance::is_separator(id)).collect();
     if r.dry_run {
         return Ok(());
     }
-    let named: HashSet<&str> = incoming.iter().map(|m| m.id.as_str()).collect();
     let listed: HashSet<String> = plugins.iter().map(|e| e.name.to_lowercase()).collect();
     inst.edit(label, |p| {
         let rest: Vec<ModEntry> = p.mods.iter().filter(|m| !named.contains(m.id.as_str())).cloned().collect();
@@ -873,13 +937,135 @@ fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<Pl
     })
 }
 
-/// Hard-link (or, across volumes, copy) a mod folder's files into `dest`. MO2's `meta.ini`,
-/// the files MO2 hides (`.mohidden`, or in a folder so named) and Vortex's marker files stay
-/// behind; a top `Root` folder (Root Builder) becomes `root/`, and with `under_root` everything
-/// goes there. Returns (linked, copied, hidden).
-// ponytail: hidden files are left out, not kept hidden; rmm has no per-mod hiding to keep them in.
-fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> Result<(usize, usize, usize)> {
-    let (mut linked, mut copied, mut hidden) = (0, 0, 0);
+#[derive(Serialize, Debug, Default)]
+pub struct Creations {
+    pub dry_run: bool,
+    /// The Creations (by plugin name) that become mods, or go back into Data.
+    pub mods: Vec<String>,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Creation Club content in the game's Data folder: each plugin the game's `.ccc` file lists,
+/// with its archives (`<name>.bsa`, `<name> - Textures.ba2`), unless a mod provides it.
+fn creation_files(inst: &Instance) -> Result<Vec<(String, Vec<String>)>> {
+    let ccc = inst.config.game_path.join(format!("{}.ccc", inst.config.game.ini_name().trim_end_matches(".ini")));
+    let Ok(text) = fs::read_to_string(&ccc) else { return Ok(vec![]) };
+    let data: Vec<String> = fs::read_dir(inst.data_dir())?.flatten().filter(|e| e.path().is_file()).filter_map(|e| e.file_name().into_string().ok()).collect();
+    let mut from_mods = HashSet::new();
+    for m in inst.profile()?.mods.iter().filter(|m| !crate::instance::is_separator(&m.id)) {
+        from_mods.extend(inst.mod_files(&m.id).unwrap_or_default().into_iter().filter(|f| !f.contains('/')).map(|f| f.to_lowercase()));
+    }
+    let mut out = Vec::new();
+    for listed in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some(plugin) = data.iter().find(|f| f.eq_ignore_ascii_case(listed) && !from_mods.contains(&f.to_lowercase())) else { continue };
+        let stem = plugin.rsplit_once('.').map_or(plugin.as_str(), |x| x.0).to_lowercase();
+        let archive = |f: &str| {
+            let rest = &f[stem.len()..];
+            [".bsa", ".ba2"].iter().any(|x| rest == *x || (rest.starts_with(" - ") && rest.ends_with(x)))
+        };
+        let files = data.iter().filter(|f| *f == plugin || (f.to_lowercase().starts_with(&stem) && archive(&f.to_lowercase()) && !from_mods.contains(&f.to_lowercase()))).cloned().collect();
+        out.push((plugin.clone(), files));
+    }
+    Ok(out)
+}
+
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to.parent().expect("a file's folder"))?;
+    if fs::rename(from, to).is_err() {
+        fs::copy(from, to)?;
+        fs::remove_file(from)?;
+    }
+    Ok(())
+}
+
+/// Take the Creation Club content out of the game's Data folder as mods, one per Creation, on
+/// and at the top of every profile, as MO2's Curation Club does: each can then be turned off,
+/// and Purge (or Play without mods) leaves them all out. Not an undo step, as the content was
+/// the game's; `restore_creations` puts it back. Deploy (or Play) links it into Data again.
+pub fn adopt_creations(inst: &Instance, dry_run: bool) -> Result<Creations> {
+    let found = creation_files(inst)?;
+    let data = inst.data_dir();
+    let mut r = Creations { dry_run, mods: found.iter().map(|x| x.0.clone()).collect(), ..Default::default() };
+    r.files = found.iter().map(|x| x.1.len()).sum();
+    r.bytes = found.iter().flat_map(|x| &x.1).filter_map(|f| fs::metadata(data.join(f)).ok()).map(|m| m.len()).sum();
+    if dry_run || found.is_empty() {
+        return Ok(r);
+    }
+    inst.locked(|| {
+        let mut added = Vec::new();
+        for (plugin, files) in &found {
+            let name = plugin.rsplit_once('.').map_or(plugin.as_str(), |x| x.0);
+            let id = crate::install::unique_id(inst, &sanitize(name));
+            let tmp = inst.root.join(".staging").join(format!("creation-{id}"));
+            let _ = fs::remove_dir_all(&tmp);
+            for f in files {
+                move_file(&data.join(f), &tmp.join(f))?;
+            }
+            fs::write(tmp.join(".rmm-index"), index_dir(&tmp)?.join("\n"))?;
+            fs::write(tmp.join(crate::instance::MOD_META), toml::to_string_pretty(&ModMeta { name: name.into(), source: Some("Creation Club".into()), creation: true, ..Default::default() })?)?;
+            fs::create_dir_all(inst.mods_dir())?;
+            fs::rename(&tmp, inst.mod_dir(&id))?;
+            added.push((id, plugin.clone()));
+        }
+        for name in inst.profiles()? {
+            let path = inst.root.join("profiles").join(&name).join("profile.toml");
+            let mut p: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
+            let entries = added.iter().filter(|(id, _)| !p.mods.iter().any(|m| m.id == *id)).map(|(id, _)| ModEntry { id: id.clone(), enabled: true }).collect::<Vec<_>>();
+            p.mods.splice(0..0, entries);
+            crate::install::add_plugins(&mut p, &added.iter().map(|x| x.1.clone()).collect::<Vec<_>>(), true);
+            crate::instance::write_atomic(&path, &toml::to_string_pretty(&p)?)?;
+        }
+        Ok(())
+    })?;
+    Ok(r)
+}
+
+/// Put adopted Creation Club content back into the game's Data folder: purges first (so no deploy
+/// record points at it), moves each Creation's files back, and takes the Creations out of every
+/// profile (their emptied folders go to trash/).
+pub fn restore_creations(inst: &Instance, dry_run: bool) -> Result<Creations> {
+    let mut ids: Vec<String> = fs::read_dir(inst.mods_dir())?.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|id| inst.mod_meta(id).creation).collect();
+    ids.sort();
+    let mut r = Creations { dry_run, ..Default::default() };
+    for id in &ids {
+        let files = inst.mod_files(id)?;
+        r.mods.extend(crate::install::top_plugins(&files));
+        r.bytes += files.iter().filter_map(|f| fs::metadata(inst.mod_dir(id).join(f)).ok()).map(|m| m.len()).sum::<u64>();
+        r.files += files.len();
+    }
+    if dry_run || ids.is_empty() {
+        return Ok(r);
+    }
+    crate::deploy::purge(inst, false)?;
+    let data = inst.data_dir();
+    inst.locked(|| {
+        for id in &ids {
+            for f in inst.mod_files(id)? {
+                if !data.join(&f).exists() {
+                    move_file(&inst.mod_dir(id).join(&f), &data.join(&f))?;
+                }
+            }
+            inst.trash_mod(id)?;
+        }
+        for name in inst.profiles()? {
+            let path = inst.root.join("profiles").join(&name).join("profile.toml");
+            let mut p: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
+            p.mods.retain(|m| !ids.contains(&m.id));
+            crate::instance::write_atomic(&path, &toml::to_string_pretty(&p)?)?;
+        }
+        Ok(())
+    })?;
+    Ok(r)
+}
+
+/// Hard-link (or, across volumes, copy) a mod folder's files into `dest`. MO2's `meta.ini` and
+/// Vortex's marker files stay behind; the files MO2 hides (`.mohidden`, or in a folder so named)
+/// go to `.rmm-hidden/` under their own names, still hidden. A top `Root` folder (Root Builder)
+/// becomes `root/`, and with `under_root` everything goes there. Returns (linked, copied, the
+/// hidden files' paths).
+fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> Result<(usize, usize, Vec<String>)> {
+    let (mut linked, mut copied, mut hidden) = (0, 0, Vec::new());
     fs::create_dir_all(dest)?;
     for e in walkdir::WalkDir::new(src).min_depth(1) {
         let e = e?;
@@ -891,15 +1077,19 @@ fn link_tree(src: &Path, dest: &Path, under_root: bool, keep_existing: bool) -> 
         if matches!(low.as_str(), "meta.ini" | "__folder_managed_by_vortex" | "rmm-mod.toml" | ".rmm-index") {
             continue;
         }
-        if low.split('/').any(|c| c.ends_with(".mohidden")) {
-            hidden += 1;
-            continue;
-        }
+        let hide = low.split('/').any(|c| c.ends_with(".mohidden"));
+        let rel = if hide { rel.split('/').map(|c| if c.to_lowercase().ends_with(".mohidden") { &c[..c.len() - 9] } else { c }).collect::<Vec<_>>().join("/") } else { rel };
         let rel = match rel.split_once('/') {
             Some((top, rest)) if top.eq_ignore_ascii_case("root") => format!("root/{rest}"),
             _ => rel,
         };
-        let to = dest.join(if under_root { format!("root/{rel}") } else { rel });
+        let rel = if under_root { format!("root/{rel}") } else { rel };
+        let to = if hide {
+            hidden.push(rel.clone());
+            dest.join(crate::install::HIDDEN_DIR).join(&rel)
+        } else {
+            dest.join(&rel)
+        };
         if keep_existing && to.exists() {
             continue;
         }

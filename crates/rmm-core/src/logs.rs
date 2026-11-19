@@ -31,6 +31,11 @@ pub struct CrashReport {
     pub suspects: Vec<Suspect>,
     /// The top of the call stack.
     pub call_stack: Vec<String>,
+    /// How many plugins its PLUGINS section lists.
+    pub plugin_count: Option<usize>,
+    /// Why the log may come from another setup (another manager, an older install), so what it
+    /// names may not apply here. Empty when nothing says so.
+    pub not_yours: Vec<String>,
     /// Other crash logs, newest first.
     pub others: Vec<LogFile>,
     /// What to try, in plain words, from what the log names.
@@ -58,6 +63,8 @@ const NOISE: &[&str] = &[
 const ASSETS: &[&str] = &["nif", "dds", "hkx", "pex", "tri", "bgsm", "bgem", "wav", "xwm", "fuz", "swf", "bsa", "ba2", "seq"];
 
 static DLL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)([\w.\-]+\.dll)\+").unwrap());
+/// "CrashLoggerSSE v1-19-0-0", "Buffout 4 v1.28.6".
+static LOGGER_VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"v(\d+)[.-](\d+)(?:[.-](\d+))?").unwrap());
 static QUOTED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"\r\n]{3,260})""#).unwrap());
 
 /// Folders the crash loggers write to, for this game.
@@ -125,8 +132,46 @@ pub fn read_crash_log(inst: &Instance, path: Option<&Path>) -> Result<CrashRepor
         s.mod_id.is_some() || !(NOISE.contains(&lower.as_str()) || lower.starts_with("skse64_") || lower.starts_with("f4se_"))
     });
     r.suspects.truncate(25);
+    r.not_yours = not_yours(inst, &r, &plugins, &mod_of);
     r.next_steps = next_steps(inst, &r, &profile);
     Ok(r)
+}
+
+/// Signs that a log wasn't written by the game as this setup runs it: written before rmm
+/// first started the game here, listing a different number of plugins, or by another version of
+/// the crash logger.
+fn not_yours(inst: &Instance, r: &CrashReport, plugins: &[crate::plugins::PluginInfo], mod_of: &impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    match fs::metadata(inst.root.join(crate::launch::PLAYED)) {
+        Err(_) => out.push("rmm hasn't started the game from this setup yet, so another setup or mod manager wrote it.".into()),
+        Ok(m) => {
+            let first = m.created().or_else(|_| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs());
+            if first.is_some_and(|f| r.modified > 0 && r.modified < f) {
+                out.push("It was written before rmm first started the game from this setup.".into());
+            }
+        }
+    }
+    let on = plugins.iter().filter(|p| p.enabled).count();
+    // ponytail: a margin of 2 lets a plugin or two changed since the crash pass.
+    if let Some(n) = r.plugin_count.filter(|n| n.abs_diff(on) > 2) {
+        out.push(format!("It lists {n} plugins, and this profile has {on} on."));
+    }
+    let logged = r.logger.as_deref().and_then(|l| Some((l, LOGGER_VERSION.captures(l)?)));
+    if let Some((line, c)) = logged {
+        let dll = [("CrashLoggerSSE", "CrashLogger.dll"), ("Buffout 4", "Buffout4.dll"), ("Addictol", "Addictol.dll"), ("Trainwreck", "Trainwreck.dll")].into_iter().find(|(n, _)| line.contains(n));
+        let se = if inst.config.game.base() == Game::SkyrimSe { "SKSE" } else { "F4SE" };
+        if let Some((name, dll)) = dll {
+            let rel = format!("{se}/Plugins/{dll}");
+            let file = mod_of(&rel).map_or_else(|| inst.data_dir().join(&rel), |id| inst.mod_dir(&id).join(&rel));
+            let was: Vec<u32> = (1..=3).map(|i| c.get(i).map_or(0, |m| m.as_str().parse().unwrap_or(0))).collect();
+            if let Ok(have) = crate::launch::exe_version(&file)
+                && have[..3] != was[..]
+            {
+                out.push(format!("{name} {}.{}.{} wrote it, and {}.{}.{} is installed.", was[0], was[1], was[2], have[0], have[1], have[2]));
+            }
+        }
+    }
+    out
 }
 
 /// Plain advice from a read crash log: the game version it ran, the likeliest suspect by kind,
@@ -167,7 +212,19 @@ fn next_steps(inst: &Instance, r: &CrashReport, profile: &crate::instance::Profi
                 out.push(format!("{m} is disabled now. If you turned it off after this crash, play again before changing anything else."));
             }
         }
-        None => out.push("Nothing the log names comes from a mod. Load an earlier save, or start a new game with the same mods: if that holds up, the save is the problem, not the mods.".into()),
+        None => {
+            let se = if inst.config.game.base() == Game::SkyrimSe { "SKSE" } else { "F4SE" };
+            let dll = r.suspects.first().filter(|s| s.name.to_lowercase().ends_with(".dll"));
+            let at = dll.and_then(|s| [inst.data_dir().join(se).join("Plugins").join(&s.name), inst.config.game_path.join(&s.name)].into_iter().find(|p| p.is_file()).map(|p| (s, p)));
+            if let Some((s, p)) = at {
+                out.push(format!("{} isn't from any mod rmm manages: it sits in {}, so something outside rmm put it there (another mod manager, or by hand). Remove it there, or check that it has a version for your game.", s.name, p.parent().unwrap_or(&p).display()));
+            } else if r.not_yours.is_empty() {
+                out.push("Nothing the log names comes from a mod. Load an earlier save, or start a new game with the same mods: if that holds up, the save is the problem, not the mods.".into());
+            }
+        }
+    }
+    if !r.not_yours.is_empty() {
+        out.insert(0, "This log may not be from this setup (see why above), so what it names may not apply. Play, and if the game crashes, read the new log.".into());
     }
     let mods: std::collections::BTreeSet<&str> = r.suspects.iter().filter_map(|s| s.mod_id.as_deref()).collect();
     if mods.len() > 1 {
@@ -222,7 +279,13 @@ pub fn parse_crash(text: &str) -> CrashReport {
         }
         if let Some(h) = heading(line) {
             section = h;
+            if section == "PLUGINS" {
+                r.plugin_count = Some(0);
+            }
             continue;
+        }
+        if section == "PLUGINS" && !l.is_empty() {
+            *r.plugin_count.get_or_insert(0) += 1;
         }
         let stack = section.contains("CALL STACK");
         if stack && r.call_stack.len() < 15 && !l.is_empty() {
@@ -476,6 +539,9 @@ PLUGINS:
         assert_eq!(names[0], ("hdtSMP64.dll", 6, true));
         assert!(names.contains(&("Cool Armor.esp", 1, false)) && names.contains(&("meshes\\armor\\cool\\cuirass.nif", 1, false)));
         assert!(!names.iter().any(|n| n.0 == "EngineFixes.dll" || n.0 == "Unrelated.esl"), "MODULES and PLUGINS are lists, not evidence");
+        assert_eq!(r.plugin_count, Some(2));
+        let v = LOGGER_VERSION.captures(r.logger.as_deref().unwrap()).unwrap();
+        assert_eq!((&v[1], &v[2], &v[3]), ("1", "19", "0"));
 
         let b4 = "Fallout 4 v1.10.163\nBuffout 4 v1.28.6\n\nUnhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF6\n\nPROBABLE CALL STACK:\n\t[0] 0x7FF6 f4ee.dll+0012345\n";
         let r = parse_crash(b4);

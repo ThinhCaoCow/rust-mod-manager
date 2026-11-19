@@ -88,20 +88,28 @@ enum Cmd {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// Turn mods on (by id, as `rmm mods` shows them). One undo step; deploy applies it.
     Enable {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// Turn mods off (by id). One undo step; deploy applies it.
     Disable {
         #[arg(required = true)]
         ids: Vec<String>,
     },
-    /// Move mods as one block, in their current order, so the first lands at --to (0 = lowest).
+    /// Move mods as one block, in their current order: the first to --to (0 = lowest priority),
+    /// or the block just after --after or just before --before another mod. One undo step.
+    #[command(group = clap::ArgGroup::new("place").required(true))]
     Move {
         #[arg(required = true)]
         ids: Vec<String>,
-        #[arg(long)]
-        to: usize,
+        #[arg(long, group = "place")]
+        to: Option<usize>,
+        #[arg(long, group = "place")]
+        after: Option<String>,
+        #[arg(long, group = "place")]
+        before: Option<String>,
     },
     /// Separators: headings that group mods in the list (ids start with "sep:").
     #[command(subcommand)]
@@ -135,6 +143,12 @@ enum Cmd {
         move_to: Option<String>,
         /// Save file names, for --copy-to and --move-to.
         files: Vec<String>,
+        /// Move script extender co-saves whose save is gone into the instance's trash (shows
+        /// them without --apply).
+        #[arg(long, conflicts_with_all = ["fix", "copy_to", "move_to"])]
+        clean_cosaves: bool,
+        #[arg(long, requires = "clean_cosaves")]
+        apply: bool,
     },
     /// Archives in the instance's downloads folder and the mods installed from them.
     Downloads {
@@ -155,6 +169,52 @@ enum Cmd {
         /// Clear overwrite/ (undo brings the files back, as a mod).
         #[arg(long, conflicts_with = "to_mod")]
         clear: bool,
+    },
+    /// Run again, in order (xLODGen, TexGen, DynDOLOD, Pandora, BodySlide, Synthesis, PGPatcher),
+    /// the tools whose generated output is out of date. Lists them; --apply runs them.
+    Rebuild {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Clean every plugin LOOT knows as dirty with xEdit QuickAutoClean (a tool from the xedit-qac
+    /// preset), one run each. Lists them; --apply cleans.
+    CleanPlugins {
+        #[arg(long)]
+        apply: bool,
+        /// Put every clean copy in one mod, "Cleaned plugins", instead of one mod each.
+        #[arg(long)]
+        one_mod: bool,
+    },
+    /// Hide files or folders of a mod (MO2's .mohidden; a hidden plugin is an optional ESP): they
+    /// leave deploys, conflicts and the plugin list, and stay hidden through reinstalls. Undoable.
+    Hide {
+        #[arg(value_name = "MOD")]
+        id: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Show them again.
+        #[arg(long)]
+        show: bool,
+    },
+    /// Move files or folders from one mod into another; `overwrite` names Overwrite (MCM settings
+    /// into a settings mod, say). --replace replaces the target's copies of clashing files; undo
+    /// brings them back.
+    MoveFiles {
+        from: String,
+        to: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Creation Club content in the game's Data folder as mods (one per Creation, on in every
+    /// profile, so each can be turned off), or with --restore back into Data. Shows what it
+    /// would do; --apply does it.
+    Creations {
+        #[arg(long)]
+        restore: bool,
+        #[arg(long)]
+        apply: bool,
     },
     /// Edits made to mod files, overwrite/ and INIs through rmm (the window's IDE and AI
     /// tools), newest first.
@@ -271,12 +331,40 @@ enum Cmd {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Health check.
+    /// Health check. Exits with 1 when it finds errors, so a script can stop before playing.
     Check,
     /// Deploy, check the script extender matches the game, and start it (through Proton on Linux); --apply to do it.
+    /// --without-mods purges instead and starts the game's own exe, as when a game update broke
+    /// the script extender (the next launch deploys the mods again).
     Launch {
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        without_mods: bool,
+        /// Switch to this profile first (what desktop shortcuts do).
+        #[arg(long)]
+        profile: Option<String>,
+        /// On an error, wait for Enter before closing: a shortcut's window closes with rmm.
+        #[arg(long)]
+        pause: bool,
+    },
+    /// A desktop shortcut that switches to a profile (default: the active one), deploys and starts
+    /// the game, like MO2's: it runs `rmm launch --profile <p> --apply --pause`. Shows it; --apply
+    /// writes it to the Desktop, or --dir.
+    Shortcut {
+        profile: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Whether Steam may update the game. --hold makes the game's Steam manifest read-only so it
+    /// can't (a copy goes to ini-backup/), --release lets Steam update it again.
+    SteamUpdates {
+        #[arg(long, conflicts_with = "release")]
+        hold: bool,
+        #[arg(long)]
+        release: bool,
     },
     /// Read a crash log (default: the newest) and rank the mods it points at, with what to try.
     /// --text prints a report to paste into a forum post or chat, without your Windows user name.
@@ -385,8 +473,20 @@ enum Cmd {
     /// closed, where FOMOD installers show their options. Without the window program beside rmm,
     /// it downloads and installs the file here (`rmm nexus install` always does).
     Nxm { link: String },
+    /// For the installer: put its folder on the user's PATH, or --remove it.
+    #[command(hide = true)]
+    InstallerPath {
+        dir: String,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Undo the last change to the profile (order, enabled mods and plugins, installs). Prints
+    /// what it undid; deploy applies it to the game.
     Undo,
+    /// Redo the last undone change. Prints what it redid.
     Redo,
+    /// The undo history, newest first, with each step's time and what it changed; when this
+    /// instance last deployed and played; and the steps Redo brings back.
     History,
     /// rmm's own AI with your API key: OpenRouter, Claude, OpenAI (GPT), Kimi, DeepSeek or Qwen.
     #[command(subcommand)]
@@ -590,6 +690,32 @@ enum NexusCmd {
         #[arg(long)]
         release: bool,
     },
+    /// Look downloads up on Nexus by their MD5 (default: every one not identified yet), so
+    /// installs from them, and the mods already made from them, get their Nexus ids for update
+    /// checks.
+    Identify { names: Vec<String> },
+    /// Requirements the enabled mods' Nexus pages list that aren't installed, or are but are off
+    /// (and DLC that isn't there). --install installs the ones on Nexus (Premium: each one's newest
+    /// main file, installer defaults) and turns on the others, in one step.
+    Requirements {
+        #[arg(long)]
+        install: bool,
+    },
+    /// Endorse an installed mod on Nexus (by its rmm id), or --abstain: take an endorsement back,
+    /// or say you won't endorse it. Public, on your Nexus account.
+    Endorse {
+        id: String,
+        #[arg(long)]
+        abstain: bool,
+    },
+    /// Track an installed mod on Nexus (its updates show in your tracking centre), or --untrack.
+    Track {
+        id: String,
+        #[arg(long)]
+        untrack: bool,
+    },
+    /// What your Nexus account has endorsed and tracks for this game, read from Nexus.
+    Account,
     /// Search the game's mods on Nexus by name and description (no key needed).
     Search {
         words: Vec<String>,
@@ -615,11 +741,14 @@ enum NexusCmd {
         /// All but nxm links need Premium.
         what: String,
     },
-    /// Install a collection (Premium accounts): its mods with the curator's installer choices,
-    /// its mod rules, plugin list and tools. Shows what it would install; --apply installs.
+    /// Install a collection: its mods with the curator's installer choices, its mod rules, plugin
+    /// list and tools. Shows what it would install; --apply installs. Premium downloads each file;
+    /// free accounts download the ones under to_download from their pages first. In a profile with
+    /// an earlier revision it updates: newer files in, dropped mods off, your own mods and the ones
+    /// you turned off as they are.
     Collection {
-        /// The collection's link or id.
-        link: String,
+        /// The collection's link or id; default: the active profile's collection.
+        link: Option<String>,
         /// A revision number (default: the newest).
         #[arg(long)]
         revision: Option<u64>,
@@ -630,6 +759,10 @@ enum NexusCmd {
         /// already installed are in it, turned off). Default: the active profile.
         #[arg(long)]
         profile: Option<String>,
+        /// Leave the plugins as the collection's list put them, for `rmm sort` to show LOOT's
+        /// order first. Default: LOOT sorts them at the end.
+        #[arg(long)]
+        no_sort: bool,
         #[arg(long)]
         apply: bool,
     },
@@ -729,13 +862,20 @@ enum BisectCmd {
 
 #[derive(Subcommand)]
 enum LockCmd {
-    /// Write the active profile to modlist.lock.toml (or --out).
+    /// Write the active profile to modlist.lock.toml (or --out). --pack writes a zip of it with the
+    /// files of mods no archive brings back (patches you made, mods made from Overwrite or a
+    /// folder); --markdown a readable list for a post.
     Export {
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long, conflicts_with = "markdown")]
+        pack: bool,
+        #[arg(long)]
+        markdown: bool,
     },
-    /// Install what a lockfile needs from archives in --downloads, list what is missing, and set
-    /// the order; --apply to do it. Mods you added that it doesn't list are kept.
+    /// Install what a lockfile (or pack) needs from archives in --downloads and the pack, list
+    /// what is missing, and set the order; --apply to do it. Mods you added that it doesn't list
+    /// are kept. Warns when the game or script extender version differs from the lockfile's.
     Apply {
         file: PathBuf,
         #[arg(long)]
@@ -743,6 +883,9 @@ enum LockCmd {
         #[arg(long)]
         apply: bool,
     },
+    /// What changed from a lockfile to the active profile, or to a second lockfile: versions, mods
+    /// and plugins added, removed, changed, turned on or off, and moved.
+    Diff { file: PathBuf, other: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -770,6 +913,15 @@ enum ProfileCmd {
         local_inis: Option<bool>,
         #[arg(long)]
         local_saves: Option<bool>,
+    },
+    /// Share another profile's mod and plugin order: this one takes it now, keeping which mods
+    /// and plugins it has on, and a change to either's order is both's from then on. --stop: this
+    /// profile keeps its own order again. Without either: the profiles it shares it with.
+    ShareOrder {
+        #[arg(conflicts_with = "stop")]
+        with: Option<String>,
+        #[arg(long)]
+        stop: bool,
     },
 }
 
@@ -836,7 +988,20 @@ fn run() -> Result<()> {
         Cmd::Uninstall { ids } => done(install::uninstall_mods(&open()?, &ids)),
         Cmd::Enable { ids } => done(ops::set_mods_enabled(&open()?, &ids, true)),
         Cmd::Disable { ids } => done(ops::set_mods_enabled(&open()?, &ids, false)),
-        Cmd::Move { ids, to } => done(ops::move_mods(&open()?, &ids, to)),
+        Cmd::Move { ids, to, after, before } => {
+            let inst = open()?;
+            let to = match (to, after.or(before.clone())) {
+                (Some(to), _) => to,
+                (None, Some(other)) => {
+                    // move_mods counts the place in the list without the moved mods.
+                    let rest: Vec<String> = inst.profile()?.mods.into_iter().map(|m| m.id).filter(|m| !ids.contains(m)).collect();
+                    let i = rest.iter().position(|m| *m == other).with_context(|| format!("no mod '{other}' (besides the ones moving)"))?;
+                    if before.is_some() { i } else { i + 1 }
+                }
+                (None, None) => unreachable!("clap requires one"),
+            };
+            done(ops::move_mods(&inst, &ids, to))
+        }
         Cmd::Separator(SeparatorCmd::Add { name, at }) => {
             print(&serde_json::json!({ "id": ops::add_separator(&open()?, &name, at)? }))
         }
@@ -856,6 +1021,7 @@ fn run() -> Result<()> {
             let q = conflicts::DataQuery { dir: dir.unwrap_or_default(), find: find.unwrap_or_default(), conflicts_only: conflicts, archives };
             print(&conflicts::data_view(&inst, &inst.profile()?, &q)?)
         }
+        Cmd::Saves { clean_cosaves: true, apply, .. } => print(&serde_json::json!({ "co_saves": saves::clean_cosaves(&open()?, !apply)?, "moved": apply })),
         Cmd::Saves { fix: Some(file), .. } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
         Cmd::Saves { copy_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, true)?),
         Cmd::Saves { move_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, false)?),
@@ -883,6 +1049,15 @@ fn run() -> Result<()> {
         Cmd::Overwrite { to_mod: Some(name), .. } => print(&install::mod_from_overwrite(&open()?, &name)?),
         Cmd::Overwrite { clear: true, .. } => print(&serde_json::json!({ "cleared": install::clear_overwrite(&open()?)? })),
         Cmd::Overwrite { .. } => print(&open()?.mod_files(rmm_core::instance::OVERWRITE)?),
+        Cmd::Rebuild { apply } => print(&rmm_core::tools::rebuild(&open()?, !apply, None)?),
+        Cmd::CleanPlugins { apply, one_mod } => print(&rmm_core::tools::clean_dirty(&open()?, !apply, one_mod)?),
+        Cmd::Hide { id, paths, show } => print(&install::hide_files(&open()?, &id, &paths, !show)?),
+        Cmd::MoveFiles { from, to, paths, replace } => {
+            let ow = |s: String| if s.eq_ignore_ascii_case("overwrite") { rmm_core::instance::OVERWRITE.to_string() } else { s };
+            print(&install::move_files(&open()?, &ow(from), &paths, &ow(to), replace)?)
+        }
+        Cmd::Creations { restore: false, apply } => print(&rmm_core::import::adopt_creations(&open()?, !apply)?),
+        Cmd::Creations { restore: true, apply } => print(&rmm_core::import::restore_creations(&open()?, !apply)?),
         Cmd::Edits { revert: Some(n) } => print(&rmm_core::workspace::revert(&open()?, n)?),
         Cmd::Edits { revert: None } => print(&rmm_core::workspace::edits(&open()?)?),
         Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),
@@ -917,9 +1092,7 @@ fn run() -> Result<()> {
         Cmd::Plugins { enable, disable, moving, after, before } => {
             let inst = open()?;
             for (names, on) in [(enable, true), (disable, false)] {
-                for n in names {
-                    ops::set_plugin_enabled(&inst, &n, on)?;
-                }
+                ops::set_plugins_enabled(&inst, &names, on)?;
             }
             if let Some(m) = moving {
                 let all = inst.profile()?.plugins;
@@ -927,8 +1100,8 @@ fn run() -> Result<()> {
                 let mut order: Vec<String> = all.into_iter().map(|p| p.name).filter(|n| *n != m).collect();
                 let (other, past) = after.map(|a| (a, 1)).or(before.map(|b| (b, 0))).context("--move needs --after or --before")?;
                 let at = order.iter().position(|n| n.eq_ignore_ascii_case(&other)).with_context(|| format!("no plugin {other} in the profile"))?;
-                order.insert(at + past, m);
-                ops::set_plugin_order(&inst, &order)?;
+                order.insert(at + past, m.clone());
+                ops::set_plugin_order(&inst, &order, std::slice::from_ref(&m))?;
             }
             print(&plugins::list(&inst, &inst.profile()?)?)
         }
@@ -936,7 +1109,14 @@ fn run() -> Result<()> {
         Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
         Cmd::Rule { plugin: None, .. } => print(&loot::rules(&open()?)?),
         Cmd::Rule { plugin: Some(plugin), after, group } => print(&serde_json::json!({ "previous": loot::set_rule(&open()?, &loot::Rule { plugin, after, group })? })),
-        Cmd::Check => print(&health::check(&open()?)?),
+        Cmd::Check => {
+            let issues = health::check(&open()?)?;
+            print(&issues)?;
+            if issues.iter().any(|i| i.severity == "error") {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Cmd::CrashLog { path, text } => {
             let inst = open()?;
             let r = logs::read_crash_log(&inst, path.as_deref())?;
@@ -966,7 +1146,31 @@ fn run() -> Result<()> {
         Cmd::Bisect(BisectCmd::Status) => print(&bisect::status(&open()?)?),
         Cmd::Bisect(BisectCmd::Stop) => print(&bisect::stop(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
-        Cmd::Launch { apply } => print(&rmm_core::launch::launch(&open()?, !apply)?),
+        Cmd::Launch { apply, without_mods, profile, pause } => {
+            let run = || -> Result<rmm_core::launch::LaunchReport> {
+                let mut inst = open()?;
+                if let Some(p) = &profile {
+                    // A dry run looks at the profile without switching to it.
+                    if apply { inst.switch_profile(p)? } else { inst.config.profile = inst.find_profile(p)? }
+                }
+                if without_mods { rmm_core::launch::launch_vanilla(&inst, !apply) } else { rmm_core::launch::launch(&inst, !apply) }
+            };
+            match run() {
+                Err(e) if pause => {
+                    eprintln!("rmm couldn't start the game: {e:#}\n\nPress Enter to close this window.");
+                    let _ = std::io::stdin().read_line(&mut String::new());
+                    Err(e)
+                }
+                r => print(&r?),
+            }
+        }
+        Cmd::Shortcut { profile, dir, apply } => {
+            let inst = open()?;
+            let p = profile.unwrap_or_else(|| inst.config.profile.clone());
+            print(&rmm_core::launch::shortcut(&inst, &p, &std::env::current_exe()?, dir.as_deref(), !apply)?)
+        }
+        Cmd::SteamUpdates { hold: false, release: false } => print(&rmm_core::launch::steam_updates(&open()?)),
+        Cmd::SteamUpdates { hold, .. } => print(&rmm_core::launch::hold_steam_updates(&open()?, hold)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),
         Cmd::Tool(ToolCmd::List) => print(&serde_json::json!({ "tools": tools::list(&open()?)?, "presets": tools::PRESETS })),
         Cmd::Tool(ToolCmd::Add { id, exe, preset, name, vars, rewrites, output_mod, keep, wait_for, edit_in_place, args }) => {
@@ -1012,6 +1216,13 @@ fn run() -> Result<()> {
         }
         Cmd::Profile(ProfileCmd::Rename { from, to }) => done(open()?.rename_profile(&from, &to)),
         Cmd::Profile(ProfileCmd::Delete { name }) => done(open()?.delete_profile(&name)),
+        Cmd::Profile(ProfileCmd::ShareOrder { with, stop }) => {
+            let inst = open()?;
+            if with.is_some() || stop {
+                inst.share_order(with.as_deref())?;
+            }
+            print(&serde_json::json!({ "profile": inst.config.profile, "shares_order_with": inst.order_sharers()? }))
+        }
         Cmd::Profile(ProfileCmd::Options { local_inis, local_saves }) => {
             let inst = open()?;
             ops::set_profile_options(&inst, local_inis, local_saves)?;
@@ -1030,7 +1241,18 @@ fn run() -> Result<()> {
         Cmd::Addon(AddonCmd::Call { name, function, input }) => {
             print(&addons::call(&open()?, &name, &function, &serde_json::from_str(&input).context("the input is not JSON")?)?)
         }
-        Cmd::Lock(LockCmd::Export { out }) => print(&serde_json::json!({ "written": lockfile::write(&open()?, out.as_deref())? })),
+        Cmd::Lock(LockCmd::Export { out, pack, markdown }) => {
+            let format = if pack { lockfile::Format::Pack } else if markdown { lockfile::Format::Markdown } else { lockfile::Format::Toml };
+            print(&lockfile::write(&open()?, out.as_deref(), format)?)
+        }
+        Cmd::Lock(LockCmd::Diff { file, other }) => {
+            let old = lockfile::read(&file)?;
+            let new = match other {
+                Some(o) => lockfile::read(&o)?,
+                None => lockfile::export(&open()?)?,
+            };
+            print(&lockfile::diff(&old, &new))
+        }
         Cmd::Lock(LockCmd::Apply { file, downloads, apply }) => print(&lockfile::apply(&open()?, &lockfile::read(&file)?, &downloads, !apply)?),
         Cmd::Nexus(NexusCmd::Login { sso: true }) => print(&nexus::sso(&|url| {
             eprintln!("Approve rmm on Nexus in your browser: {url}");
@@ -1044,9 +1266,18 @@ fn run() -> Result<()> {
         }
         Cmd::Nexus(NexusCmd::Logout) => print(&serde_json::json!({ "forgot": nexus::forget_key()? })),
         Cmd::Nexus(NexusCmd::Status) => print(&nexus::status()),
+        Cmd::Nexus(NexusCmd::Endorse { id, abstain }) => print(&nexus::endorse(&open()?, &nexus::Client::from_env()?, &id, !abstain)?),
+        Cmd::Nexus(NexusCmd::Track { id, untrack }) => print(&nexus::track(&open()?, &nexus::Client::from_env()?, &id, !untrack)?),
+        Cmd::Nexus(NexusCmd::Account) => print(&nexus::refresh_account(&open()?, &nexus::Client::from_env()?)?),
         Cmd::Nexus(NexusCmd::Search { words, category, sort, count, offset, adult }) => {
             print(&nexus::search(&open()?, &nexus::Client::any(), &nexus::Search { query: words.join(" "), category, sort, count, offset, adult })?)
         }
+        Cmd::Nexus(NexusCmd::Requirements { install: false }) => {
+            let inst = open()?;
+            print(&nexus::lacking_requirements(&inst, &inst.profile()?))
+        }
+        Cmd::Nexus(NexusCmd::Requirements { install: true }) => print(&nexus::install_lacking(&open()?, &nexus::Client::from_env()?)?),
+        Cmd::Nexus(NexusCmd::Identify { names }) => print(&nexus::identify(&open()?, &nexus::Client::from_env()?, &names)?),
         Cmd::Nexus(NexusCmd::Info { mod_id }) => print(&nexus::mod_info(&open()?, &nexus::Client::any(), mod_id)?),
         Cmd::Nexus(NexusCmd::Updates { ids }) => {
             print(&nexus::check_updates(&open()?, &nexus::Client::from_env()?, (!ids.is_empty()).then_some(ids.as_slice()))?)
@@ -1055,6 +1286,10 @@ fn run() -> Result<()> {
             let hold = if release { nexus::Hold::Release } else if skip { nexus::Hold::Skip } else { nexus::Hold::Pin };
             nexus::hold_updates(&open()?, &ids, hold)
         }
+        #[cfg(windows)]
+        Cmd::InstallerPath { dir, remove } => print(&serde_json::json!({ "changed": rmm_core::userpath::set(&dir, !remove)? })),
+        #[cfg(not(windows))]
+        Cmd::InstallerPath { .. } => anyhow::bail!("only the Windows installer uses this"),
         Cmd::Nxm { link } => {
             let inst = open()?;
             let app = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm-app.exe" } else { "rmm-app" });
@@ -1074,8 +1309,8 @@ fn run() -> Result<()> {
             let link = nexus::resolve(&inst, &client, &what)?;
             print(&nexus::install(&inst, &client, &link, None)?)
         }
-        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, apply }) => {
-            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link, revision, optional, profile.as_deref(), !apply)?)
+        Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, no_sort, apply }) => {
+            print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link.unwrap_or_default(), revision, optional, profile.as_deref(), !apply, !no_sort)?)
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;
@@ -1164,7 +1399,7 @@ fn run() -> Result<()> {
         }
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
-        Cmd::History => print(&open()?.history_details()?),
+        Cmd::History => print(&ops::history(&open()?)?),
         Cmd::Mcp { http: addr } => {
             let dir = match cli.instance {
                 Some(d) => d,

@@ -44,16 +44,20 @@ pub const KINDS: &[(&str, &str)] = &[
     ("script_extender_missing", "Script extender plugins without the loader"),
     ("script_extender_mismatch", "The script extender doesn't match the game version"),
     ("game_updated", "The game's version changed since the last Play"),
+    ("steam_updates_held", "Steam's updates for the game are held back"),
     ("address_library_mismatch", "Address Library has no file for the game version"),
     ("script_extender_plugin", "A script extender plugin didn't load in the last run"),
     ("deploy_blocked", "Deploy can't run"),
     ("not_deployed", "Changes not deployed yet"),
     ("external_change", "Deployed files changed outside rmm"),
+    ("overwrite_files", "Files in Overwrite"),
+    ("stale_output", "Generated output out of date"),
     ("loot_message", "LOOT's messages"),
     ("loot_failed", "LOOT couldn't run"),
     ("ini_test_file", "sTestFile lines in Fallout4.ini"),
     ("archive_invalidation", "Archive invalidation is off (Fallout 4)"),
     ("addon", "Add-ons' checks"),
+    ("low_disk_space", "Little free space on the instance's or the game's drive"),
 ];
 
 pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
@@ -62,6 +66,21 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     let mut add = |severity, kind, subject: &str, message: String| {
         issues.push(Issue { severity, kind, subject: subject.into(), message })
     };
+
+    // Downloads, installs, copies and tool output (DynDOLOD, grass caches) all take room.
+    let low = crate::settings::get().health.low_space_gb;
+    if low > 0 {
+        let drive = |p: &std::path::Path| p.components().next().map(|c| c.as_os_str().to_ascii_lowercase());
+        let game = &inst.config.game_path;
+        let both = drive(&inst.root) == drive(game);
+        let places = [(&inst.root, if both { "the instance and the game" } else { "the instance" }), (game, "the game")];
+        for (path, what) in places.into_iter().take(if both { 1 } else { 2 }) {
+            if let Some(free) = crate::game::free_space(path).filter(|f| *f < low << 30) {
+                let subject = path.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+                add("warning", "low_disk_space", &subject, format!("has {:.1} GB free, for {what}. Installs, downloads and tools such as DynDOLOD need room; this warns under {low} GB (health.low_space_gb)", free as f64 / (1u64 << 30) as f64));
+            }
+        }
+    }
 
     for m in profile.mods.iter().filter(|m| !crate::instance::is_separator(&m.id)) {
         if !inst.mod_dir(&m.id).is_dir() {
@@ -99,7 +118,16 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
             add("warning", "plugin_unreadable", &p.name, format!("could not read plugin header: {e}"));
         }
         if p.enabled && !p.missing_masters.is_empty() {
-            add("error", "missing_masters", &p.name, format!("needs {} enabled and loaded earlier", p.missing_masters.join(", ")));
+            // A master that is on but loads later only needs the order fixed.
+            let (later, absent): (Vec<&String>, Vec<&String>) =
+                p.missing_masters.iter().partition(|m| plugins.iter().any(|x| x.enabled && x.name.eq_ignore_ascii_case(m)));
+            let join = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            let msg = if absent.is_empty() {
+                format!("loads before {}, which it's built on (its masters); the game crashes at start until they load first. Sort with LOOT or move it below them", join(&later))
+            } else {
+                format!("needs {} turned on and loaded before it: its masters, the plugins it's built on; the game crashes at start without them", join(&p.missing_masters.iter().collect::<Vec<_>>()))
+            };
+            add("error", "missing_masters", &p.name, msg);
         }
     }
     let full = plugins.iter().filter(|p| p.enabled && !p.light).count();
@@ -179,9 +207,12 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
         add("error", "script_extender_mismatch", game.loader(), format!("{e:#}. Play won't start the game until it matches"));
     }
     let se = if game.base() == crate::Game::SkyrimSe { "SKSE" } else { "F4SE" };
+    if crate::launch::steam_updates(inst).held {
+        add("info", "steam_updates_held", game.exe(), "Steam can't update the game: its Steam manifest is read-only. When you want the update, Let Steam update the game (beside Play, or `rmm steam-updates --release`)".into());
+    }
     if let Some(v) = &version {
         if let Some(m) = crate::launch::game_updated(inst, &v.map(|x| x.to_string()).join(".")) {
-            add("warning", "game_updated", game.exe(), format!("{m}. The script extender, Address Library and many {se} plugins are made for one game version; the other findings here say what no longer matches. This goes away at the next Play"));
+            add("warning", "game_updated", game.exe(), format!("{m}. The script extender, Address Library and many {se} plugins are made for one game version; the other findings here say what no longer matches. Until they catch up, Play without mods (beside Play) starts the game with none. This goes away at the next Play"));
         }
         if let Some(m) = crate::launch::address_library(&inst.data_dir().join(se).join("Plugins"), game, v) {
             add("error", "address_library_mismatch", "Address Library", m);
@@ -203,8 +234,22 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
                 add("info", "not_deployed", "deploy", format!("{} files to link and {} to remove since the last deploy", plan.link.len(), plan.remove.len()));
             }
             for f in plan.external_changes {
-                add("warning", "external_change", &f, "changed outside rmm; deploy copies it to overwrite/, which then wins over every mod".into());
+                add("warning", "external_change", &f, "changed outside rmm; deploy keeps it in Overwrite (the files that belong to no mod), which wins over every mod".into());
             }
+        }
+    }
+    let over = inst.mod_files(crate::instance::OVERWRITE)?.len();
+    if over > 0 {
+        let files = if over == 1 { "1 file belongs" } else { &format!("{over} files belong") };
+        add("info", "overwrite_files", "Overwrite", format!("{files} to no mod: what the game, MCM menus and tools wrote, which wins over every mod. Move what you want to keep into a mod (Overwrite's Move to mod…), so it goes with the setup"));
+    }
+    let tools = crate::tools::list(inst).unwrap_or_default();
+    for s in crate::tools::stale_outputs(inst).unwrap_or_default() {
+        let tool = tools.get(&s.tool).map_or(s.tool.as_str(), |t| t.name.as_str());
+        if s.unknown {
+            add("info", "stale_output", &s.output, format!("made by {tool}, but {}, so it can't tell whether it's out of date. Rebuild outputs (Tools) runs {tool} again, and from then on rmm knows", s.summary()));
+        } else {
+            add("warning", "stale_output", &s.output, format!("made by {tool} from a setup that has changed since, in what it reads: {}. Rebuild outputs (Tools) runs it again", s.summary()));
         }
     }
     issues.extend(fallout4_ini(inst)?);

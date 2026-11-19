@@ -69,9 +69,28 @@ pub struct Profile {
     /// The profile's saves go to `Saves/<name>/`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_saves: bool,
+    /// The Nexus collection installed into this profile, so updating it to a newer revision
+    /// tells its mods from the user's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<crate::collection::Installed>,
+    /// Profiles with the same group share one mod order and plugin order; each keeps which mods
+    /// and plugins it has on (`Instance::share_order`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_order: Option<String>,
 }
 
 impl Profile {
+    /// Take `order`'s mod and plugin lists, keeping which ones this profile has on: one list, so
+    /// new mods and plugins come in off (separators as they are there), and ones it dropped go.
+    pub fn follow(&mut self, order: &Profile) {
+        let on: std::collections::HashMap<&str, bool> = self.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
+        let mods: Vec<ModEntry> = order.mods.iter().map(|m| ModEntry { id: m.id.clone(), enabled: if is_separator(&m.id) { m.enabled } else { on.get(m.id.as_str()).copied().unwrap_or(false) } }).collect();
+        let pon: std::collections::HashMap<String, bool> = self.plugins.iter().map(|e| (e.name.to_lowercase(), e.enabled)).collect();
+        let plugins: Vec<PluginEntry> = order.plugins.iter().map(|e| PluginEntry { name: e.name.clone(), enabled: pon.get(&e.name.to_lowercase()).copied().unwrap_or(false) }).collect();
+        (self.mods, self.plugins) = (mods, plugins);
+        self.apply_locks();
+    }
+
     /// Put locked plugins back at their positions, lowest first.
     pub fn apply_locks(&mut self) {
         let mut locked: Vec<(usize, PluginEntry)> = Vec::new();
@@ -126,7 +145,7 @@ pub fn diff(a: &Profile, b: &Profile) -> Diff {
 }
 
 /// Indices (into `v`) of one longest strictly increasing subsequence. O(n log n).
-fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
+pub(crate) fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
     let (mut tails, mut prev): (Vec<usize>, Vec<Option<usize>>) = (Vec::new(), vec![None; v.len()]);
     for i in 0..v.len() {
         let k = tails.partition_point(|&t| v[t] < v[i]);
@@ -147,6 +166,8 @@ fn longest_increasing(v: &[usize]) -> std::collections::HashSet<usize> {
 pub struct HistoryEntry {
     pub label: String,
     pub change: Diff,
+    /// When the change was made (or last undone and redone), seconds since 1970.
+    pub time: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -199,6 +220,18 @@ pub struct ModMeta {
     /// to the game folder (`root/`), now and on every reinstall or update.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub game_folder: bool,
+    /// Files the user hid (paths in the mod), kept in `.rmm-hidden/` and hidden again after a
+    /// reinstall or update (see `install::hide_files`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
+    /// Creation Club content rmm took out of the game's Data folder (`import::adopt_creations`):
+    /// on in every profile, kept through undo, and put back by `import::restore_creations`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creation: bool,
+    /// What a whole-setup tool made this output from (`tools::inputs`), to tell when it's out of
+    /// date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_from: Option<crate::tools::Inputs>,
 }
 
 /// A mod's page and file on Nexus Mods (the game comes from the instance).
@@ -231,7 +264,7 @@ impl Instance {
             fs::create_dir_all(root.join(d))?;
         }
         let inst = Instance {
-            root: root.to_path_buf(),
+            root: std::path::absolute(root)?,
             config: InstanceConfig {
                 game,
                 game_path: game_path.into(),
@@ -250,7 +283,8 @@ impl Instance {
         let text = fs::read_to_string(root.join(CONFIG))
             .with_context(|| format!("{} is not an rmm instance (no {CONFIG})", root.display()))?;
         crate::addons::register_games(root);
-        Ok(Instance { root: root.into(), config: toml::from_str(&text)? })
+        // Absolute, so the folder reads the same however it was named (`-i inst` or `-i D:/x/inst`).
+        Ok(Instance { root: std::path::absolute(root)?, config: toml::from_str(&text)? })
     }
 
     pub fn mods_dir(&self) -> PathBuf {
@@ -320,7 +354,8 @@ impl Instance {
     }
 
     /// The stored spelling of a profile name (folder names are case-insensitive on Windows).
-    pub(crate) fn find_profile(&self, name: &str) -> Result<String> {
+    /// The profile named `name`, in any letter case, by its own name.
+    pub fn find_profile(&self, name: &str) -> Result<String> {
         let want = name.to_lowercase();
         self.profiles()?.into_iter().find(|n| n.to_lowercase() == want).with_context(|| format!("no profile '{name}'"))
     }
@@ -366,15 +401,21 @@ impl Instance {
                 if p.mods.iter().any(|m| m.id == id) {
                     continue;
                 }
+                // Creation Club content (the game's own) is on, at the top; other mods are off.
+                let creation = next.mod_meta(&id).creation;
                 for pl in next.mod_files(&id)?.into_iter().filter(|f| !f.contains('/') && crate::install::is_plugin(f)) {
                     if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(&pl)) {
-                        p.plugins.push(PluginEntry { name: pl, enabled: false });
+                        p.plugins.push(PluginEntry { name: pl, enabled: creation });
                     }
                 }
-                p.mods.push(ModEntry { id, enabled: false });
+                if creation {
+                    p.mods.insert(0, ModEntry { id, enabled: true });
+                } else {
+                    p.mods.push(ModEntry { id, enabled: false });
+                }
             }
             if p != before {
-                write_atomic(&next.profile_file(), &toml::to_string_pretty(&p)?)?;
+                next.save_profile(&p)?;
             }
             write_atomic(&self.root.join(CONFIG), &toml::to_string_pretty(&next.config)?)
         })?;
@@ -498,9 +539,19 @@ impl Instance {
             let r = f(&mut after)?;
             after.apply_locks();
             if after != before || !swaps.is_empty() {
-                self.push("undo", label, swaps, &before)?;
+                // A run of moves of the same mods (Ctrl+Down held, say) is one step: the newest
+                // entry keeps the state before the first move and takes this label.
+                let undo = self.stack("undo")?;
+                let last = undo.last().filter(|(_, l)| swaps.is_empty() && move_key(label).is_some() && move_key(l) == move_key(label));
+                match last {
+                    Some((path, _)) if self.stack("redo")?.is_empty() => {
+                        let text = fs::read_to_string(path)?;
+                        fs::write(path, format!("# {}\n{}", label.replace('\n', " "), text.split_once('\n').map_or("", |(_, rest)| rest)))?;
+                    }
+                    _ => self.push("undo", label, swaps, &before)?,
+                }
                 let _ = fs::remove_dir_all(self.stack_dir("redo"));
-                write_atomic(&self.profile_file(), &toml::to_string_pretty(&after)?)?;
+                self.save_profile(&after)?;
             }
             Ok(r)
         })
@@ -521,13 +572,23 @@ impl Instance {
         Ok(entries.into_iter().map(|(_, label)| label).collect())
     }
 
+    /// How many undone changes Redo can bring back.
+    pub fn redo_steps(&self) -> Result<usize> {
+        Ok(self.stack("redo")?.len())
+    }
+
+    /// Labels of the changes Redo brings back, the next first.
+    pub fn redo_labels(&self) -> Result<Vec<String>> {
+        Ok(self.stack("redo")?.into_iter().rev().map(|(_, label)| label).collect())
+    }
+
     /// Undoable changes, newest first, each with the mods it touched.
     pub fn history_details(&self) -> Result<Vec<HistoryEntry>> {
         let snaps = self.snapshots()?;
         let mut after = self.profile()?;
         let mut out = Vec::new();
-        for (label, before) in snaps.into_iter().rev() {
-            out.push(HistoryEntry { label, change: diff(&before, &after) });
+        for (label, before, time) in snaps.into_iter().rev() {
+            out.push(HistoryEntry { label, change: diff(&before, &after), time });
             after = before;
         }
         Ok(out)
@@ -536,7 +597,7 @@ impl Instance {
     /// What restoring the state before history entry `n` (0 = the newest) would change.
     pub fn restore_preview(&self, n: usize) -> Result<Diff> {
         let snaps = self.snapshots()?;
-        let (_, target) = snaps.len().checked_sub(n + 1).and_then(|i| snaps.into_iter().nth(i)).context("no such history entry")?;
+        let (_, target, _) = snaps.len().checked_sub(n + 1).and_then(|i| snaps.into_iter().nth(i)).context("no such history entry")?;
         Ok(diff(&self.profile()?, &target))
     }
 
@@ -551,17 +612,18 @@ impl Instance {
         })
     }
 
-    /// (label, profile before the change) for every undo entry, oldest first. Mods deleted for good
+    /// (label, profile before the change, when) for every undo entry, oldest first. Mods deleted for good
     /// (the trash emptied) are left out: going back can't bring them, and undo drops them too.
-    fn snapshots(&self) -> Result<Vec<(String, Profile)>> {
+    fn snapshots(&self) -> Result<Vec<(String, Profile, u64)>> {
         let names = |dir: PathBuf| -> std::collections::HashSet<String> { fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect() };
         let kept: std::collections::HashSet<String> = names(self.mods_dir()).into_iter().chain(names(self.root.join("trash"))).collect();
         self.stack("undo")?
             .into_iter()
             .map(|(path, label)| {
-                let mut p: Profile = toml::from_str(&fs::read_to_string(path)?)?;
+                let mut p: Profile = toml::from_str(&fs::read_to_string(&path)?)?;
                 p.mods.retain(|m| is_separator(&m.id) || kept.contains(&m.id));
-                Ok((label, p))
+                let time = fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                Ok((label, p, time))
             })
             .collect()
     }
@@ -571,7 +633,67 @@ impl Instance {
     pub(crate) fn list_quietly(&self, id: &str) -> Result<()> {
         let mut p = self.profile()?;
         p.mods.push(ModEntry { id: id.into(), enabled: true });
-        write_atomic(&self.profile_file(), &toml::to_string_pretty(&p)?)
+        self.save_profile(&p)
+    }
+
+    /// Write the active profile, and give the profiles that share its order (`shared_order`)
+    /// the new order, each keeping what it has on. Call under the lock.
+    fn save_profile(&self, p: &Profile) -> Result<()> {
+        write_atomic(&self.profile_file(), &toml::to_string_pretty(p)?)?;
+        let Some(group) = &p.shared_order else { return Ok(()) };
+        for name in self.profiles()?.into_iter().filter(|n| *n != self.config.profile) {
+            let file = self.root.join("profiles").join(name).join("profile.toml");
+            let mut q: Profile = toml::from_str(&fs::read_to_string(&file)?)?;
+            if q.shared_order.as_ref() == Some(group) {
+                let before = q.clone();
+                q.follow(p);
+                if q != before {
+                    write_atomic(&file, &toml::to_string_pretty(&q)?)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The other profiles that share the active profile's mod order.
+    pub fn order_sharers(&self) -> Result<Vec<String>> {
+        let Some(group) = self.profile()?.shared_order else { return Ok(vec![]) };
+        let mut out = Vec::new();
+        for name in self.profiles()?.into_iter().filter(|n| *n != self.config.profile) {
+            let q: Profile = toml::from_str(&fs::read_to_string(self.root.join("profiles").join(&name).join("profile.toml"))?)?;
+            if q.shared_order.as_ref() == Some(&group) {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Share `with`'s mod and plugin order: the active profile takes it now, keeping which mods
+    /// and plugins it has on, and from then on a change to either's order is both's. `None`
+    /// stops sharing: the active profile keeps the order it has. One undo step.
+    pub fn share_order(&self, with: Option<&str>) -> Result<()> {
+        let Some(with) = with else {
+            return self.edit("own mod order", |p| {
+                p.shared_order = None;
+                Ok(())
+            });
+        };
+        let name = self.find_profile(with)?;
+        if name == self.config.profile {
+            bail!("'{name}' is the active profile");
+        }
+        let file = self.root.join("profiles").join(&name).join("profile.toml");
+        let mut other: Profile = toml::from_str(&fs::read_to_string(&file)?)?;
+        let group = other.shared_order.clone().unwrap_or_else(|| name.clone());
+        if other.shared_order.is_none() {
+            other.shared_order = Some(group.clone());
+            self.locked(|| write_atomic(&file, &toml::to_string_pretty(&other)?))?;
+        }
+        self.edit(&format!("share {name}'s mod order"), |p| {
+            p.follow(&other);
+            p.shared_order = Some(group);
+            Ok(())
+        })
     }
 
     /// Move a mod folder to trash/ so an undo can bring it back.
@@ -601,7 +723,10 @@ impl Instance {
         }
         // A mod whose files are gone for good (the trash was emptied) leaves the list.
         snapshot.mods.retain(|m| is_separator(&m.id) || self.mod_dir(&m.id).is_dir());
-        write_atomic(&self.profile_file(), &toml::to_string_pretty(&snapshot)?)?;
+        // Creation Club content taken out of Data was the game's, not a step: it stays.
+        let adopted: Vec<ModEntry> = current.mods.iter().filter(|m| !snapshot.mods.iter().any(|s| s.id == m.id) && self.mod_meta(&m.id).creation).cloned().collect();
+        snapshot.mods.splice(0..0, adopted);
+        self.save_profile(&snapshot)?;
         // Mods the step takes off the list (an install undone, an uninstall redone) go back to
         // trash/, unless another profile lists them; otherwise they'd stay installed unseen.
         let kept: std::collections::HashSet<&str> = snapshot.mods.iter().map(|m| m.id.as_str()).collect();
@@ -665,7 +790,8 @@ impl Instance {
     /// (`edit_swapping`): hard links, so it costs no space, and rmm replaces files rather than
     /// writing into them. Returns the folder under trash/.
     pub(crate) fn keep_files(&self, id: &str) -> Result<String> {
-        let folder = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !self.root.join("trash").join(f).exists()).expect("a free name");
+        let name = id.trim_matches(['<', '>']); // Overwrite's id isn't a folder name
+        let folder = (1..).map(|n| format!(".replaced/{name}-{n}")).find(|f| !self.root.join("trash").join(f).exists()).expect("a free name");
         let (from, to) = (self.mod_dir(id), self.root.join("trash").join(&folder));
         fs::create_dir_all(&to)?;
         for e in walkdir::WalkDir::new(&from).min_depth(1) {
@@ -703,6 +829,11 @@ impl Instance {
     }
 }
 
+/// What a run of moves shares: "move X to 5" and "move X to 6" are both "X".
+fn move_key(label: &str) -> Option<&str> {
+    label.strip_prefix("move ")?.rsplit_once(" to ").map(|(what, _)| what)
+}
+
 /// Profile names are folder names: no path characters, no leading dot (`.deleted` is rmm's).
 pub(crate) fn check_profile_name(name: &str) -> Result<()> {
     let bad = name.is_empty()
@@ -725,7 +856,7 @@ pub(crate) fn index_dir(dir: &Path) -> Result<Vec<String>> {
             continue;
         }
         let rel = e.path().strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
-        if rel != MOD_META && rel != MOD_INDEX {
+        if rel != MOD_META && rel != MOD_INDEX && !rel.starts_with(".rmm-hidden/") {
             files.push(rel);
         }
     }

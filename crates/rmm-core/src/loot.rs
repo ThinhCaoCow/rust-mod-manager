@@ -26,8 +26,13 @@ pub struct SortReport {
     pub dry_run: bool,
     /// Every plugin in LOOT's order.
     pub order: Vec<String>,
-    /// Plugins whose position changes, with old and new index.
+    /// The plugins that really move: the fewest whose moving explains the new order (the rest
+    /// keep their order among themselves, even when their numbers shift), with old and new index.
     pub moved: Vec<Moved>,
+    /// Plugins on in the profile but off in the game folder's plugins.txt, or the other way round.
+    /// LOOT reads which plugins are on from there, so a deploy first lets its conditions see the
+    /// profile.
+    pub undeployed: usize,
     pub warnings: Vec<String>,
 }
 
@@ -36,10 +41,17 @@ pub struct Moved {
     pub name: String,
     pub from: usize,
     pub to: usize,
+    /// The plugin it then loads right after; none when it goes first.
+    pub after: Option<String>,
 }
 
 fn dir(inst: &Instance) -> PathBuf {
     inst.root.join("loot")
+}
+
+/// Whether LOOT's masterlist was downloaded, so its messages can show in Problems.
+pub fn has_masterlist(inst: &Instance) -> bool {
+    dir(inst).join("masterlist.yaml").is_file()
 }
 
 /// Download the masterlist and prelude if the cached copies are missing, older than a day, or
@@ -93,8 +105,9 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// A libloot handle that sees the profile rather than the deployed Data folder: enabled mods are
-/// additional data paths, highest priority first, so `file()` conditions match the profile.
-/// Active-plugin conditions still come from plugins.txt, which deploy writes.
+/// additional data paths, highest priority first, so `file()` conditions match the profile, and
+/// it reads the profile's plugins.txt (written to loot/local), so `active()` conditions and the
+/// load order do too, before a deploy.
 fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<String>)> {
     let c = &inst.config;
     let game_type = match (c.game.lo_id(), c.game.base()) {
@@ -103,7 +116,9 @@ fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<Stri
         (_, Game::Fallout4) => GameType::Fallout4,
         _ => GameType::SkyrimSE,
     };
-    let mut game = libloot::Game::with_local_path(game_type, &c.game_path, &c.local_path)?;
+    let local = dir(inst).join("local");
+    write_plugins_txt(&local, &plugins::list(inst, profile)?)?;
+    let mut game = libloot::Game::with_local_path(game_type, &c.game_path, &local)?;
     let mut dirs = vec![inst.mod_dir(OVERWRITE)];
     dirs.extend(profile.mods.iter().rev().filter(|m| m.enabled).map(|m| inst.mod_dir(&m.id)));
     game.set_additional_data_paths(dirs.into_iter().filter(|d| d.is_dir()).collect())?;
@@ -130,6 +145,24 @@ fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<Stri
     Ok((game, warnings))
 }
 
+/// The profile's plugins.txt as the game would read it: `*` marks the enabled ones. Written
+/// whole and renamed, so two LOOT runs at once never read half of one.
+fn write_plugins_txt(local: &Path, infos: &[PluginInfo]) -> Result<()> {
+    fs::create_dir_all(local)?;
+    // ponytail: Latin-1 for Windows-1252 (the game's encoding); differs only in 0x80-0x9F, where
+    // a name gets '?'. encoding_rs (already in the build) if a plugin ever needs those.
+    let bytes: Vec<u8> = infos
+        .iter()
+        .filter(|p| !p.implicit)
+        .flat_map(|p| format!("{}{}
+", if p.enabled { "*" } else { "" }, p.name).chars().map(|ch| u8::try_from(ch).ok().filter(|b| !(0x80..0xA0).contains(b)).unwrap_or(b'?')).collect::<Vec<_>>())
+        .collect();
+    let tmp = local.join(format!("plugins.{}.part", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, local.join("plugins.txt"))?;
+    Ok(())
+}
+
 /// Load every readable plugin into libloot. Returns the plugins in the current load order.
 fn load<'a>(game: &mut libloot::Game, infos: &'a [PluginInfo], warnings: &mut Vec<String>) -> Result<Vec<&'a PluginInfo>> {
     let usable: Vec<&PluginInfo> = infos.iter().filter(|p| p.error.is_none()).collect();
@@ -150,7 +183,14 @@ pub fn place(inst: &Instance, new: &[String]) -> Result<SortReport> {
         let before = p.plugins.clone();
         p.plugins = placed(&before, &r.order, new);
         let at = |list: &[PluginEntry], n: &str| list.iter().position(|e| e.name.eq_ignore_ascii_case(n));
-        moved = new.iter().filter_map(|n| Some(Moved { name: n.clone(), from: at(&before, n)?, to: at(&p.plugins, n)? })).filter(|m| m.from != m.to).collect();
+        moved = new
+            .iter()
+            .filter_map(|n| {
+                let to = at(&p.plugins, n)?;
+                Some(Moved { name: n.clone(), from: at(&before, n)?, to, after: to.checked_sub(1).map(|i| p.plugins[i].name.clone()) })
+            })
+            .filter(|m| m.from != m.to)
+            .collect();
         Ok(())
     })?;
     r.order = inst.profile()?.plugins.into_iter().map(|e| e.name).collect();
@@ -185,18 +225,11 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
     let names: Vec<&str> = current.iter().map(|p| p.name.as_str()).collect();
     let order = game.sort_plugins(&names)?;
 
-    let deployed_active = current.iter().filter(|p| game.is_plugin_active(&p.name) != p.enabled).count();
-    if deployed_active > 0 {
-        warnings.push(format!("plugins.txt differs from the profile for {deployed_active} plugins; deploy, then sort again, so LOOT's conditions on active plugins see the profile"));
+    let undeployed = current.iter().filter(|p| game.is_plugin_active(&p.name) != p.enabled).count();
+    if undeployed > 0 {
+        warnings.push(format!("LOOT saw {undeployed} plugins on or off differently from this profile"));
     }
-    let moved: Vec<Moved> = order
-        .iter()
-        .enumerate()
-        .filter_map(|(to, name)| {
-            let from = names.iter().position(|n| n.eq_ignore_ascii_case(name))?;
-            (from != to).then(|| Moved { name: name.clone(), from, to })
-        })
-        .collect();
+    let moved = moves(&names, &order);
 
     if !dry_run && !moved.is_empty() {
         inst.edit("sort plugins (LOOT)", |p| {
@@ -218,14 +251,62 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
             Ok(())
         })?;
     }
-    Ok(SortReport { dry_run, order, moved, warnings })
+    Ok(SortReport { dry_run, order, moved, undeployed, warnings })
+}
+
+/// The plugins that move from `old` to `new`: all but one longest run that keeps its order, so
+/// one plugin moved up counts once, not with every plugin that shifts along.
+fn moves(old: &[&str], new: &[String]) -> Vec<Moved> {
+    let at: std::collections::HashMap<String, usize> = old.iter().enumerate().map(|(i, n)| (n.to_lowercase(), i)).collect();
+    let both: Vec<(usize, usize)> = new.iter().enumerate().filter_map(|(to, n)| Some((to, *at.get(&n.to_lowercase())?))).collect();
+    let keep = crate::instance::longest_increasing(&both.iter().map(|b| b.1).collect::<Vec<_>>());
+    both.iter()
+        .enumerate()
+        .filter(|(k, _)| !keep.contains(k))
+        .map(|(_, &(to, from))| Moved { name: new[to].clone(), from, to, after: to.checked_sub(1).map(|i| new[i].clone()) })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn one_move_counts_once() {
+        let old = ["A", "B", "C", "D", "E"];
+        let new: Vec<String> = ["E", "A", "B", "C", "D"].map(String::from).into();
+        let m = super::moves(&old, &new);
+        assert_eq!((m.len(), m[0].name.as_str(), m[0].after.as_deref()), (1, "E", None));
+        let new: Vec<String> = ["A", "C", "D", "B", "E"].map(String::from).into();
+        let m = super::moves(&old, &new);
+        assert_eq!((m.len(), m[0].name.as_str(), m[0].after.as_deref(), m[0].from, m[0].to), (1, "B", Some("D"), 1, 3));
+        assert!(super::moves(&old, &old.map(String::from)).is_empty());
+    }
+}
+
+/// A plugin LOOT's masterlist knows as dirty, in this very version (by its CRC).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Dirty {
+    pub plugin: String,
+    /// Identical-to-master records, deleted references and deleted navmeshes. QuickAutoClean fixes
+    /// the first two; deleted navmeshes take xEdit by hand.
+    pub itm: u32,
+    pub deleted_references: u32,
+    pub deleted_navmeshes: u32,
 }
 
 /// LOOT's warnings and errors for enabled plugins, plus dirty-plugin reports, from the cached
 /// masterlist. Nothing is downloaded; without a masterlist there is nothing to report.
 pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
+    Ok(scan(inst)?.0)
+}
+
+/// The enabled plugins LOOT's cached masterlist knows as dirty.
+pub fn dirty_plugins(inst: &Instance) -> Result<Vec<Dirty>> {
+    Ok(scan(inst)?.1)
+}
+
+fn scan(inst: &Instance) -> Result<(Vec<Issue>, Vec<Dirty>)> {
     if !dir(inst).join("masterlist.yaml").is_file() {
-        return Ok(vec![]);
+        return Ok(Default::default());
     }
     let profile = inst.profile()?;
     let infos = plugins::list(inst, &profile)?;
@@ -234,6 +315,7 @@ pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
     let db = game.database();
     let db = db.read().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
     let mut issues = Vec::new();
+    let mut dirty = Vec::new();
     let cfg = crate::settings::get().loot;
     let text = |m: &libloot::metadata::Message| select_message_content(m.content(), &cfg.language).map(|c| c.text().to_owned()).unwrap_or_default();
     let severity = |m: &libloot::metadata::Message| match m.message_type() {
@@ -260,16 +342,17 @@ pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
                 kind: "dirty_plugin",
                 subject: p.name.clone(),
                 message: format!(
-                    "{} ITMs, {} deleted references, {} deleted navmeshes; clean it with xEdit QuickAutoClean (run_tool xedit-qac with plugin={})",
+                    "{} ITMs, {} deleted references, {} deleted navmeshes; clean it with xEdit QuickAutoClean (Problems' Clean dirty plugins…, or run_tool xedit-qac with plugin={})",
                     d.itm_count(),
                     d.deleted_reference_count(),
                     d.deleted_navmesh_count(),
                     p.name
                 ),
             });
+            dirty.push(Dirty { plugin: p.name.clone(), itm: d.itm_count(), deleted_references: d.deleted_reference_count(), deleted_navmeshes: d.deleted_navmesh_count() });
         }
     }
-    Ok(issues)
+    Ok((issues, dirty))
 }
 
 /// A user rule for one plugin, kept in `loot/userlist.yaml` in LOOT's own format, so LOOT itself

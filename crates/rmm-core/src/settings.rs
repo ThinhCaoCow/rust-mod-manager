@@ -32,10 +32,13 @@ pub struct Deploy {
     /// Files never deployed, by their path inside Data: `*` stands for any run of characters, and a
     /// pattern without `/` matches the file's name (`*.txt`, `readme*`, `fomod/*`).
     pub exclude: Vec<String>,
+    /// Leave out what comes with mods but isn't for the game (`deploy::extra`): MO2's meta.ini,
+    /// FOMOD installers, read-me's and licences at the top, the script extender's sources.
+    pub skip_extras: bool,
 }
 impl Default for Deploy {
     fn default() -> Self {
-        Deploy { method: "link".into(), exclude: vec![] }
+        Deploy { method: "link".into(), exclude: vec![], skip_extras: true }
     }
 }
 
@@ -96,7 +99,7 @@ impl Default for Loot {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Health {
     /// Kinds of problems not reported (see `health::KINDS`).
@@ -104,6 +107,14 @@ pub struct Health {
     /// Fallout 4's limit on general BA2 archives: 0 works it out (1,024 since the August 2025
     /// update, with a warning above 256), or 256 or 1024.
     pub ba2_limit: usize,
+    /// Warn when the instance's or the game's drive has less free space than this, in GB; 0 never.
+    pub low_space_gb: u64,
+}
+
+impl Default for Health {
+    fn default() -> Health {
+        Health { hidden: vec![], ba2_limit: 0, low_space_gb: 20 }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -153,6 +164,7 @@ pub struct Ai {
     /// Model calls in one turn before rmm's AI pauses and asks to go on.
     pub max_steps: usize,
     /// US dollars a chat may cost before it stops (Claude and OpenRouter report costs); 0: no limit.
+    /// A few dollars by default, so a first try can't run up a bill.
     pub budget: f64,
     /// Tools rmm's AI may run without asking, on top of reads and dry runs.
     pub auto_allow: Vec<String>,
@@ -162,7 +174,7 @@ pub struct Ai {
 }
 impl Default for Ai {
     fn default() -> Self {
-        Ai { max_steps: 60, budget: 0.0, auto_allow: vec![], role_instructions: BTreeMap::new() }
+        Ai { max_steps: 60, budget: 2.0, auto_allow: vec![], role_instructions: BTreeMap::new() }
     }
 }
 

@@ -40,7 +40,7 @@ flate2 = "1"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
 # Directory listings with file ids (deploy checks). Already in the build (Cargo.lock).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = { version = "0.18.0", default-features = false }

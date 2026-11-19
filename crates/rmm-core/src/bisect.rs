@@ -68,19 +68,20 @@ pub fn status(inst: &Instance) -> Result<Option<Status>> {
     Ok(load(inst)?.map(|b| report(inst, b)))
 }
 
-/// The mods to test: those the newest crash log names, or with `all` every enabled mod but the
-/// script extender and the test harness (a test run needs them). In load order.
+/// The mods to test: those the newest crash log names, or with `all` every enabled mod. Either
+/// way not the script extender, Address Library, the crash logger or the test harness: the game
+/// needs them to load the rest, write a crash log, or run a test. In load order.
 pub fn suspects(inst: &Instance, all: bool) -> Result<Vec<String>> {
     let p = inst.profile()?;
+    let mut keep: BTreeSet<String> = crate::launch::essential_mods(inst)?.into_iter().collect();
+    let dll = crate::path_key(crate::harness::harness_dll(inst.config.game));
+    keep.extend(p.mods.iter().filter(|m| inst.mod_files(&m.id).is_ok_and(|f| f.iter().any(|f| crate::path_key(f) == dll))).map(|m| m.id.clone()));
     let wanted: BTreeSet<String> = if all {
-        let mut keep: BTreeSet<String> = crate::launch::script_extender_mods(inst)?.into_iter().collect();
-        let dll = crate::path_key(crate::harness::harness_dll(inst.config.game));
-        keep.extend(p.mods.iter().filter(|m| inst.mod_files(&m.id).is_ok_and(|f| f.iter().any(|f| crate::path_key(f) == dll))).map(|m| m.id.clone()));
-        p.mods.iter().map(|m| m.id.clone()).filter(|id| !keep.contains(id)).collect()
+        p.mods.iter().map(|m| m.id.clone()).collect()
     } else {
         crate::logs::read_crash_log(inst, None)?.suspects.into_iter().filter_map(|s| s.mod_id).collect()
     };
-    Ok(p.mods.iter().filter(|m| m.enabled && !is_separator(&m.id) && wanted.contains(&m.id)).map(|m| m.id.clone()).collect())
+    Ok(p.mods.iter().filter(|m| m.enabled && !is_separator(&m.id) && wanted.contains(&m.id) && !keep.contains(&m.id)).map(|m| m.id.clone()).collect())
 }
 
 /// Start a bisect over these enabled mods and turn off the first half.

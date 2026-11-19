@@ -56,7 +56,8 @@ pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bo
 
 /// The mod name, Nexus mod id and version in a Nexus download's file name, as MO2 reads them:
 /// "Address Library - All In One 47327 1.11.240 2026-08-21T23-48Z Hbu6377Rl" (the site's names
-/// now) or "Unofficial Skyrim Special Edition Patch-266-4-2-5a-1623868815" (older ones).
+/// now), "Unofficial Skyrim Special Edition Patch-266-4-2-5a-1623868815" (older ones), or without
+/// the upload time and with any version: "Relationship Dialogue Overhaul - RDO Final-1187-Final".
 fn nexus_name(stem: &str) -> Option<(String, crate::instance::NexusRef)> {
     let found = |name: &str, id: &str, version: &str| {
         let mod_id = id.bytes().all(|b| b.is_ascii_digit()).then(|| id.parse().ok()).flatten().filter(|_| !name.trim().is_empty())?;
@@ -76,7 +77,13 @@ fn nexus_name(stem: &str) -> Option<(String, crate::instance::NexusRef)> {
     }
     let (rest, time) = stem.rsplit_once('-')?;
     if time.len() != 10 || !time.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+        // No upload time: "<name>-<id>-<version>", the id the first number of 3 digits or more
+        // (shorter ones are a name's own: "UIExtensions v1-2-0-17561-1-2-0"), the version a word.
+        return stem.match_indices('-').find_map(|(i, _)| {
+            let (id, version) = stem[i + 1..].split_once('-')?;
+            let ok = id.len() >= 3 && !id.starts_with('0') && !version.is_empty() && !version.contains(' ');
+            ok.then(|| found(&stem[..i], id, &version.replace('-', "."))).flatten()
+        });
     }
     // The name ends at the first "-<digits>-": the mod id, then the version.
     rest.match_indices('-').find_map(|(i, _)| {
@@ -149,7 +156,7 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
     // An archive's hash lets a lockfile find the same download elsewhere.
     let sha256 = if source.is_file() { Some(crate::lockfile::sha256_file(source)?) } else { None };
     inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone(), sha256, ..Default::default() })?;
-    let plugins = top_plugins(&files);
+    let plugins = mod_plugins(inst, id, &files);
     inst.edit(&format!("install {id}"), |p| {
         let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
         let at = match priority {
@@ -177,6 +184,146 @@ pub fn update(inst: &Instance, id: &str, source: &Path, choices: Option<&Choices
     replace(inst, id, Some(source), choices)
 }
 
+/// Where a mod keeps the files the user hid: out of its index, so deploys, conflicts and the
+/// plugin list don't see them.
+pub const HIDDEN_DIR: &str = ".rmm-hidden";
+
+/// Hide a mod's files or folders, or with `hide` false show them again. Hidden files move to
+/// `<mod>/.rmm-hidden/`, out of deploys, conflicts and the plugin list (MO2's `.mohidden`; a
+/// hidden plugin is MO2's optional ESP), and the mod remembers them, so a reinstall or update
+/// hides them again. One undo step. Returns the files hidden or shown.
+pub fn hide_files(inst: &Instance, id: &str, paths: &[String], hide: bool) -> Result<Vec<String>> {
+    if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE || !inst.mod_dir(id).is_dir() {
+        bail!("'{id}' is not an installed mod (files in Overwrite can be moved into one first)");
+    }
+    let dir = inst.mod_dir(id);
+    let mut meta = inst.mod_meta(id);
+    let picked = pick(&if hide { inst.mod_files(id)? } else { meta.hidden.clone() }, paths)?;
+    let kept = inst.keep_files(id)?;
+    let label = format!("{} {} in {id}", if hide { "hide" } else { "show" }, files_label(&picked));
+    inst.edit_swapping(&label, &[(id, &kept)], |_| {
+        for f in &picked {
+            let (shown, hidden) = (dir.join(f), dir.join(HIDDEN_DIR).join(f));
+            let (from, to) = if hide { (shown, hidden) } else { (hidden, shown) };
+            if from.is_file() {
+                fs::create_dir_all(to.parent().expect("a file's folder"))?;
+                fs::rename(&from, &to)?;
+                prune_empty(&dir, &from);
+            }
+        }
+        if hide {
+            meta.hidden.extend(picked.iter().cloned());
+            meta.hidden.sort();
+            meta.hidden.dedup();
+        } else {
+            meta.hidden.retain(|h| !picked.contains(h));
+        }
+        crate::instance::write_atomic(&dir.join(".rmm-index"), &index_dir(&dir)?.join("\n"))?;
+        inst.write_mod_meta(id, &meta)
+    })?;
+    Ok(picked)
+}
+
+/// "Engine.log" or "3 files", for a history label.
+fn files_label(files: &[String]) -> String {
+    match files {
+        [one] => one.rsplit('/').next().unwrap_or(one).to_owned(),
+        _ => format!("{} files", files.len()),
+    }
+}
+
+/// Move files or folders from one mod (or Overwrite) into another (or Overwrite): MCM settings
+/// and tool output into the mod they belong with. A file the target has already is refused
+/// unless `replace`. One undo step, which brings back the target's replaced copies too. Returns
+/// the files moved.
+pub fn move_files(inst: &Instance, from: &str, paths: &[String], to: &str, replace: bool) -> Result<Vec<String>> {
+    use crate::instance::{OVERWRITE, is_separator};
+    for id in [from, to] {
+        if is_separator(id) || (id != OVERWRITE && !inst.mod_dir(id).is_dir()) {
+            bail!("'{id}' is not an installed mod");
+        }
+    }
+    if from == to {
+        bail!("pick another mod to move them to");
+    }
+    let picked = pick(&inst.mod_files(from)?, paths)?;
+    let (src, dest) = (inst.mod_dir(from), inst.mod_dir(to));
+    let clash: Vec<&String> = picked.iter().filter(|f| dest.join(f).exists()).collect();
+    if !clash.is_empty() && !replace {
+        let some: Vec<&str> = clash.iter().take(3).map(|f| f.as_str()).collect();
+        bail!("{to} has {} of these already ({}); replacing them puts its copies in trash", clash.len(), some.join(", "));
+    }
+    // Both folders as they are now, hard-linked under trash/, for undo to swap back.
+    let kept = [inst.keep_files(from)?, inst.keep_files(to)?];
+    let name = |id: &str| if id == OVERWRITE { "Overwrite".to_owned() } else { id.to_owned() };
+    let label = format!("move {} from {} to {}", files_label(&picked), name(from), name(to));
+    inst.edit_swapping(&label, &[(from, &kept[0]), (to, &kept[1])], |_| {
+        for f in &picked {
+            let target = dest.join(f);
+            if target.exists() {
+                fs::remove_file(&target)?; // its copy is in `kept`
+            }
+            fs::create_dir_all(target.parent().expect("a file's folder"))?;
+            if fs::rename(src.join(f), &target).is_err() {
+                fs::copy(src.join(f), &target)?;
+                fs::remove_file(src.join(f))?;
+            }
+            prune_empty(&src, &src.join(f));
+        }
+        for (id, dir) in [(from, &src), (to, &dest)] {
+            if id != OVERWRITE {
+                crate::instance::write_atomic(&dir.join(".rmm-index"), &index_dir(dir)?.join("\n"))?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(picked)
+}
+
+/// The files in `pool` that `paths` name, each a file or a folder (every file under it), in any case.
+fn pick(pool: &[String], paths: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let want = p.replace('\\', "/").trim_matches('/').to_lowercase();
+        let under = format!("{want}/");
+        let found: Vec<&String> = pool.iter().filter(|f| f.to_lowercase() == want || f.to_lowercase().starts_with(&under)).collect();
+        if found.is_empty() {
+            bail!("no file or folder '{p}' there");
+        }
+        out.extend(found.into_iter().cloned());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Remove the folders a moved file leaves empty, up to (not including) `root`.
+fn prune_empty(root: &Path, file: &Path) {
+    let mut d = file.parent();
+    while let Some(dir) = d.filter(|d| *d != root && d.starts_with(root)) {
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        d = dir.parent();
+    }
+}
+
+/// In a freshly built mod folder, hide again the files the user had hidden; returns the rest.
+fn rehide(dir: &Path, hidden: &[String], files: Vec<String>) -> Result<Vec<String>> {
+    if hidden.is_empty() {
+        return Ok(files);
+    }
+    for h in hidden.iter().filter(|h| dir.join(h).is_file()) {
+        let to = dir.join(HIDDEN_DIR).join(h);
+        fs::create_dir_all(to.parent().expect("a file's folder"))?;
+        fs::rename(dir.join(h), to)?;
+        prune_empty(dir, &dir.join(h));
+    }
+    let files = index_dir(dir)?;
+    fs::write(dir.join(".rmm-index"), files.join("\n"))?;
+    Ok(files)
+}
+
 /// Reinstall (`new_source` None) or update a mod, as one undoable step.
 fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option<&Choices>) -> Result<InstallReport> {
     if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE || !inst.mod_dir(id).is_dir() {
@@ -195,6 +342,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
     let Some(enabled) = inst.profile()?.mods.iter().find(|m| m.id == id).map(|m| m.enabled) else {
         bail!("mod '{id}' is not in the profile");
     };
+    let edited = crate::workspace::live_edits(inst, id).unwrap_or_default();
     let staging = inst.root.join(".staging").join(id);
     let _ = fs::remove_dir_all(&staging);
     let choices = choices.or(meta.fomod.as_ref()).cloned().unwrap_or_default();
@@ -203,6 +351,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
         let fresh = staging.join("mod");
         let (files, fomod, warnings) = build(inst, &source, &staging, &fresh, Some(&choices))?;
         let files = if meta.game_folder { to_game_folder(&fresh)? } else { files };
+        let files = rehide(&fresh, &meta.hidden, files)?;
         // The old files stay in trash/.replaced/ for undo to swap back.
         let kept = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !inst.root.join("trash").join(f).exists()).expect("a free name");
         inst.locked(|| {
@@ -219,12 +368,16 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
             });
             inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ..updated.transpose()?.unwrap_or_else(|| meta.clone()) })
         })?;
-        let plugins = top_plugins(&files);
+        let plugins = mod_plugins(inst, id, &files);
         let label = if new_source.is_some() { format!("update {id}") } else { format!("reinstall {id}") };
         inst.edit_swapping(&label, &[(id, &kept)], |p| {
             add_plugins(p, &plugins, enabled);
             Ok(())
         })?;
+        let mut warnings = warnings;
+        if !edited.is_empty() {
+            warnings.push(format!("the files you edited in rmm ({}) are the new archive's now; Undo puts your edited ones back", edited.join(", ")));
+        }
         Ok(report(id, &meta.name, &files, plugins, warnings, fomod))
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -239,19 +392,42 @@ pub fn nexus_id_in_name(file: &str) -> Option<u64> {
     let stem = Path::new(file).file_stem()?.to_str()?;
     let parts: Vec<&str> = stem.split('-').collect();
     // The first number after the name; the version and the upload time follow it.
-    let number = |p: &str| !p.is_empty() && !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit());
+    let number = |p: &str| p.len() >= 3 && !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit());
     parts.iter().skip(1).take(parts.len().saturating_sub(2)).find(|p| number(p))?.parse().ok()
 }
 
 /// The installed mod `source` is another version of: the same Nexus mod (`nexus_mod`, else the
 /// id in the file name), going by each mod's recorded Nexus id or its archive's name. (id, name).
+/// When several installed mods came from that page (MfgFix and MfgFix MCM), the one whose file
+/// has the same name; none when no name settles it, so the download installs as a mod of its own.
 pub fn same_mod(inst: &Instance, source: &Path, nexus_mod: Option<u64>) -> Result<Option<(String, String)>> {
     let Some(want) = nexus_mod.or_else(|| nexus_id_in_name(&source.file_name()?.to_string_lossy())) else { return Ok(None) };
-    Ok(inst.profile()?.mods.iter().filter(|m| !crate::instance::is_separator(&m.id)).find_map(|m| {
-        let meta = inst.mod_meta(&m.id);
-        let have = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| nexus_id_in_name(meta.source.as_deref()?));
-        (have == Some(want)).then(|| (m.id.clone(), meta.name))
-    }))
+    let found: Vec<(String, crate::instance::ModMeta)> = inst
+        .profile()?
+        .mods
+        .iter()
+        .filter(|m| !crate::instance::is_separator(&m.id))
+        .filter_map(|m| {
+            let meta = inst.mod_meta(&m.id);
+            let have = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| nexus_id_in_name(meta.source.as_deref()?));
+            (have == Some(want)).then(|| (m.id.clone(), meta))
+        })
+        .collect();
+    if found.len() < 2 {
+        return Ok(found.into_iter().next().map(|(id, meta)| (id, meta.name)));
+    }
+    // A file's name on the page, from its archive's name ("MfgFix MCM-11669-1-2-1600000000").
+    let file_name = |p: &Path| {
+        let stem = if p.extension().is_some_and(|e| ["zip", "7z", "rar"].iter().any(|x| e.eq_ignore_ascii_case(x))) { p.file_stem() } else { p.file_name() };
+        let stem = stem?.to_string_lossy().into_owned();
+        Some(nexus_name(&stem).map_or(stem, |(n, _)| n).to_lowercase())
+    };
+    let Some(name) = file_name(source) else { return Ok(None) };
+    let mut same = found.into_iter().filter(|(_, meta)| meta.source.as_deref().and_then(|s| file_name(Path::new(s))).as_ref() == Some(&name));
+    Ok(match (same.next(), same.next()) {
+        (Some((id, meta)), None) => Some((id, meta.name)),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -264,14 +440,51 @@ mod nexus_name_tests {
         assert_eq!(id(r"D:\Downloads\SkyUI_5_2_SE-12604-5-2SE.7z"), Some(12604));
         assert_eq!(id("Address Library All in One (1.7.104.0) v13 32444 13 2026-08-27T15-29Z Ae46W7Fw2.zip"), None);
         assert_eq!((id("Snow.zip"), id("tool:xedit"), id("Name-123.zip")), (None, None, None));
+        assert_eq!(id("UIExtensions v1-2-0-17561-1-2-0.7z"), Some(17561));
+    }
+
+    #[test]
+    fn reads_old_names_without_an_upload_time() {
+        let read = |s: &str| super::nexus_name(s).map(|(n, x)| (n, x.mod_id, x.version.unwrap_or_default()));
+        let want = |n: &str, id: u64, v: &str| Some((n.to_string(), id, v.to_string()));
+        assert_eq!(read("Relationship Dialogue Overhaul - RDO Final-1187-Final"), want("Relationship Dialogue Overhaul - RDO Final", 1187, "Final"));
+        assert_eq!(read("Reverb and Ambiance Overhaul-701-1-5"), want("Reverb and Ambiance Overhaul", 701, "1.5"));
+        assert_eq!(read("UIExtensions v1-2-0-17561-1-2-0"), want("UIExtensions v1-2-0", 17561, "1.2.0"));
+        assert_eq!(read("LazyTools 0.10.1-13381-0-10-1"), want("LazyTools 0.10.1", 13381, "0.10.1"));
+        assert_eq!((read("collection-h2uqa3-70"), read("Snow-12"), read("My Mod-2-Fixes")), (None, None, None));
     }
 }
 
-fn top_plugins(files: &[String]) -> Vec<String> {
+pub(crate) fn top_plugins(files: &[String]) -> Vec<String> {
     files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect()
 }
 
-fn add_plugins(p: &mut crate::Profile, plugins: &[String], enable: bool) {
+/// A mod's plugins, each after the ones it's built on (its masters), so a patch never loads before
+/// the plugin it patches from the same mod; otherwise in archive order.
+fn mod_plugins(inst: &Instance, id: &str, files: &[String]) -> Vec<String> {
+    let dir = inst.mod_dir(id);
+    let mut left: Vec<(String, Vec<String>)> = top_plugins(files)
+        .into_iter()
+        .map(|name| {
+            let mut p = esplugin::Plugin::new(inst.config.game.esp_id(), &dir.join(&name));
+            let masters = match p.parse_file(esplugin::ParseOptions::header_only()) {
+                Ok(()) => p.masters().unwrap_or_default().iter().map(|m| m.to_lowercase()).collect(),
+                Err(_) => vec![],
+            };
+            (name, masters)
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    while !left.is_empty() {
+        // The first plugin whose masters from this mod are all placed; a cycle keeps the order.
+        let pending: Vec<String> = left.iter().map(|(n, _)| n.to_lowercase()).collect();
+        let i = left.iter().position(|(n, ms)| ms.iter().all(|m| *m == n.to_lowercase() || !pending.contains(m))).unwrap_or(0);
+        out.push(left.remove(i).0);
+    }
+    out
+}
+
+pub(crate) fn add_plugins(p: &mut crate::Profile, plugins: &[String], enable: bool) {
     for pl in plugins {
         if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(pl)) {
             p.plugins.push(PluginEntry { name: pl.clone(), enabled: enable });
@@ -448,7 +661,7 @@ pub fn mod_from_overwrite(inst: &Instance, name: &str) -> Result<InstallReport> 
         fs::write(dest.join(".rmm-index"), files.join("\n"))?;
         inst.write_mod_meta(&id, &ModMeta { name: name.into(), ..Default::default() })
     })?;
-    let plugins = top_plugins(&files);
+    let plugins = mod_plugins(inst, &id, &files);
     inst.edit(&format!("create {id} from overwrite"), |p| {
         let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
         p.mods.insert(crate::rules::place(inst, &ids, &id)?, ModEntry { id: id.clone(), enabled: true });
@@ -521,11 +734,13 @@ pub struct Download {
     pub modified: u64,
     /// Mods installed from a file of this name.
     pub mods: Vec<String>,
+    /// Its mod and file on Nexus, when rmm downloaded it or `nexus::identify` found it; otherwise
+    /// the mod its file name carries (no `file_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nexus: Option<crate::nexus::Identified>,
 }
 
 /// The downloads folder, newest first.
-// ponytail: install from here records no Nexus ids; keep fetch's details beside the file if
-// update checks for such mods matter.
 pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
     let mut from: std::collections::HashMap<String, Vec<String>> = Default::default();
     for e in fs::read_dir(inst.mods_dir()).into_iter().flatten().flatten() {
@@ -534,14 +749,19 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
             from.entry(file.to_string_lossy().to_lowercase()).or_default().push(id);
         }
     }
+    let mut known = crate::nexus::identified(inst);
     let mut out = Vec::new();
     for e in fs::read_dir(inst.downloads_dir()).into_iter().flatten().flatten() {
         let (name, m) = (e.file_name().to_string_lossy().into_owned(), e.metadata()?);
-        if !m.is_file() || name.ends_with(".part") {
+        if !m.is_file() || name.ends_with(".part") || name.starts_with('.') {
             continue;
         }
         let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-        out.push(Download { mods: from.remove(&name.to_lowercase()).unwrap_or_default(), path: e.path(), size: m.len(), modified, name });
+        let lower = name.to_lowercase();
+        // Not identified: the mod and version a Nexus download's name carries.
+        let named = || Path::new(&name).file_stem()?.to_str().and_then(nexus_name).map(|(n, nexus)| crate::nexus::Identified { name: Some(n), nexus });
+        let nexus = known.remove(&lower).or_else(named);
+        out.push(Download { mods: from.remove(&lower).unwrap_or_default(), nexus, path: e.path(), size: m.len(), modified, name });
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
@@ -642,8 +862,7 @@ pub(crate) fn to_game_folder(dir: &Path) -> Result<Vec<String>> {
         }
     }
     let files = index_dir(dir)?;
-    fs::write(dir.join(".rmm-index"), files.join("
-"))?;
+    fs::write(dir.join(".rmm-index"), files.join("\n"))?;
     Ok(files)
 }
 

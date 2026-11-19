@@ -43,6 +43,15 @@ pub struct ModRow {
     /// The user keeps the mod at its version (`hold_updates`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Its Nexus mod id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nexus_id: Option<u64>,
+    /// The Nexus account's endorsement of it, as last read: "Endorsed" or "Abstained".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endorsed: Option<String>,
+    /// The Nexus account tracks it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tracked: bool,
 }
 
 /// A mod's categories: the ones set on it, else the name of its Nexus category.
@@ -106,17 +115,35 @@ pub fn tags(files: &[String], meta: &crate::instance::ModMeta) -> Vec<&'static s
     t
 }
 
+/// The History tab: undoable changes, newest first, each with when it was made; what Redo brings
+/// back, the next first; when this instance last deployed and started the game; and how many
+/// steps are kept (older ones are dropped).
+pub fn history(inst: &Instance) -> Result<Value> {
+    let when = |f: &str| std::fs::metadata(inst.root.join(f)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    Ok(json!({
+        "entries": inst.history_details()?,
+        "redo": inst.redo_labels()?,
+        "deployed": when(crate::deploy::MANIFEST),
+        "played": when(crate::launch::PLAYED),
+        "limit": crate::settings::get().history.limit,
+    }))
+}
+
 pub fn instance_info(inst: &Instance) -> Result<Value> {
     let p = inst.profile()?;
     Ok(json!({
         "root": inst.root,
         "game": inst.config.game,
         "game_path": inst.config.game_path,
+        "game_version": crate::launch::game_version(&inst.config.game_path, inst.config.game).ok().map(|v| v.map(|n| n.to_string()).join(".")),
         "local_path": inst.config.local_path,
         "profile": inst.config.profile,
         "mods": p.mods.iter().filter(|m| !is_separator(&m.id)).count(),
         "enabled_mods": p.mods.iter().filter(|m| m.enabled).count(),
         "undo_steps": inst.history()?.len(),
+        "redo_steps": inst.redo_steps()?,
+        "redo_next": inst.redo_labels()?.into_iter().next(),
+        "masterlist": crate::loot::has_masterlist(inst),
     }))
 }
 
@@ -124,6 +151,7 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
     let p = inst.profile()?;
     let nexus = crate::nexus::category_names(inst);
     let mut found = crate::nexus::saved_updates(inst);
+    let account = crate::nexus::account(inst);
     p.mods
         .iter()
         .enumerate()
@@ -139,6 +167,9 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
                 version: meta.nexus.as_ref().and_then(|n| n.version.clone()),
                 update: found.remove(&m.id).filter(|u| crate::nexus::offered(u, &meta)),
                 pinned: meta.pinned,
+                nexus_id: meta.nexus.as_ref().map(|n| n.mod_id),
+                endorsed: meta.nexus.as_ref().and_then(|n| account.endorsements.get(&n.mod_id).cloned()),
+                tracked: meta.nexus.as_ref().is_some_and(|n| account.tracked.contains(&n.mod_id)),
                 name: if separator { m.id[4..].to_string() } else { meta.name },
                 enabled: m.enabled,
                 plugins: files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect(),
@@ -161,6 +192,7 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
     let Some(entry) = p.mods.iter().find(|m| m.id == id) else { bail!("no mod '{id}'") };
     let files = inst.mod_files(id)?;
     let conflict = conflicts::conflicts(inst, &p)?.into_iter().find(|c| c.id == id);
+    let ext = |f: &str, exts: &[&str]| f.rsplit_once('.').is_some_and(|(_, e)| exts.iter().any(|x| e.eq_ignore_ascii_case(x)));
     Ok(json!({
         "id": id,
         "meta": inst.mod_meta(id),
@@ -168,9 +200,18 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
         "file_count": files.len(),
         "files": files.iter().take(max_files).collect::<Vec<_>>(),
         "files_truncated": files.len() > max_files,
+        // Its read-me's and settings, and its pictures, as MO2's information dialog lists them
+        // (the strings of Interface/Translations aren't read-me's).
+        "docs": files.iter().filter(|f| ext(f, &["txt", "md", "ini"]) && !f.to_lowercase().starts_with("interface/translations/")).take(50).collect::<Vec<_>>(),
+        "images": files.iter().filter(|f| ext(f, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])).take(50).collect::<Vec<_>>(),
         "conflicts": conflict,
+        // What its Nexus page lists as required (null until read), and the id to read it by.
+        "nexus_id": crate::nexus::nexus_id_of(&inst.mod_meta(id)),
+        "needs": crate::nexus::needs(inst, id),
         // The saved review with whether the files are still the ones reviewed.
         "review": crate::inspect::reviews(inst, Some(id))?.pop(),
+        // Files edited through rmm that an update or reinstall would replace.
+        "edited": crate::workspace::live_edits(inst, id).unwrap_or_default(),
     }))
 }
 
@@ -296,18 +337,29 @@ pub fn set_mod_note(inst: &Instance, id: &str, note: &str) -> Result<Option<Stri
 
 /// Colour a row (separator or mod): `#rrggbb`, or empty to remove it. Undoable.
 pub fn set_color(inst: &Instance, id: &str, color: &str) -> Result<()> {
+    set_colors(inst, &[id.to_string()], color)
+}
+
+/// Colour several rows as one undoable change.
+pub fn set_colors(inst: &Instance, ids: &[String], color: &str) -> Result<()> {
     let valid = color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|ch| ch.is_ascii_hexdigit());
     if !color.is_empty() && !valid {
         bail!("a colour is written #rrggbb");
     }
-    inst.edit(&format!("colour {}", id.strip_prefix("sep:").unwrap_or(id)), |p| {
-        if !p.mods.iter().any(|m| m.id == id) {
-            bail!("no mod or separator '{id}'");
-        }
-        if color.is_empty() {
-            p.colors.remove(id);
-        } else {
-            p.colors.insert(id.into(), color.to_lowercase());
+    let label = match ids {
+        [one] => format!("colour {}", one.strip_prefix("sep:").unwrap_or(one)),
+        _ => format!("colour {} rows", ids.len()),
+    };
+    inst.edit(&label, |p| {
+        for id in ids {
+            if !p.mods.iter().any(|m| &m.id == id) {
+                bail!("no mod or separator '{id}'");
+            }
+            if color.is_empty() {
+                p.colors.remove(id);
+            } else {
+                p.colors.insert(id.clone(), color.to_lowercase());
+            }
         }
         Ok(())
     })
@@ -396,19 +448,39 @@ pub fn set_mod_order(inst: &Instance, ids: &[String]) -> Result<()> {
 }
 
 pub fn set_plugin_enabled(inst: &Instance, name: &str, enabled: bool) -> Result<()> {
+    set_plugins_enabled(inst, &[name.to_string()], enabled)
+}
+
+/// Turn plugins on or off, as one undoable change.
+pub fn set_plugins_enabled(inst: &Instance, names: &[String], enabled: bool) -> Result<()> {
     let verb = if enabled { "enable" } else { "disable" };
-    inst.edit(&format!("{verb} plugin {name}"), |p| {
-        match p.plugins.iter_mut().find(|e| e.name.eq_ignore_ascii_case(name)) {
-            Some(e) => e.enabled = enabled,
-            None => p.plugins.push(crate::PluginEntry { name: name.into(), enabled }),
+    let label = match names {
+        [] => return Ok(()),
+        [one] => format!("{verb} plugin {one}"),
+        _ => format!("{verb} {} plugins", names.len()),
+    };
+    inst.edit(&label, |p| {
+        for name in names {
+            match p.plugins.iter_mut().find(|e| e.name.eq_ignore_ascii_case(name)) {
+                Some(e) => e.enabled = enabled,
+                None => p.plugins.push(crate::PluginEntry { name: name.clone(), enabled }),
+            }
         }
         Ok(())
     })
 }
 
 /// Put `names` in this order; plugins not listed keep their relative order after them.
-pub fn set_plugin_order(inst: &Instance, names: &[String]) -> Result<()> {
-    inst.edit("reorder plugins", |p| {
+/// `moved` names the plugins the user moved (empty for a whole new order): a run of moves of the
+/// same plugins is then one undo step, like mods'.
+pub fn set_plugin_order(inst: &Instance, names: &[String], moved: &[String]) -> Result<()> {
+    let at = moved.first().and_then(|m| names.iter().position(|n| n.eq_ignore_ascii_case(m)));
+    let label = match (moved, at) {
+        ([one], Some(at)) => format!("move {one} to {at}"),
+        (_, Some(at)) => format!("move {} plugins to {at}", moved.len()),
+        _ => "reorder plugins".into(),
+    };
+    inst.edit(&label, |p| {
         let key = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n)).unwrap_or(usize::MAX);
         for n in names {
             if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(n)) {

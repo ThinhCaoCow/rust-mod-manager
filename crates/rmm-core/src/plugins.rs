@@ -287,33 +287,128 @@ pub fn new_records(inst: &Instance, profile: &Profile, plugin: &str, kinds: &[St
 }
 
 /// Records in a run of groups and records: (type, form id as in the file, editor id, name).
-fn walk_records(mut b: &[u8], kinds: &HashSet<[u8; 4]>, out: &mut Vec<([u8; 4], u32, String, Option<String>)>) -> Result<()> {
+fn walk_records(b: &[u8], kinds: &HashSet<[u8; 4]>, out: &mut Vec<([u8; 4], u32, String, Option<String>)>) -> Result<()> {
+    each_record(b, &|k| kinds.contains(k), &mut |kind, id, data| {
+        let (edid, name) = edid_and_name(data);
+        out.push((kind, id, edid, name));
+    })
+}
+
+/// Call `f` with (type, form id as in the file, unpacked data) for each record of a type `want`
+/// takes, in a run of groups and records.
+fn each_record(mut b: &[u8], want: &impl Fn(&[u8; 4]) -> bool, f: &mut impl FnMut([u8; 4], u32, &[u8])) -> Result<()> {
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
     while b.len() >= 24 {
         let kind: [u8; 4] = b[..4].try_into()?;
         let size = u32_at(b, 4) as usize;
         if &kind == b"GRUP" {
             let end = size.clamp(24, b.len());
-            walk_records(&b[24..end], kinds, out)?;
+            each_record(&b[24..end], want, f)?;
             b = &b[end..];
             continue;
         }
         let end = (24 + size).min(b.len());
-        if kinds.contains(&kind) {
-            let flags = u32_at(b, 8);
-            let data = if flags & 0x0004_0000 != 0 && end >= 28 {
+        if want(&kind) {
+            if u32_at(b, 8) & 0x0004_0000 != 0 && end >= 28 {
                 let mut d = Vec::new();
                 std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&b[28..end]), &mut d).context("a compressed record doesn't unpack")?;
-                d
+                f(kind, u32_at(b, 12), &d);
             } else {
-                b[24..end].to_vec()
-            };
-            let (edid, name) = edid_and_name(&data);
-            out.push((kind, u32_at(b, 12), edid, name));
+                f(kind, u32_at(b, 12), &b[24..end]);
+            }
         }
         b = &b[end..];
     }
     Ok(())
+}
+
+/// The record types of a plugin's top-level groups (STAT, CELL, WRLD, QUST…): what kinds of
+/// records it has, read from the group headers alone.
+pub(crate) fn top_groups(path: &std::path::Path) -> Result<HashSet<[u8; 4]>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let mut head = [0u8; 24];
+    f.read_exact(&mut head)?;
+    f.seek(SeekFrom::Current(u32::from_le_bytes(head[4..8].try_into()?) as i64))?;
+    let mut out = HashSet::new();
+    while f.read_exact(&mut head).is_ok() && &head[..4] == b"GRUP" {
+        out.insert(head[8..12].try_into()?);
+        f.seek(SeekFrom::Current((u32::from_le_bytes(head[4..8].try_into()?) as i64 - 24).max(0)))?;
+    }
+    Ok(out)
+}
+
+/// Another enabled plugin that changes records `record_conflicts`' plugin changes too.
+#[derive(Serialize, Debug)]
+pub struct RecordConflict {
+    pub plugin: String,
+    pub mod_id: Option<String>,
+    /// It loads after the plugin, so the game uses its version of the shared records.
+    pub wins: bool,
+    /// How many records both change.
+    pub records: usize,
+    /// Of those, how many the later plugin copies unchanged from the earlier (ITPOs: identical to
+    /// the previous override, harmless unless they undo a third plugin's change).
+    pub identical: usize,
+    /// The later plugin has the earlier as a master: a patch that overrides it on purpose.
+    pub patch: bool,
+    /// Shared records by type: NPC_, ARMO, CELL...
+    pub kinds: std::collections::BTreeMap<String, usize>,
+    /// Up to 20 shared records, by editor id (or form id when they have none).
+    pub examples: Vec<String>,
+}
+
+/// What a plugin's records are, keyed by (the plugin that defines the record, its local id): its
+/// type, editor id and a hash of its data.
+type Records = std::collections::HashMap<(String, u32), ([u8; 4], String, u64)>;
+
+fn read_records(p: &PluginInfo) -> Result<Records> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(&p.path)?;
+    let start = 24 + bytes.get(4..8).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()) as usize);
+    let mut out = Records::new();
+    each_record(bytes.get(start..).unwrap_or_default(), &|_| true, &mut |kind, id, data| {
+        let origin = p.masters.get((id >> 24) as usize).unwrap_or(&p.name).to_lowercase();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut h);
+        out.insert((origin, id & 0xFF_FFFF), (kind, edid_and_name(data).0, h.finish()));
+    })?;
+    Ok(out)
+}
+
+/// The enabled plugins that change the same records as `plugin`, the one the game uses first
+/// (the last to load), with how many each shares, of which types, and how many are identical
+/// copies. The base game, DLC and Creation Club plugins are left out, as in `record_overlaps`.
+// ponytail: identical means byte-identical data; a copy whose form ids point through a different
+// master list counts as changed. Reads every enabled plugin whole on each call.
+pub fn record_conflicts(inst: &Instance, profile: &Profile, plugin: &str) -> Result<Vec<RecordConflict>> {
+    let all = list(inst, profile)?;
+    let on: Vec<&PluginInfo> = all.iter().filter(|p| p.enabled && !p.implicit && p.error.is_none()).collect();
+    let at = on.iter().position(|p| p.name.eq_ignore_ascii_case(plugin)).with_context(|| format!("{plugin} isn't an enabled plugin (the base game's and Creation Club's are left out)"))?;
+    let mine = read_records(on[at])?;
+    let mut out = Vec::new();
+    for (i, q) in on.iter().enumerate().filter(|(i, _)| *i != at) {
+        crate::progress::report("reading plugins", i, on.len());
+        let Ok(theirs) = read_records(q) else { continue };
+        let mut c = RecordConflict { plugin: q.name.clone(), mod_id: q.mod_id.clone(), wins: i > at, records: 0, identical: 0, patch: false, kinds: Default::default(), examples: vec![] };
+        let (early, late) = if i > at { (on[at], *q) } else { (*q, on[at]) };
+        c.patch = late.masters.iter().any(|m| m.eq_ignore_ascii_case(&early.name));
+        for (key, (kind, edid, hash)) in &mine {
+            let Some((_, _, other)) = theirs.get(key) else { continue };
+            c.records += 1;
+            c.identical += usize::from(hash == other);
+            *c.kinds.entry(String::from_utf8_lossy(kind).into_owned()).or_default() += 1;
+            if c.examples.len() < 20 {
+                c.examples.push(if edid.is_empty() { format!("{} {:06X} in {}", String::from_utf8_lossy(kind), key.1, key.0) } else { edid.clone() });
+            }
+        }
+        if c.records > 0 {
+            out.push((i, c));
+        }
+    }
+    // The last to load first: it's the version the game uses.
+    out.sort_by_key(|(i, _)| std::cmp::Reverse(*i));
+    Ok(out.into_iter().map(|(_, c)| c).collect())
 }
 
 /// EDID and FULL from a record's subrecords.

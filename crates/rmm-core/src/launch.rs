@@ -52,18 +52,7 @@ pub fn essentials(inst: &Instance) -> Result<Essentials> {
     let skyrim = game.base() == Game::SkyrimSe;
     let plugins = if skyrim { "skse/plugins/" } else { "f4se/plugins/" };
     let loader = format!("root/{}", game.loader().to_lowercase());
-    // Which essential a file (mod-relative, lowercase) is.
-    let kind = |f: &str| -> Option<usize> {
-        if f == loader {
-            return Some(0);
-        }
-        let name = f.strip_prefix(plugins)?;
-        if name.ends_with(".bin") && (name.starts_with("versionlib-") || name.starts_with("version-")) {
-            Some(1)
-        } else {
-            ["crashlogger.dll", "trainwreck.dll", "buffout4.dll"].contains(&name).then_some(2)
-        }
-    };
+    let kind = |f: &str| essential_kind(game, f);
     let version = game_version(&inst.config.game_path, game).ok();
     let new_gen = version.is_some_and(|v| v >= [1, 10, 980, 0]);
     let list: [(&str, &str, u64); 3] = if skyrim {
@@ -98,6 +87,28 @@ pub fn essentials(inst: &Instance) -> Result<Essentials> {
     let builtin = matches!(game, Game::SkyrimSe | Game::Fallout4);
     let items = list.into_iter().zip(have).map(|((what, name, id), have)| Essential { what, name, have, nexus_id: builtin.then_some(id) }).collect();
     Ok(Essentials { items, game_version: version.map(|v| v.map(|n| n.to_string()).join(".")), played: inst.root.join(PLAYED).is_file() })
+}
+
+/// Which essential a file (mod-relative, lowercase) is: 0 the script extender's loader, 1
+/// Address Library, 2 a crash logger.
+fn essential_kind(game: Game, f: &str) -> Option<usize> {
+    if f == format!("root/{}", game.loader().to_lowercase()) {
+        return Some(0);
+    }
+    let name = f.strip_prefix(if game.base() == Game::SkyrimSe { "skse/plugins/" } else { "f4se/plugins/" })?;
+    if name.ends_with(".bin") && (name.starts_with("versionlib-") || name.starts_with("version-")) {
+        Some(1)
+    } else {
+        ["crashlogger.dll", "trainwreck.dll", "buffout4.dll"].contains(&name).then_some(2)
+    }
+}
+
+/// Installed mods with the script extender, Address Library or a crash logger: Find the culprit
+/// keeps them on, as without them nothing else loads, or no crash log is written.
+pub fn essential_mods(inst: &Instance) -> Result<Vec<String>> {
+    let game = inst.config.game;
+    let has = |id: &str| inst.mod_files(id).is_ok_and(|f| f.iter().any(|f| essential_kind(game, &f.to_lowercase()).is_some()));
+    Ok(inst.profile()?.mods.into_iter().map(|m| m.id).filter(|id| !crate::instance::is_separator(id) && has(id)).collect())
 }
 
 /// Installed mods with the script extender's loader in root/ (the game folder).
@@ -166,8 +177,134 @@ pub fn launch_with(inst: &Instance, dry_run: bool, env: &[(&str, String)]) -> Re
     Ok(r)
 }
 
+/// Start the game without mods, as when a game update broke the script extender: purge the game
+/// folder (the next Play deploys the mods again) and start the game's own exe.
+pub fn launch_vanilla(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
+    let deploy = deploy::purge(inst, dry_run)?; // refuses while the game runs
+    let (root, game) = (&inst.config.game_path, inst.config.game);
+    let exe = root.join(game.exe());
+    let version = exe_version(&exe).with_context(|| format!("cannot read the version of {}", exe.display()))?;
+    let mut r = LaunchReport { dry_run, exe, game_version: version.map(|v| v.to_string()).join("."), script_extender: None, pid: None, warnings: vec![], deploy };
+    if !dry_run {
+        let mut cmd = if proton::needed(&r.exe) { proton::command(game, root, &r.exe)? } else { Command::new(&r.exe) };
+        let child = cmd
+            .args(crate::settings::split_args(&crate::settings::get().launch.args))
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("cannot start {}", r.exe.display()))?;
+        r.pid = Some(child.id());
+        // Not remembered as a Play: the version check is about playing with the mods.
+    }
+    Ok(r)
+}
+
+/// A shortcut that starts a profile's game, as MO2's do.
+#[derive(Serialize, Debug)]
+pub struct Shortcut {
+    pub dry_run: bool,
+    pub path: PathBuf,
+    /// What it runs: rmm's command line with `arguments`. Steam's "Add a Non-Steam Game" takes
+    /// the same two as its target and launch options.
+    pub target: PathBuf,
+    pub arguments: String,
+}
+
+/// A Windows shortcut, `<game> - <profile>.lnk` on the Desktop (or in `dir`), that runs
+/// `cli -i <instance> launch --profile <profile> --apply --pause`: switch to the profile, deploy
+/// and start the game, keeping an error on screen until it's read.
+pub fn shortcut(inst: &Instance, profile: &str, cli: &Path, dir: Option<&Path>, dry_run: bool) -> Result<Shortcut> {
+    let profile = inst.find_profile(profile)?;
+    let dir = match dir {
+        Some(d) => d.to_path_buf(),
+        None => dirs::desktop_dir().context("can't find the Desktop folder")?,
+    };
+    let r = Shortcut {
+        dry_run,
+        path: dir.join(format!("{} - {profile}.lnk", inst.config.game.local_dir())),
+        target: cli.to_path_buf(),
+        arguments: format!("-i \"{}\" launch --profile \"{profile}\" --apply --pause", std::path::absolute(&inst.root)?.display()),
+    };
+    if !dry_run {
+        anyhow::ensure!(cfg!(windows), "shortcuts are Windows .lnk files");
+        fs::create_dir_all(&dir)?;
+        // WScript.Shell writes .lnk files; the values go in through the environment, so nothing
+        // in them needs quoting.
+        let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:RMM_LNK); $s.TargetPath = $env:RMM_LNK_TARGET; \
+                      $s.Arguments = $env:RMM_LNK_ARGS; $s.WorkingDirectory = $env:RMM_LNK_DIR; $s.IconLocation = $env:RMM_LNK_ICON; $s.Save()";
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("RMM_LNK", &r.path)
+            .env("RMM_LNK_TARGET", cli)
+            .env("RMM_LNK_ARGS", &r.arguments)
+            .env("RMM_LNK_DIR", &inst.config.game_path)
+            .env("RMM_LNK_ICON", inst.config.game_path.join(inst.config.game.exe()))
+            .output()
+            .context("cannot run PowerShell to write the shortcut")?;
+        anyhow::ensure!(out.status.success() && r.path.is_file(), "couldn't write {}: {}", r.path.display(), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(r)
+}
+
+/// Steam's manifest for the game, `appmanifest_<app id>.acf` in the `steamapps` folder whose
+/// `common` folder has the game. None for a game outside a Steam library.
+pub fn app_manifest(game: Game, game_path: &Path) -> Option<PathBuf> {
+    let steamapps = game_path.parent()?.parent()?;
+    let p = steamapps.join(format!("appmanifest_{}.acf", game.steam_app_id()));
+    p.is_file().then_some(p)
+}
+
+/// Whether Steam may update the game.
+#[derive(Debug, Serialize)]
+pub struct SteamUpdates {
+    /// The game's Steam manifest; None when rmm can't find one (not a Steam install).
+    pub manifest: Option<PathBuf>,
+    /// The manifest is read-only, so Steam can't update the game.
+    pub held: bool,
+    /// The copy kept from before rmm first made it read-only.
+    pub backup: Option<PathBuf>,
+}
+
+fn manifest_backup(inst: &Instance, manifest: &Path) -> PathBuf {
+    inst.root.join("ini-backup").join(manifest.file_name().unwrap_or_default())
+}
+
+pub fn steam_updates(inst: &Instance) -> SteamUpdates {
+    let manifest = app_manifest(inst.config.game, &inst.config.game_path);
+    let held = manifest.as_ref().is_some_and(|m| fs::metadata(m).is_ok_and(|m| m.permissions().readonly()));
+    let backup = manifest.as_ref().map(|m| manifest_backup(inst, m)).filter(|b| b.is_file());
+    SteamUpdates { manifest, held, backup }
+}
+
+/// Hold Steam's updates for the game by making its manifest read-only (a game update breaks the
+/// script extender and the mods that need it until they catch up), keeping a copy of it first;
+/// `hold` false lets Steam update it again.
+pub fn hold_steam_updates(inst: &Instance, hold: bool) -> Result<SteamUpdates> {
+    let game = inst.config.game;
+    let Some(manifest) = app_manifest(game, &inst.config.game_path) else {
+        bail!(
+            "there's no Steam manifest (appmanifest_{}.acf) beside the game's folder in steamapps, so this isn't a Steam install rmm can hold updates for",
+            game.steam_app_id()
+        );
+    };
+    if hold {
+        let backup = manifest_backup(inst, &manifest);
+        fs::create_dir_all(backup.parent().unwrap())?;
+        fs::copy(&manifest, &backup).with_context(|| format!("cannot keep a copy of {}", manifest.display()))?;
+    }
+    let mut perm = fs::metadata(&manifest)?.permissions();
+    #[cfg(unix)]
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, if hold { 0o444 } else { 0o644 });
+    #[cfg(not(unix))]
+    perm.set_readonly(hold);
+    fs::set_permissions(&manifest, perm).with_context(|| format!("cannot change {}", manifest.display()))?;
+    Ok(steam_updates(inst))
+}
+
 /// The game version at the last Play, to notice a game update.
-const PLAYED: &str = "game-version.txt";
+pub(crate) const PLAYED: &str = "game-version.txt";
 
 /// Says so when the game's version changed since the last Play (a Steam update, say).
 pub(crate) fn game_updated(inst: &Instance, now: &str) -> Option<String> {
@@ -180,23 +317,10 @@ pub(crate) fn game_updated(inst: &Instance, now: &str) -> Option<String> {
 /// that use it won't load. Its files name the version: `SKSE/Plugins/versionlib-1-6-1170-0.bin`
 /// (`version-1-5-97-0.bin` before 1.6, `.csv` in VR), `F4SE/Plugins/version-1-10-163-0.bin`.
 pub(crate) fn address_library(plugins: &Path, game: Game, version: &[u32; 4]) -> Option<String> {
-    let mut have: Vec<[u32; 4]> = fs::read_dir(plugins)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            let v = name.strip_prefix("versionlib-").or_else(|| name.strip_prefix("version-"))?;
-            let v = v.strip_suffix(".bin").or_else(|| v.strip_suffix(".csv"))?;
-            // "1-6-1170-0-1" is a second file for 1.6.1170.0.
-            let parts: Vec<u32> = v.split('-').take(4).map(|p| p.parse().ok()).collect::<Option<_>>()?;
-            parts.try_into().ok()
-        })
-        .collect();
+    let have = address_library_versions(plugins);
     if have.is_empty() || have.contains(version) {
         return None;
     }
-    have.sort();
-    have.dedup();
     let dotted = |v: &[u32; 4]| v.map(|x| x.to_string()).join(".");
     let newest = have.iter().rev().take(3).map(dotted).collect::<Vec<_>>().join(", ");
     let (se, page) = match game {
@@ -209,6 +333,25 @@ pub(crate) fn address_library(plugins: &Path, game: Game, version: &[u32; 4]) ->
     Some(format!(
         "Address Library has no file for game version {now} (its newest are for {newest}), so {se} plugins that use it won't load. Install the Address Library for {now}{page}, or wait for one if this game version is new"
     ))
+}
+
+/// The game versions Address Library has files for in a `Plugins` folder, oldest first.
+pub(crate) fn address_library_versions(plugins: &Path) -> Vec<[u32; 4]> {
+    let Ok(rd) = fs::read_dir(plugins) else { return vec![] };
+    let mut have: Vec<[u32; 4]> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let v = name.strip_prefix("versionlib-").or_else(|| name.strip_prefix("version-"))?;
+            let v = v.strip_suffix(".bin").or_else(|| v.strip_suffix(".csv"))?;
+            // "1-6-1170-0-1" is a second file for 1.6.1170.0.
+            let parts: Vec<u32> = v.split('-').take(4).map(|p| p.parse().ok()).collect::<Option<_>>()?;
+            parts.try_into().ok()
+        })
+        .collect();
+    have.sort();
+    have.dedup();
+    have
 }
 
 /// The installed script extender's runtime DLL for this game version. The loader shows an error box
@@ -228,7 +371,7 @@ pub(crate) fn se_runtime(root: &Path, game: Game, version: &[u32; 4]) -> Result<
 }
 
 /// The game exe's version (cached by the exe's size and time: it takes reading the whole file).
-pub(crate) fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
+pub fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
     type Seen = (PathBuf, u64, std::time::SystemTime, [u32; 4]);
     static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
     let exe = root.join(game.exe());
@@ -246,7 +389,7 @@ pub(crate) fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
 
 /// The file version in an exe's VS_FIXEDFILEINFO: the signature 0xFEEF04BD, struct version 1.0,
 /// then the version as two u32s. The resource section is at the end, so search backwards.
-fn exe_version(exe: &Path) -> Result<[u32; 4]> {
+pub(crate) fn exe_version(exe: &Path) -> Result<[u32; 4]> {
     let b = fs::read(exe)?;
     let at = b.windows(8).rposition(|w| w == [0xBD, 0x04, 0xEF, 0xFE, 0, 0, 1, 0]).context("no version resource")?;
     let ms = u32::from_le_bytes(b.get(at + 8..at + 12).context("truncated version resource")?.try_into()?);
@@ -256,7 +399,7 @@ fn exe_version(exe: &Path) -> Result<[u32; 4]> {
 
 /// Runtime DLLs in the game folder and the game version each was built for:
 /// `skse64_1_6_1170.dll` -> 1.6.1170. The steam loader DLL doesn't parse and is skipped.
-fn runtimes(root: &Path, game: Game) -> Result<Vec<(String, [u32; 3])>> {
+pub(crate) fn runtimes(root: &Path, game: Game) -> Result<Vec<(String, [u32; 3])>> {
     let loader = game.loader();
     let prefix = &loader[..=loader.find('_').unwrap()];
     let mut out = Vec::new();

@@ -222,6 +222,12 @@ struct AddonCallArgs {
     input: Option<serde_json::Value>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct IdentifyArgs {
+    /// File names in the downloads folder (list_downloads); default: every one not identified yet.
+    #[serde(default)]
+    names: Vec<String>,
+}
+#[derive(Deserialize, JsonSchema)]
 struct UpdatesArgs {
     /// Mod ids to check; default: every mod with Nexus ids.
     ids: Option<Vec<String>>,
@@ -247,8 +253,9 @@ struct NexusInstallArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct CollectionArgs {
-    /// The collection's link (nexusmods.com/games/<game>/collections/<id>) or id.
-    link: String,
+    /// The collection's link (nexusmods.com/games/<game>/collections/<id>) or id; default: the
+    /// active profile's collection.
+    link: Option<String>,
     /// A revision number; default: the newest.
     revision: Option<u64>,
     /// Its optional mods too; default false.
@@ -256,7 +263,37 @@ struct CollectionArgs {
     /// Install into a new profile with this name, which becomes the active one; default: the
     /// active profile.
     new_profile: Option<String>,
+    /// Default true: LOOT sorts the plugins at the end. False leaves them for sort_plugins, whose
+    /// dry run shows the user what moves first.
+    sort: Option<bool>,
     /// Default true: download only the collection's list and say what would be installed.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct HideArgs {
+    /// The mod's id.
+    id: String,
+    /// Paths in the mod (files or folders, any case), as get_mod lists them; to show again, as its meta.hidden lists them.
+    paths: Vec<String>,
+    /// Show them again instead; default false.
+    show: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct MoveFilesArgs {
+    /// The mod the files are in, or "<overwrite>".
+    from: String,
+    /// The mod to move them into, or "<overwrite>".
+    to: String,
+    /// Paths (files or folders, any case).
+    paths: Vec<String>,
+    /// Replace files the target has (its copies go to trash/); default false: refused.
+    replace: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CreationsArgs {
+    /// Put adopted Creations back into the game's Data folder instead.
+    restore: Option<bool>,
+    /// Default true: say which Creations and how many files.
     dry_run: Option<bool>,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -286,8 +323,20 @@ struct VortexArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct ExportArgs {
-    /// Where to write it; default: modlist.lock.toml in the instance.
+    /// Where to write it; default: modlist.lock.toml, modlist.pack.zip or modlist.md in the instance.
     path: Option<String>,
+    /// toml (default): the lockfile. pack: a zip of the lockfile and the files of mods no archive
+    /// brings back (patches the user made, mods made from Overwrite or a folder, an xEdit patch).
+    /// markdown: a readable list for a post or a friend.
+    #[serde(default)]
+    format: lockfile::Format,
+}
+#[derive(Deserialize, JsonSchema)]
+struct DiffLockArgs {
+    /// A lockfile or pack.
+    path: String,
+    /// A second one to compare it with; default: the active profile now.
+    other: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct ApplyLockArgs {
@@ -492,7 +541,11 @@ struct OrderArgs {
 #[derive(Deserialize, JsonSchema)]
 struct PluginEnableArgs {
     /// Plugin file name, e.g. "Unofficial Skyrim Special Edition Patch.esp".
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// Several plugins, as one undoable change (with or instead of name).
+    #[serde(default)]
+    names: Vec<String>,
     enabled: bool,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -505,6 +558,30 @@ struct DryRun {
     /// Preview only (default true). Set false to change the game folder.
     dry_run: Option<bool>,
 }
+#[derive(Deserialize, JsonSchema)]
+struct ShortcutArgs {
+    /// Default: the active profile.
+    profile: Option<String>,
+    /// Default true: only show the shortcut.
+    dry_run: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct LaunchArgs {
+    /// Preview only (default true). Set false to change the game folder.
+    dry_run: Option<bool>,
+    /// Purge instead of deploying and start the game's own exe, without the script extender:
+    /// for when a game update broke it. The next launch deploys the mods again.
+    #[serde(default)]
+    without_mods: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SteamUpdatesArgs {
+    /// true: make the game's Steam manifest read-only so Steam can't update the game (a copy is
+    /// kept); false: let Steam update it again; left out: only say which it is.
+    hold: Option<bool>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct AddToolArgs {
@@ -512,6 +589,19 @@ struct AddToolArgs {
     id: String,
     #[serde(flatten)]
     spec: ToolSpec,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CleanArgs {
+    /// Default true: only list the plugins.
+    dry_run: Option<bool>,
+    /// Put every clean copy in one mod, "Cleaned plugins", instead of a "Cleaned <plugin>" mod each.
+    #[serde(default)]
+    one_mod: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+struct RemoveToolArgs {
+    /// Tool id from list_tools.
+    id: String,
 }
 #[derive(Deserialize, JsonSchema)]
 struct RunToolArgs {
@@ -825,9 +915,13 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| ops::set_mod_order(&i, &a.ids)))
     }
 
-    #[tool(description = "Enable or disable a single plugin.")]
+    #[tool(description = "Enable or disable plugins: one (name) or several (names), as one undoable change.")]
     async fn set_plugin_enabled(&self, Parameters(a): Parameters<PluginEnableArgs>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|i| ops::set_plugin_enabled(&i, &a.name, a.enabled)))
+        let names: Vec<String> = a.name.into_iter().chain(a.names).collect();
+        if names.is_empty() {
+            return Err("give name or names".into());
+        }
+        out(self.inst_mut().and_then(|i| ops::set_plugins_enabled(&i, &names, a.enabled)))
     }
 
     #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move; otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy.")]
@@ -867,7 +961,7 @@ impl Rmm {
 
     #[tool(description = "Reorder plugins. Masters still load before non-masters regardless.")]
     async fn set_plugin_order(&self, Parameters(a): Parameters<PluginOrderArgs>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|i| ops::set_plugin_order(&i, &a.names)))
+        out(self.inst_mut().and_then(|i| ops::set_plugin_order(&i, &a.names, &[])))
     }
 
     #[tool(description = "Apply the profile to the game folder (hard links, incremental) and write plugins.txt. dry_run defaults to true and returns the plan.")]
@@ -875,9 +969,26 @@ impl Rmm {
         out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| deploy::deploy(&i, a.dry_run.unwrap_or(true))))
     }
 
-    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one), through Proton on Linux. dry_run defaults to true and returns the deploy plan, game version and checks.")]
-    async fn launch_game(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::launch::launch(&i, a.dry_run.unwrap_or(true))))
+    #[tool(description = "Deploy, check that the script extender's runtime DLL matches the game version, and start the game through the script extender's loader (or the game exe without one), through Proton on Linux. without_mods purges instead and starts the game's own exe (after a game update broke the script extender). dry_run defaults to true and returns the deploy plan, game version and checks.")]
+    async fn launch_game(&self, Parameters(a): Parameters<LaunchArgs>) -> Result<String, String> {
+        let dry = a.dry_run.unwrap_or(true);
+        out(self.inst_for(dry).and_then(|i| if a.without_mods { rmm_core::launch::launch_vanilla(&i, dry) } else { rmm_core::launch::launch(&i, dry) }))
+    }
+
+    #[tool(description = "Whether Steam may update the game (a game update breaks the script extender and the mods that need it until they catch up). hold true makes the game's Steam manifest read-only so Steam can't, keeping a copy; false lets Steam update it again. Only when the user asks: it changes a file in their Steam library.")]
+    async fn steam_updates(&self, Parameters(a): Parameters<SteamUpdatesArgs>) -> Result<String, String> {
+        match a.hold {
+            None => out(self.inst().map(|i| rmm_core::launch::steam_updates(&i))),
+            Some(hold) => out(self.inst().and_then(|i| rmm_core::launch::hold_steam_updates(&i, hold))),
+        }
+    }
+
+    #[tool(description = "A desktop shortcut (.lnk) that switches to a profile (default: the active one), deploys and starts the game, as MO2's shortcuts do: it runs this rmm with `launch --profile <p> --apply --pause`. The target and arguments also work as a Steam non-Steam game. Only when the user asks: it adds a file to their Desktop. dry_run defaults to true.")]
+    async fn desktop_shortcut(&self, Parameters(a): Parameters<ShortcutArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| {
+            let p = a.profile.clone().unwrap_or_else(|| i.config.profile.clone());
+            rmm_core::launch::shortcut(&i, &p, &std::env::current_exe()?, None, a.dry_run.unwrap_or(true))
+        }))
     }
 
     #[tool(description = "Remove all deployed files and restore originals. dry_run defaults to true.")]
@@ -893,6 +1004,11 @@ impl Rmm {
     #[tool(description = "Register or replace a tool. Give the exe path; a preset fills in the arguments, which args, vars and rewrites override. edit_in_place (the xedit preset's default) suits patching: edits go back to the mods they change.")]
     async fn add_tool(&self, Parameters(a): Parameters<AddToolArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| tools::add(&i, &a.id, a.spec)))
+    }
+
+    #[tool(description = "Remove a tool from tools.toml. Its generated mod and its state folder stay.")]
+    async fn remove_tool(&self, Parameters(a): Parameters<RemoveToolArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| tools::remove(&i, &a.id).map(|()| true)))
     }
 
     #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). A tool that edits in place (xEdit) instead saves changed files back into the mods they come from and new files into its output mod, kept enabled; undo puts those mods back. dry_run defaults to true and returns the command and plan. Blocks until the tool exits, unless background is true: then it returns at once and tool_job reports progress and the result.")]
@@ -1097,6 +1213,16 @@ impl Rmm {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
     }
 
+    #[tool(description = "What the enabled mods' Nexus pages list as required that this setup lacks: each requirement with the mod that needs it, its Nexus mod id and page (none for the script extender's site or a DLC), whether it is installed but disabled (and as which mod), and whether it is a DLC (missing from the game's Data folder). health_check says the same in words. install_from_nexus installs one; set_mods_enabled turns one on.", annotations(read_only_hint = true))]
+    async fn missing_requirements(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| Ok(nexus::lacking_requirements(&i, &i.profile()?))))
+    }
+
+    #[tool(description = "Look downloads up on Nexus by their MD5, many at once (MO2's Query Info): each file's mod and file ids, version and the mod's name, or not found (not from Nexus, or changed since). What's found is kept for installs from the file, and installed mods made from one that have no Nexus ids get them, so check_mod_updates sees them. Needs the user's API key.")]
+    async fn identify_downloads(&self, Parameters(a): Parameters<IdentifyArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| nexus::identify(&i, &nexus::Client::from_env()?, &a.names)))
+    }
+
     #[tool(description = "Hold back mods' updates when the user wants a version kept: pin keeps a mod at its version, skip passes over the newer file the last check_mod_updates found (a later one is offered), release offers updates again. Held updates are left out of check_mod_updates and list_mods (which marks pinned mods). Lives with the mods like notes, not in undo history.")]
     async fn hold_updates(&self, Parameters(a): Parameters<HoldArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| nexus::hold_updates(&i, &a.ids, a.hold)))
@@ -1121,11 +1247,39 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. A big collection takes a long time. dry_run defaults to true: lists what would be installed, the download size, optional mods left out and the curator's notes.")]
+    #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly; free accounts: the user downloads each file listed in to_download from its page first, then the install goes ahead): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. Into a profile that has an earlier revision (update_from in the result) it is an update: mods with a newer file are updated in place (or installed beside the old one when another profile has that on), mods the revision dropped are turned off (turned_off, still installed), and the user's own mods (yours), the collection's mods they turned off (kept_off) and plugins they changed stay as they are. Without a link it updates the active profile's collection. A big collection takes a long time. dry_run defaults to true: lists what would be installed or updated, the download size, optional mods left out and the curator's notes.")]
     async fn install_collection(&self, Parameters(a): Parameters<CollectionArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|mut i| {
             let client = nexus::Client::from_env()?;
-            rmm_core::collection::install(&mut i, &client, &a.link, a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true))
+            rmm_core::collection::install(&mut i, &client, a.link.as_deref().unwrap_or(""), a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true), a.sort.unwrap_or(true))
+        }))
+    }
+
+    #[tool(description = "Generated output that is out of date, and the tools to run again: xLODGen, TexGen, DynDOLOD, Pandora, BodySlide, Synthesis and PGPatcher outputs record the mods and load order they were made from, and are stale once those change. Lists the tools in the order to run them, with why (dry_run defaults to true); dry_run=false runs them one after another and waits for each, and TexGen, DynDOLOD, xLODGen and PGPatcher need the user to click through, so for those prefer run_tool with background, in the listed order.")]
+    async fn rebuild_outputs(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::tools::rebuild(&i, a.dry_run.unwrap_or(true), None)))
+    }
+
+    #[tool(description = "Clean every enabled plugin LOOT's cached masterlist knows as dirty (identical-to-master records, deleted references) with xEdit QuickAutoClean, one tool run each, each its own undo step with the clean copy in a \"Cleaned <plugin>\" mod (one_mod: all in \"Cleaned plugins\"). Needs a tool from the xedit-qac preset (add_tool); plugins with only deleted navmeshes are listed for xEdit by hand. Runs xEdit, which takes a while per plugin. dry_run defaults to true: lists the plugins.")]
+    async fn clean_dirty_plugins(&self, Parameters(a): Parameters<CleanArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true), a.one_mod)))
+    }
+
+    #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. One undo step. Takes effect at the next deploy.")]
+    async fn hide_files(&self, Parameters(a): Parameters<HideArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| install::hide_files(&i, &a.id, &a.paths, !a.show.unwrap_or(false))))
+    }
+
+    #[tool(description = "Move files or folders from one mod into another, \"<overwrite>\" included: MCM settings or a tool's output from Overwrite into the mod they belong with. Files the target has already are refused unless replace. One undo step, which brings the target's replaced copies back too. Takes effect at the next deploy.")]
+    async fn move_files(&self, Parameters(a): Parameters<MoveFilesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| install::move_files(&i, &a.from, &a.paths, &a.to, a.replace.unwrap_or(false))))
+    }
+
+    #[tool(description = "Creation Club content as mods: the plugins the game's .ccc file lists that are in its Data folder, with their archives, move into mods (one per Creation) on at the top of every profile, as MO2's Curation Club does, so each can be turned off and Purge leaves them out; deploy links them back. restore purges and puts them back in Data. Not an undo step. dry_run defaults to true.")]
+    async fn creation_club(&self, Parameters(a): Parameters<CreationsArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| {
+            let dry = a.dry_run.unwrap_or(true);
+            if a.restore.unwrap_or(false) { rmm_core::import::restore_creations(&i, dry) } else { rmm_core::import::adopt_creations(&i, dry) }
         }))
     }
 
@@ -1144,7 +1298,7 @@ impl Rmm {
         out(Ok(import::find_sources()))
     }
 
-    #[tool(description = "Bring in an MO2 profile: mod folders (hard-linked on the same volume, else copied; meta.ini and .mohidden files stay behind, Root/ becomes root/), names, Nexus ids, comments as notes, ignored update versions, mod order (reversed from modlist.txt), enabled state, separators, plugin order and locks, overwrite/, the profile's own INIs and saves (MO2's profile options), and MO2's Executables as tools (rmm's preset when it has one; mods a program made become that tool's output). Goes into the active profile as one undoable step, or with all every MO2 profile into the rmm profile of its name; mods and tools already there are left as they are. dry_run defaults to true.")]
+    #[tool(description = "Bring in an MO2 profile: mod folders (hard-linked on the same volume, else copied; meta.ini stays behind, .mohidden files come over hidden, Root/ becomes root/), names, Nexus ids, comments as notes, ignored update versions, mod order (reversed from modlist.txt), enabled state, separators, plugin order and locks, overwrite/, the profile's own INIs and saves (MO2's profile options), and MO2's Executables as tools (rmm's preset when it has one; mods a program made become that tool's output). Goes into the active profile as one undoable step, or with all every MO2 profile into the rmm profile of its name; mods and tools already there are left as they are. dry_run defaults to true.")]
     async fn import_mo2(&self, Parameters(a): Parameters<Mo2Args>) -> Result<String, String> {
         let (dir, dry) = (std::path::Path::new(&a.dir), a.dry_run.unwrap_or(true));
         match a.all {
@@ -1160,12 +1314,24 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Write the active profile as modlist.lock.toml: every mod with its archive name and sha256, FOMOD choices, Nexus ids and a fingerprint of its files, plus the order, enabled state, colours, plugin order and mod rules. Returns the path.")]
+    #[tool(description = "Write the active profile as modlist.lock.toml: every mod with its archive name and sha256, FOMOD choices, Nexus ids, notes and a fingerprint of its files, plus the order, enabled state, colours, plugin order, mod rules and the game, script extender and Address Library versions. format pack zips it with the files of mods no archive brings back; markdown writes a readable list instead. Returns the path (and the packed mods).")]
     async fn export_lockfile(&self, Parameters(a): Parameters<ExportArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| lockfile::write(&i, a.path.as_deref().map(std::path::Path::new))))
+        out(self.inst().and_then(|i| lockfile::write(&i, a.path.as_deref().map(std::path::Path::new), a.format)))
     }
 
-    #[tool(description = "Rebuild a setup from a lockfile: install missing mods from archives in `downloads` (matched by name, checked by sha256, with the locked FOMOD choices), list what still has to be downloaded (with Nexus links), then set order, enabled state, colours, plugin order and mod rules. Mods the profile has that the lockfile doesn't list are kept after the mod they followed. dry_run defaults to true.")]
+    #[tool(description = "What changed from a lockfile (or pack) to the active profile, or to a second lockfile: the game, script extender and Address Library versions; mods added, removed, changed (other files: another version or other FOMOD choices), turned on or off, and moved; the same for plugins.", annotations(read_only_hint = true))]
+    async fn diff_lockfile(&self, Parameters(a): Parameters<DiffLockArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| {
+            let old = lockfile::read(std::path::Path::new(&a.path))?;
+            let new = match &a.other {
+                Some(o) => lockfile::read(std::path::Path::new(o))?,
+                None => lockfile::export(&i)?,
+            };
+            Ok(lockfile::diff(&old, &new))
+        }))
+    }
+
+    #[tool(description = "Rebuild a setup from a lockfile or pack: install missing mods from archives in `downloads` (matched by name, checked by sha256, with the locked FOMOD choices) or from the pack, list what still has to be downloaded (with Nexus links), then set order, enabled state, colours, plugin order and mod rules, and fill in notes and Nexus ids the mods lack. Mods the profile has that the lockfile doesn't list are kept after the mod they followed. Warns when the game or script extender version differs from the lockfile's. dry_run defaults to true.")]
     async fn apply_lockfile(&self, Parameters(a): Parameters<ApplyLockArgs>) -> Result<String, String> {
         let downloads: Vec<std::path::PathBuf> = a.downloads.iter().map(std::path::PathBuf::from).collect();
         out(self.inst_mut().and_then(|i| lockfile::apply(&i, &lockfile::read(std::path::Path::new(&a.path))?, &downloads, a.dry_run.unwrap_or(true))))
@@ -1181,9 +1347,9 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| i.redo()))
     }
 
-    #[tool(description = "Undoable changes, newest first, each with what it did: mods enabled, disabled, added, removed or moved, and how many plugins changed.", annotations(read_only_hint = true))]
+    #[tool(description = "Undoable changes (entries), newest first, each with what it did (mods enabled, disabled, added, removed or moved, how many plugins changed) and when; what redo brings back, the next first; when this instance last deployed and played; and how many steps are kept.", annotations(read_only_hint = true))]
     async fn history(&self) -> Result<String, String> {
-        out(self.inst().and_then(|i| i.history_details()))
+        out(self.inst().and_then(|i| ops::history(&i)))
     }
 
     #[tool(description = "Go back to the state before history entry n (0 = the newest): n + 1 undos at once, so redo can step forward again. dry_run (default true) shows what would change.")]
