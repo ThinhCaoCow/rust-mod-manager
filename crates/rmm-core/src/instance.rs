@@ -203,6 +203,14 @@ pub struct ModMeta {
     /// to the game folder (`root/`), now and on every reinstall or update.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub game_folder: bool,
+    /// Files the user hid (paths in the mod), kept in `.rmm-hidden/` and hidden again after a
+    /// reinstall or update (see `install::hide_files`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
+    /// Creation Club content rmm took out of the game's Data folder (`import::adopt_creations`):
+    /// on in every profile, kept through undo, and put back by `import::restore_creations`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creation: bool,
 }
 
 /// A mod's page and file on Nexus Mods (the game comes from the instance).
@@ -370,12 +378,18 @@ impl Instance {
                 if p.mods.iter().any(|m| m.id == id) {
                     continue;
                 }
+                // Creation Club content (the game's own) is on, at the top; other mods are off.
+                let creation = next.mod_meta(&id).creation;
                 for pl in next.mod_files(&id)?.into_iter().filter(|f| !f.contains('/') && crate::install::is_plugin(f)) {
                     if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(&pl)) {
-                        p.plugins.push(PluginEntry { name: pl, enabled: false });
+                        p.plugins.push(PluginEntry { name: pl, enabled: creation });
                     }
                 }
-                p.mods.push(ModEntry { id, enabled: false });
+                if creation {
+                    p.mods.insert(0, ModEntry { id, enabled: true });
+                } else {
+                    p.mods.push(ModEntry { id, enabled: false });
+                }
             }
             if p != before {
                 write_atomic(&next.profile_file(), &toml::to_string_pretty(&p)?)?;
@@ -605,6 +619,9 @@ impl Instance {
         }
         // A mod whose files are gone for good (the trash was emptied) leaves the list.
         snapshot.mods.retain(|m| is_separator(&m.id) || self.mod_dir(&m.id).is_dir());
+        // Creation Club content taken out of Data was the game's, not a step: it stays.
+        let adopted: Vec<ModEntry> = current.mods.iter().filter(|m| !snapshot.mods.iter().any(|s| s.id == m.id) && self.mod_meta(&m.id).creation).cloned().collect();
+        snapshot.mods.splice(0..0, adopted);
         write_atomic(&self.profile_file(), &toml::to_string_pretty(&snapshot)?)?;
         // Mods the step takes off the list (an install undone, an uninstall redone) go back to
         // trash/, unless another profile lists them; otherwise they'd stay installed unseen.
@@ -729,7 +746,7 @@ pub(crate) fn index_dir(dir: &Path) -> Result<Vec<String>> {
             continue;
         }
         let rel = e.path().strip_prefix(dir)?.to_string_lossy().replace('\\', "/");
-        if rel != MOD_META && rel != MOD_INDEX {
+        if rel != MOD_META && rel != MOD_INDEX && !rel.starts_with(".rmm-hidden/") {
             files.push(rel);
         }
     }

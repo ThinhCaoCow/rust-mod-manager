@@ -177,6 +177,133 @@ pub fn update(inst: &Instance, id: &str, source: &Path, choices: Option<&Choices
     replace(inst, id, Some(source), choices)
 }
 
+/// Where a mod keeps the files the user hid: out of its index, so deploys, conflicts and the
+/// plugin list don't see them.
+pub const HIDDEN_DIR: &str = ".rmm-hidden";
+
+/// Hide a mod's files or folders, or with `hide` false show them again. Hidden files move to
+/// `<mod>/.rmm-hidden/`, out of deploys, conflicts and the plugin list (MO2's `.mohidden`; a
+/// hidden plugin is MO2's optional ESP), and the mod remembers them, so a reinstall or update
+/// hides them again. Returns the files hidden or shown.
+pub fn hide_files(inst: &Instance, id: &str, paths: &[String], hide: bool) -> Result<Vec<String>> {
+    if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE || !inst.mod_dir(id).is_dir() {
+        bail!("'{id}' is not an installed mod (files in Overwrite can be moved into one first)");
+    }
+    let dir = inst.mod_dir(id);
+    let mut meta = inst.mod_meta(id);
+    let picked = pick(&if hide { inst.mod_files(id)? } else { meta.hidden.clone() }, paths)?;
+    inst.locked(|| {
+        for f in &picked {
+            let (shown, hidden) = (dir.join(f), dir.join(HIDDEN_DIR).join(f));
+            let (from, to) = if hide { (shown, hidden) } else { (hidden, shown) };
+            if from.is_file() {
+                fs::create_dir_all(to.parent().expect("a file's folder"))?;
+                fs::rename(&from, &to)?;
+                prune_empty(&dir, &from);
+            }
+        }
+        if hide {
+            meta.hidden.extend(picked.iter().cloned());
+            meta.hidden.sort();
+            meta.hidden.dedup();
+        } else {
+            meta.hidden.retain(|h| !picked.contains(h));
+        }
+        fs::write(dir.join(".rmm-index"), index_dir(&dir)?.join("\n"))?;
+        inst.write_mod_meta(id, &meta)
+    })?;
+    Ok(picked)
+}
+
+/// Move files or folders from one mod (or Overwrite) into another (or Overwrite): MCM settings
+/// and tool output into the mod they belong with. A file the target has already is refused
+/// unless `replace`, which puts the target's copy in trash/. Returns the files moved.
+pub fn move_files(inst: &Instance, from: &str, paths: &[String], to: &str, replace: bool) -> Result<Vec<String>> {
+    use crate::instance::{OVERWRITE, is_separator};
+    for id in [from, to] {
+        if is_separator(id) || (id != OVERWRITE && !inst.mod_dir(id).is_dir()) {
+            bail!("'{id}' is not an installed mod");
+        }
+    }
+    if from == to {
+        bail!("pick another mod to move them to");
+    }
+    let picked = pick(&inst.mod_files(from)?, paths)?;
+    let (src, dest) = (inst.mod_dir(from), inst.mod_dir(to));
+    let clash: Vec<&String> = picked.iter().filter(|f| dest.join(f).exists()).collect();
+    if !clash.is_empty() && !replace {
+        let some: Vec<&str> = clash.iter().take(3).map(|f| f.as_str()).collect();
+        bail!("{to} has {} of these already ({}); replacing them puts its copies in trash", clash.len(), some.join(", "));
+    }
+    inst.locked(|| {
+        let kept = (1..).map(|n| inst.root.join("trash").join(format!(".replaced/{}-moved-{n}", to.trim_matches(['<', '>'])))).find(|d| !d.exists()).expect("a free name");
+        for f in &picked {
+            let target = dest.join(f);
+            if target.exists() {
+                fs::create_dir_all(kept.join(f).parent().expect("a file's folder"))?;
+                fs::rename(&target, kept.join(f))?;
+            }
+            fs::create_dir_all(target.parent().expect("a file's folder"))?;
+            if fs::rename(src.join(f), &target).is_err() {
+                fs::copy(src.join(f), &target)?;
+                fs::remove_file(src.join(f))?;
+            }
+            prune_empty(&src, &src.join(f));
+        }
+        for (id, dir) in [(from, &src), (to, &dest)] {
+            if id != OVERWRITE {
+                fs::write(dir.join(".rmm-index"), index_dir(dir)?.join("\n"))?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(picked)
+}
+
+/// The files in `pool` that `paths` name, each a file or a folder (every file under it), in any case.
+fn pick(pool: &[String], paths: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let want = p.replace('\\', "/").trim_matches('/').to_lowercase();
+        let under = format!("{want}/");
+        let found: Vec<&String> = pool.iter().filter(|f| f.to_lowercase() == want || f.to_lowercase().starts_with(&under)).collect();
+        if found.is_empty() {
+            bail!("no file or folder '{p}' there");
+        }
+        out.extend(found.into_iter().cloned());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Remove the folders a moved file leaves empty, up to (not including) `root`.
+fn prune_empty(root: &Path, file: &Path) {
+    let mut d = file.parent();
+    while let Some(dir) = d.filter(|d| *d != root && d.starts_with(root)) {
+        if fs::remove_dir(dir).is_err() {
+            break;
+        }
+        d = dir.parent();
+    }
+}
+
+/// In a freshly built mod folder, hide again the files the user had hidden; returns the rest.
+fn rehide(dir: &Path, hidden: &[String], files: Vec<String>) -> Result<Vec<String>> {
+    if hidden.is_empty() {
+        return Ok(files);
+    }
+    for h in hidden.iter().filter(|h| dir.join(h).is_file()) {
+        let to = dir.join(HIDDEN_DIR).join(h);
+        fs::create_dir_all(to.parent().expect("a file's folder"))?;
+        fs::rename(dir.join(h), to)?;
+        prune_empty(dir, &dir.join(h));
+    }
+    let files = index_dir(dir)?;
+    fs::write(dir.join(".rmm-index"), files.join("\n"))?;
+    Ok(files)
+}
+
 /// Reinstall (`new_source` None) or update a mod, as one undoable step.
 fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option<&Choices>) -> Result<InstallReport> {
     if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE || !inst.mod_dir(id).is_dir() {
@@ -203,6 +330,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
         let fresh = staging.join("mod");
         let (files, fomod, warnings) = build(inst, &source, &staging, &fresh, Some(&choices))?;
         let files = if meta.game_folder { to_game_folder(&fresh)? } else { files };
+        let files = rehide(&fresh, &meta.hidden, files)?;
         // The old files stay in trash/.replaced/ for undo to swap back.
         let kept = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !inst.root.join("trash").join(f).exists()).expect("a free name");
         inst.locked(|| {
@@ -267,11 +395,11 @@ mod nexus_name_tests {
     }
 }
 
-fn top_plugins(files: &[String]) -> Vec<String> {
+pub(crate) fn top_plugins(files: &[String]) -> Vec<String> {
     files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect()
 }
 
-fn add_plugins(p: &mut crate::Profile, plugins: &[String], enable: bool) {
+pub(crate) fn add_plugins(p: &mut crate::Profile, plugins: &[String], enable: bool) {
     for pl in plugins {
         if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(pl)) {
             p.plugins.push(PluginEntry { name: pl.clone(), enabled: enable });

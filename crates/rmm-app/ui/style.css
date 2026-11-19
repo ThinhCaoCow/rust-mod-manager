@@ -349,6 +349,8 @@ pre.diff .del { background: var(--bad-bg); color: var(--bad); }
 #details ul { margin: 0; padding: 0; list-style: none; }
 #details li { padding: 2px 0; }
 #details .files { max-height: 220px; overflow: auto; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; color: var(--muted); }
+.pick { max-height: 50vh; overflow: auto; margin: 8px 0; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; font: 12px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.pick label.row { margin: 0; gap: 6px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 9px; border-radius: 12px; background: var(--hover); }
 .chip button { border: 0; background: none; padding: 0 4px; color: var(--muted); }

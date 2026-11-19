@@ -267,6 +267,33 @@ struct CollectionArgs {
     dry_run: Option<bool>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct HideArgs {
+    /// The mod's id.
+    id: String,
+    /// Paths in the mod (files or folders, any case), as get_mod lists them; to show again, as its meta.hidden lists them.
+    paths: Vec<String>,
+    /// Show them again instead; default false.
+    show: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct MoveFilesArgs {
+    /// The mod the files are in, or "<overwrite>".
+    from: String,
+    /// The mod to move them into, or "<overwrite>".
+    to: String,
+    /// Paths (files or folders, any case).
+    paths: Vec<String>,
+    /// Replace files the target has (its copies go to trash/); default false: refused.
+    replace: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct CreationsArgs {
+    /// Put adopted Creations back into the game's Data folder instead.
+    restore: Option<bool>,
+    /// Default true: say which Creations and how many files.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
 struct Mo2Args {
     /// The MO2 instance folder, holding ModOrganizer.ini (find_import_sources lists them).
     dir: String,
@@ -1192,6 +1219,24 @@ impl Rmm {
         }))
     }
 
+    #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. Takes effect at the next deploy.")]
+    async fn hide_files(&self, Parameters(a): Parameters<HideArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| install::hide_files(&i, &a.id, &a.paths, !a.show.unwrap_or(false))))
+    }
+
+    #[tool(description = "Move files or folders from one mod into another, \"<overwrite>\" included: MCM settings or a tool's output from Overwrite into the mod they belong with. Files the target has already are refused unless replace (its copies go to trash/). Takes effect at the next deploy.")]
+    async fn move_files(&self, Parameters(a): Parameters<MoveFilesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| install::move_files(&i, &a.from, &a.paths, &a.to, a.replace.unwrap_or(false))))
+    }
+
+    #[tool(description = "Creation Club content as mods: the plugins the game's .ccc file lists that are in its Data folder, with their archives, move into mods (one per Creation) on at the top of every profile, as MO2's Curation Club does, so each can be turned off and Purge leaves them out; deploy links them back. restore purges and puts them back in Data. Not an undo step. dry_run defaults to true.")]
+    async fn creation_club(&self, Parameters(a): Parameters<CreationsArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| {
+            let dry = a.dry_run.unwrap_or(true);
+            if a.restore.unwrap_or(false) { rmm_core::import::restore_creations(&i, dry) } else { rmm_core::import::adopt_creations(&i, dry) }
+        }))
+    }
+
     #[tool(description = "Installed add-ons (sandboxed WebAssembly plugins): their capabilities, the hooks they run at (after_install, before_deploy, after_deploy, after_tool_run, health_check), and the tools and panels they offer, with input schemas. The user installs add-ons themselves.", annotations(read_only_hint = true))]
     async fn list_addons(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| addons::list(&i)))
@@ -1207,7 +1252,7 @@ impl Rmm {
         out(Ok(import::find_sources()))
     }
 
-    #[tool(description = "Bring in an MO2 profile: mod folders (hard-linked on the same volume, else copied; meta.ini and .mohidden files stay behind, Root/ becomes root/), names, Nexus ids, comments as notes, ignored update versions, mod order (reversed from modlist.txt), enabled state, separators, plugin order and locks, overwrite/, the profile's own INIs and saves (MO2's profile options), and MO2's Executables as tools (rmm's preset when it has one; mods a program made become that tool's output). Goes into the active profile as one undoable step, or with all every MO2 profile into the rmm profile of its name; mods and tools already there are left as they are. dry_run defaults to true.")]
+    #[tool(description = "Bring in an MO2 profile: mod folders (hard-linked on the same volume, else copied; meta.ini stays behind, .mohidden files come over hidden, Root/ becomes root/), names, Nexus ids, comments as notes, ignored update versions, mod order (reversed from modlist.txt), enabled state, separators, plugin order and locks, overwrite/, the profile's own INIs and saves (MO2's profile options), and MO2's Executables as tools (rmm's preset when it has one; mods a program made become that tool's output). Goes into the active profile as one undoable step, or with all every MO2 profile into the rmm profile of its name; mods and tools already there are left as they are. dry_run defaults to true.")]
     async fn import_mo2(&self, Parameters(a): Parameters<Mo2Args>) -> Result<String, String> {
         let (dir, dry) = (std::path::Path::new(&a.dir), a.dry_run.unwrap_or(true));
         match a.all {

@@ -156,6 +156,36 @@ enum Cmd {
         #[arg(long, conflicts_with = "to_mod")]
         clear: bool,
     },
+    /// Hide files or folders of a mod (MO2's .mohidden; a hidden plugin is an optional ESP): they
+    /// leave deploys, conflicts and the plugin list, and stay hidden through reinstalls.
+    Hide {
+        #[arg(value_name = "MOD")]
+        id: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Show them again.
+        #[arg(long)]
+        show: bool,
+    },
+    /// Move files or folders from one mod into another; `overwrite` names Overwrite (MCM settings
+    /// into a settings mod, say). --replace puts the target's copies of clashing files in trash.
+    MoveFiles {
+        from: String,
+        to: String,
+        #[arg(required = true)]
+        paths: Vec<String>,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Creation Club content in the game's Data folder as mods (one per Creation, on in every
+    /// profile, so each can be turned off), or with --restore back into Data. Shows what it
+    /// would do; --apply does it.
+    Creations {
+        #[arg(long)]
+        restore: bool,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Edits made to mod files, overwrite/ and INIs through rmm (the window's IDE and AI
     /// tools), newest first.
     Edits {
@@ -918,6 +948,13 @@ fn run() -> Result<()> {
         Cmd::Overwrite { to_mod: Some(name), .. } => print(&install::mod_from_overwrite(&open()?, &name)?),
         Cmd::Overwrite { clear: true, .. } => print(&serde_json::json!({ "cleared": install::clear_overwrite(&open()?)? })),
         Cmd::Overwrite { .. } => print(&open()?.mod_files(rmm_core::instance::OVERWRITE)?),
+        Cmd::Hide { id, paths, show } => print(&install::hide_files(&open()?, &id, &paths, !show)?),
+        Cmd::MoveFiles { from, to, paths, replace } => {
+            let ow = |s: String| if s.eq_ignore_ascii_case("overwrite") { rmm_core::instance::OVERWRITE.to_string() } else { s };
+            print(&install::move_files(&open()?, &ow(from), &paths, &ow(to), replace)?)
+        }
+        Cmd::Creations { restore: false, apply } => print(&rmm_core::import::adopt_creations(&open()?, !apply)?),
+        Cmd::Creations { restore: true, apply } => print(&rmm_core::import::restore_creations(&open()?, !apply)?),
         Cmd::Edits { revert: Some(n) } => print(&rmm_core::workspace::revert(&open()?, n)?),
         Cmd::Edits { revert: None } => print(&rmm_core::workspace::edits(&open()?)?),
         Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),

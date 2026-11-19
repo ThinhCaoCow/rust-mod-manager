@@ -2277,9 +2277,11 @@ fn imports_all_of_an_mo2_instance() {
     assert_eq!(fs::read_to_string(inst.root.join("profiles/Main/ini/Skyrim.ini")).unwrap(), "[General]\r\nsMain=1\r\n");
     assert!(inst.root.join("profiles/Main/ini/SkyrimPrefs.ini").is_file() && my.join("Saves/Main/Save1.skse").is_file());
 
-    // Hidden files stay behind; the ignored version is skipped by update checks.
+    // Hidden files stay hidden, under their own names; the ignored version is skipped by update checks.
     assert_eq!((done[0].hidden, inst.mod_files("A").unwrap()), (2, vec!["A.esp".to_string()]));
     let meta = inst.mod_meta("A");
+    assert_eq!(meta.hidden, ["old/x.nif", "textures/a.dds"]);
+    assert!(inst.mod_dir("A").join(".rmm-hidden/textures/a.dds").is_file());
     assert_eq!(meta.skip_version.as_deref(), Some("2.0"));
     let update = |latest: &str| nexus::Update { id: "A".into(), name: "A".into(), mod_id: 123, installed: Some("1.0".into()), latest: Some(latest.into()), file_id: 9, file_name: "A".into(), url: String::new() };
     assert!(!nexus::offered(&update("2.0"), &meta) && nexus::offered(&update("2.1"), &meta));
@@ -2677,6 +2679,115 @@ fn identifies_downloads_and_downloads_again() {
     assert_eq!(fs::read(nexus::download(&inst, &client, &link).unwrap()).unwrap(), b"0123456789");
     assert!(!dl.join("Big.zip.part").exists());
     assert_eq!(hits.lock().unwrap()["/cdn/big.zip"], 3, "once to try to resume, once whole, once whole");
+}
+
+/// Hiding a mod's files takes them out of deploys, conflicts and the plugin list, and a reinstall
+/// keeps them hidden; files move from Overwrite into a mod, a clash only with replace (the old
+/// copy to trash), and Problems mentions what's left in Overwrite.
+#[test]
+fn hides_and_moves_files() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    let src = tmp.path().join("src");
+    write(&src.join("A/textures/a.dds"), "from A");
+    write(&src.join("A/A.esp"), plugin_bytes(&[], false));
+    write(&src.join("B/textures/a.dds"), "from B");
+    write(&src.join("B/textures/b.dds"), "b");
+    write(&src.join("B/B.esp"), plugin_bytes(&[], false));
+    for m in ["A", "B"] {
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    let winner = || {
+        deploy::deploy(&inst, false).unwrap();
+        fs::read_to_string(game.join("Data/textures/a.dds")).unwrap()
+    };
+    assert_eq!(winner(), "from B");
+
+    assert_eq!(install::hide_files(&inst, "B", &["Textures\\A.dds".into()], true).unwrap(), ["textures/a.dds"]);
+    assert_eq!(winner(), "from A", "the hidden file is out of the deploy");
+    assert_eq!(inst.mod_files("B").unwrap(), ["B.esp", "textures/b.dds"]);
+    assert!(conflicts::conflicts(&inst, &inst.profile().unwrap()).unwrap().iter().all(|c| c.overwrites.is_empty() && c.overwritten_by.is_empty()));
+    install::reinstall(&inst, "B", None).unwrap();
+    assert_eq!((inst.mod_files("B").unwrap(), inst.mod_meta("B").hidden), (vec!["B.esp".to_string(), "textures/b.dds".to_string()], vec!["textures/a.dds".to_string()]), "a reinstall hides it again");
+    install::hide_files(&inst, "B", &["textures/a.dds".into()], false).unwrap();
+    assert_eq!(winner(), "from B");
+    assert!(inst.mod_meta("B").hidden.is_empty());
+    // A hidden plugin is out of the plugin list: MO2's optional ESP.
+    install::hide_files(&inst, "A", &["A.esp".into()], true).unwrap();
+    assert!(!plugins::list(&inst, &inst.profile().unwrap()).unwrap().iter().any(|p| p.name == "A.esp"));
+    assert!(install::hide_files(&inst, "A", &["nope.esp".into()], true).is_err());
+
+    let over = inst.mod_dir(rmm_core::instance::OVERWRITE);
+    write(&over.join("MCM/Settings/a.ini"), "mine");
+    write(&over.join("SKSE/Plugins/x.ini"), "x");
+    let issue = || health::check(&inst).unwrap().into_iter().find(|i| i.kind == "overwrite_files").map(|i| i.message);
+    assert!(issue().unwrap().starts_with("2 files belong to no mod"));
+    assert_eq!(install::move_files(&inst, rmm_core::instance::OVERWRITE, &["MCM".into()], "A", false).unwrap(), ["MCM/Settings/a.ini"]);
+    assert!(inst.mod_files("A").unwrap().contains(&"MCM/Settings/a.ini".to_string()) && !over.join("MCM").exists(), "emptied folders go");
+    assert!(issue().unwrap().starts_with("1 file belongs"));
+    write(&over.join("MCM/Settings/a.ini"), "newer");
+    let clash = install::move_files(&inst, rmm_core::instance::OVERWRITE, &["MCM/Settings/a.ini".into()], "A", false);
+    assert!(format!("{:#}", clash.unwrap_err()).contains("has 1 of these already"));
+    install::move_files(&inst, rmm_core::instance::OVERWRITE, &["MCM/Settings/a.ini".into()], "A", true).unwrap();
+    assert_eq!(fs::read_to_string(inst.mod_dir("A").join("MCM/Settings/a.ini")).unwrap(), "newer");
+    assert_eq!(fs::read_to_string(inst.root.join("trash/.replaced/A-moved-1/MCM/Settings/a.ini")).unwrap(), "mine");
+    install::move_files(&inst, rmm_core::instance::OVERWRITE, &["SKSE".into()], "B", false).unwrap();
+    assert!(issue().is_none());
+}
+
+/// Creation Club content becomes mods, on at the top of every profile and kept through undo;
+/// deploy links it back, turning one off leaves it out, and restoring puts it back in Data.
+#[test]
+fn adopts_creation_club_content() {
+    isolate();
+    use rmm_core::import;
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&game.join("Data/ccBGSSSE001-Fish.esm"), plugin_bytes(&["Skyrim.esm"], true));
+    write(&game.join("Data/ccBGSSSE001-Fish.bsa"), "archive");
+    write(&game.join("Data/ccBGSSSE025-AdvDSGS.esm"), plugin_bytes(&["Skyrim.esm"], true));
+    write(&game.join("Skyrim.ccc"), "ccBGSSSE001-Fish.esm\r\nccQDRSSE001-SurvivalMode.esl\r\nccBGSSSE025-AdvDSGS.esm\r\n");
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    write(&tmp.path().join("src/Mine/Mine.esp"), plugin_bytes(&[], false));
+    install::install(&inst, &tmp.path().join("src/Mine"), None, true, None).unwrap();
+    inst.create_profile("Other", true).unwrap();
+
+    let plan = import::adopt_creations(&inst, true).unwrap();
+    assert_eq!((plan.mods.clone(), plan.files), (vec!["ccBGSSSE001-Fish.esm".to_string(), "ccBGSSSE025-AdvDSGS.esm".to_string()], 3), "listed ones that aren't there are skipped");
+    assert!(game.join("Data/ccBGSSSE001-Fish.bsa").is_file(), "a dry run moves nothing");
+    import::adopt_creations(&inst, false).unwrap();
+    assert!(!game.join("Data/ccBGSSSE001-Fish.bsa").exists());
+    assert_eq!(inst.mod_files("ccBGSSSE001-Fish").unwrap(), ["ccBGSSSE001-Fish.bsa", "ccBGSSSE001-Fish.esm"]);
+    let order = |inst: &Instance| inst.profile().unwrap().mods.iter().map(|m| (m.id.clone(), m.enabled)).collect::<Vec<_>>();
+    let want = vec![("ccBGSSSE001-Fish".to_string(), true), ("ccBGSSSE025-AdvDSGS".to_string(), true), ("Mine".to_string(), true)];
+    assert_eq!(order(&inst), want);
+    assert!(import::adopt_creations(&inst, true).unwrap().mods.is_empty(), "nothing left to adopt");
+    deploy::deploy(&inst, false).unwrap();
+    assert!(game.join("Data/ccBGSSSE001-Fish.bsa").is_file(), "deploy links it back");
+
+    // Undo past the adoption (and Mine's install) keeps it; another profile has it on too.
+    ops::set_mods_enabled(&inst, &["ccBGSSSE025-AdvDSGS".into()], false).unwrap();
+    inst.undo().unwrap();
+    inst.undo().unwrap();
+    assert!(order(&inst).iter().any(|(id, on)| id == "ccBGSSSE001-Fish" && *on), "{:?}", order(&inst));
+    inst.switch_profile("Other").unwrap();
+    assert_eq!(&order(&inst)[..2], &want[..2]);
+    inst.switch_profile("default").unwrap();
+    ops::set_mods_enabled(&inst, &["ccBGSSSE001-Fish".into()], false).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert!(!game.join("Data/ccBGSSSE001-Fish.bsa").exists(), "turned off, it's out of the game");
+
+    let back = import::restore_creations(&inst, false).unwrap();
+    assert_eq!((back.mods.len(), back.files), (2, 3));
+    assert!(game.join("Data/ccBGSSSE001-Fish.bsa").is_file() && game.join("Data/ccBGSSSE025-AdvDSGS.esm").is_file());
+    assert_eq!(order(&inst), [("Mine".to_string(), false)], "(the second undo took back Mine's install)");
+    assert!(!inst.mod_dir("ccBGSSSE001-Fish").exists());
 }
 
 /// A zip of (path, bytes).

@@ -590,7 +590,7 @@ function renderMods() {
   const ow = S.overwrite;
   $('#overwrite-bar').hidden = !ow;
   $('#overwrite-bar').innerHTML = ow ? `<b title="Files in the game’s Data folder that belong to no mod: what the game, tools or other programs wrote there. rmm keeps them here so they aren’t lost.">Overwrite</b><span class="muted small">${plural(ow, 'file')} that tools, the game or changes outside rmm left. They win over every mod.</span><span class="spacer"></span>
-    <button data-ow="show">Show files</button><button data-ow="mod">Create mod…</button><button data-ow="clear" class="danger">Clear…</button>` : '';
+    <button data-ow="show">Show files</button><button data-ow="move" title="Move chosen files, MCM settings say, into a mod you have">Move to mod…</button><button data-ow="mod">Create mod…</button><button data-ow="clear" class="danger">Clear…</button>` : '';
   const nb = S.broken.length;
   $('#rules-notice').hidden = !nb;
   $('#rules-notice').innerHTML = nb ? `<span>⚠ ${nb === 1 ? 'A mod rule is' : `${nb} mod rules are`} broken by the current order.</span><button id="sort-mods">Sort by rules…</button>` : '';
@@ -707,6 +707,70 @@ const fileList = (files, max = 2000) => esc(files.slice(0, max).join('\n')) + (f
 
 // ---- Details panel: one mod, one separator, or several rows -----------------------------------
 
+const OVERWRITE_ID = '<overwrite>';
+
+/** Tick files from a list, with a filter box; folders tick everything under them. Resolves to the
+ *  ticked paths, or null when cancelled. `extra` is more of the dialog's body, read after it closes. */
+async function pickFiles(title, files, intro, ok, extra = '') {
+  const dirs = [...new Set(files.flatMap(f => f.split('/').slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join('/'))))].sort();
+  const rows = [...dirs.map(d => [d + '/', true]), ...files.map(f => [f, false])].sort((a, b) => a[0].localeCompare(b[0]));
+  const body = `${intro}<input id="pf-find" type="search" placeholder="Filter…" spellcheck="false" aria-label="Filter the files">
+    <div id="pf-list" class="pick">${rows.map(([p, dir]) => `<label class="row small"${dir ? ' style="font-weight:600"' : ''}><input type="checkbox" value="${esc(p)}"> ${esc(p)}</label>`).join('')}</div>${extra}`;
+  const done = dialog({ title, body, actions: [['cancel', 'Cancel'], ['ok', ok, 'primary']] });
+  $('#dlg').classList.add('wide');
+  $('#pf-find').oninput = e => { const q = e.target.value.toLowerCase(); for (const l of $('#pf-list').children) l.hidden = !l.textContent.toLowerCase().includes(q); };
+  $('#pf-list').onchange = e => {
+    const v = e.target.value;
+    if (v.endsWith('/')) for (const c of $('#pf-list').querySelectorAll('input')) if (c.value.startsWith(v)) c.checked = e.target.checked;
+  };
+  if (await done !== 'ok') return null;
+  const picked = [...$('#pf-list').querySelectorAll('input:checked')].map(c => c.value);
+  const folders = picked.filter(p => p.endsWith('/'));
+  return picked.filter(p => !folders.some(d => p !== d && p.startsWith(d))).map(p => p.replace(/\/$/, ''));
+}
+
+/** Move files from a mod (or Overwrite) into another mod, asking again before replacing. */
+async function moveFiles(from, files) {
+  const where = `<label class="field">Into the mod <input id="mf-to" list="mod-names" spellcheck="false" placeholder="A mod’s name"></label>`;
+  const paths = await pickFiles(`Move files from ${from === OVERWRITE_ID ? 'Overwrite' : nameOf(from)}`, files, '<p class="muted small">Tick the files or folders to move, MCM settings say, then name the mod they belong with. The next deploy uses them from there.</p>', 'Move', where);
+  if (!paths?.length) return;
+  const to = idByName.get($('#mf-to').value.trim()) ?? ($('#mf-to').value.trim().toLowerCase() === 'overwrite' ? OVERWRITE_ID : null);
+  if (!to) return toast('Pick one of your mods by its name.', 'error');
+  let r = await call('move_files', { from, to, paths }).catch(e => String(e));
+  if (typeof r === 'string') {
+    if (!r.includes('of these already') || !await confirmBox('Replace files?', `${esc(r.replace(/^.*?: /, ''))}.`, 'Replace')) return toast(r, 'error');
+    r = await act('Moving the files', () => call('move_files', { from, to, paths, replace: true }), { reload: false });
+    if (!r || r === true) return;
+  }
+  toast(`Moved ${plural(r.length, 'file')} into ${to === OVERWRITE_ID ? 'Overwrite' : nameOf(to)}. Deploy uses ${r.length === 1 ? 'it' : 'them'} from there.`, 'info', ['Move back', () => act('Moving them back', () => call('move_files', { from: to, to: from, paths: r }))]);
+  await load();
+}
+
+/** Hide files of a mod (or show them again): out of the game, kept through reinstalls. */
+async function hideFiles(id, paths, show = false) {
+  const r = await act(show ? 'Showing the files' : 'Hiding the files', () => call('hide_files', { id, paths, show }), { problem: true });
+  if (!r || r === true) return;
+  details = null;
+  toast(`${show ? 'Showing' : 'Hid'} ${plural(r.length, 'file')} in ${nameOf(id)}. The next deploy ${show ? 'puts' : 'takes'} ${r.length === 1 ? 'it' : 'them'} ${show ? 'in' : 'out of'} the game.`, 'info', [show ? 'Hide again' : 'Show again', () => hideFiles(id, r, !show)]);
+  loadDetails();
+}
+
+/** Creation Club content in the game's Data folder as mods, or back into Data. */
+async function creations() {
+  const [adopt, back] = await Promise.all([call('creations', { dry_run: true }), call('creations', { dry_run: true, restore: true })]).catch(e => { toast(String(e), 'error'); return []; });
+  if (!adopt) return;
+  if (!adopt.mods.length && !back.mods.length) return toast('The game’s Data folder has no Creation Club content (the game’s .ccc file lists none that’s there).');
+  const body = `${adopt.mods.length ? `<p>${plural(adopt.mods.length, 'Creation')} in the game’s Data folder (${bytes(adopt.bytes)}) can become ${adopt.mods.length === 1 ? 'a mod' : 'mods, one each,'} at the top of every profile and on. Then you can turn ${adopt.mods.length === 1 ? 'it' : 'each'} off, and Purge or Play without mods leaves them out. Their files move into rmm’s mods folder; the next deploy links them back.</p>` : ''}
+    ${back.mods.length ? `<p>${plural(back.mods.length, 'Creation')} ${back.mods.length === 1 ? 'is a mod' : 'are mods'} now; putting them back moves their files into the game’s Data folder (after a Purge) and takes the mods out of every profile.</p>` : ''}
+    <p class="muted small">This isn’t in the undo history, as it moves the game’s own files: Put back in Data, here, undoes it.</p>`;
+  const actions = [['cancel', 'Cancel']];
+  if (back.mods.length) actions.push(['back', 'Put back in Data']);
+  if (adopt.mods.length) actions.push(['adopt', 'Make them mods', 'primary']);
+  const what = await dialog({ title: 'Creation Club content', body, actions });
+  if (what === 'adopt') act('Making the Creations mods', async () => { const r = await call('creations', {}); toast(`${plural(r.mods.length, 'Creation')} ${r.mods.length === 1 ? 'is a mod' : 'are mods'} now. Deploy or Play links ${r.mods.length === 1 ? 'it' : 'them'} back into the game.`); });
+  if (what === 'back') act('Putting the Creations back', async () => { const r = await call('creations', { restore: true }); toast(`${plural(r.mods.length, 'Creation')} ${r.mods.length === 1 ? 'is' : 'are'} back in the game’s Data folder.`); });
+}
+
 function renderDetails() {
   const box = $('#details');
   if (pluginSide()) {
@@ -768,7 +832,10 @@ function renderDetails() {
     <p class="muted small">Rules are suggestions: dragging and enabling are never blocked. Problems lists broken ones, and Sort by rules fixes the order.</p>
     <h3>Files (${m.files.toLocaleString()})</h3>
     ${m.plugins.length ? `<p>Plugins: ${esc(m.plugins.join(', '))}</p>` : ''}
+    <div class="row"><button data-act="hide-files" title="Keep chosen files out of the game, through reinstalls and updates (MO2’s hide)">Hide files…</button><button data-act="move-files" title="Move chosen files into another mod">Move files…</button></div>
     <div class="files">${d ? d.files.map(esc).join('<br>') + (d.files_truncated ? '<br>…' : '') : '…'}</div>
+    ${d?.meta?.hidden?.length ? `<h3>Hidden (${d.meta.hidden.length})</h3><p class="muted small">Kept out of the game, also after a reinstall or update.</p>
+      <div class="files">${d.meta.hidden.map(h => `<div class="row"><span>${esc(h)}</span><div class="spacer"></div><button class="link small" data-unhide="${esc(h)}">Show</button></div>`).join('')}</div>` : ''}
     ${d?.meta?.source ? `<h3>Installed from</h3><div class="small muted">${esc(d.meta.source)}</div>` : ''}`;
   if (draft) {
     const n = $('#mod-note');
@@ -1153,6 +1220,9 @@ $('#overwrite-bar').onclick = async e => {
   if (what === 'show') {
     const files = await act('Reading overwrite', () => call('overwrite_files'), { reload: false });
     if (files) dialog({ title: 'Overwrite', body: `<p class="muted small">Deployed on top of every mod. Create a mod from them to give them a place in the list.</p><pre>${esc(files.join('\n'))}</pre>`, actions: [['cancel', 'Close']] });
+  } else if (what === 'move') {
+    const files = await act('Reading overwrite', () => call('overwrite_files'), { reload: false });
+    if (files) moveFiles(OVERWRITE_ID, files);
   } else if (what === 'mod') {
     const name = await ask('Create a mod from Overwrite', 'Everything in Overwrite becomes a new mod at the end of the list.', 'Overwrite output');
     if (name) act('Creating the mod', async () => { const r = await call('mod_from_overwrite', { name }); toast(`Created ${r.name} (${plural(r.files, 'file')}).`); });
@@ -1718,6 +1788,8 @@ $('#details').addEventListener('click', async e => {
   } else if (t.dataset.unloot) {
     const old = lootRules?.rules.find(r => r.plugin.toLowerCase() === selPlugin.toLowerCase());
     setLootRule({ after: (old?.after ?? []).filter(a => a !== t.dataset.unloot) });
+  } else if (t.dataset.unhide) {
+    hideFiles(id, [t.dataset.unhide], true);
   } else if (t.dataset.uncat) {
     editCategories([id], [], [t.dataset.uncat]);
   } else if (t.dataset.unrule) {
@@ -1746,6 +1818,15 @@ $('#details').addEventListener('click', async e => {
     case 'skip-update': return act('Skipping the update', () => call('hold_updates', { ids: [id], hold: 'skip' }));
     case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
+    case 'hide-files': {
+      const files = await call('mod_files', { id }).catch(err => { toast(String(err), 'error'); return null; });
+      const paths = files && await pickFiles(`Hide files in ${nameOf(id)}`, files, '<p class="muted small">Ticked files leave the game at the next deploy and stay hidden through reinstalls and updates; the panel lists them to show again. A hidden plugin is like MO2’s optional ESP.</p>', 'Hide');
+      return paths?.length && hideFiles(id, paths);
+    }
+    case 'move-files': {
+      const files = await call('mod_files', { id }).catch(err => { toast(String(err), 'error'); return null; });
+      return files && moveFiles(id, files);
+    }
     case 'cat-clear': {
       const ids = selIds().filter(i => !isSep(i));
       return editCategories(ids, [], [...new Set(ids.flatMap(i => byId.get(i).categories ?? []))]);
@@ -1934,7 +2015,7 @@ $('#plugins tbody').addEventListener('contextmenu', e => {
   if (names.length === 1) {
     const locked = D.locks.has(p.name.toLowerCase());
     items.push([locked ? 'Unlock its position' : 'Lock at this position', () => act(locked ? 'Unlocking the plugin' : 'Locking the plugin', () => call('lock_plugin', { name: p.name, lock: !locked }))]);
-    if (p.mod_id) items.push(['Show its mod', () => { showTab('mods'); goTo(p.mod_id); }]);
+    if (p.mod_id) items.push(['Show its mod', () => { showTab('mods'); goTo(p.mod_id); }], ['Hide the plugin', () => hideFiles(p.mod_id, [p.name]), '', 'Keeps it out of the game (MO2’s optional ESP); its mod’s panel shows it again']);
   }
   ctxMenu(e, items);
 });
@@ -2100,6 +2181,7 @@ $('#play-more').onclick = async e => {
   if (!st?.manifest) items.push(['Hold game updates on Steam', () => toast('rmm can’t find the game’s Steam manifest beside its folder, so this isn’t a Steam install it can hold updates for.'), 'muted', 'Not a Steam install rmm can find the manifest for']);
   else if (st.held) items.push(['Let Steam update the game', () => steamHold(false), '', 'Makes the game’s Steam manifest writable again']);
   else items.push(['Hold game updates on Steam…', () => steamHold(true), '', 'Makes the game’s Steam manifest read-only, so Steam can’t update the game and break the script extender']);
+  items.push('-', ['Creation Club content…', creations, '', 'Make the game’s Creation Club content mods you can turn off, or put it back']);
   ctxMenu({ preventDefault() {}, clientX: b.right - 240, clientY: b.bottom + 4 }, items);
 };
 
@@ -3843,6 +3925,9 @@ const PLAIN = {
   uninstall_mods: a => [`Uninstall ${someMods(a.ids)}`, 'Their files go to the trash; Undo brings them back.'],
   overwrite_to_mod: a => [`Make the files in Overwrite into the mod “${a.name}”`, UNDO],
   clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
+  hide_files: a => [`${a.show ? 'Show' : 'Hide'} ${plural(a.paths?.length ?? 0, 'file')} in ${nameOf(a.id)}`, a.show ? '' : 'They stay out of the game until shown again.'],
+  move_files: a => [`Move ${plural(a.paths?.length ?? 0, 'file')} from ${a.from === OVERWRITE_ID ? 'Overwrite' : nameOf(a.from)} into ${a.to === OVERWRITE_ID ? 'Overwrite' : nameOf(a.to)}`, a.replace ? 'Files it replaces go to the trash.' : ''],
+  creation_club: a => [a.restore ? 'Put the Creation Club content back into the game’s Data folder' : 'Make the game’s Creation Club content mods', 'This moves the game’s own files; the other way round undoes it.'],
   set_mods_enabled: a => [`${a.enabled ? 'Turn on' : 'Turn off'} ${someMods(a.ids)}`, UNDO],
   move_mods: a => [`Move ${someMods(a.ids)} in the mod list`, UNDO],
   set_mod_order: () => ['Reorder the mod list', UNDO],

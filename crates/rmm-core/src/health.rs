@@ -50,6 +50,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("deploy_blocked", "Deploy can't run"),
     ("not_deployed", "Changes not deployed yet"),
     ("external_change", "Deployed files changed outside rmm"),
+    ("overwrite_files", "Files in Overwrite"),
     ("loot_message", "LOOT's messages"),
     ("loot_failed", "LOOT couldn't run"),
     ("ini_test_file", "sTestFile lines in Fallout4.ini"),
@@ -210,6 +211,11 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
                 add("warning", "external_change", &f, "changed outside rmm; deploy keeps it in Overwrite (the files that belong to no mod), which wins over every mod".into());
             }
         }
+    }
+    let over = inst.mod_files(crate::instance::OVERWRITE)?.len();
+    if over > 0 {
+        let files = if over == 1 { "1 file belongs" } else { &format!("{over} files belong") };
+        add("info", "overwrite_files", "Overwrite", format!("{files} to no mod: what the game, MCM menus and tools wrote, which wins over every mod. Move what you want to keep into a mod (Overwrite's Move to mod…), so it goes with the setup"));
     }
     issues.extend(fallout4_ini(inst)?);
     match crate::loot::issues(inst) {
