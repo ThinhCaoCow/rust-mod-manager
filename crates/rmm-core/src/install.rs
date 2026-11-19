@@ -149,7 +149,7 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
     // An archive's hash lets a lockfile find the same download elsewhere.
     let sha256 = if source.is_file() { Some(crate::lockfile::sha256_file(source)?) } else { None };
     inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone(), sha256, ..Default::default() })?;
-    let plugins = top_plugins(&files);
+    let plugins = mod_plugins(inst, id, &files);
     inst.edit(&format!("install {id}"), |p| {
         let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
         let at = match priority {
@@ -184,7 +184,7 @@ pub const HIDDEN_DIR: &str = ".rmm-hidden";
 /// Hide a mod's files or folders, or with `hide` false show them again. Hidden files move to
 /// `<mod>/.rmm-hidden/`, out of deploys, conflicts and the plugin list (MO2's `.mohidden`; a
 /// hidden plugin is MO2's optional ESP), and the mod remembers them, so a reinstall or update
-/// hides them again. Returns the files hidden or shown.
+/// hides them again. One undo step. Returns the files hidden or shown.
 pub fn hide_files(inst: &Instance, id: &str, paths: &[String], hide: bool) -> Result<Vec<String>> {
     if crate::instance::is_separator(id) || id == crate::instance::OVERWRITE || !inst.mod_dir(id).is_dir() {
         bail!("'{id}' is not an installed mod (files in Overwrite can be moved into one first)");
@@ -192,7 +192,9 @@ pub fn hide_files(inst: &Instance, id: &str, paths: &[String], hide: bool) -> Re
     let dir = inst.mod_dir(id);
     let mut meta = inst.mod_meta(id);
     let picked = pick(&if hide { inst.mod_files(id)? } else { meta.hidden.clone() }, paths)?;
-    inst.locked(|| {
+    let kept = inst.keep_files(id)?;
+    let label = format!("{} {} in {id}", if hide { "hide" } else { "show" }, files_label(&picked));
+    inst.edit_swapping(&label, &[(id, &kept)], |_| {
         for f in &picked {
             let (shown, hidden) = (dir.join(f), dir.join(HIDDEN_DIR).join(f));
             let (from, to) = if hide { (shown, hidden) } else { (hidden, shown) };
@@ -209,15 +211,24 @@ pub fn hide_files(inst: &Instance, id: &str, paths: &[String], hide: bool) -> Re
         } else {
             meta.hidden.retain(|h| !picked.contains(h));
         }
-        fs::write(dir.join(".rmm-index"), index_dir(&dir)?.join("\n"))?;
+        crate::instance::write_atomic(&dir.join(".rmm-index"), &index_dir(&dir)?.join("\n"))?;
         inst.write_mod_meta(id, &meta)
     })?;
     Ok(picked)
 }
 
+/// "Engine.log" or "3 files", for a history label.
+fn files_label(files: &[String]) -> String {
+    match files {
+        [one] => one.rsplit('/').next().unwrap_or(one).to_owned(),
+        _ => format!("{} files", files.len()),
+    }
+}
+
 /// Move files or folders from one mod (or Overwrite) into another (or Overwrite): MCM settings
 /// and tool output into the mod they belong with. A file the target has already is refused
-/// unless `replace`, which puts the target's copy in trash/. Returns the files moved.
+/// unless `replace`. One undo step, which brings back the target's replaced copies too. Returns
+/// the files moved.
 pub fn move_files(inst: &Instance, from: &str, paths: &[String], to: &str, replace: bool) -> Result<Vec<String>> {
     use crate::instance::{OVERWRITE, is_separator};
     for id in [from, to] {
@@ -235,13 +246,15 @@ pub fn move_files(inst: &Instance, from: &str, paths: &[String], to: &str, repla
         let some: Vec<&str> = clash.iter().take(3).map(|f| f.as_str()).collect();
         bail!("{to} has {} of these already ({}); replacing them puts its copies in trash", clash.len(), some.join(", "));
     }
-    inst.locked(|| {
-        let kept = (1..).map(|n| inst.root.join("trash").join(format!(".replaced/{}-moved-{n}", to.trim_matches(['<', '>'])))).find(|d| !d.exists()).expect("a free name");
+    // Both folders as they are now, hard-linked under trash/, for undo to swap back.
+    let kept = [inst.keep_files(from)?, inst.keep_files(to)?];
+    let name = |id: &str| if id == OVERWRITE { "Overwrite".to_owned() } else { id.to_owned() };
+    let label = format!("move {} from {} to {}", files_label(&picked), name(from), name(to));
+    inst.edit_swapping(&label, &[(from, &kept[0]), (to, &kept[1])], |_| {
         for f in &picked {
             let target = dest.join(f);
             if target.exists() {
-                fs::create_dir_all(kept.join(f).parent().expect("a file's folder"))?;
-                fs::rename(&target, kept.join(f))?;
+                fs::remove_file(&target)?; // its copy is in `kept`
             }
             fs::create_dir_all(target.parent().expect("a file's folder"))?;
             if fs::rename(src.join(f), &target).is_err() {
@@ -252,7 +265,7 @@ pub fn move_files(inst: &Instance, from: &str, paths: &[String], to: &str, repla
         }
         for (id, dir) in [(from, &src), (to, &dest)] {
             if id != OVERWRITE {
-                fs::write(dir.join(".rmm-index"), index_dir(dir)?.join("\n"))?;
+                crate::instance::write_atomic(&dir.join(".rmm-index"), &index_dir(dir)?.join("\n"))?;
             }
         }
         Ok(())
@@ -347,7 +360,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
             });
             inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ..updated.transpose()?.unwrap_or_else(|| meta.clone()) })
         })?;
-        let plugins = top_plugins(&files);
+        let plugins = mod_plugins(inst, id, &files);
         let label = if new_source.is_some() { format!("update {id}") } else { format!("reinstall {id}") };
         inst.edit_swapping(&label, &[(id, &kept)], |p| {
             add_plugins(p, &plugins, enabled);
@@ -373,13 +386,36 @@ pub fn nexus_id_in_name(file: &str) -> Option<u64> {
 
 /// The installed mod `source` is another version of: the same Nexus mod (`nexus_mod`, else the
 /// id in the file name), going by each mod's recorded Nexus id or its archive's name. (id, name).
+/// When several installed mods came from that page (MfgFix and MfgFix MCM), the one whose file
+/// has the same name; none when no name settles it, so the download installs as a mod of its own.
 pub fn same_mod(inst: &Instance, source: &Path, nexus_mod: Option<u64>) -> Result<Option<(String, String)>> {
     let Some(want) = nexus_mod.or_else(|| nexus_id_in_name(&source.file_name()?.to_string_lossy())) else { return Ok(None) };
-    Ok(inst.profile()?.mods.iter().filter(|m| !crate::instance::is_separator(&m.id)).find_map(|m| {
-        let meta = inst.mod_meta(&m.id);
-        let have = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| nexus_id_in_name(meta.source.as_deref()?));
-        (have == Some(want)).then(|| (m.id.clone(), meta.name))
-    }))
+    let found: Vec<(String, crate::instance::ModMeta)> = inst
+        .profile()?
+        .mods
+        .iter()
+        .filter(|m| !crate::instance::is_separator(&m.id))
+        .filter_map(|m| {
+            let meta = inst.mod_meta(&m.id);
+            let have = meta.nexus.as_ref().map(|n| n.mod_id).or_else(|| nexus_id_in_name(meta.source.as_deref()?));
+            (have == Some(want)).then(|| (m.id.clone(), meta))
+        })
+        .collect();
+    if found.len() < 2 {
+        return Ok(found.into_iter().next().map(|(id, meta)| (id, meta.name)));
+    }
+    // A file's name on the page, from its archive's name ("MfgFix MCM-11669-1-2-1600000000").
+    let file_name = |p: &Path| {
+        let stem = if p.extension().is_some_and(|e| ["zip", "7z", "rar"].iter().any(|x| e.eq_ignore_ascii_case(x))) { p.file_stem() } else { p.file_name() };
+        let stem = stem?.to_string_lossy().into_owned();
+        Some(nexus_name(&stem).map_or(stem, |(n, _)| n).to_lowercase())
+    };
+    let Some(name) = file_name(source) else { return Ok(None) };
+    let mut same = found.into_iter().filter(|(_, meta)| meta.source.as_deref().and_then(|s| file_name(Path::new(s))).as_ref() == Some(&name));
+    Ok(match (same.next(), same.next()) {
+        (Some((id, meta)), None) => Some((id, meta.name)),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -397,6 +433,31 @@ mod nexus_name_tests {
 
 pub(crate) fn top_plugins(files: &[String]) -> Vec<String> {
     files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect()
+}
+
+/// A mod's plugins, each after the ones it's built on (its masters), so a patch never loads before
+/// the plugin it patches from the same mod; otherwise in archive order.
+fn mod_plugins(inst: &Instance, id: &str, files: &[String]) -> Vec<String> {
+    let dir = inst.mod_dir(id);
+    let mut left: Vec<(String, Vec<String>)> = top_plugins(files)
+        .into_iter()
+        .map(|name| {
+            let mut p = esplugin::Plugin::new(inst.config.game.esp_id(), &dir.join(&name));
+            let masters = match p.parse_file(esplugin::ParseOptions::header_only()) {
+                Ok(()) => p.masters().unwrap_or_default().iter().map(|m| m.to_lowercase()).collect(),
+                Err(_) => vec![],
+            };
+            (name, masters)
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    while !left.is_empty() {
+        // The first plugin whose masters from this mod are all placed; a cycle keeps the order.
+        let pending: Vec<String> = left.iter().map(|(n, _)| n.to_lowercase()).collect();
+        let i = left.iter().position(|(n, ms)| ms.iter().all(|m| *m == n.to_lowercase() || !pending.contains(m))).unwrap_or(0);
+        out.push(left.remove(i).0);
+    }
+    out
 }
 
 pub(crate) fn add_plugins(p: &mut crate::Profile, plugins: &[String], enable: bool) {
@@ -576,7 +637,7 @@ pub fn mod_from_overwrite(inst: &Instance, name: &str) -> Result<InstallReport> 
         fs::write(dest.join(".rmm-index"), files.join("\n"))?;
         inst.write_mod_meta(&id, &ModMeta { name: name.into(), ..Default::default() })
     })?;
-    let plugins = top_plugins(&files);
+    let plugins = mod_plugins(inst, &id, &files);
     inst.edit(&format!("create {id} from overwrite"), |p| {
         let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
         p.mods.insert(crate::rules::place(inst, &ids, &id)?, ModEntry { id: id.clone(), enabled: true });

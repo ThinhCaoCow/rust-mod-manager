@@ -403,8 +403,10 @@ pub(crate) fn manifest_files(inst: &Instance) -> Result<BTreeMap<String, Deploye
 
 fn check_owner(inst: &Instance) -> Result<()> {
     let owner = inst.config.game_path.join(OWNER);
+    // Windows paths: the same folder whatever the case or slashes.
+    let key = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
     if let Ok(other) = fs::read_to_string(&owner)
-        && Path::new(other.trim()) != inst.root {
+        && key(Path::new(other.trim())) != key(&inst.root) {
             bail!("the game folder is deployed by another instance ({}); purge it there first", other.trim());
         }
     Ok(())

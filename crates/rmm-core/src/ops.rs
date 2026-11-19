@@ -117,6 +117,7 @@ pub fn instance_info(inst: &Instance) -> Result<Value> {
         "mods": p.mods.iter().filter(|m| !is_separator(&m.id)).count(),
         "enabled_mods": p.mods.iter().filter(|m| m.enabled).count(),
         "undo_steps": inst.history()?.len(),
+        "redo_steps": inst.redo_steps()?,
     }))
 }
 

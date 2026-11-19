@@ -169,7 +169,7 @@ enum Cmd {
         apply: bool,
     },
     /// Hide files or folders of a mod (MO2's .mohidden; a hidden plugin is an optional ESP): they
-    /// leave deploys, conflicts and the plugin list, and stay hidden through reinstalls.
+    /// leave deploys, conflicts and the plugin list, and stay hidden through reinstalls. Undoable.
     Hide {
         #[arg(value_name = "MOD")]
         id: String,
@@ -180,7 +180,8 @@ enum Cmd {
         show: bool,
     },
     /// Move files or folders from one mod into another; `overwrite` names Overwrite (MCM settings
-    /// into a settings mod, say). --replace puts the target's copies of clashing files in trash.
+    /// into a settings mod, say). --replace replaces the target's copies of clashing files; undo
+    /// brings them back.
     MoveFiles {
         from: String,
         to: String,
@@ -313,7 +314,7 @@ enum Cmd {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Health check.
+    /// Health check. Exits with 1 when it finds errors, so a script can stop before playing.
     Check,
     /// Deploy, check the script extender matches the game, and start it (through Proton on Linux); --apply to do it.
     /// --without-mods purges instead and starts the game's own exe, as when a game update broke
@@ -1036,7 +1037,14 @@ fn run() -> Result<()> {
         Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
         Cmd::Rule { plugin: None, .. } => print(&loot::rules(&open()?)?),
         Cmd::Rule { plugin: Some(plugin), after, group } => print(&serde_json::json!({ "previous": loot::set_rule(&open()?, &loot::Rule { plugin, after, group })? })),
-        Cmd::Check => print(&health::check(&open()?)?),
+        Cmd::Check => {
+            let issues = health::check(&open()?)?;
+            print(&issues)?;
+            if issues.iter().any(|i| i.severity == "error") {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Cmd::CrashLog { path, text } => {
             let inst = open()?;
             let r = logs::read_crash_log(&inst, path.as_deref())?;

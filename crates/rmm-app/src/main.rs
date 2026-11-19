@@ -475,6 +475,14 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}{tab}", inst.config.game.nexus_domain(), n("mod_id")?))?)
         }
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
+        // A web page a message links to (LOOT's): https only, so nothing else gets opened.
+        "open_link" => {
+            let url = s("url")?;
+            if !url.starts_with("https://") || url.contains(|c: char| c.is_whitespace() || c == '"') {
+                bail!("not a web link: {url}");
+            }
+            json!(nexus::open_in_browser(&url)?)
+        }
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
         "nexus_handler" => json!(nexus::register_handler(&cli_exe()?, &inst.root)?),
         // Only on the user's click: a file on their Desktop.

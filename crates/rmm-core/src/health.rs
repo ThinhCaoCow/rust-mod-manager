@@ -102,7 +102,16 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
             add("warning", "plugin_unreadable", &p.name, format!("could not read plugin header: {e}"));
         }
         if p.enabled && !p.missing_masters.is_empty() {
-            add("error", "missing_masters", &p.name, format!("needs {} turned on and loaded before it: its masters, the plugins it's built on; the game crashes at start without them", p.missing_masters.join(", ")));
+            // A master that is on but loads later only needs the order fixed.
+            let (later, absent): (Vec<&String>, Vec<&String>) =
+                p.missing_masters.iter().partition(|m| plugins.iter().any(|x| x.enabled && x.name.eq_ignore_ascii_case(m)));
+            let join = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            let msg = if absent.is_empty() {
+                format!("loads before {}, which it's built on (its masters); the game crashes at start until they load first. Sort with LOOT or move it below them", join(&later))
+            } else {
+                format!("needs {} turned on and loaded before it: its masters, the plugins it's built on; the game crashes at start without them", join(&p.missing_masters.iter().collect::<Vec<_>>()))
+            };
+            add("error", "missing_masters", &p.name, msg);
         }
     }
     let full = plugins.iter().filter(|p| p.enabled && !p.light).count();

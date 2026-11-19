@@ -172,6 +172,7 @@ button.pill:hover:not(:disabled) { background: var(--bad-bg); text-decoration: u
 main.split #pane-plugins { flex: 0.85; border-left: 1px solid var(--line); }
 #split[aria-pressed=true], #ai-access[aria-pressed=true] { background: var(--sel); border-color: var(--accent); }
 dialog.wide { width: min(1000px, 94vw); }
+.doc-view { margin: 0; max-height: none; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; }
 figure.shot { margin: 12px 0 0; }
 figure.shot img { display: block; max-width: 100%; max-height: 300px; border-radius: 6px; border: 1px solid var(--line); }
 table.fc { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -403,7 +404,7 @@ dialog {
   width: min(560px, 92vw); max-height: 80vh;
 }
 dialog::backdrop { background: rgb(10 14 18 / 0.35); }
-dialog form { display: flex; flex-direction: column; max-height: 80vh; margin: 0; }
+dialog form { display: flex; flex-direction: column; max-height: calc(80vh - 2px); margin: 0; } /* inside the border, so the dialog itself never scrolls */
 dialog h2 { margin: 0; padding: 16px 18px 6px; font-size: 16px; }
 dialog .body { padding: 6px 18px 12px; overflow: auto; user-select: text; }
 dialog .body p { margin: 0 0 10px; }

@@ -417,7 +417,7 @@ fn game_of(ini: &HashMap<String, HashMap<String, String>>) -> Option<Game> {
 }
 
 fn mo2_ini(dir: &Path) -> Result<HashMap<String, HashMap<String, String>>> {
-    Ok(qt_ini(&fs::read_to_string(dir.join("ModOrganizer.ini")).with_context(|| format!("{} has no ModOrganizer.ini; pass the MO2 instance folder", dir.display()))?))
+    Ok(qt_ini(&fs::read_to_string(dir.join("ModOrganizer.ini")).with_context(|| format!("{} has no ModOrganizer.ini; pass the MO2 instance folder. A global instance keeps it in %LOCALAPPDATA%\\ModOrganizer\\<instance name>, and `rmm import sources` lists the ones found", dir.display()))?))
 }
 
 /// A folder ModOrganizer.ini sets (`%BASE_DIR%` filled in), or its default in the base folder.

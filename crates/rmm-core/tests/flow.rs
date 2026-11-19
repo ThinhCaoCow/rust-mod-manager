@@ -2683,7 +2683,7 @@ fn identifies_downloads_and_downloads_again() {
 
 /// Hiding a mod's files takes them out of deploys, conflicts and the plugin list, and a reinstall
 /// keeps them hidden; files move from Overwrite into a mod, a clash only with replace (the old
-/// copy to trash), and Problems mentions what's left in Overwrite.
+/// copy to trash), each one undo step, and Problems mentions what's left in Overwrite.
 #[test]
 fn hides_and_moves_files() {
     isolate();
@@ -2718,7 +2718,13 @@ fn hides_and_moves_files() {
     assert!(inst.mod_meta("B").hidden.is_empty());
     // A hidden plugin is out of the plugin list: MO2's optional ESP.
     install::hide_files(&inst, "A", &["A.esp".into()], true).unwrap();
-    assert!(!plugins::list(&inst, &inst.profile().unwrap()).unwrap().iter().any(|p| p.name == "A.esp"));
+    let listed = || plugins::list(&inst, &inst.profile().unwrap()).unwrap().iter().any(|p| p.name == "A.esp");
+    assert!(!listed());
+    // Hiding is an undo step: Ctrl+Z shows it again, rather than undoing the step before.
+    assert_eq!(inst.undo().unwrap().as_deref(), Some("hide A.esp in A"));
+    assert!(listed() && inst.mod_meta("A").hidden.is_empty());
+    inst.redo().unwrap();
+    assert!(!listed() && inst.mod_meta("A").hidden == ["A.esp"]);
     assert!(install::hide_files(&inst, "A", &["nope.esp".into()], true).is_err());
 
     let over = inst.mod_dir(rmm_core::instance::OVERWRITE);
@@ -2734,7 +2740,13 @@ fn hides_and_moves_files() {
     assert!(format!("{:#}", clash.unwrap_err()).contains("has 1 of these already"));
     install::move_files(&inst, rmm_core::instance::OVERWRITE, &["MCM/Settings/a.ini".into()], "A", true).unwrap();
     assert_eq!(fs::read_to_string(inst.mod_dir("A").join("MCM/Settings/a.ini")).unwrap(), "newer");
-    assert_eq!(fs::read_to_string(inst.root.join("trash/.replaced/A-moved-1/MCM/Settings/a.ini")).unwrap(), "mine");
+    // Undo puts both back: the target's replaced copy and the file in Overwrite.
+    assert_eq!(inst.undo().unwrap().as_deref(), Some("move a.ini from Overwrite to A"));
+    assert_eq!(fs::read_to_string(inst.mod_dir("A").join("MCM/Settings/a.ini")).unwrap(), "mine");
+    assert_eq!(fs::read_to_string(over.join("MCM/Settings/a.ini")).unwrap(), "newer");
+    inst.redo().unwrap();
+    assert_eq!(fs::read_to_string(inst.mod_dir("A").join("MCM/Settings/a.ini")).unwrap(), "newer");
+    assert!(!over.join("MCM/Settings/a.ini").exists());
     install::move_files(&inst, rmm_core::instance::OVERWRITE, &["SKSE".into()], "B", false).unwrap();
     assert!(issue().is_none());
 }
@@ -3964,4 +3976,95 @@ fn bisect_finds_the_mod_behind_a_crash() {
     assert!(bisect::mark(&inst, true).unwrap_err().to_string().contains("the setup changed"));
     let s = bisect::stop(&inst).unwrap().unwrap();
     assert!(s.message.contains("History: D"), "{}", s.message);
+}
+
+/// Majestic Mountains' installer names none of its steps: each must take its own choices.
+#[test]
+fn fomod_steps_without_names() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let src = tmp.path().join("MM");
+    let xml = r#"<config><moduleName>MM</moduleName><installSteps>
+      <installStep name=""><optionalFileGroups><group name="Landscape" type="SelectExactlyOne"><plugins>
+        <plugin name="Non AE"><description/><files><file source="se.txt" destination="landscape.txt"/></files><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+        <plugin name="AE"><description/><files><file source="ae.txt" destination="landscape.txt"/></files><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+      </plugins></group></optionalFileGroups></installStep>
+      <installStep name=""><optionalFileGroups><group name="Final Notes" type="SelectAny"><plugins>
+        <plugin name="Read me"><description/><files><file source="notes.txt" destination="notes.txt"/></files><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+      </plugins></group></optionalFileGroups></installStep>
+    </installSteps></config>"#;
+    write(&src.join("fomod/ModuleConfig.xml"), xml);
+    for f in ["se.txt", "ae.txt", "notes.txt"] {
+        write(&src.join(f), f);
+    }
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+
+    // The window sends back every step's choices, both called "".
+    let walk = install::fomod_options(&inst, &src, None).unwrap();
+    assert_eq!(walk.steps.len(), 2);
+    let mut c = walk.choices.clone();
+    c.options[0].groups[0].choices = vec![serde_json::from_value(serde_json::json!({"name": "AE"})).unwrap()];
+    c.options[1].groups[0].choices = vec![serde_json::from_value(serde_json::json!({"name": "Read me"})).unwrap()];
+    let w = install::fomod_options(&inst, &src, Some(&c)).unwrap();
+    assert!(w.warnings.is_empty(), "{:?}", w.warnings);
+    let picked: Vec<&str> = w.choices.options.iter().map(|s| s.groups[0].choices[0].name.as_str()).collect();
+    assert_eq!(picked, ["AE", "Read me"]);
+    let r = install::install(&inst, &src, None, true, Some(&c)).unwrap();
+    let dir = inst.mod_dir(&r.id);
+    assert_eq!(read(&dir.join("landscape.txt")), "ae.txt");
+    assert_eq!(read(&dir.join("notes.txt")), "notes.txt");
+}
+
+/// Embers XD's Lanterns patch sorted before Embers XD.esp by name: a mod's plugins go in after
+/// their masters from the same mod, so nothing loads before what it's built on.
+#[test]
+fn installs_plugins_after_their_masters() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let game = tmp.path().join("game");
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let src = tmp.path().join("Embers");
+    write(&src.join("A Patch.esp"), plugin_bytes(&["Skyrim.esm", "Zed.esp"], false));
+    write(&src.join("Zed.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    install::install(&inst, &src, None, true, None).unwrap();
+    let order: Vec<String> = inst.profile().unwrap().plugins.iter().map(|p| p.name.clone()).collect();
+    assert_eq!(order, ["Zed.esp", "A Patch.esp"]);
+    let issues = health::check(&inst).unwrap();
+    assert!(!issues.iter().any(|i| i.kind == "missing_masters"), "{issues:?}");
+
+    // Out of order with its master on: the finding says so instead of "needs it turned on".
+    inst.edit("swap", |p| {
+        p.plugins.reverse();
+        Ok(())
+    })
+    .unwrap();
+    let issues = health::check(&inst).unwrap();
+    let m = issues.iter().find(|i| i.kind == "missing_masters").unwrap();
+    assert!(m.message.starts_with("loads before Zed.esp, which it's built on"), "{}", m.message);
+}
+
+/// MfgFix and MfgFix MCM come from one Nexus page: a new file updates the mod whose file has its
+/// name, and when no name settles it there's no offer, rather than the first mod of that page.
+#[test]
+fn update_offer_tells_files_of_one_page_apart() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    write(&tmp.path().join("game/SkyrimSE.exe"), "exe");
+    write(&tmp.path().join("game/Data/Skyrim.esm"), plugin_bytes(&[], true));
+    for d in ["MfgFix-11669-1-6-1700000000", "MfgFix MCM-11669-1-0-1700000000", "MfgFix MCM-11669-1-2-1710000000", "Extra-11669-1-0-1710000000"] {
+        write(&src.join(d).join("x.txt"), d);
+    }
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &tmp.path().join("game"), &tmp.path().join("local")).unwrap();
+    let fix = install::install(&inst, &src.join("MfgFix-11669-1-6-1700000000"), None, true, None).unwrap().id;
+    let new_mcm = src.join("MfgFix MCM-11669-1-2-1710000000");
+    assert_eq!(install::same_mod(&inst, &new_mcm, None).unwrap().map(|m| m.0), Some(fix), "one mod from the page: offered as before");
+    let mcm = install::install(&inst, &src.join("MfgFix MCM-11669-1-0-1700000000"), None, true, None).unwrap().id;
+    assert_eq!(install::same_mod(&inst, &new_mcm, Some(11669)).unwrap().map(|m| m.0), Some(mcm));
+    assert_eq!(install::same_mod(&inst, &src.join("Extra-11669-1-0-1710000000"), None).unwrap(), None);
 }

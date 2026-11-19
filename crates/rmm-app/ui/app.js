@@ -102,7 +102,8 @@ async function act(label, fn, { reload = true, problem = false } = {}) {
   } catch (e) {
     toast(`${label} failed.\n${e}`, 'error');
     if (problem) {
-      failures = [{ severity: 'error', subject: `${label} failed`, message: String(e) }, ...failures].slice(0, 20);
+      const f = { severity: 'error', subject: `${label} failed`, message: String(e) };
+      failures = [f, ...failures.filter(x => x.subject !== f.subject || x.message !== f.message)].slice(0, 20); // a retry doesn't add a copy
       renderProblems();
     }
     if (reload) load().catch(() => {}); // undo what the window showed ahead of the call
@@ -407,6 +408,7 @@ function render() {
   $('#instance-path').title = i.root;
   $('#profile-name').textContent = i.profile;
   $('#undo').disabled = !S.history.length;
+  $('#redo').disabled = !i.redo_steps;
   $('#n-mods').textContent = i.mods ? `${i.enabled_mods}/${i.mods}` : '';
   $('#n-plugins').textContent = S.plugins.length ? S.plugins.filter(p => p.enabled).length : '';
   renderMods();
@@ -615,11 +617,16 @@ function renderTicks() {
   box.innerHTML = h;
 }
 
+/** A master that is on but loads after the plugin that needs it: present, just out of order. */
+const loadsLater = m => S.plugins.some(x => x.enabled && x.name.toLowerCase() === m.toLowerCase());
+
 function pluginRow(p, i) {
   const type = p.master ? (p.light ? 'ESL' : 'ESM') : p.light ? 'ESP · light' : 'ESP';
   const from = p.implicit ? 'Base game' : p.mod_id ? nameOf(p.mod_id) : 'Data folder';
   const issue = p.error ? `<span class="pill bad" title="${esc(p.error)}">Unreadable</span>`
-    : p.enabled && p.missing_masters.length ? `<span class="pill bad" title="Needs ${esc(p.missing_masters.join(', '))} turned on and loaded before it: masters are the plugins this one is built on, and the game crashes at start without them.">Missing masters</span>` : '';
+    : p.enabled && p.missing_masters.length ? (p.missing_masters.every(loadsLater)
+      ? `<span class="pill bad" title="${esc(p.missing_masters.join(', '))} load after it. Masters are the plugins this one is built on, and the game crashes at start until they load first: sort with LOOT, or move it below them.">Loads before its masters</span>`
+      : `<span class="pill bad" title="Needs ${esc(p.missing_masters.join(', '))} turned on and loaded before it: masters are the plugins this one is built on, and the game crashes at start without them.">Missing masters</span>`) : '';
   const sp = selPlugin && S.plugins.find(x => x.name === selPlugin), om = oneMod();
   const rel = sp ? sp.masters.some(m => m.toLowerCase() === p.name.toLowerCase()) : !!om && p.mod_id === om.id;
   const cls = [p.implicit ? 'locked' : '', p.enabled ? '' : 'off', plugSel.has(p.name) ? 'sel' : '', rel ? 'rel' : '', ...dragCls(lists.plugins, p.name, i)];
@@ -928,7 +935,7 @@ function renderPluginDetails(box) {
     ${p.error ? `<p><span class="pill bad">Unreadable</span> ${esc(p.error)}</p>` : ''}
     <h3>Masters (${p.masters.length})</h3>
     ${p.masters.length ? '<p class="muted small">The plugins this one is built on. They have to be on and load before it.</p>' : ''}
-    ${p.masters.length ? `<ul>${p.masters.map(m => `<li>${lower.has(m.toLowerCase()) ? '<span class="pill bad">Missing</span>' : ''}<button class="link" data-plugin="${esc(m)}">${esc(m)}</button></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
+    ${p.masters.length ? `<ul>${p.masters.map(m => `<li>${!lower.has(m.toLowerCase()) ? '' : loadsLater(m) ? '<span class="pill bad">Loads after it</span>' : '<span class="pill bad">Missing</span>'}<button class="link" data-plugin="${esc(m)}">${esc(m)}</button></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
     ${loaders.length ? `<h3>Needed by (${loaders.length})</h3><ul>${loaders.slice(0, 50).map(x => `<li><button class="link" data-plugin="${esc(x.name)}">${esc(x.name)}</button></li>`).join('')}</ul>` : ''}
     <h3>LOOT rule</h3>
     ${!lootRules ? '<p class="muted">Loading…</p>' : `
@@ -1276,6 +1283,12 @@ function targetOf(i) {
   return byId.has(owner) ? { mod: owner } : null;
 }
 const keyOf = i => `${i.kind}|${i.subject}`;
+
+/** LOOT's messages are Markdown: bold, code and links, the rest as text. */
+const markdown = text => esc(text)
+  .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+  .replace(/`([^`]+)`/g, '<code>$1</code>')
+  .replace(/\[([^\]]+)\]\((https:\/\/[^\s)]+)\)/g, (_, t, u) => `<button class="link" data-link="${u}" title="${u}">${t}</button>`);
 let showIgnored = false;
 
 function renderProblems() {
@@ -1287,7 +1300,7 @@ function renderProblems() {
     ? list.map(i => {
       const k = keyOf(i), ign = ignored.has(k), to = i.kind && targetOf(i);
       return `<li class="${esc(i.severity)}${to ? ' link' : ''}${ign ? ' ignored' : ''}" data-key="${esc(k)}" ${to ? `data-mod="${esc(to.mod ?? '')}" data-plugin="${esc(to.plugin ?? '')}" title="Show it in the list"` : ''}>
-        <span class="sev">${esc(i.severity)}</span><span class="subject">${esc(to?.mod ? nameOf(to.mod) : i.subject)}</span><span class="message">${esc(i.message)}</span>
+        <span class="sev">${esc(i.severity)}</span><span class="subject">${esc(to?.mod ? nameOf(to.mod) : i.subject)}</span><span class="message">${i.kind === 'loot_message' ? markdown(i.message) : esc(i.message)}</span>
         ${i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : ''}${failures.includes(i) ? `<button class="link ign" data-dismiss="${failures.indexOf(i)}">Dismiss</button>` : ''}</li>`;
     }).join('')
     : `<li class="info"><span class="sev">ok</span><span class="subject">No problems found${hidden ? ' apart from ignored ones' : ''}.</span></li>`;
@@ -1303,7 +1316,9 @@ function renderProblems() {
   $('#n-problems').textContent = serious || '';
   $('#n-problems').classList.toggle('bad', shown.some(i => i.severity === 'error'));
   if (filters.has('problems')) renderMods();
-  $('#problems-note').textContent = `${plural(all.length - failures.length, 'finding')}. LOOT's messages are included once its masterlist is downloaded.`;
+  const info = shown.length - serious, lootRan = all.some(i => i.kind === 'loot_message');
+  $('#problems-note').textContent = [serious ? `${serious} to look at` : 'Nothing to look at', info ? `${info} for information` : '', hidden ? `${hidden} ignored` : ''].filter(Boolean).join(', ') + '.'
+    + (lootRan ? '' : ' LOOT’s messages show here once its masterlist is downloaded (Sort with LOOT downloads it).');
 }
 
 /** Run again, in order, the whole-setup tools whose generated output is out of date. */
@@ -1622,6 +1637,8 @@ $('#issues').onclick = e => {
     failures.splice(Number(dismiss), 1);
     return renderProblems();
   }
+  const link = e.target.closest('[data-link]')?.dataset.link;
+  if (link) return void act('Opening the page', () => call('open_link', { url: link }), { reload: false });
   const ign = e.target.closest('[data-ignore]')?.dataset.ignore;
   if (ign) {
     if (!ignored.delete(ign)) ignored.add(ign);
@@ -1864,8 +1881,8 @@ $('#details').addEventListener('click', async e => {
   } else if (t.dataset.unhide) {
     hideFiles(id, [t.dataset.unhide], true);
   } else if (t.dataset.doc) {
-    showTab('ai');
-    ideOpen(`mods/${id}/${t.dataset.doc}`);
+    if (W.simple) showDoc(id, t.dataset.doc); // the editor is in the AI tab, which Simple hides
+    else { showTab('ai'); ideOpen(`mods/${id}/${t.dataset.doc}`); }
   } else if (t.dataset.pic) {
     const url = t.src;
     dialog({ title: t.dataset.pic, body: `<img src="${url}" alt="" style="max-width:100%">`, actions: [['ok', 'Close', 'primary']] });
@@ -1998,6 +2015,8 @@ function setPluginsEnabled(names, enabled) {
 
 /** Put `names`, in their order, at `at` in the load order without them. */
 function placePlugins(names, at) {
+  const locked = names.filter(n => D.locks.has(n.toLowerCase()));
+  if (locked.length) return toast(`${locked.join(', ')} ${locked.length > 1 ? 'are' : 'is'} locked at ${locked.length > 1 ? 'their positions' : 'its position'}. Untick “Lock at this position” in the plugin’s panel to move it.`);
   const order = pluginsWithout(names);
   order.splice(at, 0, ...names);
   const now = S.plugins.filter(p => !p.implicit).map(p => p.name);
@@ -2279,18 +2298,22 @@ $('#play-more').onclick = async e => {
 
 // ---- Profiles -------------------------------------------------------------------------------
 
-/** A Desktop shortcut that switches to `profile` and starts the game, as MO2's do; Steam can start the same. */
+/** A Desktop shortcut that switches to `profile` and starts the game, as MO2's do; Steam can start
+ *  the same. It says what it would make first: nothing is written until Make the shortcut. */
 async function profileShortcut(profile) {
-  const r = await act('Making the shortcut', () => call('desktop_shortcut', { profile }), { reload: false });
-  if (!r || r === true) return;
+  const plan = await act('Getting the shortcut ready', () => call('desktop_shortcut', { profile, dry_run: true }), { reload: false });
+  if (!plan || plan === true) return;
   const field = v => `<input type="text" readonly spellcheck="false" value="${esc(v)}">`;
-  await dialog({
+  const how = await dialog({
     title: 'Desktop shortcut',
-    body: `<p>“${esc(r.path.split(/[\\/]/).pop())}” is on your Desktop. It switches to “${esc(profile)}”, deploys and starts the game with its script extender, as Play does. If something stops it, its window stays open to say why.</p>
-      <p class="muted small">To start it from Steam: Games → Add a Non-Steam Game to My Library → Browse, pick the program below, then paste the launch options into its Properties. The game’s own Steam entry skips the script extender and anything not yet deployed.</p>
-      <p class="small">Program</p>${field(r.target)}<p class="small">Launch options</p>${field(r.arguments)}`,
-    actions: [['ok', 'OK', 'primary']],
+    body: `<p>Makes “${esc(plan.path.split(/[\\/]/).pop())}” on your Desktop. It switches to “${esc(profile)}”, deploys and starts the game with its script extender, as Play does. If something stops it, its window stays open to say why. A shortcut of that name is replaced.</p>
+      <p class="muted small">To start it from Steam instead: Games → Add a Non-Steam Game to My Library → Browse, pick the program below, then paste the launch options into its Properties. The game’s own Steam entry skips the script extender and anything not yet deployed.</p>
+      <p class="small">Program</p>${field(plan.target)}<p class="small">Launch options</p>${field(plan.arguments)}`,
+    actions: [['cancel', 'Cancel'], ['ok', 'Make the shortcut', 'primary']],
   });
+  if (how !== 'ok') return;
+  const r = await act('Making the shortcut', () => call('desktop_shortcut', { profile }), { reload: false });
+  if (r && r !== true) toast(`“${r.path.split(/[\\/]/).pop()}” is on your Desktop.`);
 }
 
 $('#profile-btn').onclick = e => {
@@ -2340,7 +2363,7 @@ $('#profile-pop').onclick = async e => {
       toast(`Switched to ${name}. Deploy or Play applies it to the game folder.`);
     }
   } else if (t.dataset.new === 'playthrough') {
-    const name = await ask('New playthrough', `A copy of “${cur}”: the same mods, order and plugins, with saves of its own. From the next Play the game saves in Saves\\<name>\\, so this character’s saves don’t mix with the others. Your saves so far stay with “${cur}”; the Saves tab copies or moves saves between profiles.`, 'New playthrough');
+    const name = await ask('New playthrough', `A copy of “${cur}”: the same mods, order and plugins, with saves of its own. From the next Play the game saves in a folder of its own under Saves, named after the profile, so this character’s saves don’t mix with the others. Your saves so far stay with “${cur}”; the Saves tab copies or moves saves between profiles.`, 'New playthrough');
     if (name && await act('Starting the playthrough', () => call('new_playthrough', { name }))) {
       toast(`Switched to ${name}. Play starts the game with its own saves.`);
     }
@@ -2823,7 +2846,7 @@ async function importExport(what) {
     if (!done || done === true) return;
     const res = [].concat(done), n = k => res.reduce((t, x) => t + (x[k]?.length ?? x[k] ?? 0), 0);
     const notes = [...new Set(res.flatMap(x => x.warnings))];
-    if (n('hidden')) notes.push(`${plural(n('hidden'), 'file')} MO2 had hidden stayed behind.`);
+    if (n('hidden')) notes.push(`${plural(n('hidden'), 'file')} MO2 had hidden came in hidden too (Hide files… in a mod’s panel shows them).`);
     toast(`Imported ${plural(n('mods'), 'mod')}${args.all ? ` into ${plural(res.length, 'profile')}` : ''} (${n('linked').toLocaleString()} files linked, ${n('copied').toLocaleString()} copied)${n('tools') ? `, and ${plural(n('tools'), 'tool')}` : ''}.${notes.length ? '\n' + notes.join('\n') : ''}`, notes.length ? 'warn' : 'info');
     if (n('tools')) loadTools();
     return;
@@ -3314,7 +3337,7 @@ function fomodWizard(path, first) {
     d.className = 'wizard';
     d.innerHTML = `<form method="dialog">
       <h2>${esc(w.module || basename(path))}</h2>
-      <div class="stepline muted small">Step ${at + 1} of ${w.steps.length} · <b>${esc(step.name)}</b></div>
+      <div class="stepline muted small">Step ${at + 1} of ${w.steps.length}${step.name.trim() ? ` · <b>${esc(step.name)}</b>` : ''}</div>
       <div class="body wiz">
         <div class="groups">${step.groups.map(group).join('')}</div>
         <aside id="opt-info"></aside>
@@ -4212,6 +4235,15 @@ $('#ai-stop').onclick = () => { $('#ai-status').textContent = 'Stopping after th
 
 /** Modal dialog. actions: [[value, label, class]]. Resolves to the chosen value (the input's
  *  text when `input` is given), or null when cancelled. */
+/** A mod's read-me, wrapped, to read in a dialog. */
+async function showDoc(id, doc) {
+  let d;
+  try { d = await call('ide_read', { path: `mods/${id}/${doc}` }); } catch (e) { return toast(String(e), 'error'); }
+  const shown = dialog({ title: doc.split('/').pop(), body: `<pre class="doc-view">${esc(d.text)}</pre>`, actions: [['ok', 'Close', 'primary']] });
+  $('#dlg').classList.add('wide');
+  await shown;
+}
+
 function dialog({ title, body = '', actions, input }) {
   const d = $('#dlg');
   d.className = '';

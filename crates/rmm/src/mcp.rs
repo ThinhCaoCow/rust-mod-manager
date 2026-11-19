@@ -1244,12 +1244,12 @@ impl Rmm {
         out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true))))
     }
 
-    #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. Takes effect at the next deploy.")]
+    #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. One undo step. Takes effect at the next deploy.")]
     async fn hide_files(&self, Parameters(a): Parameters<HideArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| install::hide_files(&i, &a.id, &a.paths, !a.show.unwrap_or(false))))
     }
 
-    #[tool(description = "Move files or folders from one mod into another, \"<overwrite>\" included: MCM settings or a tool's output from Overwrite into the mod they belong with. Files the target has already are refused unless replace (its copies go to trash/). Takes effect at the next deploy.")]
+    #[tool(description = "Move files or folders from one mod into another, \"<overwrite>\" included: MCM settings or a tool's output from Overwrite into the mod they belong with. Files the target has already are refused unless replace. One undo step, which brings the target's replaced copies back too. Takes effect at the next deploy.")]
     async fn move_files(&self, Parameters(a): Parameters<MoveFilesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| install::move_files(&i, &a.from, &a.paths, &a.to, a.replace.unwrap_or(false))))
     }

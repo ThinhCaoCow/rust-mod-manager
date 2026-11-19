@@ -247,7 +247,7 @@ impl Instance {
             fs::create_dir_all(root.join(d))?;
         }
         let inst = Instance {
-            root: root.to_path_buf(),
+            root: std::path::absolute(root)?,
             config: InstanceConfig {
                 game,
                 game_path: game_path.into(),
@@ -266,7 +266,8 @@ impl Instance {
         let text = fs::read_to_string(root.join(CONFIG))
             .with_context(|| format!("{} is not an rmm instance (no {CONFIG})", root.display()))?;
         crate::addons::register_games(root);
-        Ok(Instance { root: root.into(), config: toml::from_str(&text)? })
+        // Absolute, so the folder reads the same however it was named (`-i inst` or `-i D:/x/inst`).
+        Ok(Instance { root: std::path::absolute(root)?, config: toml::from_str(&text)? })
     }
 
     pub fn mods_dir(&self) -> PathBuf {
@@ -544,6 +545,11 @@ impl Instance {
         Ok(entries.into_iter().map(|(_, label)| label).collect())
     }
 
+    /// How many undone changes Redo can bring back.
+    pub fn redo_steps(&self) -> Result<usize> {
+        Ok(self.stack("redo")?.len())
+    }
+
     /// Undoable changes, newest first, each with the mods it touched.
     pub fn history_details(&self) -> Result<Vec<HistoryEntry>> {
         let snaps = self.snapshots()?;
@@ -691,7 +697,8 @@ impl Instance {
     /// (`edit_swapping`): hard links, so it costs no space, and rmm replaces files rather than
     /// writing into them. Returns the folder under trash/.
     pub(crate) fn keep_files(&self, id: &str) -> Result<String> {
-        let folder = (1..).map(|n| format!(".replaced/{id}-{n}")).find(|f| !self.root.join("trash").join(f).exists()).expect("a free name");
+        let name = id.trim_matches(['<', '>']); // Overwrite's id isn't a folder name
+        let folder = (1..).map(|n| format!(".replaced/{name}-{n}")).find(|f| !self.root.join("trash").join(f).exists()).expect("a free name");
         let (from, to) = (self.mod_dir(id), self.root.join("trash").join(&folder));
         fs::create_dir_all(&to)?;
         for e in walkdir::WalkDir::new(&from).min_depth(1) {
