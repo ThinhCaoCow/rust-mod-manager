@@ -1050,7 +1050,7 @@ fn archive_conflicts() {
     assert_eq!(view("", "X.DDS", false, true), ["textures/x.dds A,B in B - Textures.bsa"]);
     assert!(conflicts::data_view(&inst, &inst.profile().unwrap(), &conflicts::DataQuery { dir: "../..".into(), ..Default::default() }).is_err());
 
-    ops::set_plugin_order(&inst, &["B.esp".into(), "A.esp".into()]).unwrap();
+    ops::set_plugin_order(&inst, &["B.esp".into(), "A.esp".into()], &[]).unwrap();
     let a = get(&inst, "A");
     assert_eq!((a.archived_losing, a.archive_overwritten_by.as_slice()), (1, ["C".to_string()].as_slice()));
     assert_eq!(a.archive_overwrites, ["B"]);
@@ -2130,15 +2130,27 @@ fn notes_colours_locks_and_restore() {
     assert_eq!(row("A").color, None);
 
     // A locked plugin stays put whatever else moves.
-    ops::set_plugin_order(&inst, &v(&["C.esp", "A.esp", "B.esp"])).unwrap();
+    ops::set_plugin_order(&inst, &v(&["C.esp", "A.esp", "B.esp"]), &[]).unwrap();
     ops::lock_plugin(&inst, "c.esp", true).unwrap();
     assert_eq!(inst.profile().unwrap().locks["C.esp"], 0);
-    ops::set_plugin_order(&inst, &v(&["B.esp", "A.esp", "C.esp"])).unwrap();
+    ops::set_plugin_order(&inst, &v(&["B.esp", "A.esp", "C.esp"]), &[]).unwrap();
     assert_eq!(plugins(), "C.esp B.esp A.esp");
     ops::lock_plugin(&inst, "C.esp", false).unwrap();
-    ops::set_plugin_order(&inst, &v(&["A.esp", "B.esp", "C.esp"])).unwrap();
+    ops::set_plugin_order(&inst, &v(&["A.esp", "B.esp", "C.esp"]), &[]).unwrap();
     assert_eq!(plugins(), "A.esp B.esp C.esp");
     assert!(ops::lock_plugin(&inst, "Nope.esp", true).is_err());
+
+    // A run of moves of the same plugin (Ctrl+Down held) is one undo step back to where it began.
+    let steps = inst.history().unwrap().len();
+    ops::set_plugin_order(&inst, &v(&["B.esp", "A.esp", "C.esp"]), &v(&["A.esp"])).unwrap();
+    ops::set_plugin_order(&inst, &v(&["B.esp", "C.esp", "A.esp"]), &v(&["A.esp"])).unwrap();
+    assert_eq!(inst.history().unwrap().len(), steps + 1);
+    assert_eq!(inst.history().unwrap()[0], "move A.esp to 2");
+    ops::set_plugin_order(&inst, &v(&["C.esp", "B.esp", "A.esp"]), &v(&["C.esp"])).unwrap();
+    assert_eq!(inst.history().unwrap().len(), steps + 2, "another plugin's move is its own step");
+    inst.undo().unwrap();
+    inst.undo().unwrap();
+    assert_eq!(plugins(), "A.esp B.esp C.esp");
 
     // Loose per-file conflicts.
     let files = conflicts::file_conflicts(&inst, &inst.profile().unwrap(), "A").unwrap();

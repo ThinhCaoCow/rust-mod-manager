@@ -2291,11 +2291,11 @@ function placePlugins(names, at, queue = false) {
   order.splice(at, 0, ...names);
   const now = S.plugins.filter(p => !p.implicit).map(p => p.name);
   if (order.every((n, i) => n === now[i])) return;
-  if (!queue) return act(names.length > 1 ? 'Moving the plugins' : 'Moving the plugin', () => call('plugin_order', { names: order }));
+  if (!queue) return act(names.length > 1 ? 'Moving the plugins' : 'Moving the plugin', () => call('plugin_order', { names: order, moved: names }));
   const byName = new Map(S.plugins.map(p => [p.name, p]));
   S.plugins = [...S.plugins.filter(p => p.implicit), ...order.map(n => byName.get(n))];
   renderPlugins();
-  queueSend('plugins', names.join('\n'), () => call('plugin_order', { names: S.plugins.filter(p => !p.implicit).map(p => p.name) }));
+  queueSend('plugins', names.join('\n'), () => call('plugin_order', { names: S.plugins.filter(p => !p.implicit).map(p => p.name), moved: names }));
 }
 
 /** Ctrl+Up/Down: the selected plugins one place, together. */

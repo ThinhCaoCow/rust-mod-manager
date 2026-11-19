@@ -961,7 +961,7 @@ impl Rmm {
 
     #[tool(description = "Reorder plugins. Masters still load before non-masters regardless.")]
     async fn set_plugin_order(&self, Parameters(a): Parameters<PluginOrderArgs>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|i| ops::set_plugin_order(&i, &a.names)))
+        out(self.inst_mut().and_then(|i| ops::set_plugin_order(&i, &a.names, &[])))
     }
 
     #[tool(description = "Apply the profile to the game folder (hard links, incremental) and write plugins.txt. dry_run defaults to true and returns the plan.")]

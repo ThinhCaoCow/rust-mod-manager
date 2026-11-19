@@ -463,7 +463,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "edit_separator" => json!(ops::edit_separator(&inst, &s("id")?, a["name"].as_str(), a["color"].as_str())?),
         "enable_plugin" => json!(ops::set_plugin_enabled(&inst, &s("name")?, flag("enabled"))?),
         "enable_plugins" => json!(ops::set_plugins_enabled(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, flag("enabled"))?),
-        "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?)?),
+        "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, &serde_json::from_value::<Vec<String>>(a["moved"].clone()).unwrap_or_default())?),
         "set_rule" => json!(rules::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
         "sort_mods" => json!(rules::sort(&inst, flag("dry_run"))?),
         "sort_plugins" => json!(loot::sort(&inst, flag("dry_run"))?),

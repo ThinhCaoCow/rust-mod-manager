@@ -471,8 +471,16 @@ pub fn set_plugins_enabled(inst: &Instance, names: &[String], enabled: bool) -> 
 }
 
 /// Put `names` in this order; plugins not listed keep their relative order after them.
-pub fn set_plugin_order(inst: &Instance, names: &[String]) -> Result<()> {
-    inst.edit("reorder plugins", |p| {
+/// `moved` names the plugins the user moved (empty for a whole new order): a run of moves of the
+/// same plugins is then one undo step, like mods'.
+pub fn set_plugin_order(inst: &Instance, names: &[String], moved: &[String]) -> Result<()> {
+    let at = moved.first().and_then(|m| names.iter().position(|n| n.eq_ignore_ascii_case(m)));
+    let label = match (moved, at) {
+        ([one], Some(at)) => format!("move {one} to {at}"),
+        (_, Some(at)) => format!("move {} plugins to {at}", moved.len()),
+        _ => "reorder plugins".into(),
+    };
+    inst.edit(&label, |p| {
         let key = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n)).unwrap_or(usize::MAX);
         for n in names {
             if !p.plugins.iter().any(|e| e.name.eq_ignore_ascii_case(n)) {

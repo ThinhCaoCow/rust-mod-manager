@@ -1100,8 +1100,8 @@ fn run() -> Result<()> {
                 let mut order: Vec<String> = all.into_iter().map(|p| p.name).filter(|n| *n != m).collect();
                 let (other, past) = after.map(|a| (a, 1)).or(before.map(|b| (b, 0))).context("--move needs --after or --before")?;
                 let at = order.iter().position(|n| n.eq_ignore_ascii_case(&other)).with_context(|| format!("no plugin {other} in the profile"))?;
-                order.insert(at + past, m);
-                ops::set_plugin_order(&inst, &order)?;
+                order.insert(at + past, m.clone());
+                ops::set_plugin_order(&inst, &order, std::slice::from_ref(&m))?;
             }
             print(&plugins::list(&inst, &inst.profile()?)?)
         }
