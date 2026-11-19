@@ -53,8 +53,9 @@ jobs:
           $pfx = Join-Path $env:RUNNER_TEMP 'rmm.pfx'
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT))
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
-          $cmd = "`"$($signtool.FullName)`" sign /fd sha256 /f `"$pfx`" /p `"$env:CERT_PASSWORD`" /tr http://timestamp.digicert.com /td sha256 `"%1`""
-          @{ bundle = @{ windows = @{ signCommand = $cmd } } } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $env:RUNNER_TEMP 'sign.conf.json')
+          # {cmd, args}: Tauri splits a string command on spaces, and signtool is under "Program Files (x86)".
+          $sign = @{ cmd = $signtool.FullName; args = @('sign', '/fd', 'sha256', '/f', $pfx, '/p', $env:CERT_PASSWORD, '/tr', 'http://timestamp.digicert.com', '/td', 'sha256', '%1') }
+          @{ bundle = @{ windows = @{ signCommand = $sign } } } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $env:RUNNER_TEMP 'sign.conf.json')
           "args=--config $(Join-Path $env:RUNNER_TEMP 'sign.conf.json')" >> $env:GITHUB_OUTPUT
 
       - uses: tauri-apps/tauri-action@v0

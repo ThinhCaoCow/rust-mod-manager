@@ -473,6 +473,13 @@ enum Cmd {
     /// closed, where FOMOD installers show their options. Without the window program beside rmm,
     /// it downloads and installs the file here (`rmm nexus install` always does).
     Nxm { link: String },
+    /// For the installer: put its folder on the user's PATH, or --remove it.
+    #[command(hide = true)]
+    InstallerPath {
+        dir: String,
+        #[arg(long)]
+        remove: bool,
+    },
     /// Undo the last change to the profile (order, enabled mods and plugins, installs). Prints
     /// what it undid; deploy applies it to the game.
     Undo,
@@ -1279,6 +1286,10 @@ fn run() -> Result<()> {
             let hold = if release { nexus::Hold::Release } else if skip { nexus::Hold::Skip } else { nexus::Hold::Pin };
             nexus::hold_updates(&open()?, &ids, hold)
         }
+        #[cfg(windows)]
+        Cmd::InstallerPath { dir, remove } => print(&serde_json::json!({ "changed": rmm_core::userpath::set(&dir, !remove)? })),
+        #[cfg(not(windows))]
+        Cmd::InstallerPath { .. } => anyhow::bail!("only the Windows installer uses this"),
         Cmd::Nxm { link } => {
             let inst = open()?;
             let app = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm-app.exe" } else { "rmm-app" });
