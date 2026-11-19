@@ -66,11 +66,11 @@
         <div class="fchips" id="fchips" role="group" aria-label="Show only">
           <button data-f="enabled">Enabled</button>
           <button data-f="disabled">Disabled</button>
-          <button data-f="conflicted">Conflicted</button>
-          <button data-f="overridden">Overridden</button>
-          <button data-f="rule">Broken rule</button>
-          <button data-f="masters" title="Mods with a plugin whose masters (the plugins it's built on) are off or load after it">Missing masters</button>
-          <button data-f="plugins">Has plugins</button>
+          <button data-f="conflicted" class="adv">Conflicted</button>
+          <button data-f="overridden" class="adv">Overridden</button>
+          <button data-f="rule" class="adv">Broken rule</button>
+          <button data-f="masters" class="adv" title="Mods with a plugin whose masters (the plugins it's built on) are off or load after it">Missing masters</button>
+          <button data-f="plugins" class="adv">Has plugins</button>
           <button data-f="recent" title="Installed in the last 7 days">Recent</button>
           <button data-f="update" title="Mods the last update check found a newer file for (Check for updates)">Update available</button>
           <button data-f="problems" title="Mods the health check or the list flags">Problems</button>
@@ -82,7 +82,7 @@
         <button id="disable-matching" hidden>Disable matching</button>
         <button id="updates" title="Check Nexus Mods for newer files">Check for updates</button>
         <button id="split" title="Show the plugins beside the mods" hidden>Plugins beside</button>
-        <button id="add-sep" title="Add a separator above the selected rows">＋ Separator</button>
+        <button id="add-sep" class="adv" title="Add a separator above the selected rows">＋ Separator</button>
       </div>
       <div class="start" id="start-card" hidden></div>
       <div class="notice" id="rules-notice" hidden></div>
@@ -100,7 +100,7 @@
       <div class="toolbar"><span class="muted small" id="plugins-note"></span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
       <div class="scroll">
         <table class="list" id="plugins">
-          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num">#</th></tr></thead>
+          <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num idx-col" title="Load-order index: the first part of the form ids the plugin's records get in game (FE and three digits for light plugins), as xEdit and the console show them">Index</th><th class="num">#</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -132,10 +132,10 @@
       </div>
     </section>
     <section class="pane" id="pane-downloads" hidden>
-      <div class="toolbar"><span class="muted small" id="downloads-note">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="dl-delete" class="link" hidden></button><button id="dl-install" class="primary" hidden></button><button id="dl-identify" title="Look the files up on Nexus by their contents, so installs from them and the mods made from them get update checks">Identify on Nexus</button><button id="downloads-reload">Refresh</button></div>
+      <div class="toolbar"><input id="dl-find" type="search" placeholder="Find a download" spellcheck="false" aria-label="Find a download by its file, Nexus or mod name"><span class="muted small" id="downloads-note">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="dl-delete" class="link danger" hidden></button><button id="dl-install" class="primary" hidden></button><button id="dl-identify" title="Look the files up on Nexus by their contents, so installs from them and the mods made from them get update checks">Identify on Nexus</button><button id="downloads-reload">Refresh</button></div>
       <div class="notice plain" id="dl-queue" hidden></div>
       <div class="scroll">
-        <table class="list tall" id="downloads">
+        <table class="list" id="downloads">
           <thead><tr><th class="check-col"><input type="checkbox" id="dl-all" title="Select every file"></th><th>File</th><th class="from-col">On Nexus</th><th class="from-col">Installed as</th><th class="size-col">Size</th><th class="when-col">Downloaded</th><th class="run-col"></th></tr></thead>
           <tbody></tbody>
         </table>
@@ -240,12 +240,14 @@
     <section class="pane" id="pane-settings" hidden>
       <div class="scroll"><div class="settings">
         <div id="set-more"></div>
+        <div class="adv">
         <h2>AI providers</h2>
         <p class="muted small">rmm's own AI runs on a provider you pay for, with your API key. Keys are kept in your user folder, never in the instance.</p>
         <table class="set" id="set-providers"></table>
         <h2>Mod team</h2>
         <p class="muted small">Who answers in the AI tab. A message with a role goes to that role's AI, and the Lead hands each step to the AI of its role. An AI app such as Claude can take a role over MCP (<button class="link small" id="set-access">AI access…</button> or <code>rmm mcp</code>): steps for it wait on the team board until you ask the app to do its rmm team tasks, and it can hand steps to the roles on a provider here.</p>
         <table class="set" id="set-team"></table>
+        </div>
         <div id="set-more-ai"></div>
       </div></div>
     </section>

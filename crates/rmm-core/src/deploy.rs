@@ -75,6 +75,29 @@ struct Want {
 }
 
 /// Mod-relative path -> game-relative target (`root/x` goes to the game root, the rest to Data).
+/// A file that comes with a mod but isn't for the game, by its target (`Data/...`, or a path in
+/// the game folder): MO2's meta.ini, Vortex's override notes, a FOMOD installer, documents (read-
+/// me's, licences, change logs, install notes) at the top of Data or the game folder or in a docs
+/// folder at the top of Data, and the script extender's sources (`src/` in the game folder).
+pub(crate) fn extra(target: &str) -> bool {
+    const DOCS: &[&str] = &[".txt", ".md", ".pdf", ".rtf", ".htm", ".html", ".url", ".doc", ".docx"];
+    let t = target.to_ascii_lowercase();
+    let (in_root, rel) = match t.strip_prefix("data/") {
+        Some(r) => (false, r),
+        None => (true, t.as_str()),
+    };
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let first = rel.split('/').next().unwrap_or(rel);
+    // "LICENSE" and "README" with no extension too; a plugin called readme.esp stays.
+    let doc = DOCS.iter().any(|e| name.ends_with(e)) || (!name.contains('.') && ["readme", "license", "licence"].iter().any(|p| name.starts_with(p)));
+    name == "meta.ini"
+        || name == "vortex_override_instructions.json"
+        || rel.starts_with("fomod/")
+        || (!rel.contains('/') && doc)
+        || (!in_root && rel.contains('/') && (first.starts_with("readme") || matches!(first, "docs" | "documentation")))
+        || (in_root && rel.starts_with("src/"))
+}
+
 fn target_of(rel: &str) -> String {
     match rel.strip_prefix("root/") {
         Some(r) => r.to_string(),
@@ -191,6 +214,9 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
             if !cfg.exclude.is_empty() {
                 desired.retain(|_, w| !crate::settings::excluded(&cfg.exclude, w.target.strip_prefix("Data/").unwrap_or(&w.target)));
             }
+            if cfg.skip_extras {
+                desired.retain(|_, w| !extra(&w.target));
+            }
             let copy_all = cfg.method == "copy";
             for key in &changed {
                 // Already true after a real capture; a dry run has to pretend.
@@ -283,6 +309,11 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
                 plan.copied += e.copied as usize;
                 let s = stat(&path).expect("just deployed");
                 (e.size, e.mtime, e.id) = (s.size, s.mtime, s.id);
+            }
+            // Folders rmm made that the removals above left empty (a mod's Docs, now an extra).
+            if !dry_run {
+                man.dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
+                man.dirs.retain(|d| fs::remove_dir(game.join(d)).is_err()); // only succeeds when empty
             }
             Ok(())
         })();
@@ -763,5 +794,20 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::extra;
+
+    #[test]
+    fn files_that_arent_for_the_game() {
+        for t in ["Data/meta.ini", "Data/fomod/ModuleConfig.xml", "Data/README.txt", "Data/License.md", "src/skse64/main.cpp", "readme.txt", "LICENSE", "Data/vortex_override_instructions.json", "skse64_whatsnew.txt", "SSE Engine Fixes - Install Instructions.txt", "Data/readmes/a.pdf", "Data/Docs/x.html"] {
+            assert!(extra(t), "{t}");
+        }
+        for t in ["Data/SkyUI_SE.esp", "Data/interface/readme.swf", "skse64_loader.exe", "Data/scripts/source/a.psc", "Data/src/x.txt", "Data/meshes/fomod.nif", "enbseries.ini", "Data/SKSE/Plugins/notes.txt", "Data/readme.esp"] {
+            assert!(!extra(t), "{t}");
+        }
     }
 }

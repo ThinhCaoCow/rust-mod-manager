@@ -591,6 +591,11 @@ struct AddToolArgs {
     spec: ToolSpec,
 }
 #[derive(Deserialize, JsonSchema)]
+struct RemoveToolArgs {
+    /// Tool id from list_tools.
+    id: String,
+}
+#[derive(Deserialize, JsonSchema)]
 struct RunToolArgs {
     /// Tool id from list_tools.
     id: String,
@@ -991,6 +996,11 @@ impl Rmm {
     #[tool(description = "Register or replace a tool. Give the exe path; a preset fills in the arguments, which args, vars and rewrites override. edit_in_place (the xedit preset's default) suits patching: edits go back to the mods they change.")]
     async fn add_tool(&self, Parameters(a): Parameters<AddToolArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| tools::add(&i, &a.id, a.spec)))
+    }
+
+    #[tool(description = "Remove a tool from tools.toml. Its generated mod and its state folder stay.")]
+    async fn remove_tool(&self, Parameters(a): Parameters<RemoveToolArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| tools::remove(&i, &a.id).map(|()| true)))
     }
 
     #[tool(description = "Run a tool against the deployed setup and capture its output into a generated mod (replacing its previous output, undoable). A tool that edits in place (xEdit) instead saves changed files back into the mods they come from and new files into its output mod, kept enabled; undo puts those mods back. dry_run defaults to true and returns the command and plan. Blocks until the tool exits, unless background is true: then it returns at once and tool_job reports progress and the result.")]

@@ -580,6 +580,32 @@ pub fn hold_updates(inst: &Instance, ids: &[String], hold: Hold) -> Result<()> {
     })
 }
 
+/// A version's numbers, for ordering: "1.10b" -> [1, 10]. Nexus versions are free text.
+fn ver_key(v: &str) -> Vec<u64> {
+    v.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse().unwrap_or(u64::MAX)).collect()
+}
+
+/// A mod's changelog on Nexus, newest first: the versions after `since` (the installed one), or
+/// the newest three when that's unknown.
+pub fn changelog(inst: &Instance, client: &Client, mod_id: u64, since: Option<&str>) -> Result<Vec<(String, Vec<String>)>> {
+    let v = client.get(&format!("/v1/games/{}/mods/{mod_id}/changelogs.json", inst.config.game.nexus_domain()))?;
+    Ok(changelog_after(&v, since))
+}
+
+fn changelog_after(v: &Value, since: Option<&str>) -> Vec<(String, Vec<String>)> {
+    let mut all: Vec<(String, Vec<String>)> = v
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, l)| (k.clone(), l.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(|s| s.trim().to_owned())).filter(|s| !s.is_empty()).collect()))
+        .collect();
+    all.sort_by_key(|(k, _)| std::cmp::Reverse(ver_key(k)));
+    match since.map(ver_key).filter(|k| !k.is_empty()) {
+        Some(have) => all.into_iter().take_while(|(k, _)| ver_key(k) > have).collect(),
+        None => all.into_iter().take(3).collect(),
+    }
+}
+
 /// Mods with a newer file on Nexus, leaving out the ones the user holds back (`hold_updates`).
 /// `ids` limits the check (default: every mod with Nexus ids).
 pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -> Result<Vec<Update>> {
@@ -1056,6 +1082,15 @@ pub fn handler_command() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changelog_after_the_installed_version() {
+        let v = serde_json::json!({ "1.9": ["nine"], "1.10": ["ten", " "], "2.0b": ["two"], "1.2": ["old"] });
+        let names = |l: Vec<(String, Vec<String>)>| l.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+        assert_eq!(names(changelog_after(&v, Some("1.9"))), ["2.0b", "1.10"]);
+        assert_eq!(names(changelog_after(&v, None)), ["2.0b", "1.10", "1.9"]);
+        assert_eq!(changelog_after(&v, Some("1.9"))[1].1, ["ten"]);
+    }
 
     /// Single sign-on against a fake Nexus: rmm's id goes out, the approval page opens once the
     /// connection token arrives, a ping gets its pong, and the key comes back.

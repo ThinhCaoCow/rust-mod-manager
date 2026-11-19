@@ -32,10 +32,13 @@ pub struct Deploy {
     /// Files never deployed, by their path inside Data: `*` stands for any run of characters, and a
     /// pattern without `/` matches the file's name (`*.txt`, `readme*`, `fomod/*`).
     pub exclude: Vec<String>,
+    /// Leave out what comes with mods but isn't for the game (`deploy::extra`): MO2's meta.ini,
+    /// FOMOD installers, read-me's and licences at the top, the script extender's sources.
+    pub skip_extras: bool,
 }
 impl Default for Deploy {
     fn default() -> Self {
-        Deploy { method: "link".into(), exclude: vec![] }
+        Deploy { method: "link".into(), exclude: vec![], skip_extras: true }
     }
 }
 

@@ -230,7 +230,11 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     let tools = crate::tools::list(inst).unwrap_or_default();
     for s in crate::tools::stale_outputs(inst).unwrap_or_default() {
         let tool = tools.get(&s.tool).map_or(s.tool.as_str(), |t| t.name.as_str());
-        add("warning", "stale_output", &s.output, format!("made by {tool} from a setup that has changed since: {}. Rebuild outputs (Tools) runs it again", s.summary()));
+        if s.unknown {
+            add("info", "stale_output", &s.output, format!("made by {tool}, but {}, so it can't tell whether it's out of date. Rebuild outputs (Tools) runs {tool} again, and from then on rmm knows", s.summary()));
+        } else {
+            add("warning", "stale_output", &s.output, format!("made by {tool} from a setup that has changed since, in what it reads: {}. Rebuild outputs (Tools) runs it again", s.summary()));
+        }
     }
     issues.extend(fallout4_ini(inst)?);
     match crate::loot::issues(inst) {

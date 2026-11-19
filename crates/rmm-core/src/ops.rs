@@ -321,18 +321,29 @@ pub fn set_mod_note(inst: &Instance, id: &str, note: &str) -> Result<Option<Stri
 
 /// Colour a row (separator or mod): `#rrggbb`, or empty to remove it. Undoable.
 pub fn set_color(inst: &Instance, id: &str, color: &str) -> Result<()> {
+    set_colors(inst, &[id.to_string()], color)
+}
+
+/// Colour several rows as one undoable change.
+pub fn set_colors(inst: &Instance, ids: &[String], color: &str) -> Result<()> {
     let valid = color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|ch| ch.is_ascii_hexdigit());
     if !color.is_empty() && !valid {
         bail!("a colour is written #rrggbb");
     }
-    inst.edit(&format!("colour {}", id.strip_prefix("sep:").unwrap_or(id)), |p| {
-        if !p.mods.iter().any(|m| m.id == id) {
-            bail!("no mod or separator '{id}'");
-        }
-        if color.is_empty() {
-            p.colors.remove(id);
-        } else {
-            p.colors.insert(id.into(), color.to_lowercase());
+    let label = match ids {
+        [one] => format!("colour {}", one.strip_prefix("sep:").unwrap_or(one)),
+        _ => format!("colour {} rows", ids.len()),
+    };
+    inst.edit(&label, |p| {
+        for id in ids {
+            if !p.mods.iter().any(|m| &m.id == id) {
+                bail!("no mod or separator '{id}'");
+            }
+            if color.is_empty() {
+                p.colors.remove(id);
+            } else {
+                p.colors.insert(id.clone(), color.to_lowercase());
+            }
         }
         Ok(())
     })

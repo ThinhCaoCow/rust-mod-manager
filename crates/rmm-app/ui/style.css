@@ -58,6 +58,7 @@ button.primary .muted { color: inherit; font-weight: 400; opacity: .75; }
 button.danger { color: var(--bad); }
 button.link { border: 0; background: none; padding: 0; color: var(--accent); }
 button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+button.link.danger { color: var(--bad); }
 #nexus-btn.warn { color: var(--lose); border-color: var(--lose); }
 input[type=search], input[type=text], input[type=number], input:not([type]), select {
   background: var(--panel);
@@ -205,6 +206,10 @@ table.list { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .list tr.pad td { padding: 0; border: 0; }
 .list .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
 .list th.num { width: 64px; }
+.list th.idx-col { width: 72px; }
+.list td.idx { font: 12px ui-monospace, "Cascadia Mono", Consolas, monospace; }
+.records li { margin-bottom: 8px; }
+.records details { margin-top: 2px; }
 .list .grip-col { width: 30px; padding-right: 0; }
 .list .check-col { width: 32px; padding-right: 0; }
 .list .conf-col { width: 200px; }
@@ -214,6 +219,11 @@ table.list { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .cats .cat:hover { color: var(--text); text-decoration: underline; }
 .list .type-col { width: 90px; }
 .list .from-col { width: 26%; }
+#downloads .from-col { width: 20%; }
+#dl-find { width: 220px; }
+#downloads .run-col { width: 200px; }
+#downloads .run-col button + button { margin-left: 10px; }
+body.simple .adv { display: none !important; }
 .list .issue-col { width: 130px; }
 .list tbody tr { cursor: default; }
 .list tbody tr:not(.pad):hover { background: var(--hover); }
@@ -254,6 +264,10 @@ body.dragging, body.dragging * { cursor: grabbing !important; }
 .pill.lose { background: var(--lose-bg); color: var(--lose); }
 .pill.bad { background: var(--bad-bg); color: var(--bad); }
 .pill.plain { background: var(--hover); color: var(--muted); }
+button.pill { border: 0; font-family: inherit; line-height: inherit; cursor: pointer; }
+button.pill:hover { filter: brightness(1.15); }
+.changelog ul { margin: 2px 0 6px 18px; padding: 0; }
+.changelog summary { cursor: pointer; }
 .warn-icon { color: var(--lose); margin-left: 6px; }
 .empty { padding: 40px; text-align: center; color: var(--muted); }
 

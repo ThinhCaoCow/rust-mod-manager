@@ -337,7 +337,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "fomod" => {
             let path = s("path")?;
             match install::has_fomod(&inst, Path::new(&path))? {
-                true => json!(install::fomod_options(&inst, Path::new(&path), choices()?.as_ref())?),
+                true => {
+                    let mut v = json!(install::fomod_options(&inst, Path::new(&path), choices()?.as_ref())?);
+                    // For the wizard's hints: which option is for this game version.
+                    v["game_version"] = json!(rmm_core::launch::game_version(&inst.config.game_path, inst.config.game).ok().map(|v| v.map(|n| n.to_string()).join(".")));
+                    v
+                }
                 false => Value::Null,
             }
         }
@@ -400,8 +405,25 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "clear_overwrite" => json!(install::clear_overwrite(&inst)?),
         "tools" => {
             // With each tool's last run, so the list can say how it went.
-            let last = |id: &str| fs::read_to_string(inst.root.join("tools").join(id).join("last-run.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-            let list: Vec<Value> = tools::list(&inst)?.into_iter().map(|(id, t)| json!({ "id": id, "last": last(&id), "tool": t })).collect();
+            let file = |id: &str| inst.root.join("tools").join(id).join("last-run.json");
+            let last = |id: &str| fs::read_to_string(file(id)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            let when = |id: &str| fs::metadata(file(id)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+            // Whole-setup generators: their output in this profile and whether it's up to date.
+            let (stale, p) = (tools::stale_outputs(&inst)?, inst.profile()?);
+            let output = |id: &str| p.mods.iter().find(|m| m.enabled && inst.mod_meta(&m.id).source.as_deref() == Some(&format!("tool:{id}"))).map(|m| m.id.clone());
+            let list: Vec<Value> = tools::list(&inst)?
+                .into_iter()
+                .map(|(id, t)| {
+                    let whole = tools::chain_preset(&inst, &id, &t).is_some();
+                    let out = output(&id).filter(|_| whole);
+                    let st = out.as_ref().and_then(|o| stale.iter().find(|s| &s.output == o));
+                    let status = out.as_ref().map(|_| match st {
+                        None => json!({ "state": "current" }),
+                        Some(s) => json!({ "state": if s.unknown { "unknown" } else { "stale" }, "why": s.summary() }),
+                    });
+                    json!({ "id": id, "last": last(&id), "when": when(&id), "tool": t, "output": out, "status": status })
+                })
+                .collect();
             json!({ "tools": list, "presets": tools::PRESETS })
         }
         "add_tool" => json!(tools::add(&inst, &s("id")?, serde_json::from_value(a["spec"].clone())?)?),
@@ -484,6 +506,16 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}{tab}", inst.config.game.nexus_domain(), n("mod_id")?))?)
         }
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
+        "nexus_changelog" => json!(nexus::changelog(&inst, &nexus::Client::any(), n("mod_id")? as u64, a["since"].as_str())?),
+        // A mod's folder (or Overwrite's) in Explorer.
+        "open_mod_folder" => {
+            let dir = inst.mod_dir(&s("id")?);
+            if !dir.is_dir() {
+                bail!("{} isn't there", dir.display());
+            }
+            std::process::Command::new("explorer").arg(dir.to_string_lossy().replace('/', "\\")).spawn()?;
+            json!(true)
+        }
         // A web page a message links to (LOOT's): https only, so nothing else gets opened.
         "open_link" => {
             let url = s("url")?;
@@ -529,6 +561,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "trash" => json!(install::trash(&inst)?),
         "empty_trash" => json!(install::empty_trash(&inst)?),
         "history_details" => ops::history(&inst)?,
+        "record_conflicts" => json!(plugins::record_conflicts(&inst, &inst.profile()?, &s("plugin")?)?),
         "restore_preview" => json!(inst.restore_preview(n("n")?)?),
         "restore" => json!(inst.restore(n("n")?)?),
         "set_note" => json!(ops::set_mod_note(&inst, &s("id")?, &s("note")?)?),
@@ -541,6 +574,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let list = |k: &str| serde_json::from_value::<Vec<String>>(a[k].clone()).unwrap_or_default();
             json!(ops::edit_categories(&inst, &ids()?, &list("add"), &list("remove"))?)
         }
+        "set_color" if a["ids"].is_array() => json!(ops::set_colors(&inst, &ids()?, &s("color")?)?),
         "set_color" => json!(ops::set_color(&inst, &s("id")?, &s("color")?)?),
         "lock_plugin" => json!(ops::lock_plugin(&inst, &s("name")?, flag("lock"))?),
         other => bail!("unknown call '{other}'"),

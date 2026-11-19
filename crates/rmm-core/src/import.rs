@@ -46,7 +46,51 @@ pub struct ImportReport {
     /// Files hard-linked (sharing the source's disk space) and copied.
     pub linked: usize,
     pub copied: usize,
+    /// The files of the mods brought in, and the bytes of those copied rather than linked (on
+    /// another drive than the instance): new disk space.
+    pub files: usize,
+    pub copy_bytes: u64,
+    /// Files in MO2's overwrite folder, which go to rmm's overwrite/.
+    pub overwrite: usize,
+    /// Mods already installed under an imported mod's id, with both versions.
+    pub clashes: Vec<Clash>,
+    /// The profile's mods the import doesn't name: they stay, after the imported list, so they
+    /// win their file conflicts with it.
+    pub after: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// A mod being imported whose id is installed already: the installed one stays.
+#[derive(Serialize, Debug)]
+pub struct Clash {
+    pub id: String,
+    /// The installed mod's version and file count.
+    pub have: Option<String>,
+    pub have_files: usize,
+    /// The imported one's.
+    pub incoming: Option<String>,
+    pub incoming_files: usize,
+}
+
+/// What a folder would bring in: (files, bytes, hidden files), as `link_tree` counts them.
+fn count_tree(src: &Path) -> (usize, u64, usize) {
+    let (mut files, mut bytes, mut hidden) = (0, 0, 0);
+    for e in walkdir::WalkDir::new(src).min_depth(1).into_iter().flatten().filter(|e| e.file_type().is_file()) {
+        let low = e.path().strip_prefix(src).map(|p| p.to_string_lossy().to_lowercase().replace('\\', "/")).unwrap_or_default();
+        if matches!(low.as_str(), "meta.ini" | "__folder_managed_by_vortex" | "rmm-mod.toml" | ".rmm-index") {
+            continue;
+        }
+        files += 1;
+        bytes += e.metadata().map_or(0, |m| m.len());
+        hidden += usize::from(low.split('/').any(|c| c.ends_with(".mohidden")));
+    }
+    (files, bytes, hidden)
+}
+
+/// Whether two paths are on the same drive, so a hard link can join them.
+fn same_volume(a: &Path, b: &Path) -> bool {
+    let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
+    root(&fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf())) == root(&fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf()))
 }
 
 /// One row of the imported list: a mod folder to bring in, or a separator (`from` is None).
@@ -185,6 +229,9 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
         for (id, t) in &tools {
             crate::tools::put(inst, id, t)?;
         }
+    }
+    if overwrite_dir.is_dir() {
+        r.overwrite = count_tree(&overwrite_dir).0;
     }
     if !dry_run && overwrite_dir.is_dir() {
         let (l, c, _) = link_tree(&overwrite_dir, &inst.mod_dir(OVERWRITE), false, true)?;
@@ -842,25 +889,41 @@ fn bring_in(inst: &Instance, label: &str, incoming: &[Incoming], plugins: Vec<Pl
         };
         if inst.mod_dir(&m.id).exists() {
             r.existing.push(m.id.clone());
+            let have = inst.mod_meta(&m.id);
+            r.clashes.push(Clash {
+                id: m.id.clone(),
+                have: have.nexus.and_then(|n| n.version),
+                have_files: inst.mod_files(&m.id).map_or(0, |f| f.len()),
+                incoming: meta.nexus.as_ref().and_then(|n| n.version.clone()),
+                incoming_files: count_tree(dir).0,
+            });
             continue;
         }
         r.mods.push(m.id.clone());
         if r.dry_run {
+            let (files, bytes, hidden) = count_tree(dir);
+            r.files += files;
+            r.hidden += hidden;
+            if !same_volume(dir, &inst.root) {
+                r.copy_bytes += bytes;
+            }
             continue;
         }
         let tmp = inst.root.join(".staging").join(format!("import-{}", m.id));
         let _ = fs::remove_dir_all(&tmp);
         let (l, c, h) = link_tree(dir, &tmp, *root, false)?;
-        (r.linked, r.copied, r.hidden) = (r.linked + l, r.copied + c, r.hidden + h.len());
+        (r.linked, r.copied, r.hidden, r.files) = (r.linked + l, r.copied + c, r.hidden + h.len(), r.files + l + c);
         fs::write(tmp.join(".rmm-index"), index_dir(&tmp)?.join("\n"))?;
         fs::write(tmp.join(crate::instance::MOD_META), toml::to_string_pretty(&ModMeta { hidden: h, ..meta.clone() })?)?;
         fs::rename(&tmp, inst.mod_dir(&m.id))?;
     }
     r.plugins = plugins.len();
+    let named: HashSet<&str> = incoming.iter().map(|m| m.id.as_str()).collect();
+    // A dry run into a profile not made yet: nothing there to keep.
+    r.after = inst.profile().map(|p| p.mods).unwrap_or_default().into_iter().map(|m| m.id).filter(|id| !named.contains(id.as_str()) && !crate::instance::is_separator(id)).collect();
     if r.dry_run {
         return Ok(());
     }
-    let named: HashSet<&str> = incoming.iter().map(|m| m.id.as_str()).collect();
     let listed: HashSet<String> = plugins.iter().map(|e| e.name.to_lowercase()).collect();
     inst.edit(label, |p| {
         let rest: Vec<ModEntry> = p.mods.iter().filter(|m| !named.contains(m.id.as_str())).cloned().collect();

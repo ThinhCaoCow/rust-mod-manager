@@ -1154,7 +1154,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
             r#"mkdir "%~1\meshes""#,
             r#"echo built> "%~1\meshes\body.nif""#,
             r#"echo setting>> "%~2\CalienteTools\BodySlide\Config.xml""#,
-            r#"echo new> "%~2\newfile.txt""#,
+            r#"echo new> "%~2\newfile.json""#,
             r#"echo cleaned> "%~2\vanilla.ini""#,
             r#"echo oops>> "%~2\meshes\a.nif""#,
             r#"echo enb> "%~3\enblocal.ini""#,
@@ -1177,7 +1177,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
 
     let plan = tools::run(&inst, "gen", &BTreeMap::new(), true, None).unwrap();
     assert_eq!(plan.swapped.len(), 2, "{plan:?}");
-    assert!(!game.join("Data/newfile.txt").exists(), "a dry run changes nothing");
+    assert!(!game.join("Data/newfile.json").exists(), "a dry run changes nothing");
 
     let r = tools::run(&inst, "gen", &BTreeMap::new(), false, None).unwrap();
     assert_eq!(r.mod_id.as_deref(), Some("gen Output"), "{r:?}");
@@ -1185,7 +1185,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert!(r.log_tail.contains("done"), "{r:?}");
     let out = root.join("mods/gen Output");
     assert!(read(&out.join("meshes/body.nif")).contains("built"));
-    assert!(read(&out.join("newfile.txt")).contains("new"));
+    assert!(read(&out.join("newfile.json")).contains("new"));
     assert!(read(&out.join("vanilla.ini")).contains("cleaned"));
     assert!(read(&out.join("CalienteTools/BodySlide/Config.xml")).contains("setting"));
     assert!(read(&out.join("meshes/a.nif")).contains("oops"));
@@ -1197,7 +1197,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert_eq!(r.modified_in_place, vec!["Plain: meshes/a.nif".to_string()]);
     // Untouched swapped copies are links again; the vanilla original went to backup/.
     assert!(same_file::is_same_file(game.join("Data/CalienteTools/BodySlide/Other.xml"), root.join("mods/BodySlide/CalienteTools/BodySlide/Other.xml")).unwrap());
-    assert!(same_file::is_same_file(game.join("Data/newfile.txt"), out.join("newfile.txt")).unwrap());
+    assert!(same_file::is_same_file(game.join("Data/newfile.json"), out.join("newfile.json")).unwrap());
     assert_eq!(read(&root.join("backup/Data/vanilla.ini")), "vanilla");
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 
@@ -1217,7 +1217,7 @@ fn tool_runs_capture_output_into_a_generated_mod() {
 
     deploy::purge(&inst, false).unwrap();
     assert_eq!(read(&game.join("Data/vanilla.ini")), "vanilla");
-    assert!(!game.join("Data/newfile.txt").exists() && !game.join("Data/meshes/body.nif").exists());
+    assert!(!game.join("Data/newfile.json").exists() && !game.join("Data/meshes/body.nif").exists());
     assert!(!game.join("enblocal.ini").exists());
 }
 
@@ -2171,9 +2171,11 @@ fn imports_an_mo2_instance() {
     let dry = import::import_mo2(&inst, &mo2, None, true).unwrap();
     assert_eq!((dry.mods.join(" "), dry.separators, dry.plugins), ("A B C".into(), 1, 3));
     assert!(!inst.mod_dir("A").exists() && order(&inst).is_empty());
+    assert_eq!((dry.overwrite, dry.copy_bytes, dry.after.len()), (1, 0, 0), "one overwrite file; the same drive links");
 
     let r = import::import_mo2(&inst, &mo2, None, false).unwrap();
     assert_eq!(r.linked + r.copied, 6, "{r:?}"); // 5 mod files and the overwrite file; meta.ini stays behind
+    assert_eq!(dry.files, r.files, "the preview counts the files the import brings"); 
     assert_eq!(order(&inst), "A sep:Visuals B+ C");
     assert_eq!(inst.mod_files("B").unwrap(), ["B.esp", "root/enbseries.ini", "textures/a.dds"]);
     let meta = inst.mod_meta("A");
@@ -2205,6 +2207,8 @@ fn imports_an_mo2_instance() {
     // Again: nothing new to bring in.
     let again = import::import_mo2(&inst, &mo2, Some("Main"), false).unwrap();
     assert_eq!((again.mods.len(), again.existing.join(" ")), (0, "A B C".into()));
+    let a = again.clashes.iter().find(|c| c.id == "A").unwrap();
+    assert_eq!((a.have.as_deref(), a.have_files, a.incoming.as_deref(), a.incoming_files), (Some("1.0"), 2, Some("1.0"), 2));
     assert!(import::import_mo2(&inst, &mo2, Some("Nope"), true).is_err());
 }
 
@@ -2266,6 +2270,7 @@ fn imports_all_of_an_mo2_instance() {
     assert!(dry[0].warnings.iter().any(|w| w.contains("Gone")), "{:?}", dry[0].warnings);
     assert_eq!(dry[0].outputs, ["BodySlide Output (bodyslide)", "Tool Stuff (my-tool)"]);
     assert_eq!((dry[0].inis, dry[0].saves, dry[1].inis), (2, 2, 0));
+    assert_eq!(dry[0].hidden, 2, "the preview counts MO2's hidden files");
     assert_eq!(inst.profiles().unwrap(), ["default"], "nothing made");
     assert!(tools::list(&inst).unwrap().is_empty() && !my.exists());
 
@@ -4133,4 +4138,101 @@ PLUGINS:
     ops::move_mods(&inst, &["Logger".to_string()], 0).unwrap();
     assert_eq!(inst.history().unwrap().len(), before + 2);
     assert_eq!(order(), ["Logger", "AddrLib", "A"]);
+}
+
+/// One record (type, form id as in the file, EDID) in a group, after a plugin header.
+fn with_record(mut header: Vec<u8>, kind: &[u8; 4], id: u32, edid: &str, extra: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend(b"EDID");
+    data.extend(((edid.len() + 1) as u16).to_le_bytes());
+    data.extend(edid.as_bytes());
+    data.push(0);
+    data.extend(extra);
+    let mut rec = Vec::new();
+    rec.extend(kind);
+    rec.extend((data.len() as u32).to_le_bytes());
+    rec.extend(0u32.to_le_bytes());
+    rec.extend(id.to_le_bytes());
+    rec.extend([0u8; 8]);
+    rec.extend(data);
+    header.extend(b"GRUP");
+    header.extend(((24 + rec.len()) as u32).to_le_bytes());
+    header.extend(kind);
+    header.extend([0u8; 12]);
+    header.extend(rec);
+    header
+}
+
+/// The plugin panel's record conflicts: who else changes a plugin's records, who wins, and
+/// which copies are identical.
+#[test]
+fn record_conflicts_name_the_winner_and_identical_copies() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    // Both change Skyrim.esm's record 0x123; C copies B's version unchanged.
+    write(&tmp.path().join("B/B.esp"), with_record(plugin_bytes(&["Skyrim.esm"], false), b"NPC_", 0x0000_0123, "Lydia", b"B's change"));
+    write(&tmp.path().join("C/C.esp"), with_record(plugin_bytes(&["Skyrim.esm"], false), b"NPC_", 0x0000_0123, "Lydia", b"B's change"));
+    write(&tmp.path().join("D/D.esp"), with_record(plugin_bytes(&["Skyrim.esm"], false), b"ARMO", 0x0000_0456, "Other", b""));
+    for m in ["B", "C", "D"] {
+        install::install(&inst, &tmp.path().join(m), None, true, None).unwrap();
+    }
+    let p = inst.profile().unwrap();
+    let r = plugins::record_conflicts(&inst, &p, "B.esp").unwrap();
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].plugin.as_str(), r[0].wins, r[0].records, r[0].identical, r[0].patch), ("C.esp", true, 1, 1, false));
+    assert_eq!(r[0].examples, ["Lydia"]);
+    assert_eq!(r[0].kinds.get("NPC_"), Some(&1));
+    let r = plugins::record_conflicts(&inst, &p, "C.esp").unwrap();
+    assert!(!r[0].wins && r[0].plugin == "B.esp");
+}
+
+/// A LOD generator's output goes out of date only for what it reads: a HUD mod (a quest plugin
+/// and interface files) leaves it alone, a mesh mod or an edit to a plugin with cells doesn't.
+/// Output rmm doesn't know the making of is in Problems as unknown.
+#[test]
+fn stale_output_counts_only_what_the_tool_reads() {
+    isolate();
+    use rmm_core::tools::{self, ToolSpec};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&src.join("Town/Town.esp"), with_record(plugin_bytes(&["Skyrim.esm"], false), b"CELL", 0x0000_0800, "Town", b""));
+    write(&src.join("Hud/Hud.esp"), with_record(plugin_bytes(&["Skyrim.esm"], false), b"QUST", 0x0000_0800, "HudQuest", b""));
+    write(&src.join("Hud/interface/hud.swf"), "swf");
+    write(&src.join("Rocks/meshes/rock.nif"), "nif");
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    install::install(&inst, &src.join("Town"), None, true, None).unwrap();
+    write(&src.join("gen.bat"), "@echo off\r\necho made> \"%~1\\lod.txt\"\r\n");
+    tools::add(&inst, "dyndolod", ToolSpec { exe: src.join("gen.bat"), args: Some(vec!["{output}".into()]), ..Default::default() }).unwrap();
+    tools::run(&inst, "dyndolod", &Default::default(), false, None).unwrap().mod_id.unwrap();
+    assert!(tools::stale_outputs(&inst).unwrap().is_empty());
+
+    install::install(&inst, &src.join("Hud"), None, true, None).unwrap();
+    assert!(tools::stale_outputs(&inst).unwrap().is_empty(), "a HUD mod isn't something DynDOLOD reads");
+
+    // xEdit saves the cell plugin under the same name: bigger, newer.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let town = root.join("mods/Town/Town.esp");
+    let mut bytes = fs::read(&town).unwrap();
+    bytes.extend(b"GRUP\x18\x00\x00\x00STAT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    fs::remove_file(&town).unwrap(); // a hard link to the deployed copy: replace, don't write through
+    write(&town, bytes);
+    let s = tools::stale_outputs(&inst).unwrap();
+    assert_eq!((s.len(), s[0].summary().as_str()), (1, "1 mod changed (Town)"));
+
+    tools::run(&inst, "dyndolod", &Default::default(), false, None).unwrap();
+    install::install(&inst, &src.join("Rocks"), None, true, None).unwrap();
+    assert_eq!(tools::stale_outputs(&inst).unwrap()[0].summary(), "1 mod added (Rocks)");
+
+    // Output from before rmm kept track (or imported): unknown, as information.
+    let out = inst.profile().unwrap().mods.into_iter().find(|m| inst.mod_meta(&m.id).source.as_deref() == Some("tool:dyndolod")).unwrap().id;
+    let mut meta = inst.mod_meta(&out);
+    meta.built_from = None;
+    inst.write_mod_meta(&out, &meta).unwrap();
+    let s = tools::stale_outputs(&inst).unwrap();
+    assert!(s[0].unknown, "{s:?}");
+    assert!(health::check(&inst).unwrap().iter().any(|i| i.kind == "stale_output" && i.severity == "info" && i.subject == out));
 }

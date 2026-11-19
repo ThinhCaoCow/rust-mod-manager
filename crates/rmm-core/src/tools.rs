@@ -306,19 +306,86 @@ fn chain_rank(inst: &Instance, id: &str, tool: &Tool) -> Option<usize> {
 }
 
 /// What a whole-setup tool reads: each enabled mod but generated output (so outputs don't make
-/// each other stale), by its file list and the archive or Nexus file it came from, and the order
-/// of the other enabled plugins.
+/// each other stale) that has files the tool reads, by those files, the archive or Nexus file it
+/// came from and its plugins' sizes and times; and the order of the plugins the tool reads.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Inputs {
     pub mods: BTreeMap<String, String>,
     pub plugins: String,
+    /// What the tool reads (`Reads::name`); empty from an rmm that counted every file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reads: String,
 }
 
-// ponytail: files changed under the same names (an update from a folder, an edit) don't count;
-// add sizes if that misses real changes.
-pub fn inputs(inst: &Instance) -> Result<Inputs> {
+/// What a whole-setup tool reads, so only a change to that makes its output out of date.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Reads {
+    /// LOD and parallax generators: meshes, textures, archives, and plugins with worldspace,
+    /// cell or object records.
+    Lod,
+    /// Pandora: behaviour and animation files.
+    Behaviour,
+    /// BodySlide: its projects and shapes under CalienteTools.
+    BodySlide,
+    /// Synthesis: every plugin.
+    Plugins,
+    /// Anything else: every file and plugin.
+    All,
+}
+
+/// Top-level record groups a LOD or parallax generator reads.
+const LOD_GROUPS: &[&[u8; 4]] = &[b"WRLD", b"CELL", b"STAT", b"MSTT", b"TREE", b"FLOR", b"ACTI", b"FURN", b"SCOL", b"TXST", b"LTEX", b"GRAS", b"LIGH", b"DOOR", b"CONT"];
+
+impl Reads {
+    /// From a `CHAIN` preset's name.
+    pub fn of(preset: &str) -> Reads {
+        match preset {
+            "xlodgen" | "texgen" | "dyndolod" | "pgpatcher" => Reads::Lod,
+            "pandora" => Reads::Behaviour,
+            "bodyslide" => Reads::BodySlide,
+            "synthesis" => Reads::Plugins,
+            _ => Reads::All,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Reads::Lod => "lod",
+            Reads::Behaviour => "behaviour",
+            Reads::BodySlide => "bodyslide",
+            Reads::Plugins => "plugins",
+            Reads::All => "all",
+        }
+    }
+    /// A mod file (lowercase, mod-relative) that isn't a plugin.
+    fn file(self, f: &str) -> bool {
+        let archive = f.ends_with(".bsa") || f.ends_with(".ba2");
+        match self {
+            Reads::Lod => archive || ["meshes/", "textures/", "dyndolod/", "lodsettings/"].iter().any(|d| f.starts_with(d)),
+            Reads::Behaviour => (f.starts_with("meshes/") && [".hkx", ".txt", ".xml"].iter().any(|e| f.ends_with(e))) || f.starts_with("nemesis_engine/") || f.starts_with("pandora_engine/"),
+            Reads::BodySlide => f.starts_with("calientetools/"),
+            Reads::Plugins => false,
+            Reads::All => true,
+        }
+    }
+    fn plugin(self, path: &Path) -> bool {
+        match self {
+            Reads::Lod => crate::plugins::top_groups(path).is_ok_and(|g| LOD_GROUPS.iter().any(|k| g.contains(*k))),
+            Reads::Behaviour | Reads::BodySlide => false,
+            Reads::Plugins | Reads::All => true,
+        }
+    }
+}
+
+/// The `CHAIN` preset a configured tool is, if it's a whole-setup generator.
+pub fn chain_preset(inst: &Instance, id: &str, tool: &Tool) -> Option<&'static str> {
+    chain_rank(inst, id, tool).map(|i| CHAIN[i])
+}
+
+// ponytail: a plugin counts by its size and time, not its contents: an edit that keeps both (rare)
+// goes unseen, and a reinstall of the same file with a new time counts as a change.
+pub fn inputs(inst: &Instance, reads: Reads) -> Result<Inputs> {
     use sha2::{Digest, Sha256};
-    let digest = |parts: &[&str]| -> String {
+    let digest = |parts: &[String]| -> String {
         let mut h = Sha256::new();
         for s in parts {
             h.update(s.as_bytes());
@@ -327,6 +394,7 @@ pub fn inputs(inst: &Instance) -> Result<Inputs> {
         h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
     };
     let p = inst.profile()?;
+    let read: std::collections::HashMap<String, bool> = crate::plugins::list(inst, &p)?.into_iter().filter(|x| x.enabled).map(|x| (x.name.to_lowercase(), reads.plugin(&x.path))).collect();
     let (mut mods, mut generated) = (BTreeMap::new(), HashSet::new());
     for m in p.mods.iter().filter(|m| m.enabled && !crate::instance::is_separator(&m.id)) {
         let meta = inst.mod_meta(&m.id);
@@ -335,12 +403,33 @@ pub fn inputs(inst: &Instance) -> Result<Inputs> {
             generated.extend(files.iter().filter(|f| !f.contains('/') && is_plugin(f)).map(|f| f.to_lowercase()));
             continue;
         }
-        let (archive, file) = (meta.sha256.unwrap_or_default(), meta.nexus.and_then(|n| n.file_id).map(|f| f.to_string()).unwrap_or_default());
-        let parts: Vec<&str> = files.iter().map(String::as_str).chain([archive.as_str(), file.as_str()]).collect();
+        let mut parts = Vec::new();
+        for f in &files {
+            let lower = f.to_lowercase();
+            if !lower.contains('/') && is_plugin(f) {
+                if read.get(&lower).copied().unwrap_or(false) {
+                    let st = fs::metadata(inst.mod_dir(&m.id).join(f)).ok();
+                    let when = st.as_ref().and_then(|s| s.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                    parts.push(format!("{f} {} {when}", st.map_or(0, |s| s.len())));
+                }
+            } else if reads.file(&lower) {
+                parts.push(f.clone());
+            }
+        }
+        if parts.is_empty() {
+            continue; // nothing the tool reads
+        }
+        parts.push(meta.sha256.unwrap_or_default());
+        parts.push(meta.nexus.and_then(|n| n.file_id).map(|f| f.to_string()).unwrap_or_default());
         mods.insert(m.id.clone(), digest(&parts));
     }
-    let order: Vec<String> = p.plugins.iter().filter(|e| e.enabled && !generated.contains(&e.name.to_lowercase())).map(|e| e.name.to_lowercase()).collect();
-    Ok(Inputs { mods, plugins: digest(&order.iter().map(String::as_str).collect::<Vec<_>>()) })
+    let order: Vec<String> = p
+        .plugins
+        .iter()
+        .map(|e| e.name.to_lowercase())
+        .filter(|n| read.get(n).copied().unwrap_or(false) && !generated.contains(n))
+        .collect();
+    Ok(Inputs { mods, plugins: digest(&order), reads: reads.name().into() })
 }
 
 /// A generated mod whose tool would now read a different setup.
@@ -352,11 +441,16 @@ pub struct Stale {
     pub removed: Vec<String>,
     pub changed: Vec<String>,
     pub load_order: bool,
+    /// rmm doesn't know what it was made from: imported, or made by an older rmm.
+    pub unknown: bool,
 }
 
 impl Stale {
     /// "2 mods added (A, B), 1 mod changed (C)", or that the load order changed.
     pub fn summary(&self) -> String {
+        if self.unknown {
+            return "rmm doesn't know what it was made from (it was imported, or made before rmm kept track)".into();
+        }
         let part = |what: &str, ids: &[String]| {
             (!ids.is_empty()).then(|| {
                 let more = if ids.len() > 3 { ", …" } else { "" };
@@ -368,28 +462,34 @@ impl Stale {
     }
 }
 
-/// Enabled generated mods made from a setup that has changed since. Output made before rmm kept
-/// track of its inputs isn't listed.
+/// Enabled output of whole-setup tools made from a setup that has changed since, in what the
+/// tool reads, or from a setup rmm doesn't know (`unknown`: imported, or made by an older rmm).
 pub fn stale_outputs(inst: &Instance) -> Result<Vec<Stale>> {
-    let mut now = None;
+    let tools = list(inst)?;
+    let mut now: std::collections::HashMap<&'static str, Inputs> = Default::default();
     let mut out = vec![];
     for m in inst.profile()?.mods.into_iter().filter(|m| m.enabled && !crate::instance::is_separator(&m.id)) {
         let meta = inst.mod_meta(&m.id);
-        let Some(then) = meta.built_from else { continue };
-        let now = match &now {
-            Some(n) => n,
-            None => now.insert(inputs(inst)?),
-        };
-        let keys = |a: &Inputs, b: &Inputs| a.mods.keys().filter(|k| !b.mods.contains_key(*k)).cloned().collect::<Vec<_>>();
-        let s = Stale {
-            tool: meta.source.as_deref().and_then(|s| s.strip_prefix("tool:")).unwrap_or_default().into(),
-            output: m.id,
-            added: keys(now, &then),
-            removed: keys(&then, now),
-            changed: now.mods.iter().filter(|(k, v)| then.mods.get(*k).is_some_and(|t| t != *v)).map(|(k, _)| k.clone()).collect(),
-            load_order: now.plugins != then.plugins,
-        };
-        if s.load_order || !(s.added.is_empty() && s.removed.is_empty() && s.changed.is_empty()) {
+        let Some(tool) = meta.source.as_deref().and_then(|s| s.strip_prefix("tool:")).map(str::to_owned) else { continue };
+        let preset = tools.get(&tool).and_then(|t| chain_preset(inst, &tool, t)).or_else(|| CHAIN.iter().find(|p| **p == tool).copied());
+        let Some(preset) = preset else { continue }; // not a whole-setup tool
+        let reads = Reads::of(preset);
+        let mut s = Stale { tool, output: m.id, added: vec![], removed: vec![], changed: vec![], load_order: false, unknown: false };
+        match meta.built_from.filter(|b| b.reads == reads.name()) {
+            None => s.unknown = true,
+            Some(then) => {
+                let now = match now.get(reads.name()) {
+                    Some(n) => n,
+                    None => now.entry(reads.name()).or_insert(inputs(inst, reads)?),
+                };
+                let keys = |a: &Inputs, b: &Inputs| a.mods.keys().filter(|k| !b.mods.contains_key(*k)).cloned().collect::<Vec<_>>();
+                s.added = keys(now, &then);
+                s.removed = keys(&then, now);
+                s.changed = now.mods.iter().filter(|(k, v)| then.mods.get(*k).is_some_and(|t| t != *v)).map(|(k, _)| k.clone()).collect();
+                s.load_order = now.plugins != then.plugins;
+            }
+        }
+        if s.unknown || s.load_order || !(s.added.is_empty() && s.removed.is_empty() && s.changed.is_empty()) {
             out.push(s);
         }
     }
@@ -418,11 +518,7 @@ pub fn rebuild(inst: &Instance, dry_run: bool, timeout: Option<Duration>) -> Res
     for (_, id) in chain {
         let source = format!("tool:{id}");
         let Some(out) = p.mods.iter().find(|m| m.enabled && inst.mod_meta(&m.id).source.as_deref() == Some(source.as_str())) else { continue };
-        let why = match stale.iter().find(|s| s.output == out.id) {
-            Some(s) => s.summary(),
-            None if inst.mod_meta(&out.id).built_from.is_none() => "made before rmm kept track of what it was made from".into(),
-            None => continue,
-        };
+        let Some(why) = stale.iter().find(|s| s.output == out.id).map(Stale::summary) else { continue };
         r.steps.push((id, why));
     }
     if dry_run {
@@ -551,7 +647,10 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
     }
     deploy::deploy(inst, false)?;
     // A whole-setup generator notes what it reads, so its output can tell when it's out of date.
-    let built_from = if !in_place && chain_rank(inst, id, tool).is_some() { Some(inputs(inst)?) } else { None };
+    let built_from = match chain_preset(inst, id, tool) {
+        Some(p) if !in_place => Some(inputs(inst, Reads::of(p))?),
+        _ => None,
+    };
 
     let game = &inst.config.game_path;
     let stash = state.join("stash");

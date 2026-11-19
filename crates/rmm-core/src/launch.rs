@@ -371,7 +371,7 @@ pub(crate) fn se_runtime(root: &Path, game: Game, version: &[u32; 4]) -> Result<
 }
 
 /// The game exe's version (cached by the exe's size and time: it takes reading the whole file).
-pub(crate) fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
+pub fn game_version(root: &Path, game: Game) -> Result<[u32; 4]> {
     type Seen = (PathBuf, u64, std::time::SystemTime, [u32; 4]);
     static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
     let exe = root.join(game.exe());

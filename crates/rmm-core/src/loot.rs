@@ -105,8 +105,9 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 }
 
 /// A libloot handle that sees the profile rather than the deployed Data folder: enabled mods are
-/// additional data paths, highest priority first, so `file()` conditions match the profile.
-/// Active-plugin conditions still come from plugins.txt, which deploy writes.
+/// additional data paths, highest priority first, so `file()` conditions match the profile, and
+/// it reads the profile's plugins.txt (written to loot/local), so `active()` conditions and the
+/// load order do too, before a deploy.
 fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<String>)> {
     let c = &inst.config;
     let game_type = match (c.game.lo_id(), c.game.base()) {
@@ -115,7 +116,9 @@ fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<Stri
         (_, Game::Fallout4) => GameType::Fallout4,
         _ => GameType::SkyrimSE,
     };
-    let mut game = libloot::Game::with_local_path(game_type, &c.game_path, &c.local_path)?;
+    let local = dir(inst).join("local");
+    write_plugins_txt(&local, &plugins::list(inst, profile)?)?;
+    let mut game = libloot::Game::with_local_path(game_type, &c.game_path, &local)?;
     let mut dirs = vec![inst.mod_dir(OVERWRITE)];
     dirs.extend(profile.mods.iter().rev().filter(|m| m.enabled).map(|m| inst.mod_dir(&m.id)));
     game.set_additional_data_paths(dirs.into_iter().filter(|d| d.is_dir()).collect())?;
@@ -140,6 +143,24 @@ fn handle(inst: &Instance, profile: &Profile) -> Result<(libloot::Game, Vec<Stri
         }
     }
     Ok((game, warnings))
+}
+
+/// The profile's plugins.txt as the game would read it: `*` marks the enabled ones. Written
+/// whole and renamed, so two LOOT runs at once never read half of one.
+fn write_plugins_txt(local: &Path, infos: &[PluginInfo]) -> Result<()> {
+    fs::create_dir_all(local)?;
+    // ponytail: Latin-1 for Windows-1252 (the game's encoding); differs only in 0x80-0x9F, where
+    // a name gets '?'. encoding_rs (already in the build) if a plugin ever needs those.
+    let bytes: Vec<u8> = infos
+        .iter()
+        .filter(|p| !p.implicit)
+        .flat_map(|p| format!("{}{}
+", if p.enabled { "*" } else { "" }, p.name).chars().map(|ch| u8::try_from(ch).ok().filter(|b| !(0x80..0xA0).contains(b)).unwrap_or(b'?')).collect::<Vec<_>>())
+        .collect();
+    let tmp = local.join(format!("plugins.{}.part", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, local.join("plugins.txt"))?;
+    Ok(())
 }
 
 /// Load every readable plugin into libloot. Returns the plugins in the current load order.
@@ -206,7 +227,7 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
 
     let undeployed = current.iter().filter(|p| game.is_plugin_active(&p.name) != p.enabled).count();
     if undeployed > 0 {
-        warnings.push(format!("LOOT reads which plugins are on from the game folder, where {undeployed} differ from this profile: deploy, then sort again"));
+        warnings.push(format!("LOOT saw {undeployed} plugins on or off differently from this profile"));
     }
     let moved = moves(&names, &order);
 
