@@ -156,6 +156,12 @@ enum Cmd {
         #[arg(long, conflicts_with = "to_mod")]
         clear: bool,
     },
+    /// Run again, in order (xLODGen, TexGen, DynDOLOD, Pandora, BodySlide, Synthesis, PGPatcher),
+    /// the tools whose generated output is out of date. Lists them; --apply runs them.
+    Rebuild {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Clean every plugin LOOT knows as dirty with xEdit QuickAutoClean (a tool from the xedit-qac
     /// preset), one run each. Lists them; --apply cleans.
     CleanPlugins {
@@ -970,6 +976,7 @@ fn run() -> Result<()> {
         Cmd::Overwrite { to_mod: Some(name), .. } => print(&install::mod_from_overwrite(&open()?, &name)?),
         Cmd::Overwrite { clear: true, .. } => print(&serde_json::json!({ "cleared": install::clear_overwrite(&open()?)? })),
         Cmd::Overwrite { .. } => print(&open()?.mod_files(rmm_core::instance::OVERWRITE)?),
+        Cmd::Rebuild { apply } => print(&rmm_core::tools::rebuild(&open()?, !apply, None)?),
         Cmd::CleanPlugins { apply } => print(&rmm_core::tools::clean_dirty(&open()?, !apply)?),
         Cmd::Hide { id, paths, show } => print(&install::hide_files(&open()?, &id, &paths, !show)?),
         Cmd::MoveFiles { from, to, paths, replace } => {

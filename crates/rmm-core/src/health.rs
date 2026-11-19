@@ -51,6 +51,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("not_deployed", "Changes not deployed yet"),
     ("external_change", "Deployed files changed outside rmm"),
     ("overwrite_files", "Files in Overwrite"),
+    ("stale_output", "Generated output out of date"),
     ("loot_message", "LOOT's messages"),
     ("loot_failed", "LOOT couldn't run"),
     ("ini_test_file", "sTestFile lines in Fallout4.ini"),
@@ -216,6 +217,11 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     if over > 0 {
         let files = if over == 1 { "1 file belongs" } else { &format!("{over} files belong") };
         add("info", "overwrite_files", "Overwrite", format!("{files} to no mod: what the game, MCM menus and tools wrote, which wins over every mod. Move what you want to keep into a mod (Overwrite's Move to mod…), so it goes with the setup"));
+    }
+    let tools = crate::tools::list(inst).unwrap_or_default();
+    for s in crate::tools::stale_outputs(inst).unwrap_or_default() {
+        let tool = tools.get(&s.tool).map_or(s.tool.as_str(), |t| t.name.as_str());
+        add("warning", "stale_output", &s.output, format!("made by {tool} from a setup that has changed since: {}. Rebuild outputs (Tools) runs it again", s.summary()));
     }
     issues.extend(fallout4_ini(inst)?);
     match crate::loot::issues(inst) {

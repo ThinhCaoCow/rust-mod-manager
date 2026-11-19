@@ -2882,6 +2882,49 @@ fn mod_details_lists_docs_and_pictures() {
     assert_eq!(d["images"], serde_json::json!(["shot.JPG"]));
 }
 
+/// A whole-setup tool's output records what it was made from; a new mod makes it stale (and goes
+/// in before it), and a rebuild runs the tool again.
+#[test]
+fn rebuilds_stale_generated_output() {
+    isolate();
+    use rmm_core::tools::{self, ToolSpec};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    for m in ["A", "B", "C"] {
+        write(&src.join(m).join(format!("{m}.esp")), plugin_bytes(&["Skyrim.esm"], false));
+    }
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    for m in ["A", "B"] {
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    // A stand-in generator: writes a file into {output}.
+    write(&src.join("gen.bat"), "@echo off\r\necho made> \"%~1\\out.txt\"\r\n");
+    let spec = |exe: &str| ToolSpec { exe: src.join(exe), args: Some(vec!["{output}".into()]), ..Default::default() };
+    tools::add(&inst, "synthesis", spec("gen.bat")).unwrap();
+    tools::add(&inst, "mine", spec("gen.bat")).unwrap();
+    let out = tools::run(&inst, "synthesis", &Default::default(), false, None).unwrap().mod_id.unwrap();
+    let mine = tools::run(&inst, "mine", &Default::default(), false, None).unwrap().mod_id.unwrap();
+    assert!(inst.mod_meta(&out).built_from.is_some_and(|b| b.mods.keys().eq(["A", "B"])), "generated output isn't an input");
+    assert!(inst.mod_meta(&mine).built_from.is_none(), "only whole-setup tools keep track");
+    assert!(tools::stale_outputs(&inst).unwrap().is_empty());
+    assert!(tools::rebuild(&inst, true, None).unwrap().steps.is_empty());
+
+    install::install(&inst, &src.join("C"), None, true, None).unwrap();
+    let ids: Vec<String> = inst.profile().unwrap().mods.into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, ["A", "B", "C", out.as_str(), mine.as_str()], "a new mod goes in before generated output");
+    let stale = tools::stale_outputs(&inst).unwrap();
+    assert_eq!((stale.len(), stale[0].summary().as_str()), (1, "1 mod added (C)"));
+    assert!(rmm_core::health::check(&inst).unwrap().iter().any(|i| i.kind == "stale_output" && i.subject == out));
+    let plan = tools::rebuild(&inst, true, None).unwrap();
+    assert_eq!(plan.steps, [("synthesis".to_string(), "1 mod added (C)".to_string())]);
+
+    let r = tools::rebuild(&inst, false, None).unwrap();
+    assert!(r.failed.is_none() && r.done.len() == 1 && r.done[0].1.is_some(), "{r:?}");
+    assert!(tools::stale_outputs(&inst).unwrap().is_empty(), "rebuilt from the current setup");
+}
+
 /// A zip of (path, bytes).
 fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();

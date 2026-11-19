@@ -28,6 +28,9 @@ const TOOLS: &str = "tools.toml";
 /// Presets `add` knows. The exe always comes from the user.
 pub const PRESETS: &[&str] = &["xedit", "xedit-qac", "xlodgen", "bodyslide", "synthesis", "pandora", "pgpatcher", "texgen", "dyndolod"];
 const LIST_CAP: usize = 100;
+/// Presets that generate output from the whole setup, in the order a rebuild runs them: TexGen's
+/// textures before DynDOLOD, and the patchers after what the generators made.
+pub const CHAIN: &[&str] = &["xlodgen", "texgen", "dyndolod", "pandora", "bodyslide", "synthesis", "pgpatcher"];
 
 /// A configured tool, stored in the instance's `tools.toml` under its id.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -274,12 +277,13 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
         // must be enabled when DynDOLOD runs. DynDOLOD has no Fallout 4 object LOD.
         "texgen" => tool("TexGen", s(&lod_args)),
         "dyndolod" if skyrim => tool("DynDOLOD", s(&lod_args)),
-        // -o is never read; paths come from Settings.json, and outputPath must exist or output
-        // silently goes to Data. Its mod list lives in the output folder, so it carries over.
+        // 4.1 takes --tesv (the game folder) and --output; without them it writes to the Data
+        // folder of the game in the registry, whatever rmm's game is. Older versions read the
+        // paths only from Settings.json, where outputPath must exist or output goes to Data.
         "pandora" if skyrim => Tool {
             settings: settings("Settings.json", &[("games.SkyrimSE.gameDataPath", "{data}".into()), ("games.SkyrimSE.outputPath", "{output}".into())]),
             keep: s(&["Pandora_Engine/ActiveMods.json"]),
-            ..tool("Pandora", s(&["--auto_run", "--auto_close"]))
+            ..tool("Pandora", s(&["--tesv", "{game}", "--output", "{output}", "--auto_run", "--auto_close"]))
         },
         // Mod manager 0 (None) reads the deployed Data folder. It reuses the previous
         // PGPatcher.esp for stable FormIDs. The run ends in a dialog someone has to close.
@@ -293,6 +297,148 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
         },
         _ => return None,
     })
+}
+
+/// A configured tool's place in `CHAIN`: its id is the preset's, or it has the preset's name.
+// ponytail: tools don't record their preset, so one renamed under another id isn't recognised.
+fn chain_rank(inst: &Instance, id: &str, tool: &Tool) -> Option<usize> {
+    CHAIN.iter().position(|p| *p == id || preset(inst.config.game, p).is_some_and(|t| t.name == tool.name))
+}
+
+/// What a whole-setup tool reads: each enabled mod but generated output (so outputs don't make
+/// each other stale), by its file list and the archive or Nexus file it came from, and the order
+/// of the other enabled plugins.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Inputs {
+    pub mods: BTreeMap<String, String>,
+    pub plugins: String,
+}
+
+// ponytail: files changed under the same names (an update from a folder, an edit) don't count;
+// add sizes if that misses real changes.
+pub fn inputs(inst: &Instance) -> Result<Inputs> {
+    use sha2::{Digest, Sha256};
+    let digest = |parts: &[&str]| -> String {
+        let mut h = Sha256::new();
+        for s in parts {
+            h.update(s.as_bytes());
+            h.update([0]);
+        }
+        h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let p = inst.profile()?;
+    let (mut mods, mut generated) = (BTreeMap::new(), HashSet::new());
+    for m in p.mods.iter().filter(|m| m.enabled && !crate::instance::is_separator(&m.id)) {
+        let meta = inst.mod_meta(&m.id);
+        let files = inst.mod_files(&m.id).unwrap_or_default();
+        if meta.source.as_deref().is_some_and(|s| s.starts_with("tool:")) {
+            generated.extend(files.iter().filter(|f| !f.contains('/') && is_plugin(f)).map(|f| f.to_lowercase()));
+            continue;
+        }
+        let (archive, file) = (meta.sha256.unwrap_or_default(), meta.nexus.and_then(|n| n.file_id).map(|f| f.to_string()).unwrap_or_default());
+        let parts: Vec<&str> = files.iter().map(String::as_str).chain([archive.as_str(), file.as_str()]).collect();
+        mods.insert(m.id.clone(), digest(&parts));
+    }
+    let order: Vec<String> = p.plugins.iter().filter(|e| e.enabled && !generated.contains(&e.name.to_lowercase())).map(|e| e.name.to_lowercase()).collect();
+    Ok(Inputs { mods, plugins: digest(&order.iter().map(String::as_str).collect::<Vec<_>>()) })
+}
+
+/// A generated mod whose tool would now read a different setup.
+#[derive(Serialize, Debug)]
+pub struct Stale {
+    pub output: String,
+    pub tool: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+    pub load_order: bool,
+}
+
+impl Stale {
+    /// "2 mods added (A, B), 1 mod changed (C)", or that the load order changed.
+    pub fn summary(&self) -> String {
+        let part = |what: &str, ids: &[String]| {
+            (!ids.is_empty()).then(|| {
+                let more = if ids.len() > 3 { ", …" } else { "" };
+                format!("{} mod{} {what} ({}{more})", ids.len(), if ids.len() == 1 { "" } else { "s" }, ids[..ids.len().min(3)].join(", "))
+            })
+        };
+        let parts: Vec<String> = [part("added", &self.added), part("removed", &self.removed), part("changed", &self.changed)].into_iter().flatten().collect();
+        if parts.is_empty() { "the load order changed".into() } else { parts.join(", ") }
+    }
+}
+
+/// Enabled generated mods made from a setup that has changed since. Output made before rmm kept
+/// track of its inputs isn't listed.
+pub fn stale_outputs(inst: &Instance) -> Result<Vec<Stale>> {
+    let mut now = None;
+    let mut out = vec![];
+    for m in inst.profile()?.mods.into_iter().filter(|m| m.enabled && !crate::instance::is_separator(&m.id)) {
+        let meta = inst.mod_meta(&m.id);
+        let Some(then) = meta.built_from else { continue };
+        let now = match &now {
+            Some(n) => n,
+            None => now.insert(inputs(inst)?),
+        };
+        let keys = |a: &Inputs, b: &Inputs| a.mods.keys().filter(|k| !b.mods.contains_key(*k)).cloned().collect::<Vec<_>>();
+        let s = Stale {
+            tool: meta.source.as_deref().and_then(|s| s.strip_prefix("tool:")).unwrap_or_default().into(),
+            output: m.id,
+            added: keys(now, &then),
+            removed: keys(&then, now),
+            changed: now.mods.iter().filter(|(k, v)| then.mods.get(*k).is_some_and(|t| t != *v)).map(|(k, _)| k.clone()).collect(),
+            load_order: now.plugins != then.plugins,
+        };
+        if s.load_order || !(s.added.is_empty() && s.removed.is_empty() && s.changed.is_empty()) {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Serialize, Debug, Default)]
+pub struct Rebuild {
+    pub dry_run: bool,
+    /// The tools to run, in order, and why.
+    pub steps: Vec<(String, String)>,
+    /// Each run's generated mod (None: it captured nothing).
+    pub done: Vec<(String, Option<String>)>,
+    /// The run that failed, and why; the tools after it didn't run, since they'd read its output.
+    pub failed: Option<(String, String)>,
+}
+
+/// Run again, in `CHAIN` order, the whole-setup tools whose output is out of date or was made
+/// before rmm kept track of its inputs, each a run of its own. Tools with no output in this
+/// profile are left alone.
+pub fn rebuild(inst: &Instance, dry_run: bool, timeout: Option<Duration>) -> Result<Rebuild> {
+    let (stale, p) = (stale_outputs(inst)?, inst.profile()?);
+    let mut chain: Vec<(usize, String)> = list(inst)?.into_iter().filter_map(|(id, t)| Some((chain_rank(inst, &id, &t)?, id))).collect();
+    chain.sort();
+    let mut r = Rebuild { dry_run, ..Default::default() };
+    for (_, id) in chain {
+        let source = format!("tool:{id}");
+        let Some(out) = p.mods.iter().find(|m| m.enabled && inst.mod_meta(&m.id).source.as_deref() == Some(source.as_str())) else { continue };
+        let why = match stale.iter().find(|s| s.output == out.id) {
+            Some(s) => s.summary(),
+            None if inst.mod_meta(&out.id).built_from.is_none() => "made before rmm kept track of what it was made from".into(),
+            None => continue,
+        };
+        r.steps.push((id, why));
+    }
+    if dry_run {
+        return Ok(r);
+    }
+    for (i, (id, _)) in r.steps.iter().enumerate() {
+        crate::progress::report(&format!("running {id}"), i, r.steps.len());
+        match run(inst, id, &BTreeMap::new(), false, timeout) {
+            Ok(x) => r.done.push((id.clone(), x.mod_id)),
+            Err(e) => {
+                r.failed = Some((id.clone(), format!("{e:#}")));
+                break;
+            }
+        }
+    }
+    Ok(r)
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -404,6 +550,8 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         ops::set_mod_enabled(inst, p, false)?;
     }
     deploy::deploy(inst, false)?;
+    // A whole-setup generator notes what it reads, so its output can tell when it's out of date.
+    let built_from = if !in_place && chain_rank(inst, id, tool).is_some() { Some(inputs(inst)?) } else { None };
 
     let game = &inst.config.game_path;
     let stash = state.join("stash");
@@ -597,7 +745,7 @@ fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_ru
         }
     } else {
         if made {
-            inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), ..Default::default() })?;
+            inst.write_mod_meta(&new_id, &ModMeta { name: output_mod, source: Some(source), built_from, ..Default::default() })?;
         }
         for id in kept_as.keys() {
             inst.forget_index(id);

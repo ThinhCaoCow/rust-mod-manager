@@ -211,6 +211,10 @@ pub struct ModMeta {
     /// on in every profile, kept through undo, and put back by `import::restore_creations`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub creation: bool,
+    /// What a whole-setup tool made this output from (`tools::inputs`), to tell when it's out of
+    /// date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_from: Option<crate::tools::Inputs>,
 }
 
 /// A mod's page and file on Nexus Mods (the game comes from the instance).

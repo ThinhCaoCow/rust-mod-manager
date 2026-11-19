@@ -1294,6 +1294,7 @@ function renderProblems() {
   $('#show-ignored').hidden = !hidden;
   $('#install-missing').hidden = !all.some(i => i.kind === 'nexus_requirement' && !ignored.has(keyOf(i)));
   $('#clean-dirty').hidden = !all.some(i => i.kind === 'dirty_plugin' && !ignored.has(keyOf(i)));
+  $('#rebuild-stale').hidden = !all.some(i => i.kind === 'stale_output' && !ignored.has(keyOf(i)));
   $('#show-ignored').textContent = showIgnored ? 'Hide ignored' : `Show ${hidden} ignored`;
   // Mods with a finding, for the Problems filter.
   D.flagged = new Set(all.filter(i => !ignored.has(keyOf(i)) && i.severity !== 'info').map(i => targetOf(i)?.mod).filter(Boolean));
@@ -1304,6 +1305,33 @@ function renderProblems() {
   if (filters.has('problems')) renderMods();
   $('#problems-note').textContent = `${plural(all.length - failures.length, 'finding')}. LOOT's messages are included once its masterlist is downloaded.`;
 }
+
+/** Run again, in order, the whole-setup tools whose generated output is out of date. */
+async function rebuildOutputs() {
+  const plan = await act('Checking the outputs', () => call('rebuild_outputs', { dry_run: true }), { reload: false });
+  if (!plan || plan === true) return;
+  if (!toolsData) await loadTools();
+  const name = id => toolsData?.tools.find(t => t.id === id)?.tool.name ?? id;
+  if (!plan.steps.length) {
+    return dialog({ title: 'Rebuild outputs', body: '<p>Every generated output is up to date. The outputs of xLODGen, TexGen, DynDOLOD, Pandora, BodySlide, Synthesis and PGPatcher are checked against the mods and load order they were made from.</p>', actions: [['ok', 'OK', 'primary']] });
+  }
+  const body = `<p>rmm runs these one after another, each a run of its own (deploy, run, capture; Undo takes one back):</p>
+    <ol>${plan.steps.map(([id, why]) => `<li><b>${esc(name(id))}</b> <span class="muted small">${esc(why)}</span></li>`).join('')}</ol>
+    <p class="muted small">TexGen, DynDOLOD, xLODGen and PGPatcher need you to click through their windows; the next one starts when one closes. A failed run stops the rest, since the later tools read its output.</p>`;
+  if (await dialog({ title: 'Rebuild outputs', body, actions: [['cancel', 'Cancel'], ['ok', `Run ${plural(plan.steps.length, 'tool')}`, 'primary']] }) !== 'ok') return;
+  const r = await act('Rebuilding outputs', () => call('rebuild_outputs', {}), { problem: true });
+  if (!r || r === true) return;
+  loadTools();
+  runHealth();
+  const rows = r.done.map(([id, m]) => `<li>${esc(name(id))}: ${m ? `<b>${esc(nameOf(m))}</b>` : 'captured nothing'}</li>`).join('');
+  dialog({
+    title: r.failed ? 'Rebuild stopped' : 'Outputs rebuilt',
+    body: `${rows ? `<ul>${rows}</ul>` : ''}${r.failed ? `<p>⚠ ${esc(name(r.failed[0]))} failed: ${esc(r.failed[1])}</p><p class="muted small">The tools after it didn’t run.</p>` : ''}`,
+    actions: [['ok', 'OK', 'primary']],
+  });
+}
+$('#rebuild-outputs').onclick = rebuildOutputs;
+$('#rebuild-stale').onclick = rebuildOutputs;
 
 /** Clean the plugins LOOT knows as dirty with xEdit QuickAutoClean, one run each. */
 $('#clean-dirty').onclick = async () => {
@@ -4008,6 +4036,7 @@ const PLAIN = {
   overwrite_to_mod: a => [`Make the files in Overwrite into the mod “${a.name}”`, UNDO],
   clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
   desktop_shortcut: a => [`Put a shortcut to ${a.profile ? `“${a.profile}”` : 'this profile'} on the Desktop`, 'It switches to the profile, deploys and starts the game.'],
+  rebuild_outputs: () => ['Run again the tools whose output is out of date', 'Each run is its own undo step.'],
   clean_dirty_plugins: () => ['Clean the dirty plugins with xEdit QuickAutoClean', 'Each clean copy goes into its own mod; Undo brings the original back.'],
   hide_files: a => [`${a.show ? 'Show' : 'Hide'} ${plural(a.paths?.length ?? 0, 'file')} in ${nameOf(a.id)}`, a.show ? '' : 'They stay out of the game until shown again.'],
   move_files: a => [`Move ${plural(a.paths?.length ?? 0, 'file')} from ${a.from === OVERWRITE_ID ? 'Overwrite' : nameOf(a.from)} into ${a.to === OVERWRITE_ID ? 'Overwrite' : nameOf(a.to)}`, a.replace ? 'Files it replaces go to the trash.' : ''],

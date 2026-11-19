@@ -1234,6 +1234,11 @@ impl Rmm {
         }))
     }
 
+    #[tool(description = "Generated output that is out of date, and the tools to run again: xLODGen, TexGen, DynDOLOD, Pandora, BodySlide, Synthesis and PGPatcher outputs record the mods and load order they were made from, and are stale once those change. Lists the tools in the order to run them, with why (dry_run defaults to true); dry_run=false runs them one after another and waits for each, and TexGen, DynDOLOD, xLODGen and PGPatcher need the user to click through, so for those prefer run_tool with background, in the listed order.")]
+    async fn rebuild_outputs(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::tools::rebuild(&i, a.dry_run.unwrap_or(true), None)))
+    }
+
     #[tool(description = "Clean every enabled plugin LOOT's cached masterlist knows as dirty (identical-to-master records, deleted references) with xEdit QuickAutoClean, one tool run each, each its own undo step with the clean copy in a \"Cleaned <plugin>\" mod. Needs a tool from the xedit-qac preset (add_tool); plugins with only deleted navmeshes are listed for xEdit by hand. Runs xEdit, which takes a while per plugin. dry_run defaults to true: lists the plugins.")]
     async fn clean_dirty_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
         out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true))))
