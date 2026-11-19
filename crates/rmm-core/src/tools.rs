@@ -295,6 +295,50 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
     })
 }
 
+#[derive(Serialize, Debug, Default)]
+pub struct Cleaned {
+    pub dry_run: bool,
+    /// The QuickAutoClean tool's id.
+    pub tool: String,
+    /// The plugins to clean (or cleaned), with what LOOT found in them.
+    pub plugins: Vec<crate::loot::Dirty>,
+    /// Plugins with only deleted navmeshes, which QuickAutoClean can't fix: xEdit by hand.
+    pub by_hand: Vec<crate::loot::Dirty>,
+    /// Each cleaned plugin and the mod its clean copy went into ("Cleaned <plugin>").
+    pub mods: Vec<(String, Option<String>)>,
+    /// Plugins whose run failed, and why.
+    pub failed: Vec<(String, String)>,
+    /// Plugins LOOT still finds dirty afterwards.
+    pub still_dirty: Vec<String>,
+}
+
+/// Clean every enabled plugin LOOT's masterlist knows as dirty with xEdit QuickAutoClean, one run
+/// after another (each its own undo step, its clean copy in its own "Cleaned <plugin>" mod), as
+/// MO2's Batch Plugin Cleaner does. Needs a QuickAutoClean tool (the xedit-qac preset); a dry run
+/// lists the plugins.
+pub fn clean_dirty(inst: &Instance, dry_run: bool) -> Result<Cleaned> {
+    let tool = list(inst)?
+        .into_iter()
+        .find(|(_, t)| t.args.iter().any(|a| a.eq_ignore_ascii_case("-qac")))
+        .map(|(id, _)| id)
+        .context("add xEdit QuickAutoClean as a tool first: the xedit-qac preset with SSEEdit's or FO4Edit's exe (Tools, Add a tool)")?;
+    let (plugins, by_hand) = crate::loot::dirty_plugins(inst)?.into_iter().partition(|d| d.itm + d.deleted_references > 0);
+    let mut r = Cleaned { dry_run, tool, plugins, by_hand, ..Default::default() };
+    if dry_run {
+        return Ok(r);
+    }
+    for (i, d) in r.plugins.iter().enumerate() {
+        crate::progress::report(&format!("cleaning {}", d.plugin), i, r.plugins.len());
+        match run(inst, &r.tool, &BTreeMap::from([("plugin".to_string(), d.plugin.clone())]), false, None) {
+            Ok(x) => r.mods.push((d.plugin.clone(), x.mod_id)),
+            Err(e) => r.failed.push((d.plugin.clone(), format!("{e:#}"))),
+        }
+    }
+    let after = crate::loot::dirty_plugins(inst)?;
+    r.still_dirty = r.plugins.iter().filter(|d| after.iter().any(|a| a.plugin == d.plugin)).map(|d| d.plugin.clone()).collect();
+    Ok(r)
+}
+
 /// Run a tool. With `dry_run` nothing happens: the report shows the command, the generated mod
 /// it would replace, the links it would swap and the deploy that runs first.
 pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {

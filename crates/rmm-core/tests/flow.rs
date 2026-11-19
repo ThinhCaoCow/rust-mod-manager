@@ -2790,6 +2790,60 @@ fn adopts_creation_club_content() {
     assert!(!inst.mod_dir("ccBGSSSE001-Fish").exists());
 }
 
+/// Every plugin LOOT knows as dirty is cleaned with the QuickAutoClean tool, one run each, into its
+/// own mod; one with only deleted navmeshes is left for xEdit by hand.
+#[test]
+fn cleans_dirty_plugins_in_one_job() {
+    isolate();
+    use rmm_core::tools::{self, ToolSpec};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src, root) = (tmp.path().join("game"), tmp.path().join("src"), tmp.path().join("inst"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let dirty = plugin_bytes(&["Skyrim.esm"], false);
+    let clean = plugin_bytes(&[], false);
+    write(&src.join("Dirty/Dirty.esp"), &dirty);
+    write(&src.join("Nav/Nav.esp"), &dirty);
+    write(&src.join("clean.esp"), &clean);
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    for m in ["Dirty", "Nav"] {
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+    }
+    let crc = crc32(&dirty);
+    write(
+        &root.join("loot/masterlist.yaml"),
+        format!(
+            "plugins:\n  - name: 'Dirty.esp'\n    dirty:\n      - crc: 0x{crc:08X}\n        util: 'SSEEdit v4.1.5'\n        itm: 3\n        udr: 2\n  \
+             - name: 'Nav.esp'\n    dirty:\n      - crc: 0x{crc:08X}\n        util: 'SSEEdit v4.1.5'\n        nav: 1\n"
+        ),
+    );
+    write(&root.join("loot/prelude.yaml"), "common: []\n");
+    deploy::deploy(&inst, false).unwrap();
+    assert!(format!("{:#}", tools::clean_dirty(&inst, true).unwrap_err()).contains("xedit-qac"), "no QuickAutoClean tool yet");
+
+    // A stand-in for QuickAutoClean: copies a clean plugin over the one it's given.
+    write(&src.join("qac.bat"), "@echo off\r\ncopy /y \"%~4\" \"%~2\\%~3\" >nul\r\n");
+    let spec = ToolSpec {
+        exe: src.join("qac.bat"),
+        args: Some(vec!["-qac".into(), "{data}".into(), "{plugin}".into(), src.join("clean.esp").display().to_string()]),
+        rewrites: Some(vec!["{plugin}".into()]),
+        output_mod: Some("Cleaned {plugin}".into()),
+        ..Default::default()
+    };
+    tools::add(&inst, "qac", spec).unwrap();
+    let names = |d: &[rmm_core::loot::Dirty]| d.iter().map(|d| d.plugin.clone()).collect::<Vec<_>>();
+    let plan = tools::clean_dirty(&inst, true).unwrap();
+    assert_eq!((plan.tool.as_str(), names(&plan.plugins), names(&plan.by_hand)), ("qac", vec!["Dirty.esp".to_string()], vec!["Nav.esp".to_string()]));
+    assert_eq!((plan.plugins[0].itm, plan.plugins[0].deleted_references), (3, 2));
+
+    let r = tools::clean_dirty(&inst, false).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    assert_eq!(r.mods, [("Dirty.esp".to_string(), Some("Cleaned Dirty.esp".to_string()))]);
+    assert!(r.still_dirty.is_empty(), "the clean copy has another CRC");
+    assert_eq!(fs::read(game.join("Data/Dirty.esp")).unwrap(), clean, "the clean copy is deployed");
+    assert_eq!(fs::read(inst.mod_dir("Dirty").join("Dirty.esp")).unwrap(), dirty, "the original stays in its mod");
+}
+
 /// A zip of (path, bytes).
 fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();

@@ -1272,6 +1272,7 @@ function renderProblems() {
     : `<li class="info"><span class="sev">ok</span><span class="subject">No problems found${hidden ? ' apart from ignored ones' : ''}.</span></li>`;
   $('#show-ignored').hidden = !hidden;
   $('#install-missing').hidden = !all.some(i => i.kind === 'nexus_requirement' && !ignored.has(keyOf(i)));
+  $('#clean-dirty').hidden = !all.some(i => i.kind === 'dirty_plugin' && !ignored.has(keyOf(i)));
   $('#show-ignored').textContent = showIgnored ? 'Hide ignored' : `Show ${hidden} ignored`;
   // Mods with a finding, for the Problems filter.
   D.flagged = new Set(all.filter(i => !ignored.has(keyOf(i)) && i.severity !== 'info').map(i => targetOf(i)?.mod).filter(Boolean));
@@ -1282,6 +1283,29 @@ function renderProblems() {
   if (filters.has('problems')) renderMods();
   $('#problems-note').textContent = `${plural(all.length - failures.length, 'finding')}. LOOT's messages are included once its masterlist is downloaded.`;
 }
+
+/** Clean the plugins LOOT knows as dirty with xEdit QuickAutoClean, one run each. */
+$('#clean-dirty').onclick = async () => {
+  const r = await call('clean_dirty', { dry_run: true }).catch(e => { toast(String(e), 'error', /tool first/.test(String(e)) ? ['Open Tools', () => showTab('tools')] : null); return null; });
+  if (!r) return;
+  const what = d => `${d.itm ? plural(d.itm, 'ITM') : ''}${d.itm && d.deleted_references ? ', ' : ''}${d.deleted_references ? plural(d.deleted_references, 'deleted reference') : ''}`;
+  const body = (r.plugins.length ? `<p>xEdit QuickAutoClean cleans ${plural(r.plugins.length, 'plugin')}, one run after another. Each clean copy goes into its own “Cleaned …” mod above the original, so Undo or turning that mod off brings the original back.</p>
+      <ul>${r.plugins.map(d => `<li><b>${esc(d.plugin)}</b> <span class="muted small">${esc(what(d))}${d.deleted_navmeshes ? '; its deleted navmeshes take xEdit by hand' : ''}</span></li>`).join('')}</ul>` : '<p>No plugin LOOT knows as dirty can be cleaned automatically.</p>')
+    + (r.by_hand.length ? `<p class="muted small">Only deleted navmeshes, which QuickAutoClean can’t fix (xEdit by hand, or leave them): ${esc(r.by_hand.map(d => d.plugin).join(', '))}.</p>` : '')
+    + '<p class="muted small">xEdit opens for each plugin and closes when done; this takes a while. ITMs are records identical to the master’s; deleted references can crash the game when another mod uses them.</p>';
+  if (!r.plugins.length) return dialog({ title: 'Dirty plugins', body, actions: [['cancel', 'Close']] });
+  if (await dialog({ title: 'Clean dirty plugins', body, actions: [['cancel', 'Cancel'], ['ok', `Clean ${plural(r.plugins.length, 'plugin')}`, 'primary']] }) !== 'ok') return;
+  const done = await act('Cleaning plugins', () => call('clean_dirty', {}), { problem: true });
+  if (!done || done === true) return;
+  const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p><ul class="small">${xs.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '';
+  await dialog({
+    title: 'Cleaning done',
+    body: part('Cleaned', done.mods.map(([p, m]) => m ? `${p} → ${m}` : `${p} (xEdit found nothing to remove)`)) + part('Couldn’t clean', done.failed.map(([p, e]) => `${p}: ${e}`)) + part('LOOT still lists as dirty', done.still_dirty)
+      + (done.mods.some(([p, m]) => !m && done.still_dirty.includes(p)) ? '<p class="muted small">Where xEdit found nothing to remove, LOOT’s entry likely comes from another xEdit version; the plugin is fine as it is.</p>' : ''),
+    actions: [['ok', 'OK', 'primary']],
+  });
+  runHealth();
+};
 
 /** What the mods' Nexus pages list as required and this setup lacks: install it all (Premium) or
  *  open the Files tabs (free), and turn on what's installed but off. */
@@ -3925,6 +3949,7 @@ const PLAIN = {
   uninstall_mods: a => [`Uninstall ${someMods(a.ids)}`, 'Their files go to the trash; Undo brings them back.'],
   overwrite_to_mod: a => [`Make the files in Overwrite into the mod “${a.name}”`, UNDO],
   clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
+  clean_dirty_plugins: () => ['Clean the dirty plugins with xEdit QuickAutoClean', 'Each clean copy goes into its own mod; Undo brings the original back.'],
   hide_files: a => [`${a.show ? 'Show' : 'Hide'} ${plural(a.paths?.length ?? 0, 'file')} in ${nameOf(a.id)}`, a.show ? '' : 'They stay out of the game until shown again.'],
   move_files: a => [`Move ${plural(a.paths?.length ?? 0, 'file')} from ${a.from === OVERWRITE_ID ? 'Overwrite' : nameOf(a.from)} into ${a.to === OVERWRITE_ID ? 'Overwrite' : nameOf(a.to)}`, a.replace ? 'Files it replaces go to the trash.' : ''],
   creation_club: a => [a.restore ? 'Put the Creation Club content back into the game’s Data folder' : 'Make the game’s Creation Club content mods', 'This moves the game’s own files; the other way round undoes it.'],

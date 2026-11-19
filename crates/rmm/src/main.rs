@@ -156,6 +156,12 @@ enum Cmd {
         #[arg(long, conflicts_with = "to_mod")]
         clear: bool,
     },
+    /// Clean every plugin LOOT knows as dirty with xEdit QuickAutoClean (a tool from the xedit-qac
+    /// preset), one run each. Lists them; --apply cleans.
+    CleanPlugins {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Hide files or folders of a mod (MO2's .mohidden; a hidden plugin is an optional ESP): they
     /// leave deploys, conflicts and the plugin list, and stay hidden through reinstalls.
     Hide {
@@ -948,6 +954,7 @@ fn run() -> Result<()> {
         Cmd::Overwrite { to_mod: Some(name), .. } => print(&install::mod_from_overwrite(&open()?, &name)?),
         Cmd::Overwrite { clear: true, .. } => print(&serde_json::json!({ "cleared": install::clear_overwrite(&open()?)? })),
         Cmd::Overwrite { .. } => print(&open()?.mod_files(rmm_core::instance::OVERWRITE)?),
+        Cmd::CleanPlugins { apply } => print(&rmm_core::tools::clean_dirty(&open()?, !apply)?),
         Cmd::Hide { id, paths, show } => print(&install::hide_files(&open()?, &id, &paths, !show)?),
         Cmd::MoveFiles { from, to, paths, replace } => {
             let ow = |s: String| if s.eq_ignore_ascii_case("overwrite") { rmm_core::instance::OVERWRITE.to_string() } else { s };

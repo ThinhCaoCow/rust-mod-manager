@@ -221,11 +221,31 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
     Ok(SortReport { dry_run, order, moved, warnings })
 }
 
+/// A plugin LOOT's masterlist knows as dirty, in this very version (by its CRC).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Dirty {
+    pub plugin: String,
+    /// Identical-to-master records, deleted references and deleted navmeshes. QuickAutoClean fixes
+    /// the first two; deleted navmeshes take xEdit by hand.
+    pub itm: u32,
+    pub deleted_references: u32,
+    pub deleted_navmeshes: u32,
+}
+
 /// LOOT's warnings and errors for enabled plugins, plus dirty-plugin reports, from the cached
 /// masterlist. Nothing is downloaded; without a masterlist there is nothing to report.
 pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
+    Ok(scan(inst)?.0)
+}
+
+/// The enabled plugins LOOT's cached masterlist knows as dirty.
+pub fn dirty_plugins(inst: &Instance) -> Result<Vec<Dirty>> {
+    Ok(scan(inst)?.1)
+}
+
+fn scan(inst: &Instance) -> Result<(Vec<Issue>, Vec<Dirty>)> {
     if !dir(inst).join("masterlist.yaml").is_file() {
-        return Ok(vec![]);
+        return Ok(Default::default());
     }
     let profile = inst.profile()?;
     let infos = plugins::list(inst, &profile)?;
@@ -234,6 +254,7 @@ pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
     let db = game.database();
     let db = db.read().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
     let mut issues = Vec::new();
+    let mut dirty = Vec::new();
     let cfg = crate::settings::get().loot;
     let text = |m: &libloot::metadata::Message| select_message_content(m.content(), &cfg.language).map(|c| c.text().to_owned()).unwrap_or_default();
     let severity = |m: &libloot::metadata::Message| match m.message_type() {
@@ -260,16 +281,17 @@ pub fn issues(inst: &Instance) -> Result<Vec<Issue>> {
                 kind: "dirty_plugin",
                 subject: p.name.clone(),
                 message: format!(
-                    "{} ITMs, {} deleted references, {} deleted navmeshes; clean it with xEdit QuickAutoClean (run_tool xedit-qac with plugin={})",
+                    "{} ITMs, {} deleted references, {} deleted navmeshes; clean it with xEdit QuickAutoClean (Problems' Clean dirty plugins…, or run_tool xedit-qac with plugin={})",
                     d.itm_count(),
                     d.deleted_reference_count(),
                     d.deleted_navmesh_count(),
                     p.name
                 ),
             });
+            dirty.push(Dirty { plugin: p.name.clone(), itm: d.itm_count(), deleted_references: d.deleted_reference_count(), deleted_navmeshes: d.deleted_navmesh_count() });
         }
     }
-    Ok(issues)
+    Ok((issues, dirty))
 }
 
 /// A user rule for one plugin, kept in `loot/userlist.yaml` in LOOT's own format, so LOOT itself

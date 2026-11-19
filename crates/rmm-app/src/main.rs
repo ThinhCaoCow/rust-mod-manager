@@ -381,6 +381,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "rename_mod" => json!(ops::rename_mod(&inst, &s("id")?, &s("name")?)?),
         "overwrite_files" => json!(inst.mod_files(OVERWRITE)?),
         "mod_files" => json!(inst.mod_files(&s("id")?)?),
+        "clean_dirty" => json!(tools::clean_dirty(&inst, flag("dry_run"))?),
         "hide_files" => json!(install::hide_files(&inst, &s("id")?, &serde_json::from_value::<Vec<String>>(a["paths"].clone())?, !flag("show"))?),
         "move_files" => json!(install::move_files(&inst, &s("from")?, &serde_json::from_value::<Vec<String>>(a["paths"].clone())?, &s("to")?, flag("replace"))?),
         "creations" if flag("restore") => json!(rmm_core::import::restore_creations(&inst, flag("dry_run"))?),

@@ -1219,6 +1219,11 @@ impl Rmm {
         }))
     }
 
+    #[tool(description = "Clean every enabled plugin LOOT's cached masterlist knows as dirty (identical-to-master records, deleted references) with xEdit QuickAutoClean, one tool run each, each its own undo step with the clean copy in a \"Cleaned <plugin>\" mod. Needs a tool from the xedit-qac preset (add_tool); plugins with only deleted navmeshes are listed for xEdit by hand. Runs xEdit, which takes a while per plugin. dry_run defaults to true: lists the plugins.")]
+    async fn clean_dirty_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true))))
+    }
+
     #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. Takes effect at the next deploy.")]
     async fn hide_files(&self, Parameters(a): Parameters<HideArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| install::hide_files(&i, &a.id, &a.paths, !a.show.unwrap_or(false))))
