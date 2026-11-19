@@ -126,6 +126,7 @@ pub fn instance_info(inst: &Instance) -> Result<Value> {
         "root": inst.root,
         "game": inst.config.game,
         "game_path": inst.config.game_path,
+        "game_version": crate::launch::game_version(&inst.config.game_path, inst.config.game).ok().map(|v| v.map(|n| n.to_string()).join(".")),
         "local_path": inst.config.local_path,
         "profile": inst.config.profile,
         "mods": p.mods.iter().filter(|m| !is_separator(&m.id)).count(),

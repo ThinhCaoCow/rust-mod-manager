@@ -546,7 +546,8 @@ pub struct Cleaned {
     pub plugins: Vec<crate::loot::Dirty>,
     /// Plugins with only deleted navmeshes, which QuickAutoClean can't fix: xEdit by hand.
     pub by_hand: Vec<crate::loot::Dirty>,
-    /// Each cleaned plugin and the mod its clean copy went into ("Cleaned <plugin>").
+    /// Each cleaned plugin and the mod its clean copy went into ("Cleaned <plugin>", or
+    /// "Cleaned plugins" for all of them with `one_mod`).
     pub mods: Vec<(String, Option<String>)>,
     /// Plugins whose run failed, and why.
     pub failed: Vec<(String, String)>,
@@ -554,11 +555,15 @@ pub struct Cleaned {
     pub still_dirty: Vec<String>,
 }
 
+/// The mod `clean_dirty` puts every clean copy in, with `one_mod`.
+pub const CLEANED_MOD: &str = "Cleaned plugins";
+
 /// Clean every enabled plugin LOOT's masterlist knows as dirty with xEdit QuickAutoClean, one run
 /// after another (each its own undo step, its clean copy in its own "Cleaned <plugin>" mod), as
-/// MO2's Batch Plugin Cleaner does. Needs a QuickAutoClean tool (the xedit-qac preset); a dry run
-/// lists the plugins.
-pub fn clean_dirty(inst: &Instance, dry_run: bool) -> Result<Cleaned> {
+/// MO2's Batch Plugin Cleaner does. With `one_mod`, every clean copy goes into one mod,
+/// "Cleaned plugins": each run keeps the copies the earlier ones made. Needs a QuickAutoClean tool
+/// (the xedit-qac preset); a dry run lists the plugins.
+pub fn clean_dirty(inst: &Instance, dry_run: bool, one_mod: bool) -> Result<Cleaned> {
     let tool = list(inst)?
         .into_iter()
         .find(|(_, t)| t.args.iter().any(|a| a.eq_ignore_ascii_case("-qac")))
@@ -569,9 +574,24 @@ pub fn clean_dirty(inst: &Instance, dry_run: bool) -> Result<Cleaned> {
     if dry_run {
         return Ok(r);
     }
+    let stored = list(inst)?.remove(&r.tool).context("the tool went away")?;
+    let source = format!("tool:{}", r.tool);
     for (i, d) in r.plugins.iter().enumerate() {
         crate::progress::report(&format!("cleaning {}", d.plugin), i, r.plugins.len());
-        match run(inst, &r.tool, &BTreeMap::from([("plugin".to_string(), d.plugin.clone())]), false, None) {
+        // One mod: the same output each run, keeping every file the earlier runs put there but
+        // this plugin's old copy (the run's new copy, its output, makes it a new version).
+        let shared = one_mod.then(|| -> Result<Tool> {
+            let had = inst.profile()?.mods.into_iter().find(|m| {
+                let meta = inst.mod_meta(&m.id);
+                meta.name == CLEANED_MOD && meta.source.as_deref() == Some(source.as_str())
+            });
+            let keep = match had {
+                Some(m) => inst.mod_files(&m.id)?.into_iter().filter(|f| !f.eq_ignore_ascii_case(&d.plugin)).collect(),
+                None => vec![],
+            };
+            Ok(Tool { output_mod: Some(CLEANED_MOD.into()), keep, ..stored.clone() })
+        }).transpose()?;
+        match run_with(inst, &r.tool, shared.as_ref(), &BTreeMap::from([("plugin".to_string(), d.plugin.clone())]), false, None) {
             Ok(x) => r.mods.push((d.plugin.clone(), x.mod_id)),
             Err(e) => r.failed.push((d.plugin.clone(), format!("{e:#}"))),
         }
@@ -584,7 +604,12 @@ pub fn clean_dirty(inst: &Instance, dry_run: bool) -> Result<Cleaned> {
 /// Run a tool. With `dry_run` nothing happens: the report shows the command, the generated mod
 /// it would replace, the links it would swap and the deploy that runs first.
 pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {
-    let mut r = run_inner(inst, id, given, dry_run, timeout)?;
+    run_with(inst, id, None, given, dry_run, timeout)
+}
+
+/// `run`, with `tool` in place of the stored definition when given.
+fn run_with(inst: &Instance, id: &str, tool: Option<&Tool>, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {
+    let mut r = run_inner(inst, id, tool, given, dry_run, timeout)?;
     if !dry_run {
         let done = crate::addons::hook(inst, "after_tool_run", &serde_json::json!({ "tool": id, "mod": r.mod_id }));
         r.warnings.extend(crate::addons::warnings(&done));
@@ -592,9 +617,12 @@ pub fn run(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run:
     Ok(r)
 }
 
-fn run_inner(inst: &Instance, id: &str, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {
+fn run_inner(inst: &Instance, id: &str, over: Option<&Tool>, given: &BTreeMap<String, String>, dry_run: bool, timeout: Option<Duration>) -> Result<RunReport> {
     let tools = list(inst)?;
-    let tool = tools.get(id).with_context(|| format!("no tool '{id}'; add one first (presets: {})", PRESETS.join(", ")))?;
+    let tool = match over {
+        Some(t) => t,
+        None => tools.get(id).with_context(|| format!("no tool '{id}'; add one first (presets: {})", PRESETS.join(", ")))?,
+    };
     let state = inst.root.join("tools").join(id);
     let staging = inst.root.join(".staging").join(format!("tool-{id}"));
     let vars = vars(inst, tool, &state, &staging, given);

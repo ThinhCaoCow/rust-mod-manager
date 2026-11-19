@@ -56,7 +56,8 @@ pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bo
 
 /// The mod name, Nexus mod id and version in a Nexus download's file name, as MO2 reads them:
 /// "Address Library - All In One 47327 1.11.240 2026-08-21T23-48Z Hbu6377Rl" (the site's names
-/// now) or "Unofficial Skyrim Special Edition Patch-266-4-2-5a-1623868815" (older ones).
+/// now), "Unofficial Skyrim Special Edition Patch-266-4-2-5a-1623868815" (older ones), or without
+/// the upload time and with any version: "Relationship Dialogue Overhaul - RDO Final-1187-Final".
 fn nexus_name(stem: &str) -> Option<(String, crate::instance::NexusRef)> {
     let found = |name: &str, id: &str, version: &str| {
         let mod_id = id.bytes().all(|b| b.is_ascii_digit()).then(|| id.parse().ok()).flatten().filter(|_| !name.trim().is_empty())?;
@@ -76,7 +77,13 @@ fn nexus_name(stem: &str) -> Option<(String, crate::instance::NexusRef)> {
     }
     let (rest, time) = stem.rsplit_once('-')?;
     if time.len() != 10 || !time.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+        // No upload time: "<name>-<id>-<version>", the id the first number of 3 digits or more
+        // (shorter ones are a name's own: "UIExtensions v1-2-0-17561-1-2-0"), the version a word.
+        return stem.match_indices('-').find_map(|(i, _)| {
+            let (id, version) = stem[i + 1..].split_once('-')?;
+            let ok = id.len() >= 3 && !id.starts_with('0') && !version.is_empty() && !version.contains(' ');
+            ok.then(|| found(&stem[..i], id, &version.replace('-', "."))).flatten()
+        });
     }
     // The name ends at the first "-<digits>-": the mod id, then the version.
     rest.match_indices('-').find_map(|(i, _)| {
@@ -380,7 +387,7 @@ pub fn nexus_id_in_name(file: &str) -> Option<u64> {
     let stem = Path::new(file).file_stem()?.to_str()?;
     let parts: Vec<&str> = stem.split('-').collect();
     // The first number after the name; the version and the upload time follow it.
-    let number = |p: &str| !p.is_empty() && !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit());
+    let number = |p: &str| p.len() >= 3 && !p.starts_with('0') && p.bytes().all(|b| b.is_ascii_digit());
     parts.iter().skip(1).take(parts.len().saturating_sub(2)).find(|p| number(p))?.parse().ok()
 }
 
@@ -428,6 +435,18 @@ mod nexus_name_tests {
         assert_eq!(id(r"D:\Downloads\SkyUI_5_2_SE-12604-5-2SE.7z"), Some(12604));
         assert_eq!(id("Address Library All in One (1.7.104.0) v13 32444 13 2026-08-27T15-29Z Ae46W7Fw2.zip"), None);
         assert_eq!((id("Snow.zip"), id("tool:xedit"), id("Name-123.zip")), (None, None, None));
+        assert_eq!(id("UIExtensions v1-2-0-17561-1-2-0.7z"), Some(17561));
+    }
+
+    #[test]
+    fn reads_old_names_without_an_upload_time() {
+        let read = |s: &str| super::nexus_name(s).map(|(n, x)| (n, x.mod_id, x.version.unwrap_or_default()));
+        let want = |n: &str, id: u64, v: &str| Some((n.to_string(), id, v.to_string()));
+        assert_eq!(read("Relationship Dialogue Overhaul - RDO Final-1187-Final"), want("Relationship Dialogue Overhaul - RDO Final", 1187, "Final"));
+        assert_eq!(read("Reverb and Ambiance Overhaul-701-1-5"), want("Reverb and Ambiance Overhaul", 701, "1.5"));
+        assert_eq!(read("UIExtensions v1-2-0-17561-1-2-0"), want("UIExtensions v1-2-0", 17561, "1.2.0"));
+        assert_eq!(read("LazyTools 0.10.1-13381-0-10-1"), want("LazyTools 0.10.1", 13381, "0.10.1"));
+        assert_eq!((read("collection-h2uqa3-70"), read("Snow-12"), read("My Mod-2-Fixes")), (None, None, None));
     }
 }
 

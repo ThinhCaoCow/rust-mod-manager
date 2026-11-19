@@ -99,7 +99,7 @@ impl Default for Loot {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Health {
     /// Kinds of problems not reported (see `health::KINDS`).
@@ -107,6 +107,14 @@ pub struct Health {
     /// Fallout 4's limit on general BA2 archives: 0 works it out (1,024 since the August 2025
     /// update, with a warning above 256), or 256 or 1024.
     pub ba2_limit: usize,
+    /// Warn when the instance's or the game's drive has less free space than this, in GB; 0 never.
+    pub low_space_gb: u64,
+}
+
+impl Default for Health {
+    fn default() -> Health {
+        Health { hidden: vec![], ba2_limit: 0, low_space_gb: 20 }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

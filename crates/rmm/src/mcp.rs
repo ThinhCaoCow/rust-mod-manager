@@ -591,6 +591,14 @@ struct AddToolArgs {
     spec: ToolSpec,
 }
 #[derive(Deserialize, JsonSchema)]
+struct CleanArgs {
+    /// Default true: only list the plugins.
+    dry_run: Option<bool>,
+    /// Put every clean copy in one mod, "Cleaned plugins", instead of a "Cleaned <plugin>" mod each.
+    #[serde(default)]
+    one_mod: bool,
+}
+#[derive(Deserialize, JsonSchema)]
 struct RemoveToolArgs {
     /// Tool id from list_tools.
     id: String,
@@ -1252,9 +1260,9 @@ impl Rmm {
         out(self.inst().and_then(|i| rmm_core::tools::rebuild(&i, a.dry_run.unwrap_or(true), None)))
     }
 
-    #[tool(description = "Clean every enabled plugin LOOT's cached masterlist knows as dirty (identical-to-master records, deleted references) with xEdit QuickAutoClean, one tool run each, each its own undo step with the clean copy in a \"Cleaned <plugin>\" mod. Needs a tool from the xedit-qac preset (add_tool); plugins with only deleted navmeshes are listed for xEdit by hand. Runs xEdit, which takes a while per plugin. dry_run defaults to true: lists the plugins.")]
-    async fn clean_dirty_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true))))
+    #[tool(description = "Clean every enabled plugin LOOT's cached masterlist knows as dirty (identical-to-master records, deleted references) with xEdit QuickAutoClean, one tool run each, each its own undo step with the clean copy in a \"Cleaned <plugin>\" mod (one_mod: all in \"Cleaned plugins\"). Needs a tool from the xedit-qac preset (add_tool); plugins with only deleted navmeshes are listed for xEdit by hand. Runs xEdit, which takes a while per plugin. dry_run defaults to true: lists the plugins.")]
+    async fn clean_dirty_plugins(&self, Parameters(a): Parameters<CleanArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true), a.one_mod)))
     }
 
     #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. One undo step. Takes effect at the next deploy.")]

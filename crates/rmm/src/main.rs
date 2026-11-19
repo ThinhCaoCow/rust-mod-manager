@@ -88,20 +88,28 @@ enum Cmd {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// Turn mods on (by id, as `rmm mods` shows them). One undo step; deploy applies it.
     Enable {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// Turn mods off (by id). One undo step; deploy applies it.
     Disable {
         #[arg(required = true)]
         ids: Vec<String>,
     },
-    /// Move mods as one block, in their current order, so the first lands at --to (0 = lowest).
+    /// Move mods as one block, in their current order: the first to --to (0 = lowest priority),
+    /// or the block just after --after or just before --before another mod. One undo step.
+    #[command(group = clap::ArgGroup::new("place").required(true))]
     Move {
         #[arg(required = true)]
         ids: Vec<String>,
-        #[arg(long)]
-        to: usize,
+        #[arg(long, group = "place")]
+        to: Option<usize>,
+        #[arg(long, group = "place")]
+        after: Option<String>,
+        #[arg(long, group = "place")]
+        before: Option<String>,
     },
     /// Separators: headings that group mods in the list (ids start with "sep:").
     #[command(subcommand)]
@@ -167,6 +175,9 @@ enum Cmd {
     CleanPlugins {
         #[arg(long)]
         apply: bool,
+        /// Put every clean copy in one mod, "Cleaned plugins", instead of one mod each.
+        #[arg(long)]
+        one_mod: bool,
     },
     /// Hide files or folders of a mod (MO2's .mohidden; a hidden plugin is an optional ESP): they
     /// leave deploys, conflicts and the plugin list, and stay hidden through reinstalls. Undoable.
@@ -456,8 +467,13 @@ enum Cmd {
     /// closed, where FOMOD installers show their options. Without the window program beside rmm,
     /// it downloads and installs the file here (`rmm nexus install` always does).
     Nxm { link: String },
+    /// Undo the last change to the profile (order, enabled mods and plugins, installs). Prints
+    /// what it undid; deploy applies it to the game.
     Undo,
+    /// Redo the last undone change. Prints what it redid.
     Redo,
+    /// The undo history, newest first, with each step's time and what it changed; when this
+    /// instance last deployed and played; and the steps Redo brings back.
     History,
     /// rmm's own AI with your API key: OpenRouter, Claude, OpenAI (GPT), Kimi, DeepSeek or Qwen.
     #[command(subcommand)]
@@ -934,7 +950,20 @@ fn run() -> Result<()> {
         Cmd::Uninstall { ids } => done(install::uninstall_mods(&open()?, &ids)),
         Cmd::Enable { ids } => done(ops::set_mods_enabled(&open()?, &ids, true)),
         Cmd::Disable { ids } => done(ops::set_mods_enabled(&open()?, &ids, false)),
-        Cmd::Move { ids, to } => done(ops::move_mods(&open()?, &ids, to)),
+        Cmd::Move { ids, to, after, before } => {
+            let inst = open()?;
+            let to = match (to, after.or(before.clone())) {
+                (Some(to), _) => to,
+                (None, Some(other)) => {
+                    // move_mods counts the place in the list without the moved mods.
+                    let rest: Vec<String> = inst.profile()?.mods.into_iter().map(|m| m.id).filter(|m| !ids.contains(m)).collect();
+                    let i = rest.iter().position(|m| *m == other).with_context(|| format!("no mod '{other}' (besides the ones moving)"))?;
+                    if before.is_some() { i } else { i + 1 }
+                }
+                (None, None) => unreachable!("clap requires one"),
+            };
+            done(ops::move_mods(&inst, &ids, to))
+        }
         Cmd::Separator(SeparatorCmd::Add { name, at }) => {
             print(&serde_json::json!({ "id": ops::add_separator(&open()?, &name, at)? }))
         }
@@ -982,7 +1011,7 @@ fn run() -> Result<()> {
         Cmd::Overwrite { clear: true, .. } => print(&serde_json::json!({ "cleared": install::clear_overwrite(&open()?)? })),
         Cmd::Overwrite { .. } => print(&open()?.mod_files(rmm_core::instance::OVERWRITE)?),
         Cmd::Rebuild { apply } => print(&rmm_core::tools::rebuild(&open()?, !apply, None)?),
-        Cmd::CleanPlugins { apply } => print(&rmm_core::tools::clean_dirty(&open()?, !apply)?),
+        Cmd::CleanPlugins { apply, one_mod } => print(&rmm_core::tools::clean_dirty(&open()?, !apply, one_mod)?),
         Cmd::Hide { id, paths, show } => print(&install::hide_files(&open()?, &id, &paths, !show)?),
         Cmd::MoveFiles { from, to, paths, replace } => {
             let ow = |s: String| if s.eq_ignore_ascii_case("overwrite") { rmm_core::instance::OVERWRITE.to_string() } else { s };

@@ -57,6 +57,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("ini_test_file", "sTestFile lines in Fallout4.ini"),
     ("archive_invalidation", "Archive invalidation is off (Fallout 4)"),
     ("addon", "Add-ons' checks"),
+    ("low_disk_space", "Little free space on the instance's or the game's drive"),
 ];
 
 pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
@@ -65,6 +66,21 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     let mut add = |severity, kind, subject: &str, message: String| {
         issues.push(Issue { severity, kind, subject: subject.into(), message })
     };
+
+    // Downloads, installs, copies and tool output (DynDOLOD, grass caches) all take room.
+    let low = crate::settings::get().health.low_space_gb;
+    if low > 0 {
+        let drive = |p: &std::path::Path| p.components().next().map(|c| c.as_os_str().to_ascii_lowercase());
+        let game = &inst.config.game_path;
+        let both = drive(&inst.root) == drive(game);
+        let places = [(&inst.root, if both { "the instance and the game" } else { "the instance" }), (game, "the game")];
+        for (path, what) in places.into_iter().take(if both { 1 } else { 2 }) {
+            if let Some(free) = crate::game::free_space(path).filter(|f| *f < low << 30) {
+                let subject = path.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+                add("warning", "low_disk_space", &subject, format!("has {:.1} GB free, for {what}. Installs, downloads and tools such as DynDOLOD need room; this warns under {low} GB (health.low_space_gb)", free as f64 / (1u64 << 30) as f64));
+            }
+        }
+    }
 
     for m in profile.mods.iter().filter(|m| !crate::instance::is_separator(&m.id)) {
         if !inst.mod_dir(&m.id).is_dir() {

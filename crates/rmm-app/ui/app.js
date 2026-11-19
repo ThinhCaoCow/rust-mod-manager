@@ -8,6 +8,8 @@ const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': 
 const basename = p => String(p).split(/[\\/]/).pop();
 const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
 const GAMES = { 'skyrim-se': 'Skyrim Special Edition', fallout4: 'Fallout 4' };
+/** The game's name as players know it: Skyrim's 1.6 builds are the Anniversary Edition's. */
+const gameName = (game, version) => game === 'skyrim-se' && /^1\.6\./.test(version ?? '') ? 'Skyrim Anniversary Edition' : GAMES[game] ?? game;
 const LAST = 'rmm.lastInstance';
 const remember = path => { try { localStorage.setItem(LAST, path); } catch {} };
 const recall = () => { try { return localStorage.getItem(LAST); } catch { return null; } };
@@ -316,7 +318,7 @@ function drawGames() {
   $('#search-note').hidden = found.length > 0;
   $('#search-note').textContent = 'No game found through Steam or the registry. Auto search looks through every drive, for copies outside Steam too.';
   $('#create-games').innerHTML = found.map((d, i) =>
-    `<button data-game="${esc(d.game)}" data-path="${esc(d.game_path)}"${first && !i ? ' class="primary"' : ''}>New instance for ${esc(GAMES[d.game] ?? d.game)}<br><span class="muted small">${esc(d.game_path)}</span></button>`).join('');
+    `<button data-game="${esc(d.game)}" data-path="${esc(d.game_path)}"${first && !i ? ' class="primary"' : ''}>New instance for ${esc(gameName(d.game, d.version))}<br><span class="muted small">${esc([d.version && `version ${d.version}`, d.steam ? 'Steam' : 'not Steam', d.free != null && `${bytes(d.free)} free`].filter(Boolean).join(' · '))}<br>${esc(d.game_path)}</span></button>`).join('');
 }
 
 /** Same folder, whatever the case and trailing slash. */
@@ -359,10 +361,13 @@ $('#pick-game').onclick = async () => {
  *  instance ever starts in the Simple view. */
 async function newInstance(game, gamePath) {
   const first = !recall(), name = GAMES[game] ?? game, there = gamePath.slice(0, 2).toUpperCase();
+  const d = gamesFound.find(g => samePath(g.game_path, gamePath));
   const suggested = `${there}\\rmm\\${name}`;
+  // A modded setup soon takes tens of GB: downloads, the mods, and tool output.
+  const free = d?.free != null ? `<p class="${d.free < 20 * 2 ** 30 ? 'bad' : 'muted'} small">${bytes(d.free)} free on drive ${esc(there.replace(':', ''))}.${d.free < 20 * 2 ** 30 ? ' A modded game soon takes tens of GB: downloads, mods and tool output such as DynDOLOD’s. Problems warns while it’s under 20 GB.' : ''}</p>` : '';
   const how = await dialog({
-    title: `New instance for ${name}`,
-    body: `<p>The instance folder holds your mods, profiles and undo history. On the game’s drive, deploys link mod files into the game folder instead of copying them.</p><p><b>${esc(suggested)}</b></p>`,
+    title: `New instance for ${gameName(game, d?.version)}`,
+    body: `<p>The instance folder holds your mods, profiles and undo history. On the game’s drive, deploys link mod files into the game folder instead of copying them.</p><p><b>${esc(suggested)}</b></p>${free}`,
     actions: [['cancel', 'Cancel'], ['pick', 'Choose another folder…'], ['ok', 'Use this folder', 'primary']],
   });
   if (!how) return;
@@ -433,7 +438,7 @@ function reveal(id) {
 
 function render() {
   const i = S.info;
-  $('#game-name').textContent = GAMES[i.game] ?? i.game;
+  $('#game-name').textContent = gameName(i.game, i.game_version);
   $('#instance-path').textContent = i.root;
   $('#instance-path').title = i.root;
   $('#profile-name').textContent = i.profile;
@@ -1436,18 +1441,21 @@ $('#clean-dirty').onclick = async () => {
   const r = await call('clean_dirty', { dry_run: true }).catch(e => { toast(String(e), 'error', /tool first/.test(String(e)) ? ['Open Tools', () => showTab('tools')] : null); return null; });
   if (!r) return;
   const what = d => `${d.itm ? plural(d.itm, 'ITM') : ''}${d.itm && d.deleted_references ? ', ' : ''}${d.deleted_references ? plural(d.deleted_references, 'deleted reference') : ''}`;
-  const body = (r.plugins.length ? `<p>xEdit QuickAutoClean cleans ${plural(r.plugins.length, 'plugin')}, one run after another. Each clean copy goes into its own “Cleaned …” mod above the original, so Undo or turning that mod off brings the original back.</p>
+  const body = (r.plugins.length ? `<p>xEdit QuickAutoClean cleans ${plural(r.plugins.length, 'plugin')}, one run after another. The clean copies go into a mod above the originals, so Undo or turning that mod off brings the originals back.</p>
+      <label class="row" style="margin:0 0 8px"><input type="checkbox" id="cd-one" ${prefs.cleanOneMod ?? true ? 'checked' : ''}> All in one mod, “Cleaned plugins” (otherwise a “Cleaned …” mod each)</label>
       <ul>${r.plugins.map(d => `<li><b>${esc(d.plugin)}</b> <span class="muted small">${esc(what(d))}${d.deleted_navmeshes ? '; its deleted navmeshes take xEdit by hand' : ''}</span></li>`).join('')}</ul>` : '<p>No plugin LOOT knows as dirty can be cleaned automatically.</p>')
     + (r.by_hand.length ? `<p class="muted small">Only deleted navmeshes, which QuickAutoClean can’t fix (xEdit by hand, or leave them): ${esc(r.by_hand.map(d => d.plugin).join(', '))}.</p>` : '')
     + '<p class="muted small">xEdit opens for each plugin and closes when done; this takes a while. ITMs are records identical to the master’s; deleted references can crash the game when another mod uses them.</p>';
   if (!r.plugins.length) return dialog({ title: 'Dirty plugins', body, actions: [['cancel', 'Close']] });
   if (await dialog({ title: 'Clean dirty plugins', body, actions: [['cancel', 'Cancel'], ['ok', `Clean ${plural(r.plugins.length, 'plugin')}`, 'primary']] }) !== 'ok') return;
-  const done = await act('Cleaning plugins', () => call('clean_dirty', {}), { problem: true });
+  const one_mod = prefs.cleanOneMod = $('#cd-one').checked;
+  savePrefs();
+  const done = await act('Cleaning plugins', () => call('clean_dirty', { one_mod }), { problem: true });
   if (!done || done === true) return;
   const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p><ul class="small">${xs.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '';
   await dialog({
     title: 'Cleaning done',
-    body: part('Cleaned', done.mods.map(([p, m]) => m ? `${p} → ${m}` : `${p} (xEdit found nothing to remove)`)) + part('Couldn’t clean', done.failed.map(([p, e]) => `${p}: ${e}`)) + part('LOOT still lists as dirty', done.still_dirty)
+    body: part('Cleaned', done.mods.map(([p, m]) => m ? `${p} → ${nameOf(m)}` : `${p} (xEdit found nothing to remove)`)) + part('Couldn’t clean', done.failed.map(([p, e]) => `${p}: ${e}`)) + part('LOOT still lists as dirty', done.still_dirty)
       + (done.mods.some(([p, m]) => !m && done.still_dirty.includes(p)) ? '<p class="muted small">Where xEdit found nothing to remove, LOOT’s entry likely comes from another xEdit version; the plugin is fine as it is.</p>' : ''),
     actions: [['ok', 'OK', 'primary']],
   });
@@ -1898,6 +1906,55 @@ $('#mods tbody').addEventListener('dblclick', e => {
 });
 
 /** Every file a mod shares with others: who provides it, in load order, and who wins. */
+/** What kind of file a conflict is over, in a player's words. */
+function fileKind(f) {
+  const l = f.toLowerCase();
+  return /\.(pex|psc)$/.test(l) ? 'scripts' : /\.dll$/.test(l) ? 'script extender plugins' : /\.es[pml]$/.test(l) ? 'plugins'
+    : /\.hkx$/.test(l) ? 'animations' : /^interface\/|\.swf$/.test(l) ? 'menus' : /\.(dds|png|tga)$/.test(l) ? 'textures'
+    : /\.(nif|tri|btr|bto)$/.test(l) ? 'meshes' : /\.(wav|xwm|fuz|lip)$/.test(l) ? 'sounds'
+    : /\.(ini|json|toml|yaml|yml|xml|txt)$/.test(l) ? 'settings files' : 'other files';
+}
+const LOOKS = new Set(['textures', 'meshes', 'sounds']);
+const ONE_KIND = { scripts: 'script', 'script extender plugins': 'script extender plugin', plugins: 'plugin', animations: 'animation', menus: 'menu', textures: 'texture', meshes: 'mesh', sounds: 'sound', 'settings files': 'settings file', 'other files': 'other file' };
+
+/** One line per mod `id` shares files with: what kinds, who wins, and whether that's expected
+ *  (a patch over what it patches, or two replacers of the same looks) or worth a look. */
+function conflictSummary(id, all) {
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const patchy = n => /patch|fix|compat|tweak|add-?on|plugin for/i.test(n);
+  const by = new Map(); // other mod -> { kinds: Map, wins, loses }
+  for (const f of all) {
+    const others = f.winner === id ? f.mods.filter(m => m !== id) : [f.winner];
+    for (const o of others) {
+      const e = by.get(o) ?? { kinds: new Map(), wins: 0, loses: 0 };
+      const k = fileKind(f.file);
+      e.kinds.set(k, (e.kinds.get(k) ?? 0) + 1);
+      f.winner === id ? e.wins++ : e.loses++;
+      by.set(o, e);
+    }
+  }
+  const me = nameOf(id);
+  const rows = [...by].sort((a, b) => (b[1].wins + b[1].loses) - (a[1].wins + a[1].loses)).slice(0, 10).map(([o, e]) => {
+    const other = nameOf(o), kinds = [...e.kinds].sort((a, b) => b[1] - a[1]);
+    const what = kinds.map(([k, n]) => `${n.toLocaleString()} ${n === 1 ? ONE_KIND[k] : k}`).join(', ');
+    const who = !e.loses ? 'this mod wins' : !e.wins ? 'it wins' : `each wins some (this mod ${e.wins.toLocaleString()}, it ${e.loses.toLocaleString()})`;
+    // A patch names what it patches, or says it's a patch; it should win.
+    const meP = patchy(me) || norm(me).includes(norm(other)), otherP = patchy(other) || norm(other).includes(norm(me));
+    let ok, why;
+    if (meP !== otherP) {
+      const patch = meP ? 'This mod looks like a patch for it' : 'It looks like a patch for this mod', winsIt = meP ? !e.loses : !e.wins;
+      [ok, why] = winsIt ? [true, `${patch}, and wins, as a patch should.`] : [false, `${patch}, but loses: move the patch below the other.`];
+    } else if (kinds.every(([k]) => LOOKS.has(k))) {
+      [ok, why] = [true, 'Both change how the same things look or sound. Whichever is lower in the list shows; order them for the look you want.'];
+    } else {
+      const risky = kinds.map(([k]) => k).filter(k => !LOOKS.has(k));
+      [ok, why] = [false, `Only the winner’s ${risky.join(' and ')} are used, so the other mod may not work fully. Its page may name a patch, or the order it wants.`];
+    }
+    return `<li><b>${esc(other)}</b>: ${esc(what)}; ${esc(who)}. <span class="pill ${ok ? 'win' : 'lose'}">${ok ? 'Expected' : 'Worth a look'}</span> <span class="muted">${esc(why)}</span></li>`;
+  });
+  return `<ul class="fc-sum small">${rows.join('')}</ul>${by.size > 10 ? `<p class="muted small">And ${plural(by.size - 10, 'more mod')}.</p>` : ''}`;
+}
+
 async function fileConflicts(id) {
   const all = await act('Reading the conflicts', () => call('file_conflicts', { id }), { reload: false });
   if (!Array.isArray(all)) return;
@@ -1918,7 +1975,8 @@ async function fileConflicts(id) {
   };
   const done = dialog({
     title: `File conflicts: ${nameOf(id)}`,
-    body: `<p class="muted small">Providers load left to right; the winner is in bold. Archives lose to every loose file.</p><input id="fc-filter" type="search" placeholder="Filter files" spellcheck="false"><div id="fc"></div>`,
+    body: `<p class="small">When two mods have the same file, the game uses one: the mod lower in the list wins, and a loose file beats one packed in an archive.</p>${conflictSummary(id, all)}
+      <p class="muted small">Each file below lists the mods that have it, in load order; the copy the game uses is in bold.</p><input id="fc-filter" type="search" placeholder="Filter files" spellcheck="false"><div id="fc"></div>`,
     actions: [['cancel', 'Close']],
   });
   $('#dlg').classList.add('wide');
@@ -3894,6 +3952,7 @@ const SETTINGS = [
   ]],
   ['Problems', 'What the Problems tab and the AI’s health check report.', [
     ['health.hidden', 'Report', 'kinds'],
+    ['health.low_space_gb', 'Warn when a drive has less free space than', 'num', [0, 10000], 'GB (0: never)'],
     ['health.ba2_limit', 'Fallout 4’s limit on BA2 archives', 'select', [[0, 'Work it out (1,024, a warning above 256)'], [256, '256 (before the August 2025 update)'], [1024, '1,024']]],
   ]],
   ['Test runs', 'Defaults for a test run; the Test run dialog and AI apps can change them for one run.', [
@@ -4365,7 +4424,7 @@ const PLAIN = {
   clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
   desktop_shortcut: a => [`Put a shortcut to ${a.profile ? `“${a.profile}”` : 'this profile'} on the Desktop`, 'It switches to the profile, deploys and starts the game.'],
   rebuild_outputs: () => ['Run again the tools whose output is out of date', 'Each run is its own undo step.'],
-  clean_dirty_plugins: () => ['Clean the dirty plugins with xEdit QuickAutoClean', 'Each clean copy goes into its own mod; Undo brings the original back.'],
+  clean_dirty_plugins: a => ['Clean the dirty plugins with xEdit QuickAutoClean', `${a.one_mod ? 'The clean copies go into one mod, “Cleaned plugins”' : 'Each clean copy goes into its own mod'}; Undo brings the originals back.`],
   hide_files: a => [`${a.show ? 'Show' : 'Hide'} ${plural(a.paths?.length ?? 0, 'file')} in ${nameOf(a.id)}`, a.show ? '' : 'They stay out of the game until shown again.'],
   move_files: a => [`Move ${plural(a.paths?.length ?? 0, 'file')} from ${a.from === OVERWRITE_ID ? 'Overwrite' : nameOf(a.from)} into ${a.to === OVERWRITE_ID ? 'Overwrite' : nameOf(a.to)}`, a.replace ? 'Files it replaces go to the trash.' : ''],
   creation_club: a => [a.restore ? 'Put the Creation Club content back into the game’s Data folder' : 'Make the game’s Creation Club content mods', 'This moves the game’s own files; the other way round undoes it.'],

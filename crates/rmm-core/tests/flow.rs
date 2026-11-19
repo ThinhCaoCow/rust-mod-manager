@@ -2841,7 +2841,7 @@ fn cleans_dirty_plugins_in_one_job() {
     );
     write(&root.join("loot/prelude.yaml"), "common: []\n");
     deploy::deploy(&inst, false).unwrap();
-    assert!(format!("{:#}", tools::clean_dirty(&inst, true).unwrap_err()).contains("xedit-qac"), "no QuickAutoClean tool yet");
+    assert!(format!("{:#}", tools::clean_dirty(&inst, true, false).unwrap_err()).contains("xedit-qac"), "no QuickAutoClean tool yet");
 
     // A stand-in for QuickAutoClean: copies a clean plugin over the one it's given.
     write(&src.join("qac.bat"), "@echo off\r\ncopy /y \"%~4\" \"%~2\\%~3\" >nul\r\n");
@@ -2854,16 +2854,45 @@ fn cleans_dirty_plugins_in_one_job() {
     };
     tools::add(&inst, "qac", spec).unwrap();
     let names = |d: &[rmm_core::loot::Dirty]| d.iter().map(|d| d.plugin.clone()).collect::<Vec<_>>();
-    let plan = tools::clean_dirty(&inst, true).unwrap();
+    let plan = tools::clean_dirty(&inst, true, false).unwrap();
     assert_eq!((plan.tool.as_str(), names(&plan.plugins), names(&plan.by_hand)), ("qac", vec!["Dirty.esp".to_string()], vec!["Nav.esp".to_string()]));
     assert_eq!((plan.plugins[0].itm, plan.plugins[0].deleted_references), (3, 2));
 
-    let r = tools::clean_dirty(&inst, false).unwrap();
+    let r = tools::clean_dirty(&inst, false, false).unwrap();
     assert!(r.failed.is_empty(), "{:?}", r.failed);
     assert_eq!(r.mods, [("Dirty.esp".to_string(), Some("Cleaned Dirty.esp".to_string()))]);
     assert!(r.still_dirty.is_empty(), "the clean copy has another CRC");
     assert_eq!(fs::read(game.join("Data/Dirty.esp")).unwrap(), clean, "the clean copy is deployed");
     assert_eq!(fs::read(inst.mod_dir("Dirty").join("Dirty.esp")).unwrap(), dirty, "the original stays in its mod");
+
+    // One mod: two more dirty plugins, each run carrying the copy the one before it made.
+    let mut ml = fs::read_to_string(root.join("loot/masterlist.yaml")).unwrap();
+    for m in ["Two", "Three"] {
+        write(&src.join(m).join(format!("{m}.esp")), &dirty);
+        install::install(&inst, &src.join(m), None, true, None).unwrap();
+        ml += &format!("  - name: '{m}.esp'
+    dirty:
+      - crc: 0x{crc:08X}
+        util: 'SSEEdit v4.1.5'
+        itm: 1
+");
+    }
+    write(&root.join("loot/masterlist.yaml"), ml);
+    deploy::deploy(&inst, false).unwrap();
+    let r = tools::clean_dirty(&inst, false, true).unwrap();
+    assert!(r.failed.is_empty(), "{:?}", r.failed);
+    // A rerun's output gets a new id; the name stays.
+    let named = |id: &Option<String>| inst.mod_meta(id.as_deref().unwrap()).name;
+    assert_eq!(r.mods.iter().map(|(p, m)| (p.as_str(), named(m))).collect::<Vec<_>>(), [("Two.esp", "Cleaned plugins".into()), ("Three.esp", "Cleaned plugins".to_string())]);
+    let mods = inst.profile().unwrap().mods;
+    let ours: Vec<_> = mods.iter().filter(|m| inst.mod_meta(&m.id).name == "Cleaned plugins").collect();
+    assert_eq!(ours.len(), 1, "one mod");
+    assert_eq!(ours[0].id, mods.last().unwrap().id, "after the originals");
+    let files = inst.mod_files(&ours[0].id).unwrap();
+    assert!(files.contains(&"Two.esp".to_string()) && files.contains(&"Three.esp".to_string()), "{files:?}");
+    for m in ["Two", "Three"] {
+        assert_eq!(fs::read(game.join(format!("Data/{m}.esp"))).unwrap(), clean, "{m}'s clean copy is deployed");
+    }
 }
 
 /// A desktop shortcut runs `rmm launch --profile <p>` on this instance; a dry run writes nothing.

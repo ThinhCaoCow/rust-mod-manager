@@ -396,7 +396,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             let limit = Some(Duration::from_secs(settings::get().tools.timeout_mins * 60)).filter(|d| !d.is_zero());
             json!(tools::rebuild(&inst, flag("dry_run"), limit)?)
         }
-        "clean_dirty" => json!(tools::clean_dirty(&inst, flag("dry_run"))?),
+        "clean_dirty" => json!(tools::clean_dirty(&inst, flag("dry_run"), flag("one_mod"))?),
         "hide_files" => json!(install::hide_files(&inst, &s("id")?, &serde_json::from_value::<Vec<String>>(a["paths"].clone())?, !flag("show"))?),
         "move_files" => json!(install::move_files(&inst, &s("from")?, &serde_json::from_value::<Vec<String>>(a["paths"].clone())?, &s("to")?, flag("replace"))?),
         "creations" if flag("restore") => json!(rmm_core::import::restore_creations(&inst, flag("dry_run"))?),
