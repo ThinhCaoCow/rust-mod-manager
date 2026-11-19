@@ -190,6 +190,53 @@ pub fn launch_vanilla(inst: &Instance, dry_run: bool) -> Result<LaunchReport> {
     Ok(r)
 }
 
+/// A shortcut that starts a profile's game, as MO2's do.
+#[derive(Serialize, Debug)]
+pub struct Shortcut {
+    pub dry_run: bool,
+    pub path: PathBuf,
+    /// What it runs: rmm's command line with `arguments`. Steam's "Add a Non-Steam Game" takes
+    /// the same two as its target and launch options.
+    pub target: PathBuf,
+    pub arguments: String,
+}
+
+/// A Windows shortcut, `<game> - <profile>.lnk` on the Desktop (or in `dir`), that runs
+/// `cli -i <instance> launch --profile <profile> --apply --pause`: switch to the profile, deploy
+/// and start the game, keeping an error on screen until it's read.
+pub fn shortcut(inst: &Instance, profile: &str, cli: &Path, dir: Option<&Path>, dry_run: bool) -> Result<Shortcut> {
+    let profile = inst.find_profile(profile)?;
+    let dir = match dir {
+        Some(d) => d.to_path_buf(),
+        None => dirs::desktop_dir().context("can't find the Desktop folder")?,
+    };
+    let r = Shortcut {
+        dry_run,
+        path: dir.join(format!("{} - {profile}.lnk", inst.config.game.local_dir())),
+        target: cli.to_path_buf(),
+        arguments: format!("-i \"{}\" launch --profile \"{profile}\" --apply --pause", std::path::absolute(&inst.root)?.display()),
+    };
+    if !dry_run {
+        anyhow::ensure!(cfg!(windows), "shortcuts are Windows .lnk files");
+        fs::create_dir_all(&dir)?;
+        // WScript.Shell writes .lnk files; the values go in through the environment, so nothing
+        // in them needs quoting.
+        let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:RMM_LNK); $s.TargetPath = $env:RMM_LNK_TARGET; \
+                      $s.Arguments = $env:RMM_LNK_ARGS; $s.WorkingDirectory = $env:RMM_LNK_DIR; $s.IconLocation = $env:RMM_LNK_ICON; $s.Save()";
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("RMM_LNK", &r.path)
+            .env("RMM_LNK_TARGET", cli)
+            .env("RMM_LNK_ARGS", &r.arguments)
+            .env("RMM_LNK_DIR", &inst.config.game_path)
+            .env("RMM_LNK_ICON", inst.config.game_path.join(inst.config.game.exe()))
+            .output()
+            .context("cannot run PowerShell to write the shortcut")?;
+        anyhow::ensure!(out.status.success() && r.path.is_file(), "couldn't write {}: {}", r.path.display(), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(r)
+}
+
 /// Steam's manifest for the game, `appmanifest_<app id>.acf` in the `steamapps` folder whose
 /// `common` folder has the game. None for a game outside a Steam library.
 pub fn app_manifest(game: Game, game_path: &Path) -> Option<PathBuf> {

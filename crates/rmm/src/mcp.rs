@@ -555,6 +555,13 @@ struct DryRun {
     /// Preview only (default true). Set false to change the game folder.
     dry_run: Option<bool>,
 }
+#[derive(Deserialize, JsonSchema)]
+struct ShortcutArgs {
+    /// Default: the active profile.
+    profile: Option<String>,
+    /// Default true: only show the shortcut.
+    dry_run: Option<bool>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct LaunchArgs {
@@ -958,6 +965,14 @@ impl Rmm {
             None => out(self.inst().map(|i| rmm_core::launch::steam_updates(&i))),
             Some(hold) => out(self.inst().and_then(|i| rmm_core::launch::hold_steam_updates(&i, hold))),
         }
+    }
+
+    #[tool(description = "A desktop shortcut (.lnk) that switches to a profile (default: the active one), deploys and starts the game, as MO2's shortcuts do: it runs this rmm with `launch --profile <p> --apply --pause`. The target and arguments also work as a Steam non-Steam game. Only when the user asks: it adds a file to their Desktop. dry_run defaults to true.")]
+    async fn desktop_shortcut(&self, Parameters(a): Parameters<ShortcutArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| {
+            let p = a.profile.clone().unwrap_or_else(|| i.config.profile.clone());
+            rmm_core::launch::shortcut(&i, &p, &std::env::current_exe()?, None, a.dry_run.unwrap_or(true))
+        }))
     }
 
     #[tool(description = "Remove all deployed files and restore originals. dry_run defaults to true.")]

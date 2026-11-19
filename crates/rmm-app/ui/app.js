@@ -2211,6 +2211,20 @@ $('#play-more').onclick = async e => {
 
 // ---- Profiles -------------------------------------------------------------------------------
 
+/** A Desktop shortcut that switches to `profile` and starts the game, as MO2's do; Steam can start the same. */
+async function profileShortcut(profile) {
+  const r = await act('Making the shortcut', () => call('desktop_shortcut', { profile }), { reload: false });
+  if (!r || r === true) return;
+  const field = v => `<input type="text" readonly spellcheck="false" value="${esc(v)}">`;
+  await dialog({
+    title: 'Desktop shortcut',
+    body: `<p>“${esc(r.path.split(/[\\/]/).pop())}” is on your Desktop. It switches to “${esc(profile)}”, deploys and starts the game with its script extender, as Play does. If something stops it, its window stays open to say why.</p>
+      <p class="muted small">To start it from Steam: Games → Add a Non-Steam Game to My Library → Browse, pick the program below, then paste the launch options into its Properties. The game’s own Steam entry skips the script extender and anything not yet deployed.</p>
+      <p class="small">Program</p>${field(r.target)}<p class="small">Launch options</p>${field(r.arguments)}`,
+    actions: [['ok', 'OK', 'primary']],
+  });
+}
+
 $('#profile-btn').onclick = e => {
   e.stopPropagation();
   const pop = $('#profile-pop');
@@ -2221,6 +2235,7 @@ $('#profile-btn').onclick = e => {
     + '<button class="item" data-new="copy"><span class="check"></span>Copy this profile…</button>'
     + '<button class="item" data-new="empty"><span class="check"></span>New empty profile…</button>'
     + '<button class="item" data-rename="1"><span class="check"></span>Rename this profile…</button>'
+    + '<button class="item" data-shortcut="1" title="A shortcut on your Desktop that switches to this profile and starts the game, as Play does"><span class="check"></span>Desktop shortcut…</button>'
     + `<hr><button class="item" data-opt="local_inis" title="Deploy puts this profile's copies of the game's INI files in My Games; what the game changes there comes back to the profile. Purge puts yours back."><span class="check">${S.options?.local_inis ? '✓' : ''}</span>Own INI files</button>`
     + `<button class="item" data-opt="local_saves" title="Deploy points the game's saves at Saves\\${esc(cur)}\\. Purge puts your save folder back."><span class="check">${S.options?.local_saves ? '✓' : ''}</span>Own saves</button>`
     + '<hr><button class="item" data-io="mo2"><span class="check"></span>Import from MO2…</button>'
@@ -2233,11 +2248,12 @@ $('#profile-btn').onclick = e => {
 document.addEventListener('click', e => { if (!e.target.closest('.menu')) $('#profile-pop').hidden = true; if (!e.target.closest('#ctx')) closeCtx(); });
 
 $('#profile-pop').onclick = async e => {
-  const t = e.target.closest('[data-delete],[data-switch],[data-new],[data-rename],[data-io],[data-opt]');
+  const t = e.target.closest('[data-delete],[data-switch],[data-new],[data-rename],[data-io],[data-opt],[data-shortcut]');
   if (!t) return;
   $('#profile-pop').hidden = true;
   const cur = S.info.profile;
   if (t.dataset.io) return importExport(t.dataset.io);
+  if (t.dataset.shortcut) return profileShortcut(cur);
   if (t.dataset.opt) {
     const on = !S.options?.[t.dataset.opt];
     if (await act('Changing the profile', () => call('set_profile_options', { [t.dataset.opt]: on }))) {
@@ -3949,6 +3965,7 @@ const PLAIN = {
   uninstall_mods: a => [`Uninstall ${someMods(a.ids)}`, 'Their files go to the trash; Undo brings them back.'],
   overwrite_to_mod: a => [`Make the files in Overwrite into the mod “${a.name}”`, UNDO],
   clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
+  desktop_shortcut: a => [`Put a shortcut to ${a.profile ? `“${a.profile}”` : 'this profile'} on the Desktop`, 'It switches to the profile, deploys and starts the game.'],
   clean_dirty_plugins: () => ['Clean the dirty plugins with xEdit QuickAutoClean', 'Each clean copy goes into its own mod; Undo brings the original back.'],
   hide_files: a => [`${a.show ? 'Show' : 'Hide'} ${plural(a.paths?.length ?? 0, 'file')} in ${nameOf(a.id)}`, a.show ? '' : 'They stay out of the game until shown again.'],
   move_files: a => [`Move ${plural(a.paths?.length ?? 0, 'file')} from ${a.from === OVERWRITE_ID ? 'Overwrite' : nameOf(a.from)} into ${a.to === OVERWRITE_ID ? 'Overwrite' : nameOf(a.to)}`, a.replace ? 'Files it replaces go to the trash.' : ''],

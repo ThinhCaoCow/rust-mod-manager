@@ -332,7 +332,8 @@ impl Instance {
     }
 
     /// The stored spelling of a profile name (folder names are case-insensitive on Windows).
-    pub(crate) fn find_profile(&self, name: &str) -> Result<String> {
+    /// The profile named `name`, in any letter case, by its own name.
+    pub fn find_profile(&self, name: &str) -> Result<String> {
         let want = name.to_lowercase();
         self.profiles()?.into_iter().find(|n| n.to_lowercase() == want).with_context(|| format!("no profile '{name}'"))
     }

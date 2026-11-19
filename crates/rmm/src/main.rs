@@ -317,6 +317,22 @@ enum Cmd {
         apply: bool,
         #[arg(long)]
         without_mods: bool,
+        /// Switch to this profile first (what desktop shortcuts do).
+        #[arg(long)]
+        profile: Option<String>,
+        /// On an error, wait for Enter before closing: a shortcut's window closes with rmm.
+        #[arg(long)]
+        pause: bool,
+    },
+    /// A desktop shortcut that switches to a profile (default: the active one), deploys and starts
+    /// the game, like MO2's: it runs `rmm launch --profile <p> --apply --pause`. Shows it; --apply
+    /// writes it to the Desktop, or --dir.
+    Shortcut {
+        profile: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
     },
     /// Whether Steam may update the game. --hold makes the game's Steam manifest read-only so it
     /// can't (a copy goes to ini-backup/), --release lets Steam update it again.
@@ -1043,8 +1059,29 @@ fn run() -> Result<()> {
         Cmd::Bisect(BisectCmd::Status) => print(&bisect::status(&open()?)?),
         Cmd::Bisect(BisectCmd::Stop) => print(&bisect::stop(&open()?)?),
         Cmd::Deploy { apply } => print(&deploy::deploy(&open()?, !apply)?),
-        Cmd::Launch { apply, without_mods: false } => print(&rmm_core::launch::launch(&open()?, !apply)?),
-        Cmd::Launch { apply, without_mods: true } => print(&rmm_core::launch::launch_vanilla(&open()?, !apply)?),
+        Cmd::Launch { apply, without_mods, profile, pause } => {
+            let run = || -> Result<rmm_core::launch::LaunchReport> {
+                let mut inst = open()?;
+                if let Some(p) = &profile {
+                    // A dry run looks at the profile without switching to it.
+                    if apply { inst.switch_profile(p)? } else { inst.config.profile = inst.find_profile(p)? }
+                }
+                if without_mods { rmm_core::launch::launch_vanilla(&inst, !apply) } else { rmm_core::launch::launch(&inst, !apply) }
+            };
+            match run() {
+                Err(e) if pause => {
+                    eprintln!("rmm couldn't start the game: {e:#}\n\nPress Enter to close this window.");
+                    let _ = std::io::stdin().read_line(&mut String::new());
+                    Err(e)
+                }
+                r => print(&r?),
+            }
+        }
+        Cmd::Shortcut { profile, dir, apply } => {
+            let inst = open()?;
+            let p = profile.unwrap_or_else(|| inst.config.profile.clone());
+            print(&rmm_core::launch::shortcut(&inst, &p, &std::env::current_exe()?, dir.as_deref(), !apply)?)
+        }
         Cmd::SteamUpdates { hold: false, release: false } => print(&rmm_core::launch::steam_updates(&open()?)),
         Cmd::SteamUpdates { hold, .. } => print(&rmm_core::launch::hold_steam_updates(&open()?, hold)?),
         Cmd::Purge { apply } => print(&deploy::purge(&open()?, !apply)?),

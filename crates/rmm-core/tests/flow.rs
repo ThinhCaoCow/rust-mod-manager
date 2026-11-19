@@ -2844,6 +2844,27 @@ fn cleans_dirty_plugins_in_one_job() {
     assert_eq!(fs::read(inst.mod_dir("Dirty").join("Dirty.esp")).unwrap(), dirty, "the original stays in its mod");
 }
 
+/// A desktop shortcut runs `rmm launch --profile <p>` on this instance; a dry run writes nothing.
+#[cfg(windows)]
+#[test]
+fn makes_a_profile_shortcut() {
+    isolate();
+    use rmm_core::launch::shortcut;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, root, desk) = (tmp.path().join("game"), tmp.path().join("inst"), tmp.path().join("desk"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    let inst = Instance::create(&root, Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    inst.create_profile("Pack", true).unwrap();
+    let cli = tmp.path().join("rmm.exe");
+    assert!(shortcut(&inst, "nope", &cli, Some(&desk), true).is_err());
+    let plan = shortcut(&inst, "pack", &cli, Some(&desk), true).unwrap();
+    assert_eq!(plan.path, desk.join("Skyrim Special Edition - Pack.lnk"));
+    assert_eq!(plan.arguments, format!("-i \"{}\" launch --profile \"Pack\" --apply --pause", root.display()));
+    assert!(!desk.exists(), "a dry run writes nothing");
+    shortcut(&inst, "Pack", &cli, Some(&desk), false).unwrap();
+    assert!(plan.path.is_file());
+}
+
 /// A zip of (path, bytes).
 fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut bytes = Vec::new();

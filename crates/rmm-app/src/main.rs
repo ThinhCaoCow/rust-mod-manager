@@ -472,11 +472,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "open_nexus_mod" => json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}?tab=files", inst.config.game.nexus_domain(), n("mod_id")?))?),
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
-        "nexus_handler" => {
-            let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm.exe" } else { "rmm" });
-            anyhow::ensure!(cli.is_file(), "rmm's command-line program isn't next to the app ({})", cli.display());
-            json!(nexus::register_handler(&cli, &inst.root)?)
-        }
+        "nexus_handler" => json!(nexus::register_handler(&cli_exe()?, &inst.root)?),
+        // Only on the user's click: a file on their Desktop.
+        "desktop_shortcut" => json!(launch::shortcut(&inst, &s("profile")?, &cli_exe()?, None, flag("dry_run"))?),
         "addons" => json!(addons::list(&inst)?),
         "addon_install" => json!(addons::install(&inst, Path::new(&s("path")?), flag("dry_run"))?),
         "addon_remove" => json!(addons::remove(&inst, &s("name")?)?),
@@ -543,6 +541,13 @@ fn stamp(inst: &Instance) -> String {
         r.join("mods"),
     ];
     format!("{:?}", files.map(|f| fs::metadata(f).and_then(|m| m.modified()).ok()))
+}
+
+/// rmm's command-line program, shipped next to the app.
+fn cli_exe() -> Result<PathBuf> {
+    let cli = std::env::current_exe()?.with_file_name(if cfg!(windows) { "rmm.exe" } else { "rmm" });
+    anyhow::ensure!(cli.is_file(), "rmm's command-line program isn't next to the app ({})", cli.display());
+    Ok(cli)
 }
 
 fn main() {
