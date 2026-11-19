@@ -41,6 +41,27 @@ async fn mcp(current: tauri::State<'_, Current>, server: tauri::State<'_, Mcp>, 
     Ok(json!({ "on": true, "url": url, "token": token }))
 }
 
+/// Settings' "Check for updates": the newest signed release (`plugins.updater` in tauri.conf.json),
+/// and with `install` its installer, which closes this window and opens the new rmm.
+#[tauri::command]
+async fn app_update(app: tauri::AppHandle, install: bool) -> Result<Value, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let keyed = app.config().plugins.0.get("updater").and_then(|u| u["pubkey"].as_str()).is_some_and(|k| !k.is_empty());
+    if !keyed {
+        return Err("this rmm was built by hand, so it can't update itself. The installer from rmm's releases page on GitHub can".into());
+    }
+    let err = |e: tauri_plugin_updater::Error| e.to_string();
+    let current = app.package_info().version.to_string();
+    let Some(update) = app.updater().map_err(err)?.check().await.map_err(err)? else {
+        return Ok(json!({ "current": current, "newer": null }));
+    };
+    if install {
+        update.download_and_install(|_, _| {}, || {}).await.map_err(err)?;
+        app.restart(); // Windows: the installer has closed rmm already
+    }
+    Ok(json!({ "current": current, "newer": update.version, "notes": update.body }))
+}
+
 /// The AI tab's chat: the agent (for this instance folder), the window's answer to a change waiting
 /// for approval, and the Stop button.
 #[derive(Default)]
@@ -276,7 +297,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
                 "broken": rules::broken(&inst, &p)?,
                 "unmet": rules::unmet(&inst, &p)?,
                 "locks": p.locks.keys().collect::<Vec<_>>(),
-                "options": { "local_inis": p.local_inis, "local_saves": p.local_saves },
+                "options": { "local_inis": p.local_inis, "local_saves": p.local_saves, "shares_order_with": inst.order_sharers()? },
                 "collection": p.collection.as_ref().map(|c| json!({ "slug": c.slug, "name": c.name, "revision": c.revision })),
                 "history": inst.history()?,
                 "mods": mods,
@@ -454,6 +475,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "new_playthrough" => json!(ops::new_playthrough(&mut inst, &s("name")?)?),
         "rename_profile" => json!(inst.rename_profile(&s("from")?, &s("to")?)?),
         "set_profile_options" => json!(ops::set_profile_options(&inst, a["local_inis"].as_bool(), a["local_saves"].as_bool())?),
+        "share_order" => json!(inst.share_order(a["with"].as_str())?),
         "delete_profile" => json!(inst.delete_profile(&s("name")?)?),
         // With `text`, the report to paste into a post.
         "crash_log" => {
@@ -502,10 +524,19 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "essentials" => json!(launch::essentials(&inst)?),
         // A mod's Files tab, for the getting-started list (Nexus mod pages only).
         "open_nexus_mod" => {
-            let tab = if flag("page") { "" } else { "?tab=files" };
+            // A file's id: its download prompt ("Mod manager download"), for free accounts.
+            let tab = match a["file_id"].as_u64() {
+                Some(f) => format!("?tab=files&file_id={f}&nmm=1"),
+                None if flag("page") => String::new(),
+                None => "?tab=files".into(),
+            };
             json!(nexus::open_in_browser(&format!("https://www.nexusmods.com/{}/mods/{}{tab}", inst.config.game.nexus_domain(), n("mod_id")?))?)
         }
         "nexus_keys_page" => json!(nexus::open_in_browser(nexus::KEYS_PAGE)?),
+        // Public actions on the user's Nexus account, only from the window's own buttons.
+        "nexus_endorse" => json!(nexus::endorse(&inst, &nexus::Client::from_env()?, &s("id")?, flag("yes"))?),
+        "nexus_track" => json!(nexus::track(&inst, &nexus::Client::from_env()?, &s("id")?, flag("yes"))?),
+        "nexus_account" => json!(nexus::refresh_account(&inst, &nexus::Client::from_env()?)?),
         "nexus_changelog" => json!(nexus::changelog(&inst, &nexus::Client::any(), n("mod_id")? as u64, a["since"].as_str())?),
         // A mod's folder (or Overwrite's) in Explorer.
         "open_mod_folder" => {
@@ -549,6 +580,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "data" => json!(conflicts::data_view(&inst, &p, &serde_json::from_value(a.clone())?)?),
         "saves" => json!(saves::list(&inst)?),
         "newest_save_using" => json!(saves::newest_using(&inst, &serde_json::from_value::<Vec<String>>(a["plugins"].clone())?)?),
+        "clean_cosaves" => json!(saves::clean_cosaves(&inst, false)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
         "transfer_saves" => json!(saves::transfer(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?, &s("profile")?, !flag("move"))?),
         "downloads" => json!(install::downloads(&inst)?),
@@ -630,6 +662,7 @@ fn main() {
         .map(PathBuf::from);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Current(Mutex::new(start)))
         .manage(Mcp(Mutex::new(None)))
         .manage(Ai::default())
@@ -672,7 +705,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![call, mcp, ai, ai_send, ai_answer, ai_stop])
+        .invoke_handler(tauri::generate_handler![call, mcp, ai, ai_send, ai_answer, ai_stop, app_update])
         .run(tauri::generate_context!())
         .expect("error while running rmm");
 }

@@ -204,6 +204,15 @@ impl Client {
     }
 
     fn request(&self, path: &str, body: Option<&str>) -> Result<Value> {
+        self.send("", path, body.map(|b| ("application/json", b)))
+    }
+
+    /// A v1 call that takes form data (endorse, track): POST or DELETE.
+    fn form(&self, method: &str, path: &str, form: &str) -> Result<Value> {
+        self.send(method, path, Some(("application/x-www-form-urlencoded", form)))
+    }
+
+    fn send(&self, method: &str, path: &str, body: Option<(&str, &str)>) -> Result<Value> {
         let url = format!("{}{path}", self.base);
         let version = env!("CARGO_PKG_VERSION");
         // The key goes to curl on stdin, never on its command line where other programs see it.
@@ -212,8 +221,12 @@ impl Client {
             config += &format!("header = \"apikey: {}\"\n", self.key);
         }
         let mut args = vec!["-sS", "--max-time", "60", "-w", "\n%{http_code}", "-K", "-"];
-        if let Some(b) = body {
-            args.extend(["-H", "Content-Type: application/json", "-H", "Expect:", "--data-binary", b]);
+        if !method.is_empty() {
+            args.extend(["-X", method]);
+        }
+        let content_type = body.map(|(t, _)| format!("Content-Type: {t}"));
+        if let (Some(t), Some((_, b))) = (&content_type, body) {
+            args.extend(["-H", t.as_str(), "-H", "Expect:", "--data-binary", b]);
         }
         args.extend(["--", &url]);
         let mut child = Command::new("curl").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("cannot run curl")?;
@@ -741,17 +754,26 @@ fn download_info(inst: &Instance, client: &Client, link: &NxmLink) -> Result<(Pa
 /// newer uploads end in an id, not the file's name.)
 pub(crate) fn fetch_file(inst: &Instance, client: &Client, mod_id: u64, file_id: u64, query: &str) -> Result<(PathBuf, Value)> {
     let base = format!("/v1/games/{}/mods/{mod_id}/files/{file_id}", inst.config.game.nexus_domain());
-    let info = client.get(&format!("{base}.json"))?;
-    let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{mod_id}-{file_id}"));
-    let dest = inst.downloads_dir().join(&name);
-    if info["size_in_bytes"].as_u64().is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s)) {
+    let (dest, info, there) = downloaded(inst, client, mod_id, file_id)?;
+    if there {
         return Ok((dest, info));
     }
+    let name = dest.file_name().unwrap_or_default().to_string_lossy().into_owned();
     let links = client.get(&format!("{base}/download_link.json{query}"))?;
     let uri = links.as_array().and_then(|l| l.first()).and_then(|l| l["URI"].as_str()).context("Nexus sent no download link")?;
     fs::create_dir_all(dest.parent().unwrap())?;
     fetch_sized(uri, &dest, info["size_in_bytes"].as_u64(), &format!("downloading {name} (MB)"))?;
     Ok((dest, info))
+}
+
+/// Where a Nexus file goes in the downloads folder, its details, and whether it's there already
+/// (by name and size). One request.
+pub(crate) fn downloaded(inst: &Instance, client: &Client, mod_id: u64, file_id: u64) -> Result<(PathBuf, Value, bool)> {
+    let info = client.get(&format!("/v1/games/{}/mods/{mod_id}/files/{file_id}.json", inst.config.game.nexus_domain()))?;
+    let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{mod_id}-{file_id}"));
+    let dest = inst.downloads_dir().join(&name);
+    let there = info["size_in_bytes"].as_u64().is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s));
+    Ok((dest, info, there))
 }
 
 pub(crate) fn fetch_url(url: &str, dest: &Path) -> Result<()> {
@@ -1030,6 +1052,89 @@ pub fn resolve(inst: &Instance, client: &Client, what: &str) -> Result<NxmLink> 
         }
     };
     Ok(premium_link(inst, mod_id, file_id))
+}
+
+/// What the signed-in account has endorsed, abstained from and tracks on this game's Nexus, as
+/// last read (`refresh_account`), kept beside the key: it's the account's, not the instance's.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct Account {
+    /// Nexus mod id -> "Endorsed" or "Abstained".
+    pub endorsements: BTreeMap<u64, String>,
+    pub tracked: std::collections::BTreeSet<u64>,
+    /// When it was read (seconds since 1970).
+    pub read: u64,
+}
+
+fn accounts() -> BTreeMap<String, Account> {
+    crate::config_file("nexus-account.json").and_then(|p| fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_account(domain: &str, a: &Account) -> Result<()> {
+    let path = crate::config_file("nexus-account.json").context("no config folder")?;
+    let mut all = accounts();
+    all.insert(domain.into(), a.clone());
+    if let Some(d) = path.parent() {
+        fs::create_dir_all(d)?;
+    }
+    crate::instance::write_atomic(&path, &serde_json::to_string_pretty(&all)?)
+}
+
+/// The account's endorsements and tracked mods for this game, as last read (no network).
+pub fn account(inst: &Instance) -> Account {
+    accounts().remove(inst.config.game.nexus_domain()).unwrap_or_default()
+}
+
+/// Read the account's endorsements and tracked mods from Nexus (two requests) and keep them.
+pub fn refresh_account(inst: &Instance, client: &Client) -> Result<Account> {
+    let domain = inst.config.game.nexus_domain();
+    let ours = |v: &Value| v["domain_name"].as_str() == Some(domain);
+    let mut a = Account { read: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()), ..Default::default() };
+    for e in client.get("/v1/user/endorsements.json")?.as_array().into_iter().flatten().filter(|e| ours(e)) {
+        if let (Some(id), Some(s)) = (e["mod_id"].as_u64(), e["status"].as_str()) {
+            a.endorsements.insert(id, s.into());
+        }
+    }
+    a.tracked = client.get("/v1/user/tracked_mods.json")?.as_array().into_iter().flatten().filter(|t| ours(t)).filter_map(|t| t["mod_id"].as_u64()).collect();
+    save_account(domain, &a)?;
+    Ok(a)
+}
+
+/// An installed mod's Nexus mod id and version, for endorsing and tracking.
+fn nexus_of(inst: &Instance, id: &str) -> Result<(u64, Option<String>)> {
+    let n = inst.mod_meta(id).nexus.with_context(|| format!("{id} has no Nexus id: Identify on Nexus (Downloads) or install it from Nexus first"))?;
+    Ok((n.mod_id, n.version))
+}
+
+/// Endorse an installed mod on Nexus, or abstain (Nexus's way to take an endorsement back, or to
+/// say you won't). Acts publicly on the account. Returns the account's state after.
+pub fn endorse(inst: &Instance, client: &Client, id: &str, yes: bool) -> Result<Account> {
+    let (mod_id, version) = nexus_of(inst, id)?;
+    let domain = inst.config.game.nexus_domain();
+    let what = if yes { "endorse" } else { "abstain" };
+    let r = client.form("POST", &format!("/v1/games/{domain}/mods/{mod_id}/{what}.json"), &format!("version={}", urlencode(version.as_deref().unwrap_or(""))))?;
+    let mut a = account(inst);
+    a.endorsements.insert(mod_id, r["status"].as_str().unwrap_or(if yes { "Endorsed" } else { "Abstained" }).into());
+    save_account(domain, &a)?;
+    Ok(a)
+}
+
+/// Track an installed mod on Nexus (its updates show in the account's tracking centre), or stop.
+pub fn track(inst: &Instance, client: &Client, id: &str, yes: bool) -> Result<Account> {
+    let (mod_id, _) = nexus_of(inst, id)?;
+    let domain = inst.config.game.nexus_domain();
+    client.form(if yes { "POST" } else { "DELETE" }, &format!("/v1/user/tracked_mods.json?domain_name={domain}"), &format!("mod_id={mod_id}"))?;
+    let mut a = account(inst);
+    if yes {
+        a.tracked.insert(mod_id);
+    } else {
+        a.tracked.remove(&mod_id);
+    }
+    save_account(domain, &a)?;
+    Ok(a)
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 /// The page where users make a personal API key.

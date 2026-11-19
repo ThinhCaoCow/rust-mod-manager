@@ -292,15 +292,30 @@ function showApp() {
   $('#app').hidden = false;
   remember(S.info.root);
   showTab(tab);
-  nexusShow().then(async () => { if ((await loadConf())?.nexus.check_on_start && nexus.user) checkUpdates(true); });
+  nexusShow().then(async () => {
+    if (!nexus.user) return;
+    // The account's endorsements and tracked mods, for the panel and the filters (two requests).
+    call('nexus_account').then(load).catch(() => {});
+    if ((await loadConf())?.nexus.check_on_start) checkUpdates(true);
+  });
   takeLinks(); // a link that started the window
+  rmmUpdateOnStart();
+}
+
+/** Once a launch, quietly: a newer rmm release, offered on a toast. */
+let rmmChecked = false;
+async function rmmUpdateOnStart() {
+  if (rmmChecked) return;
+  rmmChecked = true;
+  const r = await T.core.invoke('app_update', { install: false }).catch(() => null); // hand-built or offline: nothing to say
+  if (r?.newer) toast(`rmm ${r.newer} is out (you have ${r.current}).`, 'info', ['Install…', () => $('#set-update').click()]);
 }
 
 // The last tab, filter and state chips come back with the window.
 const START = W.startTab === 'last' ? prefs.tab : W.startTab;
 tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'ai', 'settings'].includes(START) ? START : 'mods';
 $('#filter').value = prefs.filter ?? '';
-filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, update: 1, problems: 1 }));
+filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, update: 1, endorsed: 1, tracked: 1, problems: 1 }));
 
 let gamesFound = []; // the welcome screen's game folders: detected, then any the search adds
 
@@ -465,6 +480,8 @@ const CRITERIA = {
   plugins: m => m.plugins.length > 0,
   recent: m => (m.installed ?? 0) >= Date.now() / 1000 - W.recentDays * 86400,
   update: m => !!m.update,
+  endorsed: m => m.endorsed === 'Endorsed',
+  tracked: m => !!m.tracked,
   problems: m => D.broken.has(m.id) || D.missing.has(m.id) || !!D.C[m.id]?.fully_overridden || !!D.flagged?.has(m.id),
 };
 const filterText = () => $('#filter').value.trim().toLowerCase();
@@ -877,6 +894,7 @@ function renderDetails() {
     <div class="chips">${(m.categories ?? []).map(c => `<span class="chip">${esc(c)}<button data-uncat="${esc(c)}" title="Remove the category" aria-label="Remove ${esc(c)}">×</button></span>`).join('') || '<span class="muted">None.</span>'}</div>
     <div class="row"><input class="cat-add" list="cat-names" placeholder="Add a category…" aria-label="Add a category" spellcheck="false"></div>
     ${d?.nexus_id ? needsBlock(d.needs) : ''}
+    ${m.nexus_id && nexus.user ? accountBlock(m) : ''}
     ${d?.meta?.nexus ? nexusBlock(d.meta.nexus.mod_id) : ''}
     ${d?.docs?.length ? `<h3>Read me and settings</h3><div class="files">${d.docs.map(f => `<button class="link" data-doc="${esc(f)}" title="Open in the editor (AI tab)">${esc(f)}</button>`).join('<br>')}</div>` : ''}
     ${d?.images?.length ? `<h3>Pictures (${d.images.length})</h3>${modPics.has(m.id)
@@ -922,6 +940,27 @@ function needsBlock(needs) {
     : r.mod_id ? `<button class="link" data-page="${r.mod_id}" title="Open its Files tab on Nexus">${esc(r.name)}</button>` : esc(r.name);
   return `<h3>Needs</h3><ul class="small">${needs.map(r => `<li>${name(r)} <span class="muted">· ${state(r)}${r.notes ? ` · ${esc(r.notes)}` : ''}</span></li>`).join('')}</ul>
     <p class="muted small">From its Nexus page. Problems says when one is missing for this game version.</p>`;
+}
+
+/** Endorse and Track on Nexus, with the account's state as last read. Both act publicly. */
+function accountBlock(m) {
+  const state = m.endorsed === 'Endorsed' ? 'You endorsed it.' : m.endorsed === 'Abstained' ? 'You abstained from endorsing it.' : 'Not endorsed.';
+  return `<h3>Your Nexus account</h3>
+    <div class="row"><span class="small">${state}${m.tracked ? ' Tracked.' : ''}</span><div class="spacer"></div>
+      ${m.endorsed === 'Endorsed' ? '<button data-act="abstain" title="Take the endorsement back (Nexus calls it abstaining)">Withdraw</button>'
+        : `<button data-act="endorse" class="primary" title="Endorse it on Nexus, as your account">Endorse</button>${m.endorsed ? '' : ' <button data-act="abstain" title="Tell Nexus you won’t endorse it, so it stops asking">Abstain</button>'}`}
+      <button data-act="${m.tracked ? 'untrack' : 'track'}" title="${m.tracked ? 'Stop tracking it' : 'Its updates show in your tracking centre on Nexus'}">${m.tracked ? 'Untrack' : 'Track'}</button></div>`;
+}
+
+/** Endorse, abstain, track or untrack mods on Nexus, then show the account's new state. */
+async function nexusAccount(ids, what) {
+  if (!await nexusReady('Endorsing and tracking act on your Nexus account.')) return;
+  const [cmd, yes, verb] = { endorse: ['nexus_endorse', true, 'Endorsing'], abstain: ['nexus_endorse', false, 'Abstaining'], track: ['nexus_track', true, 'Tracking'], untrack: ['nexus_track', false, 'Untracking'] }[what];
+  const ok = await act(`${verb} ${ids.length > 1 ? plural(ids.length, 'mod') : nameOf(ids[0])} on Nexus`, async () => {
+    for (const id of ids) await call(cmd, { id, yes });
+  });
+  const done = { endorse: 'Endorsed', abstain: 'Abstained from endorsing', track: 'Now tracking', untrack: 'Stopped tracking' }[what];
+  if (ok) toast(`${done} ${ids.length > 1 ? plural(ids.length, 'mod') : nameOf(ids[0])} on Nexus.`);
 }
 
 /** What the mod's Nexus page says, read when asked: summary, picture, description. */
@@ -1265,6 +1304,14 @@ async function renameMod(id) {
   act('Renaming the mod', () => call('rename_mod', { id, name }));
 }
 
+/** Files of the mod edited in rmm, which an update or reinstall replaces: ask first. */
+async function editsOk(d, verb) {
+  const ed = d?.edited ?? [];
+  if (!ed.length) return true;
+  const which = ed.length === 1 ? ed[0] : `${ed.length} of its files (${ed.slice(0, 4).join(', ')}${ed.length > 4 ? '…' : ''})`;
+  return confirmBox(`${verb} ${nameOf(d.id)}?`, `You edited ${which} in rmm. ${verb === 'Update' ? 'Updating' : 'Reinstalling'} puts the archive’s files in their place. Undo brings your edited ones back; Edits… in the file editor shows what you changed.`, `${verb} anyway`, 'primary');
+}
+
 /** Install a mod again from where it came from; a FOMOD installer opens with its stored choices. */
 async function reinstall(id) {
   const d = details?.id === id ? details : await call('details', { id }).catch(() => null);
@@ -1276,6 +1323,7 @@ async function reinstall(id) {
     catch { return call('fomod', { path }); } // the stored choices no longer fit; start from the defaults
   }, { reload: false });
   if (!walk) return;
+  if (!await editsOk(d, 'Reinstall')) return;
   if (walk === true) {
     if (!await confirmBox(`Reinstall ${nameOf(id)}?`, `Its files are read again from ${path}. The old files go to the instance's trash folder, and Undo puts them back.`, 'Reinstall', 'primary')) return;
   } else {
@@ -1290,6 +1338,7 @@ async function reinstall(id) {
  *  installed with. */
 async function updateMod(id, path, nx = null) {
   const d = await call('details', { id }).catch(() => null);
+  if (!await editsOk(d, 'Update')) return;
   const walk = await act(`Reading ${basename(path)}`, async () => {
     try { return await call('fomod', { path, choices: d?.meta?.fomod ?? null }); }
     catch { return call('fomod', { path }); } // the stored choices don't fit the new installer
@@ -2067,6 +2116,7 @@ $('#details').addEventListener('click', async e => {
       return act(t.checked ? 'Holding its updates' : 'Offering its updates again', () => call('hold_updates', { ids: [id], hold: t.checked ? 'pin' : 'release' }));
     case 'skip-update': return act('Skipping the update', () => call('hold_updates', { ids: [id], hold: 'skip' }));
     case 'nexus-update': return updateFromNexus(id);
+    case 'endorse': case 'abstain': case 'track': case 'untrack': return nexusAccount([id], t.dataset.act);
     case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
     case 'nexus-page': return call('open_nexus_mod', { mod_id: details.meta.nexus.mod_id, page: true }).catch(err => toast(String(err), 'error'));
@@ -2339,6 +2389,13 @@ $('#mods tbody').addEventListener('contextmenu', e => {
     items.push(['Update from a file…', () => updateFromFile(id), '', 'Install a newer archive of it in its place, keeping its order, rules and notes'], '-');
     items.push(['File conflicts', () => fileConflicts(id)], ['Hide files…', () => hideFilesDialog(id), '', 'Keep chosen files out of the game (MO2’s hide)'], ['Notes…', () => notesDialog(id)], ['Open folder', () => call('open_mod_folder', { id }).catch(err => toast(String(err), 'error'))]);
   }
+  // Nexus: endorse and track the selected mods that have Nexus ids (public, on the account).
+  const onNexus = mods.filter(i => byId.get(i)?.nexus_id);
+  if (onNexus.length && nexus.user) {
+    const all = (f) => onNexus.every(i => f(byId.get(i)));
+    items.push('-', all(x => x.endorsed === 'Endorsed') ? ['Withdraw endorsement', () => nexusAccount(onNexus, 'abstain')] : ['Endorse on Nexus', () => nexusAccount(onNexus, 'endorse'), '', 'Endorse as your Nexus account'],
+      all(x => x.tracked) ? ['Untrack on Nexus', () => nexusAccount(onNexus, 'untrack')] : ['Track on Nexus', () => nexusAccount(onNexus, 'track'), '', 'Its updates show in your tracking centre on Nexus']);
+  }
   items.push('-', ['Colour…', () => colourDialog(ids)]);
   if (mods.length) items.push(['Categories…', () => categoriesDialog(mods)]);
   items.push('-', ['Collapse every group', () => setAllGroups(false)], ['Expand every group', () => setAllGroups(true)], '-');
@@ -2582,6 +2639,29 @@ async function profileShortcut(profile) {
   if (r && r !== true) toast(`“${r.path.split(/[\\/]/).pop()}” is on your Desktop.`);
 }
 
+/** Share another profile's mod and plugin order, or stop sharing it. */
+async function shareOrder(cur) {
+  const sharers = S.options?.shares_order_with ?? [];
+  if (sharers.length) {
+    if (await confirmBox(`Stop sharing ${cur}’s order?`, `${cur} shares its mod and plugin order with ${sharers.join(', ')}: moving a mod in one moves it in the others. Stopping keeps the order ${cur} has now as its own.`, 'Stop sharing', 'primary')) {
+      if (await act('Changing the profile', () => call('share_order', { with: null }))) toast(`${cur} has its own order again.`);
+    }
+    return;
+  }
+  const others = S.profiles.filter(p => p !== cur);
+  if (!others.length) return toast('There’s no other profile to share an order with. Copy this profile first.', 'warn');
+  const v = await dialog({
+    title: 'Share another profile’s order',
+    body: `<p>${esc(cur)} takes the other profile’s mod and plugin order now, and from then on moving a mod in either moves it in both. Each keeps its own mods and plugins turned on or off, so one list can serve, say, a light and a heavy setup.</p>
+      <label class="field">Profile <select id="share-with">${others.map(p => `<option>${esc(p)}</option>`).join('')}</select></label>
+      <p class="muted small">Undo puts ${esc(cur)}’s order back.</p>`,
+    actions: [['cancel', 'Cancel'], ['ok', 'Share its order', 'primary']],
+  });
+  if (v !== 'ok') return;
+  const with_ = $('#share-with').value;
+  if (await act('Changing the profile', () => call('share_order', { with: with_ }))) toast(`${cur} now shares ${with_}’s mod order.`);
+}
+
 $('#profile-btn').onclick = e => {
   e.stopPropagation();
   const pop = $('#profile-pop');
@@ -2595,6 +2675,7 @@ $('#profile-btn').onclick = e => {
     + '<button class="item" data-shortcut="1" title="A shortcut on your Desktop that switches to this profile and starts the game, as Play does"><span class="check"></span>Desktop shortcut…</button>'
     + `<hr><button class="item" data-opt="local_inis" title="Deploy puts this profile's copies of the game's INI files in My Games; what the game changes there comes back to the profile. Purge puts yours back."><span class="check">${S.options?.local_inis ? '✓' : ''}</span>Own INI files</button>`
     + `<button class="item" data-opt="local_saves" title="Deploy points the game's saves at Saves\\${esc(cur)}\\. Purge puts your save folder back."><span class="check">${S.options?.local_saves ? '✓' : ''}</span>Own saves</button>`
+    + `<button class="item adv" data-share="1" title="Profiles that share one mod and plugin order, each with its own mods turned on"><span class="check">${S.options?.shares_order_with?.length ? '✓' : ''}</span>${S.options?.shares_order_with?.length ? `Order shared with ${esc(S.options.shares_order_with.join(', '))}…` : 'Share another profile’s order…'}</button>`
     + '<hr class="adv"><button class="item adv" data-io="mo2"><span class="check"></span>Import from MO2…</button>'
     + '<button class="item adv" data-io="vortex"><span class="check"></span>Import from Vortex…</button>'
     + '<button class="item adv" data-io="export" title="A lockfile, a pack with your own files, or a readable list"><span class="check"></span>Share this setup…</button>'
@@ -2605,10 +2686,11 @@ $('#profile-btn').onclick = e => {
 document.addEventListener('click', e => { if (!e.target.closest('.menu')) $('#profile-pop').hidden = true; if (!e.target.closest('#ctx')) closeCtx(); });
 
 $('#profile-pop').onclick = async e => {
-  const t = e.target.closest('[data-delete],[data-switch],[data-new],[data-rename],[data-io],[data-opt],[data-shortcut]');
+  const t = e.target.closest('[data-delete],[data-switch],[data-new],[data-rename],[data-io],[data-opt],[data-shortcut],[data-share]');
   if (!t) return;
   $('#profile-pop').hidden = true;
   const cur = S.info.profile;
+  if (t.dataset.share) return shareOrder(cur);
   if (t.dataset.io) return importExport(t.dataset.io);
   if (t.dataset.shortcut) return profileShortcut(cur);
   if (t.dataset.opt) {
@@ -2702,7 +2784,10 @@ $('#start-card').onclick = async e => {
 /** Ask for the API key (the user pastes it; it is checked with Nexus and kept in their config
  *  folder, never in the instance). Resolves to true once a key works. */
 async function nexusLogin(why, sso) {
-  const body = `<p>${esc(why)}</p><p class="muted small">${sso ? 'Sign in on nexusmods.com and approve rmm there, or paste' : 'Paste'} your personal API key from your Nexus account’s API Keys page. rmm keeps it in your user folder, never in the instance or a lockfile.</p>
+  const ways = sso
+    ? 'Sign in on nexusmods.com and approve rmm there. Or paste your personal API key from your account’s API Keys page.'
+    : 'Open your account’s API Keys page on nexusmods.com, copy the Personal API Key at the bottom, and paste it here. (A sign-in button that skips this comes once Nexus approves rmm.)';
+  const body = `<p>${esc(why)}</p><p class="muted small">${ways} rmm keeps the key in your user folder, never in the instance or a lockfile.</p>
     <p><button type="button" class="link" id="nexus-keys">Open the API Keys page</button></p>
     <input id="nexus-key" type="password" autocomplete="off" spellcheck="false" placeholder="API key" aria-label="Nexus API key">`;
   const done = dialog({ title: 'Sign in to Nexus Mods', body, actions: [['cancel', 'Cancel'], ...(sso ? [['sso', 'Sign in on nexusmods.com']] : []), ['ok', 'Save key', 'primary']] });
@@ -2807,7 +2892,9 @@ async function runQueue() {
       if (f && f !== true) {
         renderQueue();
         if (downloadsData) loadDownloads();
-        if (job.update && byId.has(job.update)) await updateMod(job.update, f.path, f);
+        const wanted = coll?.pending.find(p => p.mod_id === f.nexus?.mod_id && p.file_id === f.nexus?.file_id);
+        if (wanted) await collGot(wanted);
+        else if (job.update && byId.has(job.update)) await updateMod(job.update, f.path, f);
         else await install([f.path], job.at, f);
       } else nxmFailed.push({ ...job, error });
     }
@@ -2820,6 +2907,13 @@ function linkName(link) {
 }
 function renderQueue() {
   const rows = [];
+  if (coll) {
+    const got = coll.total - coll.pending.length, open = coll.pending.filter(p => coll.opened.has(p.file_id));
+    rows.push(`<div><b>${esc(coll.name)}</b>: ${got} of ${plural(coll.total, 'file')} downloaded, ${coll.pending.length} to go.
+      ${coll.paused ? 'Paused.' : `On each Nexus page that opens, click “Mod manager download” (free accounts wait a few seconds there).${open.length ? ` <span class="muted small">Open now: ${esc(open.map(p => p.name).join(', '))}.</span>` : ''}`}
+      The install starts when they’re all in.${nexus.handler_here ? '' : ' <span class="pill bad">Nexus links don’t open with rmm</span> <button data-coll="handler">Set it up</button>'}
+      <div class="row" style="margin-top:6px"><button data-coll="more">Open the next ones</button><button data-coll="pause">${coll.paused ? 'Resume' : 'Pause'}</button><button class="link" data-coll="stop">Stop</button></div></div>`);
+  }
   if (nxmNow) rows.push(`<div>Downloading ${esc(linkName(nxmNow.link))}…${nxmQueue.length ? ` <span class="muted small">${nxmQueue.length} more waiting</span>` : ''}</div>`);
   else if (nxmQueue.length) rows.push(`<div class="muted small">${plural(nxmQueue.length, 'download')} waiting.</div>`);
   nxmFailed.forEach((f, i) => rows.push(`<div><span class="pill bad">Failed</span> ${esc(linkName(f.link))} <span class="muted small">${esc(f.error)}</span> <button data-retry="${i}">Retry</button> <button class="link" data-drop="${i}">Remove</button></div>`));
@@ -2828,6 +2922,14 @@ function renderQueue() {
   $('#n-downloads').classList.toggle('bad', nxmFailed.length > 0);
 }
 $('#dl-queue').onclick = e => {
+  const c = e.target.closest('[data-coll]')?.dataset.coll;
+  if (c && coll) {
+    if (c === 'more') collOpen(coll.pending.filter(p => !coll.opened.has(p.file_id)).length && COLL_AT_ONCE);
+    else if (c === 'pause') { coll.paused = !coll.paused; if (!coll.paused) collOpen(); }
+    else if (c === 'stop') { coll = null; toast('Stopped. The files downloaded so far stay; installing the collection again carries on from them.'); }
+    else if (c === 'handler') setHandler().then(renderQueue);
+    return renderQueue();
+  }
   const retry = e.target.closest('[data-retry]')?.dataset.retry, drop = e.target.closest('[data-drop]')?.dataset.drop;
   if (retry !== undefined) nxmQueue.push(...nxmFailed.splice(+retry, 1));
   else if (drop !== undefined) nxmFailed.splice(+drop, 1);
@@ -2836,26 +2938,66 @@ $('#dl-queue').onclick = e => {
 T.event.listen('nxm', () => takeLinks());
 
 $('#nxm').onclick = async () => {
-  const free = nexus.user && !nexus.user.is_premium;
-  const link = await ask('Install from Nexus Mods', free
-    ? 'Free accounts download from the website: on the mod’s Files tab, click “Mod manager download” (with rmm opening Nexus links, the file installs here). Or paste that button’s nxm:// link.'
-    : 'Paste a mod page link or a mod id (Premium: downloads its newest main file), a collection’s link, or the nxm:// link of a file’s “Mod manager download” button.', '');
-  if (!link || !await nexusReady('Downloads from Nexus Mods need your API key.')) return;
+  // Signed in first: every download goes through the user's Nexus account.
+  if (!nexus.user && !await nexusLogin('Sign in to Nexus Mods first: rmm downloads with your Nexus account, free or Premium.', nexus.sso)) return;
+  const link = await ask('Install from Nexus Mods', nexus.user?.is_premium
+    ? 'Paste a mod page link or a mod id (downloads its newest main file), a collection’s link, or the link of a file’s “Mod manager download” button.'
+    : 'Paste a collection’s link: rmm opens each file’s page for you to download. For one mod, click “Mod manager download” on its Files tab on nexusmods.com, or paste that button’s link here.', '');
+  if (!link || !await nexusReady('Downloads from Nexus Mods need you signed in.')) return;
   if (link.includes('/collections/')) return installCollection(link);
   nxmQueue.push({ link, at: slotAfter(selIds().length === 1 ? selIds()[0] : null) });
   runQueue();
 };
 
+// A collection for a free account: Nexus lets free accounts download only through the website, so
+// rmm opens the download page of each file it still needs, a few at a time, and the links its
+// "Mod manager download" buttons send back are matched to those files by mod and file id. When
+// they are all in, `go` installs from the downloads folder.
+const COLL_AT_ONCE = 3;
+let coll = null;
+async function collectionGo(args, name, go) {
+  if (nexus.user?.is_premium) return go();
+  const r = await act('Checking which files you have', () => call('install_collection', { ...args, dry_run: true }), { reload: false, problem: true });
+  if (!r || r === true) return;
+  if (!r.to_download.length) return go();
+  await offerHandler();
+  coll = { name, go, pending: r.to_download, total: r.to_download.length, opened: new Set(), paused: false };
+  showTab('downloads');
+  collOpen();
+}
+/** Open download pages: `extra` more, or up to COLL_AT_ONCE waiting. */
+async function collOpen(extra = 0) {
+  const waiting = coll.pending.filter(p => coll.opened.has(p.file_id)).length;
+  const next = coll.pending.filter(p => !coll.opened.has(p.file_id)).slice(0, extra || Math.max(0, COLL_AT_ONCE - waiting));
+  for (const p of next) {
+    coll.opened.add(p.file_id);
+    await call('open_nexus_mod', { mod_id: p.mod_id, file_id: p.file_id }).catch(e => toast(String(e), 'error'));
+  }
+  renderQueue();
+}
+async function collGot(p) {
+  coll.pending = coll.pending.filter(x => x !== p);
+  if (coll.pending.length) {
+    if (!coll.paused) await collOpen();
+    return renderQueue();
+  }
+  const { go } = coll;
+  coll = null;
+  renderQueue();
+  await go();
+}
+
 /** A Nexus collection: what it would install, then install it into a new profile (as Vortex
  *  does, so the user's setup stays as it was) or into this one. */
 async function installCollection(link) {
-  if (!nexus.user?.is_premium) return toast('Installing a collection downloads each of its files directly, which Nexus allows Premium accounts only. Its mods can still be installed one by one from the website.', 'error');
+  if (coll) return toast(`${coll.name} is still waiting for its downloads (Downloads tab). Stop it there first.`, 'error');
   const r = await act('Reading the collection', () => call('install_collection', { link, dry_run: true }), { reload: false, problem: true });
   if (!r || r === true) return;
   const list = (xs, n = 8) => xs.length ? `<ul class="small">${xs.slice(0, n).map(x => `<li>${esc(x)}</li>`).join('')}${xs.length > n ? `<li class="muted">and ${xs.length - n} more</li>` : ''}</ul>` : '';
   if (r.update_from != null) return updateCollection(link, r, list);
   const name = r.name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').trim().replace(/^\.+|\.+$/g, '').slice(0, 64) || 'Collection';
   const body = `<p>${plural(r.install.length, 'mod')} to download and install (${bytes(r.download_size)})${r.installed.length ? `; ${plural(r.installed.length, 'mod')} you have already are turned on` : ''}. Its mod rules, plugin list and tools come too. Then LOOT’s order for the plugins, which you see before it applies.</p>
+    ${freeNote(r)}
     ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}
     ${r.game_folder.length ? `<p class="muted small">The collection puts these in the game folder: ${esc(r.game_folder.join(', '))}.</p>` : ''}
     ${r.optional.length ? `<label class="row"><input id="co-opt" type="checkbox"> Also its ${plural(r.optional.length, 'optional mod')}</label>${list(r.optional)}` : ''}
@@ -2863,7 +3005,16 @@ async function installCollection(link) {
     <label class="field">New profile’s name <input id="co-name" type="text" value="${esc(name)}" spellcheck="false"></label>`;
   if (await dialog({ title: `Install ${r.name} (revision ${r.revision})`, body, actions: [['cancel', 'Cancel'], ['go', 'Install', 'primary']] }) !== 'go') return;
   const args = { link, revision: r.revision, optional: $('#co-opt')?.checked ?? false, profile: $('#co-new').checked ? $('#co-name').value.trim() : null };
-  const done = await act(`Installing ${r.name}`, () => call('install_collection', { ...args, sort: false }), { problem: true });
+  return collectionGo(args, r.name, () => collectionInstalled(args, list));
+}
+
+/** Free accounts: where the files come from. */
+function freeNote(r) {
+  return r.to_download?.length ? `<p class="small">Your Nexus account is free, so you download ${r.to_download.length === 1 ? 'the file' : `the ${r.to_download.length} files`} from Nexus’s pages: rmm opens them ${COLL_AT_ONCE} at a time and you click “Mod manager download” on each. The install starts when they’re all in.</p>` : '';
+}
+
+async function collectionInstalled(args, list) {
+  const done = await act(`Installing the collection`, () => call('install_collection', { ...args, sort: false }), { problem: true });
   if (!done || done === true) return;
   const sorted = await lootSort(`Sort ${done.name}’s plugins with LOOT`, '<p>The mods are in. This is the order LOOT gives the plugins.</p>');
   const part = (title, xs) => xs.length ? `<p><b>${esc(title)}</b></p>${list(xs, 20)}` : '';
@@ -2884,8 +3035,13 @@ async function updateCollection(link, r, list) {
     ${r.turned_off.length ? `<p>To turn off, still installed: the revision dropped them, or has a newer file of them that goes in beside (another profile uses these).</p>${list(r.turned_off.map(nameOf))}` : ''}
     ${r.kept_off.length ? `<p class="muted small">You turned these off; they stay off: ${esc(r.kept_off.join(', '))}.</p>` : ''}
     ${r.yours.length ? `<p class="muted small">Your own ${plural(r.yours.length, 'mod')} stay as they are, and so do plugins you turned on or off.</p>` : ''}
+    ${freeNote(r)}
     ${r.warnings.map(w => `<p class="small">${esc(w)}</p>`).join('')}`;
   if (await dialog({ title: `Update ${r.name} from revision ${r.update_from} to ${r.revision}`, body, actions: [['cancel', 'Cancel'], ['go', 'Update', 'primary']] }) !== 'go') return;
+  return collectionGo({ link, revision: r.revision }, r.name, () => collectionUpdated(link, r, list));
+}
+
+async function collectionUpdated(link, r, list) {
   const done = await act(`Updating ${r.name}`, () => call('install_collection', { link, revision: r.revision, sort: false }), { problem: true });
   if (!done || done === true) return;
   const sorted = await lootSort(`Sort ${done.name}’s plugins with LOOT`, '<p>The revision is in. This is what LOOT would move; Cancel keeps your order.</p>');
@@ -3388,7 +3544,18 @@ function renderSaves() {
     <td class="muted" title="${esc(s.file)}">${esc(s.file)}</td></tr>`).join('');
   $('#saves-empty').hidden = saves.length > 0;
   $('#saves-empty').textContent = dir ? 'No saves yet for this profile.' : '';
+  const orphans = savesData.orphans ?? [];
+  $('#saves-cosaves').hidden = !orphans.length;
+  $('#saves-cosaves').textContent = `Clean ${plural(orphans.length, 'co-save')}`;
 }
+
+$('#saves-cosaves').onclick = async () => {
+  const o = savesData.orphans;
+  if (!await confirmBox(`Clean ${plural(o.length, 'co-save')}?`, `The script extender keeps a co-save beside each save, and ${o.length === 1 ? 'this one’s save is' : 'these ones’ saves are'} gone: ${o.slice(0, 6).join(', ')}${o.length > 6 ? '…' : ''}. ${o.length === 1 ? 'It moves' : 'They move'} to the instance’s trash, which Empty the trash deletes.`, 'Move to the trash', 'primary')) return;
+  const r = await act('Cleaning the co-saves', () => call('clean_cosaves'), { reload: false });
+  if (Array.isArray(r)) toast(`Moved ${plural(r.length, 'co-save')} to the trash.`);
+  loadSaves();
+};
 
 /** A save's plugins the profile doesn't load, and the button that enables the installed ones. */
 async function savePlugins(file) {
@@ -3901,6 +4068,21 @@ for (const t of ['#set-providers', '#set-team']) {
   });
 }
 $('#set-access').onclick = () => $('#ai-access').click();
+
+// rmm's own version, and updates from its signed releases.
+T.app.getVersion().then(v => { $('#set-version').textContent = `rmm ${v}`; }).catch(() => {});
+$('#set-update').onclick = async () => {
+  rmmChecked = true;
+  const r = await act('Checking for a newer rmm', () => T.core.invoke('app_update', { install: false }), { reload: false });
+  if (!r || r === true) return;
+  if (!r.newer) return toast(`rmm ${r.current} is the newest.`);
+  const v = await dialog({
+    title: `rmm ${r.newer} is out`,
+    body: `<p>You have ${esc(r.current)}.</p>${r.notes ? `<pre class="small" style="white-space:pre-wrap">${esc(r.notes)}</pre>` : ''}<p class="muted small">Installing closes this window, runs the installer and opens the new rmm, with rmm on the command line updated too. Your instances and settings stay as they are.</p>`,
+    actions: [['cancel', 'Later'], ['ok', 'Install', 'primary']],
+  });
+  if (v === 'ok') act('Installing the update', () => T.core.invoke('app_update', { install: true }), { reload: false });
+};
 
 // ---- Settings: rmm's (settings.json, shared with the CLI and AI apps) and this window's -------
 

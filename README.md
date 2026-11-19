@@ -19,6 +19,16 @@ Plain `cargo build` and `cargo test` skip the desktop app, so they need no web v
 wsl -- bash -lc "cd /mnt/d/Games/Rust_Mod_Manager && CARGO_TARGET_DIR=\$HOME/rmm-target cargo test"
 ```
 
+### Installer and updates
+
+`.github/workflows/release.yml` builds the installer when a `v*` tag is pushed and drafts a GitHub release with it. The installer is per user (no admin rights): it puts the window and `rmm.exe` in one folder and adds that folder to the user's PATH. Settings > Check for updates reads the newest published release's `latest.json` and installs it. Before the first release:
+
+1. Install the Tauri CLI (`cargo install tauri-cli --version "^2" --locked`), then make the updater key pair: `cargo tauri signer generate -w rmm-updater.key`. Put the public key in `crates/rmm-app/tauri.release.conf.json` (`plugins.updater.pubkey`), and the private key and its password in the repository's secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Keep the private key somewhere safe: losing it means installed copies can't update.
+2. Optionally, a code-signing certificate so SmartScreen shows a publisher: the .pfx as base64 in `WINDOWS_CERTIFICATE` and its password in `WINDOWS_CERTIFICATE_PASSWORD`. Without them the installer is unsigned.
+3. Updates come from the repository's releases, so it has to be public for installed copies to see them.
+
+To build the installer by hand: copy a release `rmm.exe` to `crates/rmm-app/binaries/rmm-x86_64-pc-windows-msvc.exe`, then in `crates/rmm-app` run `cargo tauri build --config tauri.release.conf.json` (with the signing key in `TAURI_SIGNING_PRIVATE_KEY`, or add `--config '{"bundle":{"createUpdaterArtifacts":false}}'` for a build that doesn't update itself).
+
 ## Use
 
 ```

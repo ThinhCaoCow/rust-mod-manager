@@ -1,0 +1,72 @@
+# Builds the Windows installer for a version tag (v0.2.0, say) and drafts a GitHub release with it
+# and latest.json, which rmm's "Check for updates" reads once the release is published.
+#
+# Secrets (repository Settings > Secrets and variables > Actions):
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#       The updater key pair's private half (`cargo tauri signer generate`). Its public
+#       half goes in crates/rmm-app/tauri.release.conf.json (plugins.updater.pubkey).
+#   WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD (optional)
+#       A code-signing certificate (.pfx, base64) so Windows SmartScreen knows the installer's
+#       publisher. Without them the installer is built unsigned.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the updater key is set
+        shell: pwsh
+        run: |
+          $c = Get-Content crates/rmm-app/tauri.release.conf.json -Raw | ConvertFrom-Json
+          if (-not $c.plugins.updater.pubkey) { throw 'Put the updater public key in crates/rmm-app/tauri.release.conf.json (plugins.updater.pubkey).' }
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'Add the TAURI_SIGNING_PRIVATE_KEY secret.' }
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      - name: Build rmm.exe, which the installer puts beside the window
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p rmm
+          New-Item -ItemType Directory -Force crates/rmm-app/binaries | Out-Null
+          Copy-Item target/release/rmm.exe crates/rmm-app/binaries/rmm-x86_64-pc-windows-msvc.exe
+
+      - name: Code signing, when a certificate is set
+        id: sign
+        shell: pwsh
+        env:
+          CERT: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:CERT) { "args=" >> $env:GITHUB_OUTPUT; exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP 'rmm.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          $cmd = "`"$($signtool.FullName)`" sign /fd sha256 /f `"$pfx`" /p `"$env:CERT_PASSWORD`" /tr http://timestamp.digicert.com /td sha256 `"%1`""
+          @{ bundle = @{ windows = @{ signCommand = $cmd } } } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $env:RUNNER_TEMP 'sign.conf.json')
+          "args=--config $(Join-Path $env:RUNNER_TEMP 'sign.conf.json')" >> $env:GITHUB_OUTPUT
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/rmm-app
+          args: --config tauri.release.conf.json ${{ steps.sign.outputs.args }}
+          tagName: ${{ github.ref_name }}
+          releaseName: rmm ${{ github.ref_name }}
+          releaseBody: See the commits since the last release.
+          releaseDraft: true
+          includeUpdaterJson: true

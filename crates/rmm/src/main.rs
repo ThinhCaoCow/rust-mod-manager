@@ -143,6 +143,12 @@ enum Cmd {
         move_to: Option<String>,
         /// Save file names, for --copy-to and --move-to.
         files: Vec<String>,
+        /// Move script extender co-saves whose save is gone into the instance's trash (shows
+        /// them without --apply).
+        #[arg(long, conflicts_with_all = ["fix", "copy_to", "move_to"])]
+        clean_cosaves: bool,
+        #[arg(long, requires = "clean_cosaves")]
+        apply: bool,
     },
     /// Archives in the instance's downloads folder and the mods installed from them.
     Downloads {
@@ -688,6 +694,21 @@ enum NexusCmd {
         #[arg(long)]
         install: bool,
     },
+    /// Endorse an installed mod on Nexus (by its rmm id), or --abstain: take an endorsement back,
+    /// or say you won't endorse it. Public, on your Nexus account.
+    Endorse {
+        id: String,
+        #[arg(long)]
+        abstain: bool,
+    },
+    /// Track an installed mod on Nexus (its updates show in your tracking centre), or --untrack.
+    Track {
+        id: String,
+        #[arg(long)]
+        untrack: bool,
+    },
+    /// What your Nexus account has endorsed and tracks for this game, read from Nexus.
+    Account,
     /// Search the game's mods on Nexus by name and description (no key needed).
     Search {
         words: Vec<String>,
@@ -713,10 +734,11 @@ enum NexusCmd {
         /// All but nxm links need Premium.
         what: String,
     },
-    /// Install a collection (Premium accounts): its mods with the curator's installer choices,
-    /// its mod rules, plugin list and tools. Shows what it would install; --apply installs. In a
-    /// profile with an earlier revision it updates: newer files in, dropped mods off, your own
-    /// mods and the ones you turned off as they are.
+    /// Install a collection: its mods with the curator's installer choices, its mod rules, plugin
+    /// list and tools. Shows what it would install; --apply installs. Premium downloads each file;
+    /// free accounts download the ones under to_download from their pages first. In a profile with
+    /// an earlier revision it updates: newer files in, dropped mods off, your own mods and the ones
+    /// you turned off as they are.
     Collection {
         /// The collection's link or id; default: the active profile's collection.
         link: Option<String>,
@@ -885,6 +907,15 @@ enum ProfileCmd {
         #[arg(long)]
         local_saves: Option<bool>,
     },
+    /// Share another profile's mod and plugin order: this one takes it now, keeping which mods
+    /// and plugins it has on, and a change to either's order is both's from then on. --stop: this
+    /// profile keeps its own order again. Without either: the profiles it shares it with.
+    ShareOrder {
+        #[arg(conflicts_with = "stop")]
+        with: Option<String>,
+        #[arg(long)]
+        stop: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -983,6 +1014,7 @@ fn run() -> Result<()> {
             let q = conflicts::DataQuery { dir: dir.unwrap_or_default(), find: find.unwrap_or_default(), conflicts_only: conflicts, archives };
             print(&conflicts::data_view(&inst, &inst.profile()?, &q)?)
         }
+        Cmd::Saves { clean_cosaves: true, apply, .. } => print(&serde_json::json!({ "co_saves": saves::clean_cosaves(&open()?, !apply)?, "moved": apply })),
         Cmd::Saves { fix: Some(file), .. } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
         Cmd::Saves { copy_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, true)?),
         Cmd::Saves { move_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, false)?),
@@ -1177,6 +1209,13 @@ fn run() -> Result<()> {
         }
         Cmd::Profile(ProfileCmd::Rename { from, to }) => done(open()?.rename_profile(&from, &to)),
         Cmd::Profile(ProfileCmd::Delete { name }) => done(open()?.delete_profile(&name)),
+        Cmd::Profile(ProfileCmd::ShareOrder { with, stop }) => {
+            let inst = open()?;
+            if with.is_some() || stop {
+                inst.share_order(with.as_deref())?;
+            }
+            print(&serde_json::json!({ "profile": inst.config.profile, "shares_order_with": inst.order_sharers()? }))
+        }
         Cmd::Profile(ProfileCmd::Options { local_inis, local_saves }) => {
             let inst = open()?;
             ops::set_profile_options(&inst, local_inis, local_saves)?;
@@ -1220,6 +1259,9 @@ fn run() -> Result<()> {
         }
         Cmd::Nexus(NexusCmd::Logout) => print(&serde_json::json!({ "forgot": nexus::forget_key()? })),
         Cmd::Nexus(NexusCmd::Status) => print(&nexus::status()),
+        Cmd::Nexus(NexusCmd::Endorse { id, abstain }) => print(&nexus::endorse(&open()?, &nexus::Client::from_env()?, &id, !abstain)?),
+        Cmd::Nexus(NexusCmd::Track { id, untrack }) => print(&nexus::track(&open()?, &nexus::Client::from_env()?, &id, !untrack)?),
+        Cmd::Nexus(NexusCmd::Account) => print(&nexus::refresh_account(&open()?, &nexus::Client::from_env()?)?),
         Cmd::Nexus(NexusCmd::Search { words, category, sort, count, offset, adult }) => {
             print(&nexus::search(&open()?, &nexus::Client::any(), &nexus::Search { query: words.join(" "), category, sort, count, offset, adult })?)
         }

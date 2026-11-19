@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "externalBin": ["binaries/rmm"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": ""
+    }
+  }
+}

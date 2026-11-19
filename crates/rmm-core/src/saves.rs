@@ -16,6 +16,8 @@ pub struct SaveList {
     pub dir: Option<PathBuf>,
     /// Newest first.
     pub saves: Vec<Save>,
+    /// Script extender co-saves whose save is gone (deleted in the game, or by hand).
+    pub orphans: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,7 +58,7 @@ struct Header {
 
 pub fn list(inst: &Instance) -> Result<SaveList> {
     let p = inst.profile()?;
-    let Some(dir) = crate::profile_ini::save_dir(inst, &p) else { return Ok(SaveList { dir: None, saves: vec![] }) };
+    let Some(dir) = crate::profile_ini::save_dir(inst, &p) else { return Ok(SaveList { dir: None, saves: vec![], orphans: vec![] }) };
     let ext = ext(inst.config.game);
     let need = Needs::new(inst, &p)?;
     let mut saves = Vec::new();
@@ -88,7 +90,44 @@ pub fn list(inst: &Instance) -> Result<SaveList> {
         saves.push(s);
     }
     saves.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.file.cmp(&b.file)));
-    Ok(SaveList { dir: Some(dir), saves })
+    let orphans = orphans_in(&dir, inst.config.game);
+    Ok(SaveList { dir: Some(dir), saves, orphans })
+}
+
+/// Co-saves in `dir` without their save.
+fn orphans_in(dir: &Path, game: Game) -> Vec<String> {
+    let (ext, co) = (ext(game), cosave(game));
+    let mut out: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case(co)) && !p.with_extension(ext).is_file())
+        .filter_map(|p| Some(p.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Move the active profile's orphaned co-saves (`SaveList::orphans`) into the instance's trash
+/// (trash/co-saves/<profile>/), where emptying the trash deletes them. Returns them.
+pub fn clean_cosaves(inst: &Instance, dry_run: bool) -> Result<Vec<String>> {
+    let dir = crate::profile_ini::save_dir(inst, &inst.profile()?).context("cannot work out the save folder")?;
+    let orphans = orphans_in(&dir, inst.config.game);
+    if dry_run || orphans.is_empty() {
+        return Ok(orphans);
+    }
+    let to = inst.root.join("trash").join("co-saves").join(&inst.config.profile);
+    fs::create_dir_all(&to)?;
+    for f in &orphans {
+        let dest = (0..).map(|n| if n == 0 { to.join(f) } else { to.join(format!("{f}.{n}")) }).find(|p| !p.exists()).expect("a free name");
+        // My Games is often on another drive than the instance: copy, then delete.
+        if fs::rename(dir.join(f), &dest).is_err() {
+            fs::copy(dir.join(f), &dest)?;
+            fs::remove_file(dir.join(f))?;
+        }
+    }
+    Ok(orphans)
 }
 
 /// The newest save, with those of `plugins` it was made with; None when it uses none of them.
@@ -451,6 +490,16 @@ mod tests {
         assert!(enable_missing(&inst, "../x.ess").is_err());
         assert_eq!(newest_using(&inst, &["a.ESP".into(), "Other.esp".into()]).unwrap(), Some(("x.ess".into(), vec!["A.esp".to_string()])));
         assert_eq!(newest_using(&inst, &["Other.esp".into()]).unwrap(), None);
+
+        // A co-save whose save is gone moves to the trash; one with its save stays.
+        fs::write(ini.join("Saves/old.skse"), "co-save").unwrap();
+        assert_eq!(list(&inst).unwrap().orphans, ["old.skse"]);
+        assert_eq!(clean_cosaves(&inst, true).unwrap(), ["old.skse"]);
+        assert!(ini.join("Saves/old.skse").is_file(), "a dry run moves nothing");
+        assert_eq!(clean_cosaves(&inst, false).unwrap(), ["old.skse"]);
+        assert!(!ini.join("Saves/old.skse").exists() && ini.join("Saves/x.skse").is_file());
+        assert!(inst.root.join("trash/co-saves/default/old.skse").is_file());
+        assert!(list(&inst).unwrap().orphans.is_empty());
 
         // With its own saves, the profile has a folder of its own.
         crate::ops::set_profile_options(&inst, None, Some(true)).unwrap();

@@ -342,6 +342,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
     let Some(enabled) = inst.profile()?.mods.iter().find(|m| m.id == id).map(|m| m.enabled) else {
         bail!("mod '{id}' is not in the profile");
     };
+    let edited = crate::workspace::live_edits(inst, id).unwrap_or_default();
     let staging = inst.root.join(".staging").join(id);
     let _ = fs::remove_dir_all(&staging);
     let choices = choices.or(meta.fomod.as_ref()).cloned().unwrap_or_default();
@@ -373,6 +374,10 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
             add_plugins(p, &plugins, enabled);
             Ok(())
         })?;
+        let mut warnings = warnings;
+        if !edited.is_empty() {
+            warnings.push(format!("the files you edited in rmm ({}) are the new archive's now; Undo puts your edited ones back", edited.join(", ")));
+        }
         Ok(report(id, &meta.name, &files, plugins, warnings, fomod))
     })();
     let _ = fs::remove_dir_all(&staging);

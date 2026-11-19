@@ -44,6 +44,9 @@ pub struct Edit {
     pub created: bool,
     pub lines_before: usize,
     pub lines_after: usize,
+    /// SHA-256 of what was saved, to tell whether the edit is still in the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 const MAX: u64 = 8 << 20;
@@ -186,6 +189,24 @@ pub fn edits(inst: &Instance) -> Result<Vec<Edit>> {
     Ok(log)
 }
 
+/// A mod's files edited through rmm whose edit is still there: the file is what one of its
+/// edits saved (a revert back to the archive's text doesn't count). An update or reinstall
+/// replaces them with the archive's.
+pub fn live_edits(inst: &Instance, id: &str) -> Result<Vec<String>> {
+    let prefix = format!("mods/{id}/");
+    let mut now: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    let mut live = std::collections::BTreeSet::new();
+    for e in edits(inst)?.into_iter().filter(|e| !e.by.starts_with("revert")) {
+        let Some(rel) = e.path.strip_prefix(&prefix) else { continue };
+        let file = inst.mod_dir(id).join(rel);
+        let hash = now.entry(rel.to_lowercase()).or_insert_with(|| crate::lockfile::sha256_file(&file).ok());
+        if hash.is_some() && e.after.as_ref().is_none_or(|h| Some(h) == hash.as_ref()) {
+            live.insert(rel.to_string());
+        }
+    }
+    Ok(live.into_iter().collect())
+}
+
 /// Save `text` to `path` (made if it doesn't exist, except INIs), keeping the old bytes. With
 /// `expect`, refuses when the file changed since it was read with that hash.
 pub fn write(inst: &Instance, path: &str, text: &str, expect: Option<&str>, by: &str) -> Result<Edit> {
@@ -226,7 +247,8 @@ pub fn write(inst: &Instance, path: &str, text: &str, expect: Option<&str>, by: 
     // In place, not through a temp file: a deployed hard link keeps pointing at this file.
     fs::write(&file, bytes)?;
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let edit = Edit { n, path: path.trim_matches(['/', '\\']).replace('\\', "/"), at, by: by.into(), created: old.is_none(), lines_before: before, lines_after: text.lines().count() };
+    let after = crate::lockfile::sha256_file(&file).ok();
+    let edit = Edit { n, path: path.trim_matches(['/', '\\']).replace('\\', "/"), at, by: by.into(), created: old.is_none(), lines_before: before, lines_after: text.lines().count(), after };
     log.push(edit.clone());
     crate::instance::write_atomic(&edits_dir(inst).join("log.json"), &serde_json::to_string_pretty(&log)?)?;
     Ok(edit)

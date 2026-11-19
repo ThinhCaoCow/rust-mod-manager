@@ -73,9 +73,24 @@ pub struct Profile {
     /// tells its mods from the user's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection: Option<crate::collection::Installed>,
+    /// Profiles with the same group share one mod order and plugin order; each keeps which mods
+    /// and plugins it has on (`Instance::share_order`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_order: Option<String>,
 }
 
 impl Profile {
+    /// Take `order`'s mod and plugin lists, keeping which ones this profile has on: one list, so
+    /// new mods and plugins come in off (separators as they are there), and ones it dropped go.
+    pub fn follow(&mut self, order: &Profile) {
+        let on: std::collections::HashMap<&str, bool> = self.mods.iter().map(|m| (m.id.as_str(), m.enabled)).collect();
+        let mods: Vec<ModEntry> = order.mods.iter().map(|m| ModEntry { id: m.id.clone(), enabled: if is_separator(&m.id) { m.enabled } else { on.get(m.id.as_str()).copied().unwrap_or(false) } }).collect();
+        let pon: std::collections::HashMap<String, bool> = self.plugins.iter().map(|e| (e.name.to_lowercase(), e.enabled)).collect();
+        let plugins: Vec<PluginEntry> = order.plugins.iter().map(|e| PluginEntry { name: e.name.clone(), enabled: pon.get(&e.name.to_lowercase()).copied().unwrap_or(false) }).collect();
+        (self.mods, self.plugins) = (mods, plugins);
+        self.apply_locks();
+    }
+
     /// Put locked plugins back at their positions, lowest first.
     pub fn apply_locks(&mut self) {
         let mut locked: Vec<(usize, PluginEntry)> = Vec::new();
@@ -400,7 +415,7 @@ impl Instance {
                 }
             }
             if p != before {
-                write_atomic(&next.profile_file(), &toml::to_string_pretty(&p)?)?;
+                next.save_profile(&p)?;
             }
             write_atomic(&self.root.join(CONFIG), &toml::to_string_pretty(&next.config)?)
         })?;
@@ -536,7 +551,7 @@ impl Instance {
                     _ => self.push("undo", label, swaps, &before)?,
                 }
                 let _ = fs::remove_dir_all(self.stack_dir("redo"));
-                write_atomic(&self.profile_file(), &toml::to_string_pretty(&after)?)?;
+                self.save_profile(&after)?;
             }
             Ok(r)
         })
@@ -618,7 +633,67 @@ impl Instance {
     pub(crate) fn list_quietly(&self, id: &str) -> Result<()> {
         let mut p = self.profile()?;
         p.mods.push(ModEntry { id: id.into(), enabled: true });
-        write_atomic(&self.profile_file(), &toml::to_string_pretty(&p)?)
+        self.save_profile(&p)
+    }
+
+    /// Write the active profile, and give the profiles that share its order (`shared_order`)
+    /// the new order, each keeping what it has on. Call under the lock.
+    fn save_profile(&self, p: &Profile) -> Result<()> {
+        write_atomic(&self.profile_file(), &toml::to_string_pretty(p)?)?;
+        let Some(group) = &p.shared_order else { return Ok(()) };
+        for name in self.profiles()?.into_iter().filter(|n| *n != self.config.profile) {
+            let file = self.root.join("profiles").join(name).join("profile.toml");
+            let mut q: Profile = toml::from_str(&fs::read_to_string(&file)?)?;
+            if q.shared_order.as_ref() == Some(group) {
+                let before = q.clone();
+                q.follow(p);
+                if q != before {
+                    write_atomic(&file, &toml::to_string_pretty(&q)?)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The other profiles that share the active profile's mod order.
+    pub fn order_sharers(&self) -> Result<Vec<String>> {
+        let Some(group) = self.profile()?.shared_order else { return Ok(vec![]) };
+        let mut out = Vec::new();
+        for name in self.profiles()?.into_iter().filter(|n| *n != self.config.profile) {
+            let q: Profile = toml::from_str(&fs::read_to_string(self.root.join("profiles").join(&name).join("profile.toml"))?)?;
+            if q.shared_order.as_ref() == Some(&group) {
+                out.push(name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Share `with`'s mod and plugin order: the active profile takes it now, keeping which mods
+    /// and plugins it has on, and from then on a change to either's order is both's. `None`
+    /// stops sharing: the active profile keeps the order it has. One undo step.
+    pub fn share_order(&self, with: Option<&str>) -> Result<()> {
+        let Some(with) = with else {
+            return self.edit("own mod order", |p| {
+                p.shared_order = None;
+                Ok(())
+            });
+        };
+        let name = self.find_profile(with)?;
+        if name == self.config.profile {
+            bail!("'{name}' is the active profile");
+        }
+        let file = self.root.join("profiles").join(&name).join("profile.toml");
+        let mut other: Profile = toml::from_str(&fs::read_to_string(&file)?)?;
+        let group = other.shared_order.clone().unwrap_or_else(|| name.clone());
+        if other.shared_order.is_none() {
+            other.shared_order = Some(group.clone());
+            self.locked(|| write_atomic(&file, &toml::to_string_pretty(&other)?))?;
+        }
+        self.edit(&format!("share {name}'s mod order"), |p| {
+            p.follow(&other);
+            p.shared_order = Some(group);
+            Ok(())
+        })
     }
 
     /// Move a mod folder to trash/ so an undo can bring it back.
@@ -651,7 +726,7 @@ impl Instance {
         // Creation Club content taken out of Data was the game's, not a step: it stays.
         let adopted: Vec<ModEntry> = current.mods.iter().filter(|m| !snapshot.mods.iter().any(|s| s.id == m.id) && self.mod_meta(&m.id).creation).cloned().collect();
         snapshot.mods.splice(0..0, adopted);
-        write_atomic(&self.profile_file(), &toml::to_string_pretty(&snapshot)?)?;
+        self.save_profile(&snapshot)?;
         // Mods the step takes off the list (an install undone, an uninstall redone) go back to
         // trash/, unless another profile lists them; otherwise they'd stay installed unseen.
         let kept: std::collections::HashSet<&str> = snapshot.mods.iter().map(|m| m.id.as_str()).collect();

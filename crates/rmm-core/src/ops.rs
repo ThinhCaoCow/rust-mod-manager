@@ -43,6 +43,15 @@ pub struct ModRow {
     /// The user keeps the mod at its version (`hold_updates`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Its Nexus mod id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nexus_id: Option<u64>,
+    /// The Nexus account's endorsement of it, as last read: "Endorsed" or "Abstained".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endorsed: Option<String>,
+    /// The Nexus account tracks it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tracked: bool,
 }
 
 /// A mod's categories: the ones set on it, else the name of its Nexus category.
@@ -142,6 +151,7 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
     let p = inst.profile()?;
     let nexus = crate::nexus::category_names(inst);
     let mut found = crate::nexus::saved_updates(inst);
+    let account = crate::nexus::account(inst);
     p.mods
         .iter()
         .enumerate()
@@ -157,6 +167,9 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
                 version: meta.nexus.as_ref().and_then(|n| n.version.clone()),
                 update: found.remove(&m.id).filter(|u| crate::nexus::offered(u, &meta)),
                 pinned: meta.pinned,
+                nexus_id: meta.nexus.as_ref().map(|n| n.mod_id),
+                endorsed: meta.nexus.as_ref().and_then(|n| account.endorsements.get(&n.mod_id).cloned()),
+                tracked: meta.nexus.as_ref().is_some_and(|n| account.tracked.contains(&n.mod_id)),
                 name: if separator { m.id[4..].to_string() } else { meta.name },
                 enabled: m.enabled,
                 plugins: files.iter().filter(|f| !f.contains('/') && is_plugin(f)).cloned().collect(),
@@ -197,6 +210,8 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
         "needs": crate::nexus::needs(inst, id),
         // The saved review with whether the files are still the ones reviewed.
         "review": crate::inspect::reviews(inst, Some(id))?.pop(),
+        // Files edited through rmm that an update or reinstall would replace.
+        "edited": crate::workspace::live_edits(inst, id).unwrap_or_default(),
     }))
 }
 

@@ -8,6 +8,10 @@
 //! was. Mods of Vortex's "dinput" and "enb" types go to the game folder (see
 //! `install::to_game_folder`).
 //!
+//! Free accounts can't download directly: the report lists the files that aren't in the
+//! downloads folder yet (`to_download`), each with its download page, and the install goes ahead
+//! once the user has downloaded them all from there ("Mod manager download").
+//!
 //! The profile remembers the revision and which mods are the collection's, so installing a
 //! newer revision there is an update: a mod with a newer file is updated in place (or installed
 //! beside the old one when another profile has that one on), mods the revision dropped are turned
@@ -38,6 +42,8 @@ pub struct Report {
     pub install: Vec<String>,
     /// Bytes still to download.
     pub download_size: u64,
+    /// Free accounts: the files to download from their pages first (Premium downloads them).
+    pub to_download: Vec<Pending>,
     /// Mods already installed from the same Nexus file.
     pub installed: Vec<String>,
     /// Optional mods left out.
@@ -67,6 +73,17 @@ pub struct Report {
     pub kept_off: Vec<String>,
     /// Turned-on mods (ids) that aren't the collection's: left as they are.
     pub yours: Vec<String>,
+}
+
+/// A collection file a free account downloads from its page before the install.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub name: String,
+    pub mod_id: u64,
+    pub file_id: u64,
+    pub size: u64,
+    /// The file's download page ("Mod manager download").
+    pub page: String,
 }
 
 /// The collection a profile was installed from.
@@ -189,13 +206,32 @@ pub fn install(inst: &mut Instance, client: &Client, link: &str, number: Option<
         r.yours = p.mods.iter().filter(|m| m.enabled && !crate::instance::is_separator(&m.id) && !prev_mods.contains(m.id.as_str()) && !kept.contains(m.id.as_str())).map(|m| m.id.clone()).collect();
     }
     r.plugins = c["plugins"].as_array().map_or(0, Vec::len);
+    // Free accounts: which files the user still has to download from the website (a request each).
+    if !todo.is_empty() && client.validate()?["is_premium"] != true {
+        for (m, mod_id, file_id, _) in &todo {
+            if !crate::nexus::downloaded(inst, client, *mod_id, *file_id)?.2 {
+                r.to_download.push(Pending {
+                    name: m["name"].as_str().unwrap_or("?").into(),
+                    mod_id: *mod_id,
+                    file_id: *file_id,
+                    size: rev.files.get(file_id).map(|f| f.1).filter(|&s| s > 0).or(m["source"]["fileSize"].as_u64()).unwrap_or(0),
+                    page: format!("https://www.nexusmods.com/{domain}/mods/{mod_id}?tab=files&file_id={file_id}&nmm=1"),
+                });
+            }
+        }
+    }
     if dry_run {
         r.rules = c["modRules"].as_array().map_or(0, Vec::len);
         r.tools = c["tools"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect();
         return Ok(r);
     }
-    if !todo.is_empty() && client.validate()?["is_premium"] != true {
-        bail!("installing a collection needs a Nexus Premium account: rmm downloads each of its files directly");
+    if let Some(f) = r.to_download.first() {
+        bail!(
+            "{} of the collection's files aren't downloaded yet. Free Nexus accounts download each from its page: click \"Mod manager download\" there (the first is {}: {}). The install goes ahead once they're all in. A dry run lists them; Nexus Premium downloads them directly",
+            r.to_download.len(),
+            f.name,
+            f.page
+        );
     }
     if let Some(name) = new_profile {
         // Empty: switching adds every installed mod, turned off; the collection turns its own on,

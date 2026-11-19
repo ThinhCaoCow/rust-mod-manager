@@ -5,3 +5,6 @@
 
 # Written by tauri-build on every build.
 /crates/rmm-app/gen/
+
+# The CLI the installer bundles, copied in by the release workflow.
+/crates/rmm-app/binaries/
