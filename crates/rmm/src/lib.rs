@@ -1,5 +1,5 @@
-//! The MCP server (stdio and HTTP) and the built-in AI that drives it, shared by the `rmm` command
-//! and the desktop app.
-pub mod agent;
+//! The MCP server (stdio and HTTP) and the sessions it keeps, shared by the `rmm` command and the
+//! desktop app.
+pub mod chats;
 pub mod http;
 pub mod mcp;

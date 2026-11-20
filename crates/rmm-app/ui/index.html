@@ -51,8 +51,8 @@
     <button data-tab="problems">Problems <span class="count" id="n-problems"></span></button>
     <button data-tab="tools">Tools <span class="count" id="n-tools"></span></button>
     <button data-tab="history">History</button>
-    <button data-tab="ai" title="rmm's own AI, with your API key">AI</button>
-    <button data-tab="settings" title="AI providers and the mod team, how rmm deploys, sorts, tests and checks, and this window's look">Settings</button>
+    <button data-tab="mcp" title="Let AI apps such as Claude use rmm's tools">MCP</button>
+    <button data-tab="settings" title="How rmm deploys, sorts, tests and checks, and this window's look">Settings</button>
     <div class="spacer"></div>
     <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags and categories" spellcheck="false">
     <button id="install" title="Installs after the selected mod, or at the end of the selected separator’s group. You can also drop archives on a row.">＋ Install mod…</button>
@@ -149,7 +149,7 @@
       <div class="scroll"><ul class="issues" id="issues"></ul></div>
     </section>
     <section class="pane" id="pane-tools" hidden>
-      <div class="toolbar"><span class="muted small">Programs rmm runs against the deployed setup. What a tool writes is captured into its own mod; a tool that edits in place saves into the mods it changes.</span><div class="spacer"></div><button id="addons" title="Sandboxed WebAssembly plugins: what they may do, their tools and panels">Add-ons…</button><button id="ai-access" title="Let AI clients use rmm's tools over HTTP while the window is open">AI access…</button><button id="rebuild-outputs" title="Run again, in order, the tools whose output is out of date">Rebuild outputs…</button><button id="add-tool">＋ Add tool…</button></div>
+      <div class="toolbar"><span class="muted small">Programs rmm runs against the deployed setup. What a tool writes is captured into its own mod; a tool that edits in place saves into the mods it changes.</span><div class="spacer"></div><button id="addons" title="Sandboxed WebAssembly plugins: what they may do, their tools and panels">Add-ons…</button><button id="rebuild-outputs" title="Run again, in order, the tools whose output is out of date">Rebuild outputs…</button><button id="add-tool">＋ Add tool…</button></div>
       <div class="scroll">
         <table class="list tall" id="tools">
           <thead><tr><th>Tool</th><th class="from-col">Output mod</th><th class="from-col">Last run</th><th class="run-col"></th></tr></thead>
@@ -162,95 +162,20 @@
       <div class="toolbar"><span class="muted small">Every change to this profile, newest first. Undo steps back one; Restore goes back to before any of them, and Redo steps forward again.</span><span class="spacer"></span><span class="muted small" id="trash-note"></span><button id="empty-trash" hidden>Empty trash…</button></div>
       <div class="scroll"><ol class="history" id="history"></ol></div>
     </section>
-    <section class="pane" id="pane-ai" hidden>
-      <div class="toolbar wrap">
-        <button id="ai-to-settings" title="Providers, keys, and who does each role">AI settings…</button>
-        <span class="muted small" id="ai-note"></span>
-        <div class="spacer"></div>
-        <span class="muted small" id="ai-usage" title="Tokens and cost of this chat"></span>
-      </div>
-      <div class="ide">
-        <aside class="ide-side">
-          <div class="seg" role="tablist" aria-label="Side panel">
-            <button role="tab" data-side="files" aria-selected="true">Files</button>
-            <button role="tab" data-side="chats" aria-selected="false">Chats</button>
-          </div>
-          <div class="ide-list" id="ide-files">
-            <input id="ide-find" type="search" placeholder="Filter mods" spellcheck="false" aria-label="Filter mods">
-            <div class="ide-tree" id="ide-tree" role="tree" aria-label="Files"></div>
-            <button id="ide-edits" title="Every edit to these files, and Revert">Edits…</button>
-          </div>
-          <div class="ide-list" id="ide-chats" hidden>
-            <button id="ai-new" class="primary">＋ New chat</button>
-            <div id="ide-chat-list"></div>
-          </div>
-        </aside>
-        <section class="ide-editor">
-          <div class="ide-tabs" id="ide-tabs" role="tablist" aria-label="Open files"></div>
-          <div class="toolbar" id="ide-filebar" hidden>
-            <span class="muted small ide-path" id="ide-path"></span>
-            <div class="spacer"></div>
-            <button id="ide-ask" title="Send the selected lines (or the file's name) with your next message">Ask AI</button>
-            <button id="ide-reload" title="Read the file from disk again">Reload</button>
-            <button id="ide-save" class="primary" title="Save (Ctrl+S)">Save</button>
-          </div>
-          <div class="ide-code" id="ide-code" hidden>
-            <pre class="ide-gutter" id="ide-gutter" aria-hidden="true"></pre>
-            <textarea id="ide-text" spellcheck="false" wrap="off" aria-label="File contents"></textarea>
-          </div>
-          <div class="empty" id="ide-empty">
-            <p>Open a file from the list: a mod's scripts, INIs and configs, overwrite/, or the game's INI files.</p>
-            <p class="muted small">Every save keeps the old file, and Edits… puts one back. The AI's edits come to you as a diff to allow.</p>
-          </div>
-        </section>
-        <section class="ide-ai">
-          <div class="seg" role="tablist" aria-label="AI panel">
-            <button role="tab" data-view="chat" aria-selected="true">Chat</button>
-            <button role="tab" data-view="inspect" aria-selected="false">Inspector</button>
-          </div>
-          <div class="scroll" id="ai-scroll">
-            <div class="ai-log" id="ai-log" aria-live="polite"></div>
-            <div class="empty" id="ai-empty">
-              <p>Ask about your setup or the open file, or pick a role below.</p>
-              <p class="muted small">The Researcher finds mods on Nexus that fit a description, a picture or a mod you name. The Installer downloads your pick and checks it before it goes in. The Tester plays the game in a small window behind yours to try it. The Lead runs all three, handing each step to the AI chosen for it in Settings.<br>Reads and previews run straight away; you allow each change.</p>
-            </div>
-          </div>
-          <div class="scroll" id="ai-inspect" hidden></div>
-          <form class="ai-compose" id="ai-form">
-            <div class="ai-row" id="ai-ctx" hidden></div>
-            <textarea id="ai-text" rows="3" placeholder="Ask, or describe what you want… (Enter sends, Shift+Enter adds a line)" aria-label="Message"></textarea>
-            <div class="ai-row">
-              <select id="ai-role" aria-label="Role" title="A role for this message: what the AI is asked to do">
-                <option value="">Chat</option>
-                <option value="find_mods">Researcher: find mods</option>
-                <option value="install_safely">Installer: install safely</option>
-                <option value="test_mods">Tester: test in game</option>
-                <option value="mod_team">Lead: the whole team</option>
-              </select>
-              <button type="button" id="ai-attach" title="Attach pictures (PNG, JPEG, GIF, WebP); you can also drop them here">＋ Picture</button>
-              <input type="file" id="ai-file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
-              <span class="ai-pics" id="ai-pics"></span>
-              <span class="muted small" id="ai-status"></span>
-              <div class="spacer"></div>
-              <button type="button" id="ai-stop" hidden>Stop</button>
-              <button id="ai-send" class="primary">Send</button>
-            </div>
-          </form>
-        </section>
-      </div>
+    <section class="pane" id="pane-mcp" hidden>
+      <div class="scroll"><div class="settings">
+        <p class="muted small">AI apps such as Claude Code, Claude Desktop or Cursor use rmm's tools on this instance over MCP, the Model Context Protocol: they read the setup, and their changes show up here and can be undone.</p>
+        <h2>Over HTTP, while this window is open</h2>
+        <div id="mcp-http"></div>
+        <h2>Started by the app (stdio)</h2>
+        <div id="mcp-stdio"></div>
+        <div id="set-mcp"></div>
+      </div></div>
     </section>
     <section class="pane" id="pane-settings" hidden>
       <div class="scroll"><div class="settings">
         <div id="set-more"></div>
-        <div class="adv">
-        <h2>AI providers</h2>
-        <p class="muted small">rmm's own AI runs on a provider you pay for, with your API key. Keys are kept in your user folder, never in the instance.</p>
-        <table class="set" id="set-providers"></table>
-        <h2>Mod team</h2>
-        <p class="muted small">Who answers in the AI tab. A message with a role goes to that role's AI, and the Lead hands each step to the AI of its role. An AI app such as Claude can take a role over MCP (<button class="link small" id="set-access">AI access…</button> or <code>rmm mcp</code>): steps for it wait on the team board until you ask the app to do its rmm team tasks, and it can hand steps to the roles on a provider here.</p>
-        <table class="set" id="set-team"></table>
-        </div>
-        <div id="set-more-ai"></div>
+        <p class="set-reset"><button data-act="reset" id="set-reset">Reset all settings…</button> <span class="muted small">rmm’s settings are in settings.json in your user folder, also changed with <code>rmm settings</code>.</span></p>
         <h2>rmm</h2>
         <div class="row"><span class="small" id="set-version"></span><div class="spacer"></div><button id="set-update" title="Looks for a newer release of rmm on GitHub">Check for updates</button></div>
       </div></div>

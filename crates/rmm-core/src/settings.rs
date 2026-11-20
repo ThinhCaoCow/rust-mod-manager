@@ -158,30 +158,18 @@ pub struct Tools {
     pub timeout_mins: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct Ai {
-    /// Model calls in one turn before rmm's AI pauses and asks to go on.
-    pub max_steps: usize,
-    /// US dollars a chat may cost before it stops (Claude and OpenRouter report costs); 0: no limit.
-    /// A few dollars by default, so a first try can't run up a bill.
-    pub budget: f64,
-    /// Tools rmm's AI may run without asking, on top of reads and dry runs.
-    pub auto_allow: Vec<String>,
     /// The user's instructions for each mod team role (lead, researcher, installer, tester),
-    /// added to its prompt for rmm's AI and for AI apps over MCP.
+    /// added to its prompt for AI apps over MCP.
     pub role_instructions: BTreeMap<String, String>,
-}
-impl Default for Ai {
-    fn default() -> Self {
-        Ai { max_steps: 60, budget: 2.0, auto_allow: vec![], role_instructions: BTreeMap::new() }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Mcp {
-    /// The port of the window's AI access (on 127.0.0.1).
+    /// The port of the window's MCP server (on 127.0.0.1).
     pub port: u16,
     /// Keep each AI app's session as a chat in the instance.
     pub record_sessions: bool,
@@ -232,12 +220,6 @@ impl Settings {
         }
         if !(1..=365).contains(&self.nexus.recheck_days) {
             bail!("nexus.recheck_days is 1 to 365");
-        }
-        if !(1..=500).contains(&self.ai.max_steps) {
-            bail!("ai.max_steps is 1 to 500");
-        }
-        if !self.ai.budget.is_finite() || self.ai.budget < 0.0 {
-            bail!("ai.budget is 0 (no limit) or more dollars");
         }
         if let Some(r) = self.ai.role_instructions.keys().find(|r| !ROLES.contains(&r.as_str())) {
             bail!("ai.role_instructions: no role {r:?}; the roles are {}", ROLES.join(", "));

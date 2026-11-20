@@ -120,10 +120,10 @@ rmm downloads --delete "Some Mod-123-1-0-1700000000.zip"   # delete a download f
 | `test.window`, `test.dwell`, `test.timeout`, `test.screenshots`, `test.keep_runs` | 960x540, 10, 180, on, 0 | Test run defaults; screenshots of the last N runs kept (0: all) |
 | `nexus.recheck_days`, `nexus.check_on_start` | 30, off | When to ask Nexus about a mod again; check for updates when the window opens |
 | `tools.timeout_mins` | 0 | Stop a tool run from the window after this long (0: never) |
-| `ai.max_steps`, `ai.budget`, `ai.auto_allow`, `ai.role_instructions` | 60, 2, none, none | rmm's AI: steps per turn, the most a chat may cost (US$, 0: no limit), tools it runs without asking, your instructions per role (also for AI apps over MCP) |
-| `mcp.port`, `mcp.record_sessions` | 47823, on | The window's AI access port; keep AI apps' sessions as chats |
+| `ai.role_instructions` | none | Your instructions per mod team role, added to its MCP prompt |
+| `mcp.port`, `mcp.record_sessions` | 47823, on | The window's MCP server port; keep AI apps' sessions as chats |
 
-The window keeps its own look too: theme (follow Windows, light, dark), compact rows, size, the tab it opens on, how often it looks for outside changes, how long messages stay, the Recent filter's days, asking before installing dropped files, skipping the deploy preview, the editor's tab width, spaces and wrapping, and whether Enter or Ctrl+Enter sends an AI message.
+The window keeps its own look too: theme (follow Windows, light, dark), compact rows, size, the tab it opens on, how often it looks for outside changes, how long messages stay, the Recent filter's days, asking before installing dropped files, and skipping the deploy preview.
 
 ## Desktop app
 
@@ -131,9 +131,9 @@ The window keeps its own look too: theme (follow Windows, light, dark), compact 
 rmm-app --instance D:\Mods\skyrim     # or pick or create an instance on the welcome screen
 ```
 
-The mod list with drag and drop and conflict markers (select a mod to see who it wins and loses against), plugins, profiles, mod rules, problems and history, a deploy preview, Play, and an AI tab (see "Built-in AI"). Drop a .zip, .7z or .rar on the window to install it; a mod with a FOMOD installer opens a wizard for its options.
+The mod list with drag and drop and conflict markers (select a mod to see who it wins and loses against), plugins, profiles, mod rules, problems and history, a deploy preview, Play, and an MCP tab for connecting AI apps (see "AI (MCP)"). Drop a .zip, .7z or .rar on the window to install it; a mod with a FOMOD installer opens a wizard for its options.
 
-It also renames, reinstalls and updates mods in place (keeping their place, notes and rules; undo swaps the old files back), keeps notes, categories and row colours, locks plugins, edits LOOT rules, runs tools (xEdit's edits go back into the mods they change, undoably), reads crash, Papyrus and script extender logs, notices game updates (Address Library and SKSE/F4SE plugins that no longer match), restores history, purges, imports from MO2 and Vortex, writes, compares and applies lockfiles (with the game and script extender versions, and as a pack with the mods no download brings back, or a readable list), installs from Nexus (downloads queue up and carry on where they stopped) and checks for updates (pinning mods or skipping a version you want to keep), looks many downloads up on Nexus at once so the mods made from them get update checks, manages add-ons, and can let AI clients in over HTTP ("AI access").
+It also renames, reinstalls and updates mods in place (keeping their place, notes and rules; undo swaps the old files back), keeps notes, categories and row colours, locks plugins, edits LOOT rules, runs tools (xEdit's edits go back into the mods they change, undoably), reads crash, Papyrus and script extender logs, notices game updates (Address Library and SKSE/F4SE plugins that no longer match), restores history, purges, imports from MO2 and Vortex, writes, compares and applies lockfiles (with the game and script extender versions, and as a pack with the mods no download brings back, or a readable list), installs from Nexus (downloads queue up and carry on where they stopped) and checks for updates (pinning mods or skipping a version you want to keep), looks many downloads up on Nexus at once so the mods made from them get update checks, and manages add-ons.
 
 Built for long lists: only the rows on screen are drawn, separators group mods and collapse, and filters (enabled, conflicted, overridden, broken rule, missing masters, recently installed and more) show "x of y mods". Select several rows with Shift or Ctrl, then use Space (enable or disable), Delete, Ctrl+Up/Down, F2 (rename), Ctrl+A, Ctrl+F, or "Move to" (top, bottom, a group, after a mod, past every conflict); the plugin list takes the same keys, and right-clicking a row in either list opens a menu (with collapse and expand every group; Ctrl+Left/Right too). Ctrl+1 to 9 switch tabs, Ctrl+D deploys, Ctrl+P plays and F5 reads the instance again. The window reloads when the CLI or an AI changes the instance. It is plain HTML and JavaScript in `crates/rmm-app/ui/`, with no build step; every action is one call into rmm-core (`crates/rmm-app/src/main.rs`).
 
@@ -143,11 +143,11 @@ Built for long lists: only the rows on screen are drawn, separators group mods a
 claude mcp add rmm -- D:\Games\Rust_Mod_Manager\target\release\rmm.exe -i D:\Mods\skyrim mcp
 ```
 
-For clients that connect to a URL, `rmm -i D:\Mods\skyrim mcp --http 127.0.0.1:47823` serves the same tools at `http://127.0.0.1:47823/mcp` and prints the bearer token; the window's "AI access" does the same while it is open.
+For clients that connect to a URL, `rmm -i D:\Mods\skyrim mcp --http 127.0.0.1:47823` serves the same tools at `http://127.0.0.1:47823/mcp` and prints the bearer token; the window's MCP tab does the same while it is open, and shows the commands and JSON settings to connect an app either way.
 
-The server exposes 105 tools covering inspection (including the Data folder, saves and downloads), reviewing mods (a safety scan with Windows Defender and DLL checks, reading files with Papyrus scripts disassembled, record conflicts between plugins, saved reviews, what a plugin adds), editing mod files and INIs with every edit revertible, install (including FOMOD installers), profiles, ordering, separators and mod rules, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, test runs, live test sessions, logs and support bundles (the Windows user name taken out), finding the mod behind a crash by halving the suspects, purge, Nexus search and installs, import and lockfiles, add-ons, saved chats, the mod team board, and undo/redo. Writes to the game folder, installs from Nexus and imports default to `dry_run: true`. Every change to a profile lands in its undo history, so anything the AI does to a setup can be reversed.
+The server exposes 105 tools covering inspection (including the Data folder, saves and downloads), reviewing mods (a safety scan with Windows Defender and DLL checks, reading files with Papyrus scripts disassembled, record conflicts between plugins, saved reviews, what a plugin adds), editing mod files and INIs with every edit revertible, install (including FOMOD installers), profiles, ordering, separators and mod rules, LOOT sorting and rules, plugins, health checks, tool runs (also in the background), deploy, launch, test runs, live test sessions, logs and support bundles (the Windows user name taken out), finding the mod behind a crash by halving the suspects, purge, Nexus search and installs, import and lockfiles, add-ons, saved chats, and undo/redo. Writes to the game folder, installs from Nexus and imports default to `dry_run: true`. Every change to a profile lands in its undo history, so anything the AI does to a setup can be reversed.
 
-Each session of an AI app connected this way (Claude desktop, Claude Code, any MCP client) is saved as a chat in the instance (`ai/chats/`): every tool call and its answer, under the app's name. rmm never sees the conversation itself, so the server asks the app to save a short note when a task ends (`save_chat_note`: what you asked for, what it did and decided, what's left). The session then shows in the window's Chats list, and `list_chats` and `read_chat` let any AI read it, so rmm's own AI can carry on where the app left off.
+Each session of an AI app connected this way (Claude desktop, Claude Code, any MCP client) is saved as a chat in the instance (`ai/chats/`): every tool call and its answer, under the app's name. rmm never sees the conversation itself, so the server asks the app to save a short note when a task ends (`save_chat_note`: what you asked for, what it did and decided, what's left). `list_chats` and `read_chat` let any later session read it and carry on where the app left off.
 
 It also offers a mod team as four prompts, which clients show as commands:
 - `find_mods`, the researcher: finds Nexus mods that match a description or images, work with a mod you name, or fit your list, ranked by confidence.
@@ -155,33 +155,7 @@ It also offers a mod team as four prompts, which clients show as commands:
 - `test_mods`, the tester: plays the game in a small window behind yours, step by step (teleports, fights, quest stages, items), and reports crashes, script errors and FPS.
 - `mod_team`, the lead: runs all three and guides the tester.
 
-Your AI client plays the roles; rmm supplies the tools. Or rmm plays them itself with your own API key (below), and you can mix the two: in the window's **Settings**, give each role to a provider or to your AI app. A step for your app waits on rmm's team board (`team_tasks`) until you ask the app to do its rmm team tasks (`finish_team_task` hands its report back). An app that leads can hand steps to the roles on a provider (`ask_teammate`); those run in the background and can read and preview but not change anything, so they report changes for the app to make.
-
-## Built-in AI
-
-rmm can run the AI itself, with your API key for OpenRouter, Claude (Anthropic), GPT (OpenAI), Kimi (Moonshot AI), DeepSeek or Qwen (Alibaba Cloud). It works through the same tools and mod team roles as an MCP client. Reads and dry runs run straight away; each change waits for your yes.
-
-```
-rmm ai use claude                        # or openrouter, openai, kimi, deepseek, qwen
-rmm ai key claude                        # paste the key; rmm checks it with the provider, then keeps it in your user folder
-rmm ai use qwen --model qwen3-max --server https://dashscope.aliyuncs.com/compatible-mode/v1   # another model or region
-rmm ai models                            # what the key can use
-rmm ai status                            # each provider's model, server, settings and whether a key is there
-rmm ai options claude --effort max --instructions "Prefer mods with an ESL flag."   # per provider; "" clears one
-rmm ai team researcher deepseek          # who does each role: a provider (--model for another), mcp for your AI app, "" for the one in use
-rmm -i D:\Mods\skyrim ai chat --role researcher "snow that piles up on armour" --image look.png
-rmm -i D:\Mods\skyrim ai chats                       # saved chats; `ai chat --resume <id>` goes on with one
-```
-
-In the window, the **Settings** tab holds the providers (API key, model, and **Options…**: your own instructions for the AI, effort, temperature and the most output tokens per reply) and the mod team: who answers a message without a role (Chat), and who is the Lead, Researcher, Installer and Tester. Each role goes to a provider with its own model, or to your AI app over MCP. The Lead hands each step to its role's AI (`ask_teammate`); that teammate works in a chat of its own, you allow its changes in the same panel, and its cost adds to the lead's.
-
-The **AI** tab is an IDE for working with your AI:
-- **Files:** every mod's folder, `overwrite/` and the game's INI files, in a tree, opened in an editor with tabs (Ctrl+S saves). Compiled scripts open disassembled and read-only. Every save keeps the old file, and **Edits…** puts any edit back.
-- **Chat:** choose Chat or a role (Researcher, Installer, Tester, Lead; each says whose AI answers), attach or drop pictures, and **Ask AI** sends the selected lines of the open file along. Allow or Decline each change as it comes ("Allow all in this chat" stops the asking); the AI's file edits come as a diff.
-- **Chats** are saved in the instance (`ai/chats/`) to open and go on with later. Sessions of AI apps connected over MCP are listed too; opening one shows its calls and notes, and a message sent from it starts a new chat that reads that session first.
-- **Inspector:** each request to the provider and its answer, with tokens and, for Claude and OpenRouter, the cost; the toolbar shows the chat's total.
-
- A key in the provider's usual environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `MOONSHOT_API_KEY`, `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`) wins over a saved one. Your messages, pictures and the tools' answers go to the provider you pick, billed to your account.
+Your AI client plays the roles (each with its own helper agent, where it can start them); rmm supplies the tools. Your own instructions for each role go on the window's MCP tab (`ai.role_instructions`).
 
 ## Layout
 

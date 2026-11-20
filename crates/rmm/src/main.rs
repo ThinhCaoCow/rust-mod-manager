@@ -1,4 +1,4 @@
-use rmm::{agent, http, mcp};
+use rmm::{http, mcp};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -231,8 +231,8 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Edits made to mod files, overwrite/ and INIs through rmm (the window's IDE and AI
-    /// tools), newest first.
+    /// Edits made to mod files, overwrite/ and INIs through rmm (AI apps' file tools over MCP),
+    /// newest first.
     Edits {
         /// Put back the file as it was before edit N.
         #[arg(long)]
@@ -512,88 +512,12 @@ enum Cmd {
     /// The undo history, newest first, with each step's time and what it changed; when this
     /// instance last deployed and played; and the steps Redo brings back.
     History,
-    /// rmm's own AI with your API key: OpenRouter, Claude, OpenAI (GPT), Kimi, DeepSeek or Qwen.
-    #[command(subcommand)]
-    Ai(AiCmd),
     /// Serve the Model Context Protocol on stdio for AI clients.
     Mcp {
         /// Serve over HTTP on this address instead (e.g. 127.0.0.1:47823), at /mcp. Clients
         /// send `Authorization: Bearer <token>`; the token is printed on start.
         #[arg(long)]
         http: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum AiCmd {
-    /// The providers, each with its model, server and whether a key is there.
-    Status,
-    /// Use this provider from now on. --model and --server change its model or API address
-    /// ("" puts back the default).
-    Use {
-        provider: String,
-        #[arg(long)]
-        model: Option<String>,
-        /// Another address for its API, such as Qwen's China region or a proxy.
-        #[arg(long)]
-        server: Option<String>,
-    },
-    /// Save a provider's API key, after checking it with the provider. Reads it from stdin, so it
-    /// stays out of your shell history.
-    Key { provider: String },
-    /// Delete a provider's saved key.
-    Forget { provider: String },
-    /// The models the key can use (default: the provider in use).
-    Models { provider: Option<String> },
-    /// A provider's request settings; each one given replaces the saved one ("" clears it).
-    Options {
-        provider: String,
-        /// Added to rmm's own instructions for the AI.
-        #[arg(long)]
-        instructions: Option<String>,
-        /// Claude: low, medium, high (default), xhigh or max. Others: their reasoning effort.
-        #[arg(long)]
-        effort: Option<String>,
-        /// 0 to 2 (not Claude).
-        #[arg(long)]
-        temperature: Option<String>,
-        #[arg(long)]
-        max_tokens: Option<String>,
-    },
-    /// Who does each mod team role. With a role (lead, researcher, installer, tester) and a
-    /// provider, give it that provider (--model for another than its own), `mcp` for the AI app
-    /// connected over MCP, or "" for the provider in use.
-    Team {
-        role: Option<String>,
-        provider: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// This instance's saved chats, newest first.
-    Chats,
-    /// Chat with the AI about this instance, through rmm's tools. Reads and dry runs run straight
-    /// away; each change waits for your y (yes), n (no) or a (yes to all in this chat). After each
-    /// answer, type the next message; an empty line ends.
-    Chat {
-        /// The first message; without it, the first line you type.
-        words: Vec<String>,
-        /// A mod team role for the first message (lead, researcher, installer, tester): it goes to
-        /// the AI set for that role (`rmm ai team`) unless --provider says otherwise.
-        #[arg(long)]
-        role: Option<String>,
-        /// A picture (PNG, JPEG, GIF, WebP) to send with the first message; repeat for more.
-        #[arg(long)]
-        image: Vec<PathBuf>,
-        #[arg(long)]
-        provider: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        /// Run changes without asking.
-        #[arg(long)]
-        yes: bool,
-        /// Go on with a saved chat (an id from `rmm ai chats`).
-        #[arg(long)]
-        resume: Option<String>,
     },
 }
 
@@ -1346,84 +1270,6 @@ fn run() -> Result<()> {
         }
         #[cfg(target_os = "linux")]
         Cmd::Vfs => rmm_core::vfs::serve(&open()?, |data| eprintln!("Mounted the profile over {}. Ctrl+C unmounts.", data.display())),
-        Cmd::Ai(AiCmd::Status) => print(&agent::status()),
-        Cmd::Ai(AiCmd::Use { provider, model, server }) => print(&agent::configure(&provider, model.as_deref(), server.as_deref(), true)?),
-        Cmd::Ai(AiCmd::Key { provider }) => {
-            let p = agent::provider(&provider)?;
-            eprint!("Paste your {} API key: ", p.name);
-            let mut key = String::new();
-            std::io::stdin().read_line(&mut key)?;
-            let n = agent::set_key(p.id, &key)?;
-            eprintln!("Saved. {} took the key ({n} models).", p.name);
-            Ok(())
-        }
-        Cmd::Ai(AiCmd::Forget { provider }) => print(&serde_json::json!({ "forgot": agent::forget_key(&provider)? })),
-        Cmd::Ai(AiCmd::Models { provider }) => print(&agent::Conn::open(provider.as_deref(), None)?.models()?),
-        Cmd::Ai(AiCmd::Options { provider, instructions, effort, temperature, max_tokens }) => {
-            let id = agent::provider(&provider)?.id;
-            let mut o = agent::status().into_iter().find(|s| s.id == id).map(|s| s.options).unwrap_or_default();
-            let num = |v: &str| -> Result<Option<f64>> { Ok(if v.trim().is_empty() { None } else { Some(v.trim().parse().context("not a number")?) }) };
-            if let Some(v) = instructions {
-                o.instructions = v;
-            }
-            if let Some(v) = effort {
-                o.effort = Some(v);
-            }
-            if let Some(v) = temperature {
-                o.temperature = num(&v)?;
-            }
-            if let Some(v) = max_tokens {
-                o.max_tokens = num(&v)?.map(|n| n as u32);
-            }
-            print(&agent::set_options(id, o)?.options)
-        }
-        Cmd::Ai(AiCmd::Team { role, provider, model }) => match (role, provider) {
-            (Some(r), Some(p)) => {
-                agent::set_seat(&r, &p, model.as_deref().unwrap_or(""))?;
-                print(&agent::team())
-            }
-            (None, None) => print(&agent::team()),
-            _ => anyhow::bail!("give a role and a provider (mcp for the AI app connected over MCP, \"\" for the provider in use)"),
-        },
-        Cmd::Ai(AiCmd::Chats) => print(&agent::chats(&open()?.root)?),
-        Cmd::Ai(AiCmd::Chat { words, role, image, provider, model, yes, resume }) => {
-            let inst = open()?;
-            let saved = resume.map(|id| agent::load_chat(&inst.root, &id)).transpose()?;
-            // A role goes to its AI unless the provider is named; the AI app over MCP gets it as a team task.
-            let seat = match (&provider, &saved, &role) {
-                (None, None, Some(r)) => Some(agent::seat(agent::role(r)?.0)),
-                _ => None,
-            };
-            if seat.as_ref().is_some_and(|s| s.provider == agent::MCP) {
-                eprintln!("{}", agent::hand_to_app(&inst.root, role.as_deref().unwrap_or_default(), &words.join(" "))?);
-                return Ok(());
-            }
-            let conn = match seat {
-                Some(s) => agent::Conn::for_seat(&s)?,
-                None => agent::Conn::open(provider.as_deref().or(saved.as_ref().map(|c| c.provider.as_str())), model.as_deref())?,
-            };
-            let mut images = image.iter().map(|p| agent::Image::load(p)).collect::<Result<Vec<_>>>()?;
-            eprintln!("{} · {}. An empty line ends the chat.", conn.provider.name, conn.model);
-            let mut ai = match saved {
-                Some(chat) => agent::Agent::resume(conn, inst.root.clone(), chat)?,
-                None => agent::Agent::new(conn, inst.root.clone())?,
-            };
-            ai.trusted = yes;
-            let (mut text, mut role) = (words.join(" "), role);
-            loop {
-                if text.trim().is_empty() {
-                    eprint!("you> ");
-                    text.clear();
-                    if std::io::stdin().read_line(&mut text)? == 0 || text.trim().is_empty() {
-                        return Ok(());
-                    }
-                }
-                if let Err(e) = ai.send(role.take().as_deref(), text.trim(), &std::mem::take(&mut images), &mut Term) {
-                    eprintln!("error: {e:#}");
-                }
-                text.clear();
-            }
-        }
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
         Cmd::History => print(&ops::history(&open()?)?),
@@ -1442,40 +1288,6 @@ fn run() -> Result<()> {
                 }
             }
             tokio::runtime::Runtime::new()?.block_on(mcp::serve(dir))
-        }
-    }
-}
-
-/// The chat in a terminal: the AI's words on stdout, its tool calls on stderr.
-struct Term;
-
-fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    match line.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &line[..i]),
-        None => line.into(),
-    }
-}
-
-impl agent::Ui for Term {
-    fn event(&mut self, e: agent::Event) {
-        match e {
-            agent::Event::User { .. } => {}
-            agent::Event::Text { text } => println!("{text}\n"),
-            agent::Event::Call { name, args } => eprintln!("> {name} {}", first_line(&args.to_string(), 160)),
-            agent::Event::Result { ok, text, .. } => eprintln!("  {} {}", if ok { "ok:" } else { "failed:" }, first_line(&text, 160)),
-            agent::Event::Notice { text } => eprintln!("! {text}"),
-        }
-    }
-
-    fn approve(&mut self, name: &str, args: &serde_json::Value) -> agent::Answer {
-        eprint!("Run {name} {args}? [y]es, [n]o, [a]ll changes in this chat: ");
-        let mut a = String::new();
-        let _ = std::io::stdin().read_line(&mut a);
-        match a.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => agent::Answer::Yes,
-            "a" | "all" => agent::Answer::Always,
-            _ => agent::Answer::No,
         }
     }
 }
