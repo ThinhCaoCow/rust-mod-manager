@@ -1738,5 +1738,8 @@
  "#{0} INI": "{0} INI",
  "#{0} INIs": "{0} INI",
  "#{0} matches": "{0} совпадений",
- "1 match": "1 совпадение"
+ "1 match": "1 совпадение",
+ "Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:": "Claude Code: тестировщик на Haiku, самой дешёвой модели Claude, для живых тестов:",
+ "Nexus no longer has a page for {0}, or hides it (removed, hidden, or a wrong id), so it wasn’t checked: {1}.": "У Nexus больше нет страницы для {0}, или она скрыта (удалена, спрятана или неверный id), поэтому проверки не было: {1}.",
+ "Every mod with Nexus ids{0} is up to date{1}.{2}": "Все моды с id Nexus{0} актуальны{1}.{2}"
 }

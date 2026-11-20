@@ -69,10 +69,11 @@ const I18N = (() => {
       parts.forEach((s, i) => {
         re += s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         if (i === parts.length - 1) return;
-        // A part glued to a word ("Update{0}") is an optional tail like " 1.2", never more letters.
-        const after = /[A-Za-z]$/.test(s) ? '(?![A-Za-z])' : '';
+        // A part glued to a word ("Update{0}") is an optional tail like " 1.2", never more letters,
+        // and may be empty.
+        const glued = /[A-Za-z]$/.test(s);
         const before = /^[A-Za-z]/.test(parts[i + 1]) ? '(?<![A-Za-z])' : '';
-        re += count ? '(\\d[\\d.,\\s\\u00a0]*?)' : `${after}(.+?)${before}`;
+        re += count ? '(\\d[\\d.,\\s\\u00a0]*?)' : glued ? `(?![A-Za-z])(.*?)${before}` : `(.+?)${before}`;
       });
       patterns.push({ re: new RegExp(re + '$', 's'), to });
     }

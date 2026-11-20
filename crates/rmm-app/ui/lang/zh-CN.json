@@ -1738,5 +1738,8 @@
  "#{0} INI": "{0} 个 INI",
  "#{0} INIs": "{0} 个 INI",
  "#{0} matches": "{0} 个匹配",
- "1 match": "1 个匹配"
+ "1 match": "1 个匹配",
+ "Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:": "Claude Code：用 Haiku（最便宜的 Claude 模型）做实时测试的测试员：",
+ "Nexus no longer has a page for {0}, or hides it (removed, hidden, or a wrong id), so it wasn’t checked: {1}.": "Nexus 上已没有 {0} 的页面，或页面被隐藏（已删除、隐藏或 id 错误），因此未检查：{1}。",
+ "Every mod with Nexus ids{0} is up to date{1}.{2}": "所有带 Nexus ID 的模组{0}都是最新的{1}。{2}"
 }

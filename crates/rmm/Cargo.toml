@@ -15,6 +15,8 @@ rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync"] }
 schemars = "1"
 getrandom = "0.3"
+base64 = "0.23"
+png = "0.18"
 
 [dev-dependencies]
 tempfile = "3"

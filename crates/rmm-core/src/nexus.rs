@@ -259,8 +259,8 @@ impl Client {
         match code.trim() {
             "200" => serde_json::from_str(body).with_context(|| format!("Nexus sent something that isn't JSON for {path}")),
             "401" => bail!("Nexus refused the API key; copy it again from your account's API Keys page"),
-            "403" => bail!("Nexus refused {path}: {}", message(body)),
-            "404" => bail!("Nexus has no {path} (removed or hidden?)"),
+            "403" => Err(NotThere(format!("Nexus refused {path}: {}", message(body))).into()),
+            "404" => Err(NotThere(format!("Nexus has no {path} (removed or hidden?)")).into()),
             "429" => bail!("Nexus's request limit is used up for now; try again in an hour"),
             "000" | "" => bail!("couldn't reach Nexus: {}", String::from_utf8_lossy(&out.stderr).trim()),
             c => bail!("Nexus answered {c} for {path}: {}", message(body)),
@@ -276,6 +276,19 @@ impl Client {
         Ok(v)
     }
 }
+
+/// Nexus has no such page, or won't show it (a removed or hidden mod, a wrong id): a 404 or 403.
+/// Checks over many mods skip the one this happens to.
+#[derive(Debug)]
+pub struct NotThere(pub String);
+
+impl std::fmt::Display for NotThere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotThere {}
 
 fn message(body: &str) -> String {
     serde_json::from_str::<Value>(body).ok().and_then(|v| v["message"].as_str().map(str::to_owned)).unwrap_or_else(|| body.chars().take(200).collect())
@@ -513,6 +526,23 @@ mod ws {
     }
 }
 
+/// What an update check found.
+#[derive(Serialize, Debug, Default)]
+pub struct UpdateCheck {
+    pub updates: Vec<Update>,
+    /// Mods Nexus has no page for any more, or won't show (removed, hidden, or a wrong id): the
+    /// check went on without them.
+    pub unavailable: Vec<Unavailable>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct Unavailable {
+    pub id: String,
+    pub name: String,
+    pub mod_id: u64,
+    pub reason: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Update {
     pub id: String,
@@ -642,8 +672,10 @@ fn changelog_after(v: &Value, since: Option<&str>) -> Vec<(String, Vec<String>)>
 }
 
 /// Mods with a newer file on Nexus, leaving out the ones the user holds back (`hold_updates`).
-/// `ids` limits the check (default: every mod with Nexus ids).
-pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -> Result<Vec<Update>> {
+/// `ids` limits the check (default: every mod with Nexus ids). A mod whose page is gone or hidden
+/// is listed as unavailable and the check goes on; other errors (the key, the request limit, no
+/// connection) stop it, since every mod after would fail the same way.
+pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -> Result<UpdateCheck> {
     let domain = inst.config.game.nexus_domain();
     let cache_path = inst.root.join(CACHE);
     let _ = refresh_categories(inst, client); // names for the Category column; the check stands without them
@@ -666,7 +698,7 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         .collect();
     let mut found = saved_updates(inst);
     found.retain(|id, _| !mods.iter().any(|(m, _)| m == id));
-    let mut out = Vec::new();
+    let mut out = UpdateCheck::default();
     let known = requirements(inst);
     let mut reread = Vec::new(); // mods whose requirements to read again
     for (i, (id, meta)) in mods.iter().enumerate() {
@@ -678,7 +710,14 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
             Some(t) => recent.get(&n.mod_id).is_some_and(|&u| u >= t) || now().saturating_sub(t) > crate::settings::get().nexus.recheck_days * 86400,
         };
         if stale || !cache.files.contains_key(&n.mod_id) {
-            let files = client.get(&format!("/v1/games/{domain}/mods/{}/files.json", n.mod_id))?;
+            let files = match client.get(&format!("/v1/games/{domain}/mods/{}/files.json", n.mod_id)) {
+                Ok(f) => f,
+                Err(e) => {
+                    let gone = e.downcast::<NotThere>()?; // any other error stops the check
+                    out.unavailable.push(Unavailable { id: id.clone(), name: meta.name.clone(), mod_id: n.mod_id, reason: gone.0 });
+                    continue;
+                }
+            };
             cache.files.insert(n.mod_id, files);
             cache.checked.insert(n.mod_id, now());
             reread.push(n.mod_id);
@@ -687,7 +726,7 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         }
         if let Some(u) = newer(id, &meta.name, n, &cache.files[&n.mod_id], domain) {
             if offered(&u, meta) {
-                out.push(u.clone());
+                out.updates.push(u.clone());
             }
             found.insert(id.clone(), u);
         }

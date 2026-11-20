@@ -3409,24 +3409,28 @@ async function checkUpdates(quiet) {
   const fromGh = S.mods.some(m => m.web?.startsWith('https://github.com/'));
   const g = fromGh ? await (quiet ? call('link_updates').catch(() => null) : act('Checking GitHub for updates', () => call('link_updates'), { reload: false })) : [];
   const gh = Array.isArray(g) ? g : [];
-  let r = [];
+  let r = [], gone = [];
   if (quiet || nexus.user || !gh.length) {
     if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) {
       if (!gh.length) return;
     } else {
       checkCollection();
       // The mod list's Update tags come with the reload.
-      r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
-      if (!Array.isArray(r)) {
+      const c = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
+      if (!Array.isArray(c?.updates)) {
         if (!gh.length) return;
-        r = [];
+      } else {
+        r = c.updates;
+        gone = c.unavailable;
       }
     }
   }
   const all = r.length + gh.length;
   if (quiet) return all && toast(`${plural(all, 'update')} found; Check for updates lists them.`);
   const held = S.mods.filter(m => m.pinned).length;
-  if (!all) return toast(`Every mod with Nexus ids${fromGh ? ' or a GitHub page' : ''} is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.`);
+  // Mods whose Nexus page is gone: the check skipped them; there's nothing to update.
+  const goneNote = gone.length ? `Nexus no longer has a page for ${plural(gone.length, 'mod')}, or hides it (removed, hidden, or a wrong id), so it wasn’t checked: ${gone.map(g => nameOf(g.id)).join(', ')}.` : '';
+  if (!all) return toast(`Every mod with Nexus ids${fromGh ? ' or a GitHub page' : ''} is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.${goneNote ? ' ' + goneNote : ''}`, goneNote ? 'info' : undefined);
   const premium = !!nexus.user?.is_premium;
   const rows = r.map(u => `<tr data-id="${esc(u.id)}"><td>${esc(nameOf(u.id))}<details class="changelog" data-mod="${u.mod_id}" data-since="${esc(u.installed ?? '')}"><summary class="small">What’s new</summary><div class="muted small">Loading…</div></details></td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td>
     <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-get title="${premium ? 'Download it and update the mod in place' : 'Open its Files tab: Mod manager download brings it back here as an update'}">${premium ? 'Update' : 'Files tab'}</button></td></tr>`).join('')
@@ -3440,7 +3444,7 @@ async function checkUpdates(quiet) {
   ].filter(Boolean).join(' ');
   // Update all: what downloads here (GitHub, and Nexus with Premium), one mod after another.
   const auto = (premium ? r.length : 0) + gh.length;
-  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close'], ...(auto > 1 ? [['all', 'Update all', 'primary']] : [])] });
+  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>${goneNote ? `<p class="muted small">${esc(goneNote)}</p>` : ''}`, actions: [['cancel', 'Close'], ...(auto > 1 ? [['all', 'Update all', 'primary']] : [])] });
   $('#dlg').classList.add('wide');
   let changed = false;
   $('#dlg').onclick = async e => {
@@ -3630,17 +3634,21 @@ const snippet = (label, text) => `<p class="small">${label} <button class="small
 
 function drawMcp() {
   const json = server => JSON.stringify({ mcpServers: { rmm: server } }, null, 2);
+  // A helper agent the tester prompt hands live tests to (its tools are named after the server: rmm).
+  const tester = snippet('Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:', 'rmm tester-agent --apply');
   $('#mcp-http').innerHTML = mcpOn
     ? `<div class="row"><span class="pill win">On</span> <code>${esc(mcpOn.url)}</code><div class="spacer"></div><button data-mcp="off">Turn off</button></div>
        ${snippet('Claude Code:', `claude mcp add --transport http rmm ${mcpOn.url} --header "Authorization: Bearer ${mcpOn.token}"`)}
        ${snippet('Other apps (JSON settings):', json({ type: 'http', url: mcpOn.url, headers: { Authorization: `Bearer ${mcpOn.token}` } }))}
+       ${tester}
        <p class="muted small">It serves this instance on 127.0.0.1 with a private token, kept in your user folder. Anyone with the token can change this instance, so keep it to yourself. It stays on for the next window.</p>`
     : `<div class="row"><span class="muted">Off.</span><div class="spacer"></div><button class="primary" data-mcp="on">Turn on</button></div>
        <p class="muted small">For apps that connect to a running server. It serves the open instance on 127.0.0.1 with a private token, only while this window is open.</p>`;
   const root = S?.info?.root ?? '';
   $('#mcp-stdio').innerHTML = `<p class="muted small">For apps that start rmm themselves; nothing needs to be on here. They run <code>rmm mcp</code>, which the installer puts on PATH.</p>
     ${snippet('Claude Code:', `claude mcp add rmm -- rmm mcp -i "${root}"`)}
-    ${snippet('Claude Desktop, Cursor and other apps (JSON settings):', json({ command: 'rmm', args: ['mcp', '-i', root] }))}`;
+    ${snippet('Claude Desktop, Cursor and other apps (JSON settings):', json({ command: 'rmm', args: ['mcp', '-i', root] }))}
+    ${tester}`;
 }
 
 $('#pane-mcp').onclick = async e => {

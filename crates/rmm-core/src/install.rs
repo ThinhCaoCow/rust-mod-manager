@@ -57,6 +57,24 @@ pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bo
     Ok(r)
 }
 
+/// An archive's mod and file on Nexus, best source first: MO2's `<archive>.meta` (mod id, file id,
+/// version), rmm's own record of the downloads it fetched or identified, then the file's name
+/// (mod id and version). None when none of them says.
+fn archive_nexus(inst: &Instance, archive: &Path) -> Option<crate::instance::NexusRef> {
+    let file = archive.file_name()?.to_string_lossy().into_owned();
+    let mo2 = fs::read_to_string(archive.with_file_name(format!("{file}.meta"))).unwrap_or_default();
+    let get = |k: &str| mo2.lines().find_map(|l| l.trim().strip_prefix(k)?.strip_prefix('=').map(str::trim)).filter(|v| !v.is_empty());
+    if let Some(mod_id) = get("modID").and_then(|v| v.parse().ok()).filter(|&m: &u64| m > 0) {
+        let file_id = get("fileID").and_then(|v| v.parse().ok()).filter(|&f: &u64| f > 0);
+        return Some(crate::instance::NexusRef { mod_id, file_id, version: get("version").map(str::to_owned), category: None });
+    }
+    if let Some(id) = crate::nexus::identified(inst).remove(&file.to_lowercase()) {
+        return Some(id.nexus);
+    }
+    let stem = if archive.is_dir() { archive.file_name() } else { archive.file_stem() }?.to_string_lossy().into_owned();
+    nexus_name(&stem).map(|(_, n)| n)
+}
+
 /// The mod name, Nexus mod id and version in a Nexus download's file name, as MO2 reads them:
 /// "Address Library - All In One 47327 1.11.240 2026-08-21T23-48Z Hbu6377Rl" (the site's names
 /// now), "Unofficial Skyrim Special Edition Patch-266-4-2-5a-1623868815" (older ones), or without
@@ -194,8 +212,10 @@ pub fn reinstall(inst: &Instance, id: &str, choices: Option<&Choices>) -> Result
 }
 
 /// Update a mod in place from another archive or folder (a newer version): it keeps its id, name,
-/// place, enabled state, notes, categories, colour, rules and Nexus ids. Without `choices` a
-/// FOMOD installer takes the stored ones. The old files go to trash/; undo swaps them back.
+/// place, enabled state, notes, categories, colour and rules. Its Nexus ids become the new
+/// archive's when it says them (MO2's .meta, a download rmm fetched or identified, a Nexus file
+/// name), otherwise they stay. Without `choices` a FOMOD installer takes the stored ones. The old
+/// files go to trash/; undo swaps them back.
 pub fn update(inst: &Instance, id: &str, source: &Path, choices: Option<&Choices>) -> Result<InstallReport> {
     replace(inst, id, Some(source), choices)
 }
@@ -380,7 +400,9 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
             }
             let updated = new_source.map(|s| -> Result<ModMeta> {
                 let sha256 = if s.is_file() { Some(crate::lockfile::sha256_file(s)?) } else { None };
-                Ok(ModMeta { source: Some(s.display().to_string()), sha256, web: crate::web::of_source(inst, s).or_else(|| meta.web.clone()), ..meta.clone() })
+                // The new archive's Nexus file, so update checks don't offer what's installed now.
+                let nexus = archive_nexus(inst, s).map(|n| crate::instance::NexusRef { category: n.category.or(meta.nexus.as_ref().filter(|o| o.mod_id == n.mod_id).and_then(|o| o.category)), ..n });
+                Ok(ModMeta { source: Some(s.display().to_string()), sha256, web: crate::web::of_source(inst, s).or_else(|| meta.web.clone()), nexus: nexus.or_else(|| meta.nexus.clone()), ..meta.clone() })
             });
             let mut ini_tweaks = meta.ini_tweaks.clone();
             ini_tweaks.extend(script_tweak(&files).into_iter().filter(|t| !meta.ini_tweaks.contains(t)));

@@ -1738,5 +1738,8 @@
  "#{0} INI": "{0} INI",
  "#{0} INIs": "{0} INI",
  "#{0} matches": "{0} coincidencias",
- "1 match": "1 coincidencia"
+ "1 match": "1 coincidencia",
+ "Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:": "Claude Code: un tester en Haiku, el modelo de Claude más barato, para pruebas en vivo:",
+ "Nexus no longer has a page for {0}, or hides it (removed, hidden, or a wrong id), so it wasn’t checked: {1}.": "Nexus ya no tiene página para {0}, o la oculta (eliminada, oculta o un id incorrecto), así que no se comprobó: {1}.",
+ "Every mod with Nexus ids{0} is up to date{1}.{2}": "Todos los mods con ids de Nexus{0} están al día{1}.{2}"
 }
