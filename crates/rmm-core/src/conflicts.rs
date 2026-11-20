@@ -247,7 +247,8 @@ pub const FIND_LIMIT: usize = 1000;
 
 /// One folder of Data: its subfolders, then its files with the mods behind each.
 pub fn data_view(inst: &Instance, profile: &Profile, q: &DataQuery) -> Result<Vec<DataEntry>> {
-    if q.dir.split(['/', '\\']).any(|c| c == "..") {
+    // A folder in Data: "C:\Windows" or "/etc" would join to itself.
+    if q.dir.split(['/', '\\']).any(|c| c == "..") || q.dir.contains(':') || q.dir.starts_with(['/', '\\']) {
         anyhow::bail!("not a folder in Data: {}", q.dir);
     }
     let map = file_map(inst, profile)?;

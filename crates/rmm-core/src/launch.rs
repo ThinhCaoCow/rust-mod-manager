@@ -292,7 +292,19 @@ pub fn hold_steam_updates(inst: &Instance, hold: bool) -> Result<SteamUpdates> {
     if hold {
         let backup = manifest_backup(inst, &manifest);
         fs::create_dir_all(backup.parent().unwrap())?;
+        // A copy of a held (read-only) manifest comes out read-only, and the next copy can't
+        // write over it: keep the copy writable.
+        let writable = |p: &Path| -> std::io::Result<()> {
+            let mut perm = fs::metadata(p)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            fs::set_permissions(p, perm)
+        };
+        if backup.is_file() {
+            writable(&backup)?;
+        }
         fs::copy(&manifest, &backup).with_context(|| format!("cannot keep a copy of {}", manifest.display()))?;
+        writable(&backup)?;
     }
     let mut perm = fs::metadata(&manifest)?.permissions();
     #[cfg(unix)]

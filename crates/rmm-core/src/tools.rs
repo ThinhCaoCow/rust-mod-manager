@@ -634,16 +634,22 @@ fn run_inner(inst: &Instance, id: &str, over: Option<&Tool>, given: &BTreeMap<St
     }
     let source = format!("tool:{id}");
     let in_place = tool.edit_in_place;
-    let previous = inst.profile()?.mods.into_iter().find(|m| {
-        if crate::instance::is_separator(&m.id) {
-            return false;
+    let mods: Vec<_> = inst.profile()?.mods.into_iter().filter(|m| !crate::instance::is_separator(&m.id)).map(|m| (inst.mod_meta(&m.id), m)).collect();
+    let previous = match in_place {
+        true => mods.into_iter().find(|(meta, m)| m.id == output_mod || meta.name == output_mod),
+        // The tool's last output by name, else (the user renamed it) its only output, when the
+        // tool makes one mod: "Cleaned {plugin}" makes one per plugin.
+        false => {
+            let mut ours: Vec<_> = mods.into_iter().filter(|(meta, _)| meta.source.as_deref() == Some(source.as_str())).collect();
+            let one = ours.len() == 1 && !tool.output_mod.as_deref().is_some_and(|o| o.contains('{'));
+            match ours.iter().position(|(meta, _)| meta.name == output_mod) {
+                Some(i) => Some(ours.swap_remove(i)),
+                None if one => ours.pop(),
+                None => None,
+            }
         }
-        let meta = inst.mod_meta(&m.id);
-        match in_place {
-            true => m.id == output_mod || meta.name == output_mod,
-            false => meta.source.as_deref() == Some(source.as_str()) && meta.name == output_mod,
-        }
-    });
+    }
+    .map(|(_, m)| m);
     let mut r = RunReport {
         tool: id.into(),
         dry_run,

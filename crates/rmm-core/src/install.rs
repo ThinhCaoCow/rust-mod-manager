@@ -59,8 +59,9 @@ pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bo
 
 /// An archive's mod and file on Nexus, best source first: MO2's `<archive>.meta` (mod id, file id,
 /// version), rmm's own record of the downloads it fetched or identified, then the file's name
-/// (mod id and version). None when none of them says.
-fn archive_nexus(inst: &Instance, archive: &Path) -> Option<crate::instance::NexusRef> {
+/// (mod id and version), which only counts when it names `was` (the mod's id so far): "Patch
+/// Hub-2024-04-01" isn't mod 2024. None when none of them says.
+fn archive_nexus(inst: &Instance, archive: &Path, was: Option<u64>) -> Option<crate::instance::NexusRef> {
     let file = archive.file_name()?.to_string_lossy().into_owned();
     let mo2 = fs::read_to_string(archive.with_file_name(format!("{file}.meta"))).unwrap_or_default();
     let get = |k: &str| mo2.lines().find_map(|l| l.trim().strip_prefix(k)?.strip_prefix('=').map(str::trim)).filter(|v| !v.is_empty());
@@ -72,7 +73,7 @@ fn archive_nexus(inst: &Instance, archive: &Path) -> Option<crate::instance::Nex
         return Some(id.nexus);
     }
     let stem = if archive.is_dir() { archive.file_name() } else { archive.file_stem() }?.to_string_lossy().into_owned();
-    nexus_name(&stem).map(|(_, n)| n)
+    nexus_name(&stem).map(|(_, n)| n).filter(|n| Some(n.mod_id) == was)
 }
 
 /// The mod name, Nexus mod id and version in a Nexus download's file name, as MO2 reads them:
@@ -401,8 +402,9 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
             let updated = new_source.map(|s| -> Result<ModMeta> {
                 let sha256 = if s.is_file() { Some(crate::lockfile::sha256_file(s)?) } else { None };
                 // The new archive's Nexus file, so update checks don't offer what's installed now.
-                let nexus = archive_nexus(inst, s).map(|n| crate::instance::NexusRef { category: n.category.or(meta.nexus.as_ref().filter(|o| o.mod_id == n.mod_id).and_then(|o| o.category)), ..n });
-                Ok(ModMeta { source: Some(s.display().to_string()), sha256, web: crate::web::of_source(inst, s).or_else(|| meta.web.clone()), nexus: nexus.or_else(|| meta.nexus.clone()), ..meta.clone() })
+                let web = crate::web::of_source(inst, s);
+                let nexus = archive_nexus(inst, s, meta.nexus.as_ref().map(|n| n.mod_id)).filter(|_| web.is_none()).map(|n| crate::instance::NexusRef { category: n.category.or(meta.nexus.as_ref().filter(|o| o.mod_id == n.mod_id).and_then(|o| o.category)), ..n });
+                Ok(ModMeta { source: Some(s.display().to_string()), sha256, web: web.or_else(|| meta.web.clone()), nexus: nexus.or_else(|| meta.nexus.clone()), ..meta.clone() })
             });
             let mut ini_tweaks = meta.ini_tweaks.clone();
             ini_tweaks.extend(script_tweak(&files).into_iter().filter(|t| !meta.ini_tweaks.contains(t)));
@@ -653,12 +655,16 @@ fn fomod_walk(inst: &Instance, root: &Path, choices: &Choices) -> Result<Walk> {
     let installer = installer_at(root)?;
     let profile = inst.profile()?;
     let winners = crate::conflicts::file_map(inst, &profile)?.winners();
+    let implicit = crate::plugins::implicit(inst).unwrap_or_default();
     let state = |f: &str| {
         if !winners.contains_key(&path_key(f)) && !inst.data_dir().join(f.replace('\\', "/")).exists() {
             return FileState::Missing;
         }
-        // Plugins the profile doesn't list (base game, Creation Club) are loaded by the game.
-        let off = is_plugin(f) && profile.plugins.iter().any(|p| p.name.eq_ignore_ascii_case(f) && !p.enabled);
+        // The game loads the plugins the profile doesn't list, and its own (base game, Creation
+        // Club) even where an imported profile has them off.
+        let off = is_plugin(f)
+            && !implicit.iter().any(|p| p.eq_ignore_ascii_case(f))
+            && profile.plugins.iter().any(|p| p.name.eq_ignore_ascii_case(f) && !p.enabled);
         if off { FileState::Inactive } else { FileState::Active }
     };
     let loader = inst.config.game.loader();
@@ -857,7 +863,7 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
 /// reinstalled from it any more.
 pub fn delete_download(inst: &Instance, name: &str) -> Result<()> {
     let path = inst.downloads_dir().join(name);
-    if name.contains(['/', '\\']) || name.starts_with('.') || !path.is_file() {
+    if name.contains(['/', '\\', ':']) || name.starts_with('.') || !path.is_file() {
         bail!("no download named {name}");
     }
     Ok(fs::remove_file(path)?)
@@ -1028,6 +1034,14 @@ fn installer_at(root: &Path) -> Result<Installer> {
         return Installer::parse(&fs::read(config)?);
     }
     let packages = bain_packages(root).context("fomod/ModuleConfig.xml is missing")?;
+    // A sub-package with a Data folder installs what's in it, not Data/Data.
+    let packages: Vec<(String, String)> = packages
+        .into_iter()
+        .map(|p| match child_ci(&root.join(&p), "data").filter(|d| d.is_dir()) {
+            Some(data) => (p.clone(), format!("{p}/{}", data.file_name().unwrap_or_default().to_string_lossy())),
+            None => (p.clone(), p),
+        })
+        .collect();
     Ok(Installer::bain(&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), &packages))
 }
 

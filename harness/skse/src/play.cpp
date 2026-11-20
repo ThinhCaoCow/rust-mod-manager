@@ -166,7 +166,7 @@ namespace
 			json quests = json::object();
 			for (const auto& q : a_cmd["quests"]) {
 				const auto quest = q.is_string() ? quest_named(q.get<std::string>()) : nullptr;
-				quests[q.is_string() ? q.get<std::string>() : q.dump()] = quest ? json{ { "stage", quest->GetCurrentStageID() }, { "running", quest->IsRunning() }, { "completed", quest->IsCompleted() } } : json(nullptr);
+				quests[q.is_string() ? q.get<std::string>() : q.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)] = quest ? json{ { "stage", quest->GetCurrentStageID() }, { "running", quest->IsRunning() }, { "completed", quest->IsCompleted() } } : json(nullptr);
 			}
 			out["quests"] = quests;
 		}
@@ -177,7 +177,7 @@ namespace
 				const auto form = form_of(i);
 				const auto obj = form ? form->As<RE::TESBoundObject>() : nullptr;
 				const auto it = obj ? counts.find(obj) : counts.end();
-				items[i.is_string() ? i.get<std::string>() : i.dump()] = form ? json(it == counts.end() ? 0 : it->second) : json(nullptr);
+				items[i.is_string() ? i.get<std::string>() : i.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)] = form ? json(it == counts.end() ? 0 : it->second) : json(nullptr);
 			}
 			out["items"] = items;
 		}
@@ -186,7 +186,7 @@ namespace
 			for (const auto& r : a_cmd["refs"]) {
 				const auto form = form_of(r);
 				const auto ref = form ? form->AsReference() : nullptr;
-				refs[r.is_string() ? r.get<std::string>() : r.dump()] = ref ? ref_info(ref) : json(nullptr);
+				refs[r.is_string() ? r.get<std::string>() : r.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)] = ref ? ref_info(ref) : json(nullptr);
 			}
 			out["refs"] = refs;
 		}
@@ -249,7 +249,7 @@ namespace
 	public:
 		explicit Done(Reply a_reply) :
 			reply(std::move(a_reply)) {}
-		void operator()(Variable a_result) override { reply("", json{ { "value", from_variable(a_result) } }.dump()); }
+		void operator()(Variable a_result) override { reply("", json{ { "value", from_variable(a_result) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)); }
 		void SetObject(const RE::BSTSmartPointer<RE::BSScript::Object>&) override {}
 
 		Reply reply;
@@ -319,7 +319,7 @@ namespace
 		const bool method = a_cmd.contains("self") && !a_cmd["self"].is_null();
 		RE::TESForm* self = method ? form_of(a_cmd["self"]) : nullptr;
 		if (method && !self) {
-			return a_reply("no form " + a_cmd["self"].dump(), "");
+			return a_reply("no form " + a_cmd["self"].dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 		}
 		std::string owner;
 		const auto  f = find_function(cls, fn, !method, owner);
@@ -341,7 +341,7 @@ namespace
 				if (!a.is_null()) {
 					const auto form = form_of(a);
 					if (!form) {
-						return a_reply(std::format("argument {} ({}): no form {}", i + 1, name.c_str(), a.dump()), "");
+						return a_reply(std::format("argument {} ({}): no form {}", i + 1, name.c_str(), a.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)), "");
 					}
 					RE::BSScript::PackHandle(&v, form, static_cast<RE::VMTypeID>(form->GetFormType()));
 				}
@@ -363,7 +363,7 @@ namespace
 					v.SetBool(a.is_boolean() ? a.get<bool>() : a.is_number() && a.get<double>() != 0.0);
 					break;
 				case RE::BSScript::TypeInfo::RawType::kString:
-					v.SetString(a.is_string() ? a.get<std::string>() : a.dump());
+					v.SetString(a.is_string() ? a.get<std::string>() : a.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 					break;
 				default:
 					return a_reply(std::format("argument {} ({}) is an array, which isn't supported: {}", i + 1, name.c_str(), signature(f)), "");
@@ -381,7 +381,7 @@ namespace
 			ok = vm->DispatchStaticCall(RE::BSFixedString(owner), RE::BSFixedString(fn), &done->args, cb);
 		}
 		if (!ok) {
-			a_reply(std::format("the game refused the call to {} (is {} a {}?)", signature(f), a_cmd.value("self", json()).dump(), cls), "");
+			a_reply(std::format("the game refused the call to {} (is {} a {}?)", signature(f), a_cmd.value("self", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), cls), "");
 		}
 	}
 
@@ -452,7 +452,7 @@ namespace
 				list.PushBack(RE::GFxValue(a.get<bool>()));
 			} else {
 				RE::GFxValue s;
-				movie->CreateString(&s, a.is_string() ? a.get<std::string>().c_str() : a.dump().c_str());
+				movie->CreateString(&s, a.is_string() ? a.get<std::string>().c_str() : a.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace).c_str());
 				list.PushBack(s);
 			}
 		}
@@ -534,7 +534,7 @@ namespace
 			}
 		}
 		if (index < 0 || index >= static_cast<int>(d["topics"].size())) {
-			return a_reply("no such topic; the topics are " + d["topics"].dump(), "");
+			return a_reply("no such topic; the topics are " + d["topics"].dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 		}
 		const auto text = d["topics"][static_cast<std::size_t>(index)]["text"].get<std::string>();
 		// Through the menu's own click handler: calling the game's TopicClicked directly leaves the
@@ -573,7 +573,7 @@ namespace
 			}
 			json out{ { "chose", text }, { "said", said } };
 			on_main([&] { out["then"] = dialogue(); });
-			a_reply(state == 1 || state == -1 ? "" : "the answer didn't finish within 60 seconds", out.dump());
+			a_reply(state == 1 || state == -1 ? "" : "the answer didn't finish within 60 seconds", out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 		}).detach();
 	}
 
@@ -607,7 +607,7 @@ namespace
 			const auto form = form_of(a_cmd["target"]);
 			target = form ? form->AsReference() : nullptr;
 			if (!target) {
-				return "no reference " + a_cmd["target"].dump();
+				return "no reference " + a_cmd["target"].dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 			}
 			face(target);
 		}
@@ -675,7 +675,7 @@ namespace
 		const auto form = form_of(a_cmd.value("target", json()));
 		const auto ref = form ? form->AsReference() : nullptr;
 		if (!ref) {
-			return a_reply("no reference " + a_cmd.value("target", json()).dump(), "");
+			return a_reply("no reference " + a_cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 		}
 		const auto within = a_cmd.value("within", 150.0f);
 		const auto limit = std::chrono::seconds(std::clamp(a_cmd.value("timeout", 60), 1, 600));
@@ -744,7 +744,7 @@ namespace
 				out["moved_from"] = std::round(stuck);
 				out["note"] = "something was in the way, so the player was moved there";
 			}
-			a_reply(error, error.empty() ? out.dump() : "");
+			a_reply(error, error.empty() ? out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) : "");
 		}).detach();
 	}
 
@@ -764,7 +764,7 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESDeathEvent* a_e, RE::BSTEventSource<RE::TESDeathEvent>*) override
 		{
 			if (a_e && a_e->dead) {
-				rmm::game_event(json{ { "what", "death" }, { "actor", who(a_e->actorDying) }, { "killer", who(a_e->actorKiller) } }.dump());
+				rmm::game_event(json{ { "what", "death" }, { "actor", who(a_e->actorDying) }, { "killer", who(a_e->actorKiller) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -773,7 +773,7 @@ namespace
 			static constexpr std::array states{ "none", "combat", "searching" };
 			const auto                  s = static_cast<std::size_t>(a_e ? a_e->newState.get() : RE::ACTOR_COMBAT_STATE::kNone);
 			if (a_e) {
-				rmm::game_event(json{ { "what", "combat" }, { "actor", who(a_e->actor) }, { "target", who(a_e->targetActor) }, { "state", s < states.size() ? states[s] : "?" } }.dump());
+				rmm::game_event(json{ { "what", "combat" }, { "actor", who(a_e->actor) }, { "target", who(a_e->targetActor) }, { "state", s < states.size() ? states[s] : "?" } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -781,7 +781,7 @@ namespace
 		{
 			const auto q = a_e ? RE::TESForm::LookupByID<RE::TESQuest>(a_e->formID) : nullptr;
 			if (q) {
-				rmm::game_event(json{ { "what", "stage" }, { "quest", q->GetFormEditorID() }, { "stage", a_e->stage } }.dump());
+				rmm::game_event(json{ { "what", "stage" }, { "quest", q->GetFormEditorID() }, { "stage", a_e->stage } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -789,7 +789,7 @@ namespace
 		{
 			// Only the player's: NPCs open doors all over the world all the time.
 			if (a_e && a_e->actionRef && a_e->actionRef->IsPlayerRef()) {
-				rmm::game_event(json{ { "what", "activate" }, { "target", who(a_e->objectActivated) }, { "by", who(a_e->actionRef) } }.dump());
+				rmm::game_event(json{ { "what", "activate" }, { "target", who(a_e->objectActivated) }, { "by", who(a_e->actionRef) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -817,11 +817,11 @@ namespace play
 				return a_reply("not in the game yet (load a save or coc first)", "");
 			}
 			if (name == "state") {
-				a_reply("", state(cmd).dump());
+				a_reply("", state(cmd).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			} else if (name == "papyrus") {
 				papyrus(cmd, a_reply);
 			} else if (name == "dialogue") {
-				a_reply("", dialogue().dump());
+				a_reply("", dialogue().dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			} else if (name == "choose") {
 				choose(cmd, a_reply);
 			} else if (name == "menu_call") {
@@ -829,7 +829,7 @@ namespace play
 			} else if (name == "menu_get") {
 				SKSE::GetTaskInterface()->AddUITask([cmd, a_reply] {
 					const auto v = menu_get(cmd.value("menu", std::string{}), cmd.value("path", std::string{}));
-					a_reply(v.contains("error") ? v["error"].get<std::string>() : "", v.dump());
+					a_reply(v.contains("error") ? v["error"].get<std::string>() : "", v.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 				});
 			} else if (name == "act") {
 				a_reply(act(cmd), "");
@@ -839,7 +839,7 @@ namespace play
 				if (ref) {
 					face(ref);
 				}
-				a_reply(ref ? "" : "no reference " + cmd.value("target", json()).dump(), "");
+				a_reply(ref ? "" : "no reference " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 			} else if (name == "press") {
 				press(cmd, a_reply);
 			} else if (name == "walk") {
@@ -849,10 +849,10 @@ namespace play
 				const auto form = form_of(cmd.value("target", json()));
 				const auto ref = form ? form->AsReference() : nullptr;
 				if (!ref) {
-					return a_reply("no reference " + cmd.value("target", json()).dump(), "");
+					return a_reply("no reference " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 				}
 				const auto done = ref->ActivateRef(RE::PlayerCharacter::GetSingleton(), 0, nullptr, 1, false);
-				a_reply(done ? "" : "the game didn't activate " + cmd.value("target", json()).dump(), json{ { "activated", true } }.dump());
+				a_reply(done ? "" : "the game didn't activate " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), json{ { "activated", true } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			} else {
 				a_reply("unknown command '" + name + "'", "");
 			}

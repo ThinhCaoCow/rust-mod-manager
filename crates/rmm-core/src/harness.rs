@@ -703,7 +703,17 @@ fn wait_for(c: &mut Conn, w: &WaitFor, alive: &dyn Fn() -> bool) -> Result<Value
     let timeout = Duration::from_secs(w.timeout.unwrap_or(60).min(600));
     let start = Instant::now();
     loop {
-        let state = c.command(query.clone(), Duration::from_secs(30), alive)?["data"].take();
+        let state = match c.command(query.clone(), Duration::from_secs(30), alive) {
+            Ok(mut v) => v["data"].take(),
+            // The game gone ends the wait; anything else (a loading screen, a slow frame) is a
+            // condition not met yet.
+            Err(e) if !alive() => return Err(e),
+            Err(_) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            Err(e) => return Err(e.context(format!("the state wasn't readable within {} seconds", timeout.as_secs()))),
+        };
         let open = |m: &str| state["menus"].as_array().is_some_and(|ms| ms.iter().any(|x| x.as_str().is_some_and(|x| x.eq_ignore_ascii_case(m))));
         let mut unmet = vec![];
         if let Some(r) = &w.dead
@@ -911,7 +921,7 @@ impl Server {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false)?;
                     let mut c = Conn::new(stream)?;
-                    let Some(hello) = c.read(Duration::from_secs(10))? else { continue };
+                    let Ok(Some(hello)) = c.read(Duration::from_secs(10)) else { continue };
                     if hello["ev"] == "hello" && hello["token"] == self.token.as_str() {
                         c.console_output = hello["console_output"] == true;
                         return Ok((c, hello["runtime"].as_str().map(str::to_owned)));
@@ -1018,21 +1028,22 @@ impl Conn {
         let id = self.next;
         self.next += 1;
         cmd["id"] = json!(id);
+        // What came since the last step (a load that finished after it) belongs to that step.
+        while self.read(Duration::from_millis(1))?.is_some() {}
         self.early.clear();
         writeln!(self.writer, "{cmd}")?;
         let start = Instant::now();
         loop {
             if let Some(v) = self.read(Duration::from_millis(500))? {
-                if v["ev"] != "result" || v["id"] != id {
-                    if v["ev"] != "heartbeat" {
-                        self.early.push(v);
+                if v["ev"] == "result" && v["id"] == id {
+                    if v["ok"] == true {
+                        return Ok(v);
                     }
-                    continue;
+                    bail!("{}", v["out"].as_str().unwrap_or("the command failed"));
                 }
-                if v["ok"] == true {
-                    return Ok(v);
+                if v["ev"] != "heartbeat" {
+                    self.early.push(v);
                 }
-                bail!("{}", v["out"].as_str().unwrap_or("the command failed"));
             }
             if !alive() {
                 bail!("the game closed during {}", cmd["cmd"]);

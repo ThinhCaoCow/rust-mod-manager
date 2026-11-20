@@ -195,8 +195,10 @@ pub fn import_mo2(inst: &Instance, dir: &Path, profile: Option<&str>, dry_run: b
             incoming.push(Incoming { id: format!("sep:{}", sanitize(sep)), enabled: false, from: None, color });
             continue;
         }
-        if n.trim_end_matches(|c: char| c.is_ascii_digit()).to_lowercase().ends_with("backup") {
-            continue; // MO2 keeps backups of reinstalled mods as always-disabled folders
+        // MO2 keeps backups of reinstalled mods as always-disabled "<mod>_backup1" folders; a mod
+        // named "... Backup" is a mod.
+        if !enabled && n.trim_end_matches(|c: char| c.is_ascii_digit()).to_lowercase().ends_with("_backup") {
+            continue;
         }
         let folder = mods_dir.join(&n);
         if !folder.is_dir() {

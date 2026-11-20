@@ -49,24 +49,28 @@ fn bsa(r: &mut impl Read) -> Result<Vec<String>> {
     if flags & 3 != 3 {
         bail!("the archive doesn't store folder and file names");
     }
-    let mut counts = Vec::with_capacity(folders);
+    // The counts come from the file: a damaged one mustn't size the memory asked for.
+    let mut counts = Vec::with_capacity(folders.min(1 << 16));
     for _ in 0..folders {
         let mut rec = vec![0; record];
         r.read_exact(&mut rec)?;
         counts.push(u32::from_le_bytes(rec[8..12].try_into()?) as usize);
     }
     // Then, per folder: a length-prefixed name and 16-byte file records; then every file name.
-    let mut dirs = Vec::with_capacity(folders);
+    let mut dirs = Vec::with_capacity(counts.len());
     for n in counts {
         let mut name = vec![0; bytes::<1>(r)?[0] as usize];
         r.read_exact(&mut name)?;
         dirs.push((latin1(name.strip_suffix(&[0]).unwrap_or(&name)), n));
         std::io::copy(&mut r.take(16 * n as u64), &mut std::io::sink())?;
     }
-    let mut names = vec![0; file_names_len];
-    r.read_exact(&mut names)?;
+    let mut names = Vec::new();
+    r.take(file_names_len as u64).read_to_end(&mut names)?;
+    if names.len() < file_names_len {
+        bail!("the archive ends early");
+    }
     let mut names = names.split(|&c| c == 0);
-    let mut out = Vec::with_capacity(files);
+    let mut out = Vec::with_capacity(files.min(1 << 20));
     for (dir, n) in dirs {
         let dir = dir.replace('\\', "/");
         for _ in 0..n {

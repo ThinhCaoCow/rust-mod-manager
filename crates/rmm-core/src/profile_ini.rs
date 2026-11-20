@@ -104,6 +104,7 @@ pub fn apply(inst: &Instance, p: &Profile) -> Result<()> {
         let path = my_games(inst, inst.config.game.ini_name());
         let text = fs::read(&path).unwrap_or_default();
         st.saves = Some(Saves { before: ini_get(&String::from_utf8_lossy(&text), "General", "sLocalSavePath") });
+        fs::create_dir_all(path.parent().unwrap_or(&path))?; // a game not run yet has no My Games folder
         fs::write(&path, ini_set(&text, &[("General", "sLocalSavePath", Some(format!("Saves\\{cur}\\")))]))?;
     }
     apply_tweaks(inst, p, &mut st)?;

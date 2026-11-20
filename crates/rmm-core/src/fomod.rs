@@ -194,16 +194,16 @@ pub struct OptionView {
 
 impl Installer {
     /// A Wrye Bash BAIN package as an installer: one step whose options are its sub-packages
-    /// (the folders `packages`, each installed as Data, a later one winning), any number of them.
-    /// Those named `00…` start ticked, as in MO2.
-    pub fn bain(module: &str, packages: &[String]) -> Installer {
+    /// (`packages`: each one's name and the folder installed as Data, a later one winning), any
+    /// number of them. Those named `00…` start ticked, as in MO2.
+    pub fn bain(module: &str, packages: &[(String, String)]) -> Installer {
         let plugins = packages
             .iter()
-            .map(|p| Plugin {
+            .map(|(p, source)| Plugin {
                 name: p.clone(),
                 description: String::new(),
                 image: None,
-                files: vec![FileItem { source: p.clone(), destination: String::new(), folder: true, priority: 0, always: false, if_usable: false }],
+                files: vec![FileItem { source: source.clone(), destination: String::new(), folder: true, priority: 0, always: false, if_usable: false }],
                 flags: vec![],
                 default: if p.starts_with("00") { Kind::Recommended } else { Kind::Optional },
                 patterns: vec![],

@@ -217,6 +217,14 @@ async fn connection(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
     if !msg.is_object() {
         return respond(&mut stream, 400, &[], &error("send one JSON-RPC message per request")).await;
     }
+    // What rmcp can't read it drops, or answers without the request's id, so a request would wait
+    // for an answer that never comes: refuse it here, before it opens a session.
+    if let Err(e) = serde_json::from_value::<rmcp::model::ClientJsonRpcMessage>(msg.clone()) {
+        return match msg.get("id") {
+            Some(id) => respond(&mut stream, 400, &[], &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32600, "message": format!("not a JSON-RPC message rmm reads: {e}") } })).await,
+            None => respond(&mut stream, 202, &[], &Value::Null).await,
+        };
+    }
     let method = msg["method"].as_str().map(str::to_owned);
     let (sid, session) = if method.as_deref() == Some("initialize") {
         let mut bytes = [0u8; 16];
