@@ -3960,7 +3960,7 @@ async function loadData(top = true) {
   if (run !== dataRun) return; // a newer request is on its way
   const parts = dataDir ? dataDir.split('/') : [];
   $('#data-path').innerHTML = find
-    ? `<span class="muted">${!rows.length ? 'Search results' : `${rows.length >= 1000 ? 'The first 1,000 matches' : `${rows.length.toLocaleString()} match${rows.length === 1 ? '' : 'es'}`}. Click one to open its folder.`}</span>`
+    ? `<span class="muted">${!rows.length ? 'Search results' : `${rows.length >= 1000 ? 'The first 1,000 matches' : rows.length === 1 ? '1 match' : `${rows.length.toLocaleString()} matches`}. Click one to open its folder.`}</span>`
     : [parts.length ? '<button class="link" data-dir="">Data</button>' : '<b>Data</b>',
       ...parts.map((p, i) => i === parts.length - 1 ? `<b>${esc(p)}</b>` : `<button class="link" data-dir="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`)]
       .join('<span class="muted">/</span>');
@@ -4461,6 +4461,7 @@ const MCP_OPTIONS = 'Options', MCP_ROLES = 'Your instructions for each role';
 // [key, label, kind, options or [min, max, step], help]. Keys with "win." are this window's.
 const SETTINGS = [
   ['This window', 'Kept by this window on this computer.', [
+    ['win.lang', 'Language', 'select', Object.entries(I18N.LANGS), 'The window’s own words; mod names, files, and messages from the game and from rmm’s engine stay as they are. Changing it reloads the window.'],
     ['win.theme', 'Theme', 'select', [['system', 'Follow Windows'], ['light', 'Light'], ['dark', 'Dark']]],
     ['win.density', 'Rows', 'select', [['comfortable', 'Comfortable'], ['compact', 'Compact']]],
     ['win.zoom', 'Size', 'select', [[0.8, '80%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.25, '125%'], [1.5, '150%']]],
@@ -4528,7 +4529,7 @@ async function drawMore() {
   if (!conf) await loadConf();
   if (!conf) return;
   dlDir = await call('downloads_dir').catch(() => null);
-  const cur = k => k.startsWith('win.') ? W[k.slice(4)] : pathGet(conf, k);
+  const cur = k => k === 'win.lang' ? I18N.lang : k.startsWith('win.') ? W[k.slice(4)] : pathGet(conf, k);
   const control = ([k, label, kind, opt]) => {
     const v = cur(k), at = `data-key="${k}" data-kind="${kind}" aria-label="${esc(label)}"`;
     if (kind === 'bool') return `<input type="checkbox" ${at} ${v ? 'checked' : ''}>`;
@@ -4560,6 +4561,7 @@ $('#set-more').onchange = $('#set-mcp').onchange = async e => {
     : kind === 'kind' ? $$('input[data-kind="kind"]', $('#set-more')).filter(c => !c.checked).map(c => c.value)
     : kind === 'area' ? el.value.trim() : el.value;
   if (kind === 'select' && el.value !== '' && !isNaN(el.value)) v = Number(el.value);
+  if (key === 'win.lang') return I18N.set(v);
   if (key.startsWith('win.')) {
     W[key.slice(4)] = v;
     savePrefs();
