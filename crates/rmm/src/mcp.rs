@@ -16,7 +16,7 @@ use rmcp::{
 };
 use rmm_core::fomod::Choices;
 use rmm_core::tools::ToolSpec;
-use rmm_core::{Instance, addons, conflicts, deploy, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, workspace};
+use rmm_core::{Instance, addons, conflicts, deploy, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, web, workspace};
 use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -249,6 +249,22 @@ struct NexusInstallArgs {
     file_id: Option<u64>,
     /// Default true: show the file without downloading it.
     dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct LinkInstallArgs {
+    /// A GitHub repository or release link, a ModDB mod or download page, or a direct link to a
+    /// .zip, .7z or .rar.
+    url: String,
+    /// The file to take when the link offers several (the dry run lists them).
+    file: Option<String>,
+    /// Default true: show what the link offers without downloading.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct LinkUpdateArgs {
+    id: String,
+    /// The release's file, when check_link_updates couldn't tell which replaces the old one.
+    file: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct CollectionArgs {
@@ -1234,6 +1250,24 @@ impl Rmm {
             }
             Ok(serde_json::to_value(nexus::install(&inst, &client, &link, None)?)?)
         }))
+    }
+
+    #[tool(description = "Download a mod from another site into downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording the page so check_link_updates finds GitHub releases. Takes GitHub repositories and releases (the latest, or a tag's), ModDB pages and direct links to an archive. Sites that need the user's sign-in (LoversLab, AFK Mods, Patreon) come back with browser: true: ask the user to download the file in their browser, then install_mod the file. dry_run defaults to true: the site, the mod's name and the files to choose from.")]
+    async fn install_from_link(&self, Parameters(a): Parameters<LinkInstallArgs>) -> Result<String, String> {
+        if a.dry_run.unwrap_or(true) {
+            return out(web::plan(&a.url));
+        }
+        out(self.inst_mut().and_then(|i| web::install(&i, &a.url, a.file.as_deref(), None)))
+    }
+
+    #[tool(description = "Mods installed from GitHub releases that have a newer one: installed and latest tag, the page, and the new release's file that replaces the old one (file is null when that isn't clear; pick from files). Leaves out held mods and skipped versions.", annotations(read_only_hint = true))]
+    async fn check_link_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| web::check_updates(&i, a.ids.as_deref())))
+    }
+
+    #[tool(description = "Update a mod installed from GitHub to its repository's latest release, as one undoable step: it keeps its id, place, notes and FOMOD choices.")]
+    async fn update_from_link(&self, Parameters(a): Parameters<LinkUpdateArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| web::update(&i, &a.id, a.file.as_deref(), None)))
     }
 
     #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly; free accounts: the user downloads each file listed in to_download from its page first, then the install goes ahead): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. Into a profile that has an earlier revision (update_from in the result) it is an update: mods with a newer file are updated in place (or installed beside the old one when another profile has that on), mods the revision dropped are turned off (turned_off, still installed), and the user's own mods (yours), the collection's mods they turned off (kept_off) and plugins they changed stay as they are. Without a link it updates the active profile's collection. A big collection takes a long time. dry_run defaults to true: lists what would be installed or updated, the download size, optional mods left out and the curator's notes.")]

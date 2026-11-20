@@ -57,6 +57,7 @@
     <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags and categories" spellcheck="false">
     <button id="install" title="Installs after the selected mod, or at the end of the selected separator’s group. You can also drop archives on a row.">＋ Install mod…</button>
     <button id="nxm" title="Download and install a file from Nexus Mods (an nxm:// link, a mod page or a mod id), or a collection">From Nexus…</button>
+    <button id="link" title="Download and install a mod from GitHub, ModDB or another site. For sites you sign in to (LoversLab, AFK Mods, Patreon) you download in your browser and rmm takes the file from your Downloads folder">From a link…</button>
   </nav>
   <div class="notice plain" id="bisect-bar" role="status" hidden></div>
 
@@ -134,7 +135,7 @@
       </div>
     </section>
     <section class="pane" id="pane-downloads" hidden>
-      <div class="toolbar"><input id="dl-find" type="search" placeholder="Find a download" spellcheck="false" aria-label="Find a download by its file, Nexus or mod name"><span class="muted small" id="downloads-note">Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="dl-delete" class="link danger" hidden></button><button id="dl-install" class="primary" hidden></button><button id="dl-identify" title="Look the files up on Nexus by their contents, so installs from them and the mods made from them get update checks">Identify on Nexus</button><button id="downloads-reload">Refresh</button></div>
+      <div class="toolbar"><input id="dl-find" type="search" placeholder="Find a download" spellcheck="false" aria-label="Find a download by its file, Nexus or mod name"><span class="muted small" id="downloads-note">Files you get with From Nexus… or From a link… land here. Installing one leaves the file, so you can install it again later.</span><div class="spacer"></div><button id="dl-delete" class="link danger" hidden></button><button id="dl-install" class="primary" hidden></button><button id="dl-identify" title="Look the files up on Nexus by their contents, so installs from them and the mods made from them get update checks">Identify on Nexus</button><button id="downloads-reload">Refresh</button></div>
       <div class="notice plain" id="dl-queue" hidden></div>
       <div class="scroll">
         <table class="list" id="downloads">

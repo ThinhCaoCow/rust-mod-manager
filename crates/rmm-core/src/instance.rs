@@ -200,6 +200,9 @@ pub struct ModMeta {
     /// Where the mod comes from on Nexus Mods, for update checks and download links.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nexus: Option<NexusRef>,
+    /// Where the mod comes from on another site (GitHub, ModDB, a forum page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<crate::web::WebRef>,
     /// sha256 of the archive it was installed from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,

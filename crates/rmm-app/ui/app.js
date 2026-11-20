@@ -872,6 +872,7 @@ function renderDetails() {
     <h2>${esc(m.name)}</h2>
     ${m.id !== m.name ? `<div class="muted small">id: ${esc(m.id)}</div>` : ''}
     ${m.version || d?.meta?.nexus ? `<div class="row small">${m.version && !d?.meta?.nexus ? `<span class="muted">Version ${esc(m.version)}</span>` : ''}${d?.meta?.nexus ? '<button class="link" data-act="nexus-page" title="Open its page on Nexus Mods in your browser">Nexus page ↗</button>' : ''}</div>` : ''}
+    ${d?.meta?.web ? `<div class="row small">${d.meta.web.version ? `<span class="muted">Release ${esc(d.meta.web.version)}</span>` : ''}<button class="link" data-act="web-page" title="${esc(d.meta.web.page)}">${esc(new URL(d.meta.web.page).hostname.replace(/^www\./, ''))} page ↗</button></div>` : ''}
     <div class="row">
       <label class="row" style="margin:0"><input type="checkbox" data-act="enable" ${m.enabled ? 'checked' : ''}> Enabled</label>
       <div class="spacer"></div>
@@ -2122,6 +2123,7 @@ $('#details').addEventListener('click', async e => {
     case 'endorse': case 'abstain': case 'track': case 'untrack': return nexusAccount([id], t.dataset.act);
     case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
+    case 'web-page': return call('open_page', { url: details.meta.web.page }).catch(err => toast(String(err), 'error'));
     case 'nexus-page': return call('open_nexus_mod', { mod_id: details.meta.nexus.mod_id, page: true }).catch(err => toast(String(err), 'error'));
     case 'read-needs': return act('Reading its requirements on Nexus', () => call('read_requirements', { mod_id: details.nexus_id }));
     case 'nexus-info': {
@@ -3068,31 +3070,61 @@ async function checkCollection() {
 $('#updates').onclick = () => checkUpdates(false);
 /** Ask Nexus for newer files; quietly (at start) only says so when there are some. */
 async function checkUpdates(quiet) {
-  if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) return;
-  checkCollection();
-  // The mod list's Update tags come with the reload.
-  const r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
-  if (!Array.isArray(r)) return;
-  if (quiet) return r.length && toast(`${plural(r.length, 'update')} on Nexus; Check for updates lists them.`);
+  // GitHub releases need no account. Without Nexus sign-in, GitHub's updates still show.
+  const fromGh = S.mods.some(m => m.web?.startsWith('https://github.com/'));
+  const g = fromGh ? await (quiet ? call('link_updates').catch(() => null) : act('Checking GitHub for updates', () => call('link_updates'), { reload: false })) : [];
+  const gh = Array.isArray(g) ? g : [];
+  let r = [];
+  if (quiet || nexus.user || !gh.length) {
+    if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) {
+      if (!gh.length) return;
+    } else {
+      checkCollection();
+      // The mod list's Update tags come with the reload.
+      r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
+      if (!Array.isArray(r)) {
+        if (!gh.length) return;
+        r = [];
+      }
+    }
+  }
+  const all = r.length + gh.length;
+  if (quiet) return all && toast(`${plural(all, 'update')} found; Check for updates lists them.`);
   const held = S.mods.filter(m => m.pinned).length;
-  if (!r.length) return toast(`Every mod with Nexus ids is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.`);
+  if (!all) return toast(`Every mod with Nexus ids${fromGh ? ' or a GitHub page' : ''} is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.`);
   const premium = !!nexus.user?.is_premium;
   const rows = r.map(u => `<tr data-id="${esc(u.id)}"><td>${esc(nameOf(u.id))}<details class="changelog" data-mod="${u.mod_id}" data-since="${esc(u.installed ?? '')}"><summary class="small">What’s new</summary><div class="muted small">Loading…</div></details></td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td>
-    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-get title="${premium ? 'Download it and update the mod in place' : 'Open its Files tab: Mod manager download brings it back here as an update'}">${premium ? 'Update' : 'Files tab'}</button></td></tr>`).join('');
-  const done = dialog({ title: `${plural(r.length, 'update')} on Nexus`, body: `<table class="fc">${rows}</table><p class="muted small">${premium ? 'Update downloads the new file and updates the mod in place, with the FOMOD choices it was installed with; Undo puts the old files back.' : 'Free accounts download from the website: Files tab opens the mod’s, where “Mod manager download” brings the file back here as an update (once Nexus links open rmm).'} Skip passes over this file; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close']] });
+    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-get title="${premium ? 'Download it and update the mod in place' : 'Open its Files tab: Mod manager download brings it back here as an update'}">${premium ? 'Update' : 'Files tab'}</button></td></tr>`).join('')
+    + gh.map((u, i) => `<tr data-id="${esc(u.id)}" data-gh="${i}"><td>${esc(nameOf(u.id))} <span class="muted small">GitHub</span>${u.file ? '' : `<br><select data-gh-file aria-label="The release’s file to update from">${u.files.map(f => `<option>${esc(f)}</option>`).join('')}</select>`}</td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest)}</b></td>
+    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this release; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-gh-get title="Download the release and update the mod in place">Update</button></td></tr>`).join('');
+  const how = [
+    r.length ? (premium ? 'Update downloads the new file and updates the mod in place, with the FOMOD choices it was installed with; Undo puts the old files back.' : 'Free accounts download from the website: Files tab opens the mod’s, where “Mod manager download” brings the file back here as an update (once Nexus links open rmm).') : '',
+    gh.length ? 'A GitHub update downloads the latest release and updates the mod in place; Undo puts the old files back.' : '',
+    gh.length && !nexus.user && S.mods.some(m => m.nexus_id) ? 'Sign in to Nexus Mods to check your Nexus mods too.' : '',
+  ].filter(Boolean).join(' ');
+  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close']] });
   $('#dlg').classList.add('wide');
   let changed = false;
   $('#dlg').onclick = async e => {
+    const tr = e.target.closest('tr[data-id]');
+    if (!tr) return;
+    const u = tr.dataset.gh !== undefined ? gh[+tr.dataset.gh] : null;
+    if (e.target.closest('button[data-gh-get]')) {
+      const file = u.file ?? $('select[data-gh-file]', tr).value;
+      $('#dlg').close('cancel');
+      return updateFromLink(u, file);
+    }
     const get = e.target.closest('button[data-get]');
     if (get) {
-      updateFromNexus(get.closest('tr').dataset.id);
+      updateFromNexus(tr.dataset.id);
       if (premium) get.replaceWith('Queued');
       return;
     }
     const b = e.target.closest('button[data-hold]');
     if (!b) return;
     try {
-      await call('hold_updates', { ids: [b.closest('tr').dataset.id], hold: b.dataset.hold });
+      if (u && b.dataset.hold === 'skip') await call('link_skip', { id: u.id, version: u.latest });
+      else await call('hold_updates', { ids: [tr.dataset.id], hold: b.dataset.hold });
       changed = true;
       b.parentElement.textContent = b.dataset.hold === 'pin' ? 'Held' : 'Skipped';
     } catch (err) { toast(`Holding the update failed.\n${err}`, 'error'); }
@@ -3100,6 +3132,76 @@ async function checkUpdates(quiet) {
   await done;
   $('#dlg').onclick = null;
   if (changed) load();
+}
+
+/** Download a mod's newer GitHub release and update it in place. */
+async function updateFromLink(u, file) {
+  const f = await act(`Downloading ${nameOf(u.id)} ${u.latest}`, () => call('link_download', { url: u.page, file }), { reload: false, problem: true });
+  if (f && f !== true) await updateMod(u.id, f.path);
+}
+
+// ---- From a link: GitHub, ModDB and direct links download here; sites that need the user's
+// sign-in, and pages rmm can't read, open in the browser, and rmm takes the finished file from the
+// Downloads folder. -----------------------------------------------------------------------------
+
+$('#link').onclick = async () => {
+  const url = (await ask('Install from a link', 'Paste a GitHub repository or release, a ModDB page, a LoversLab, AFK Mods or Patreon page, or a link to a .zip, .7z or .rar.', ''))?.trim();
+  if (!url) return;
+  const at = slotAfter(selIds().length === 1 ? selIds()[0] : null);
+  if (/^https?:\/\/([^/]*\.)?nexusmods\.com\//i.test(url)) {
+    if (!await nexusReady('Downloads from Nexus Mods need you signed in.')) return;
+    if (url.includes('/collections/')) return installCollection(url);
+    nxmQueue.push({ link: url, at });
+    return runQueue();
+  }
+  const p = await act('Reading the link', () => call('link_plan', { url }), { reload: false, problem: true });
+  if (!p || p === true) return;
+  if (p.browser) return fromBrowser(p, at);
+  let file = p.files[0].name;
+  if (p.files.length > 1) {
+    const rows = p.files.map((f, i) => `<label class="row"><input type="radio" name="lf" value="${i}" ${i ? '' : 'checked'}> ${esc(f.name)}${f.size ? ` <span class="muted small">${bytes(f.size)}</span>` : ''}</label>`).join('');
+    const what = p.version ? `Its release ${esc(p.version)} has` : 'It has';
+    if (await dialog({ title: `${p.name ?? 'Files'} on ${p.site}`, body: `<p>${what} ${p.files.length} files. Which one?</p>${rows}`, actions: [['cancel', 'Cancel'], ['ok', 'Install', 'primary']] }) !== 'ok') return;
+    file = p.files[+$('#dlg input[name=lf]:checked').value].name;
+  }
+  const f = await act(`Downloading ${file}`, () => call('link_download', { url, file }), { reload: false, problem: true });
+  if (f && f !== true) install([{ path: f.path, nx: { name: f.name ?? undefined } }], at);
+};
+
+/** A page to download in the browser: open it, then list archives that land in the Downloads
+ *  folder until the user picks one, which moves into rmm's downloads folder and installs. */
+async function fromBrowser(p, at) {
+  const since = Math.floor(Date.now() / 1000) - 5;
+  await call('open_page', { url: p.page }).catch(e => toast(String(e), 'error'));
+  const why = p.site === 'link' ? 'rmm can’t download from that page itself' : `${esc(p.site)} needs you signed in`;
+  const body = `<p>${why}, so the page is open in your browser. Download the mod there, and pick the file here once it has finished.</p>
+    <div id="bd-list"><p class="muted">Waiting for a download…</p></div>
+    <label class="row small"><input type="checkbox" id="bd-all"> Show files downloaded earlier</label>
+    <p class="muted small">rmm looks in your Downloads folder and moves the file you pick into its own downloads folder. Your sign-in stays in your browser.</p>`;
+  const done = dialog({ title: `Download from ${p.site === 'link' ? 'the page' : p.site}`, body, actions: [['cancel', 'Cancel']] });
+  $('#dlg').classList.add('wide');
+  let picked = null;
+  const draw = async () => {
+    const list = await call('browser_downloads', { since: $('#bd-all')?.checked ? 0 : since }).catch(() => []);
+    const el = $('#bd-list');
+    if (el) el.innerHTML = list.length ? `<table class="fc">${list.slice(0, 20).map(d => `<tr><td>${esc(d.name)}</td><td class="muted small">${bytes(d.size)}</td><td><button type="button" class="primary" data-path="${esc(d.path)}">Install</button></td></tr>`).join('')}</table>` : '<p class="muted">Waiting for a download…</p>';
+  };
+  draw();
+  const timer = setInterval(draw, 2000);
+  $('#dlg').onclick = e => {
+    const b = e.target.closest('button[data-path]');
+    if (b) {
+      picked = b.dataset.path;
+      $('#dlg').close('ok');
+    }
+    if (e.target.id === 'bd-all') draw();
+  };
+  const v = await done;
+  clearInterval(timer);
+  $('#dlg').onclick = null;
+  if (v !== 'ok' || !picked) return;
+  const path = await act('Taking the download', () => call('take_browser_download', { path: picked, page: p.page }), { reload: false, problem: true });
+  if (typeof path === 'string') install([path], at);
 }
 
 // ---- Add-ons ----------------------------------------------------------------------------------
@@ -3658,7 +3760,7 @@ function renderDownloads() {
   const all = downloadsData, l = dlShown();
   for (const n of dlSel) if (!all.some(d => d.name === n)) dlSel.delete(n);
   $('#n-downloads').textContent = all.length || '';
-  $('#downloads-note').textContent = l.length === all.length ? 'Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.' : `${l.length.toLocaleString()} of ${plural(all.length, 'download')}`;
+  $('#downloads-note').textContent = l.length === all.length ? 'Files you get with From Nexus… or From a link… land here. Installing one leaves the file, so you can install it again later.' : `${l.length.toLocaleString()} of ${plural(all.length, 'download')}`;
   $('#downloads tbody').innerHTML = l.map(d => `<tr data-name="${esc(d.name)}"${dlSel.has(d.name) ? ' class="sel"' : ''}>
     <td class="check-col"><input type="checkbox" data-pick ${dlSel.has(d.name) ? 'checked' : ''}></td>
     <td class="name" title="${esc(d.name)}">${esc(d.name)}</td>
@@ -3761,7 +3863,7 @@ async function install(paths, at = null, nx0 = null) {
     const same = await call('same_mod', { path, mod_id: nx?.nexus?.mod_id ?? null }).catch(() => null);
     if (same) {
       const [id, name] = same;
-      const v = await dialog({ title: `Update ${name}?`, body: `<p><b>${esc(basename(path))}</b> looks like another version of <b>${esc(name)}</b>: the same Nexus mod.</p><p class="muted small">Update replaces its files and keeps its place, notes, categories, colour and rules; Undo puts the old files back. Install as a new mod keeps both.</p>`,
+      const v = await dialog({ title: `Update ${name}?`, body: `<p><b>${esc(basename(path))}</b> looks like another version of <b>${esc(name)}</b>: the same mod page.</p><p class="muted small">Update replaces its files and keeps its place, notes, categories, colour and rules; Undo puts the old files back. Install as a new mod keeps both.</p>`,
         actions: [['cancel', 'Cancel'], ['new', 'Install as a new mod'], ['ok', 'Update', 'primary']] });
       if (v === 'ok') await updateMod(id, path, nx);
       if (v !== 'new') continue;

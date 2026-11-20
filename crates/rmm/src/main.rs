@@ -2,7 +2,7 @@ use rmm::{http, mcp};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rmm_core::{Game, Instance, addons, bisect, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, settings, tools};
+use rmm_core::{Game, Instance, addons, bisect, conflicts, deploy, game, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, settings, tools, web};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -45,10 +45,14 @@ enum Cmd {
     /// List mods in priority order (last wins).
     Mods,
     Show { id: String },
-    /// Install from a folder, .zip, .7z or .rar. It goes at the end (before generated tool output) or
-    /// where mod rules place it, unless --at gives a priority.
+    /// Install from a folder, .zip, .7z or .rar, or a link to download it from (a GitHub
+    /// repository or release, a ModDB page, a direct link to an archive). It goes at the end
+    /// (before generated tool output) or where mod rules place it, unless --at gives a priority.
     Install {
         path: PathBuf,
+        /// The file to take when the link offers several (`rmm link show` lists them).
+        #[arg(long)]
+        file: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -492,6 +496,9 @@ enum Cmd {
     /// Nexus Mods: API key, update checks, downloads.
     #[command(subcommand)]
     Nexus(NexusCmd),
+    /// Mods from GitHub, ModDB and other links (`rmm install <link>` installs one).
+    #[command(subcommand)]
+    Link(LinkCmd),
     /// What the website's "Mod manager download" button runs where rmm-app isn't installed (rmm-app
     /// takes the same arguments): hands the nxm:// link to the rmm window for the instance,
     /// starting it if it's closed, where FOMOD installers show their options. Without the window program beside rmm,
@@ -611,6 +618,34 @@ enum ImportCmd {
         #[arg(long)]
         apply: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum LinkCmd {
+    /// What a link offers: its site, the mod's name and the files to choose from. Sites that need
+    /// your sign-in (LoversLab, AFK Mods, Patreon) say so: download those in your browser and
+    /// `rmm install` the file.
+    Show { url: String },
+    /// Download a link's file into the downloads folder without installing it.
+    Download {
+        url: String,
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Mods with a newer GitHub release (default: all from GitHub), leaving out held ones.
+    Updates { ids: Vec<String> },
+    /// Update a mod to its GitHub repository's latest release, as one undoable step.
+    Update {
+        id: String,
+        /// The release's file, when `rmm link updates` couldn't tell which replaces the old one.
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        run_script: bool,
+    },
+    /// Skip a newer version of a mod; a later one is offered again. `rmm nexus hold` pins or
+    /// releases any mod.
+    Skip { id: String, version: String },
 }
 
 #[derive(Subcommand)]
@@ -917,9 +952,18 @@ fn run() -> Result<()> {
         }
         Cmd::Mods => print(&ops::list_mods(&open()?)?),
         Cmd::Show { id } => print(&ops::mod_details(&open()?, &id, usize::MAX)?),
-        Cmd::Install { path, name, at, disabled, choices, run_script } => {
+        Cmd::Install { path, file, name, at, disabled, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&rmm_core::csharp::allowing(run_script, || install::install_at(&open()?, &path, name.as_deref(), !disabled, choices.as_ref(), at))?)
+            let inst = open()?;
+            let link = path.to_str().filter(|p| p.starts_with("https://") || p.starts_with("http://"));
+            let (path, name) = match link {
+                Some(url) => {
+                    let f = web::download(&inst, url, file.as_deref())?;
+                    (f.path, name.or(f.name))
+                }
+                None => (path, name),
+            };
+            print(&rmm_core::csharp::allowing(run_script, || install::install_at(&inst, &path, name.as_deref(), !disabled, choices.as_ref(), at))?)
         }
         Cmd::Fomod { path, choices } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
@@ -1231,6 +1275,11 @@ fn run() -> Result<()> {
         Cmd::Nexus(NexusCmd::Requirements { install: true }) => print(&nexus::install_lacking(&open()?, &nexus::Client::from_env()?)?),
         Cmd::Nexus(NexusCmd::Identify { names }) => print(&nexus::identify(&open()?, &nexus::Client::from_env()?, &names)?),
         Cmd::Nexus(NexusCmd::Info { mod_id }) => print(&nexus::mod_info(&open()?, &nexus::Client::any(), mod_id)?),
+        Cmd::Link(LinkCmd::Show { url }) => print(&web::plan(&url)?),
+        Cmd::Link(LinkCmd::Download { url, file }) => print(&web::download(&open()?, &url, file.as_deref())?),
+        Cmd::Link(LinkCmd::Updates { ids }) => print(&web::check_updates(&open()?, (!ids.is_empty()).then_some(ids.as_slice()))?),
+        Cmd::Link(LinkCmd::Update { id, file, run_script }) => print(&rmm_core::csharp::allowing(run_script, || web::update(&open()?, &id, file.as_deref(), None))?),
+        Cmd::Link(LinkCmd::Skip { id, version }) => web::skip(&open()?, &id, &version),
         Cmd::Nexus(NexusCmd::Updates { ids }) => {
             print(&nexus::check_updates(&open()?, &nexus::Client::from_env()?, (!ids.is_empty()).then_some(ids.as_slice()))?)
         }

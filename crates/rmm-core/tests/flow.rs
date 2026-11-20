@@ -4596,3 +4596,30 @@ fn stale_output_counts_only_what_the_tool_reads() {
     assert!(s[0].unknown, "{s:?}");
     assert!(health::check(&inst).unwrap().iter().any(|i| i.kind == "stale_output" && i.severity == "info" && i.subject == out));
 }
+
+#[test]
+fn a_download_from_a_link_keeps_its_page() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("game/SkyrimSE.exe"), "exe");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &tmp.path().join("game"), &tmp.path().join("local")).unwrap();
+    let dl = inst.downloads_dir();
+    write(&dl.join("Tool v1/SKSE/Plugins/tool.dll"), "v1");
+    write(&dl.join("Tool v2/SKSE/Plugins/tool.dll"), "v2");
+    // What `web::download` records for each file it fetches.
+    let page = "https://github.com/someone/tool";
+    write(&dl.join(".web.json"), serde_json::json!({
+        "tool v1": { "page": page, "version": "v1", "file": "Tool v1" },
+        "tool v2": { "page": page, "version": "v2", "file": "Tool v2" },
+    }).to_string());
+    let id = install::install(&inst, &dl.join("Tool v1"), None, true, None).unwrap().id;
+    assert_eq!(inst.mod_meta(&id).web.unwrap().version.as_deref(), Some("v1"));
+    assert_eq!(ops::list_mods(&inst).unwrap()[0].web.as_deref(), Some(page));
+
+    // The next release from the same page is that mod's update, and keeps the page with its version.
+    assert_eq!(install::same_mod(&inst, &dl.join("Tool v2"), None).unwrap().map(|m| m.0), Some(id.clone()));
+    install::update(&inst, &id, &dl.join("Tool v2"), None).unwrap();
+    assert_eq!(inst.mod_meta(&id).web.unwrap().version.as_deref(), Some("v2"));
+    rmm_core::web::skip(&inst, &id, "v3").unwrap();
+    assert_eq!(inst.mod_meta(&id).skip_version.as_deref(), Some("v3"));
+}

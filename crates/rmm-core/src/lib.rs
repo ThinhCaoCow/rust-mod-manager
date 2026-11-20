@@ -30,6 +30,7 @@ pub mod settings;
 pub mod support;
 pub mod tools;
 pub mod userpath;
+pub mod web;
 pub mod workspace;
 #[cfg(target_os = "linux")]
 pub mod vfs;

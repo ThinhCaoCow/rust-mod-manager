@@ -357,6 +357,19 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "nexus_set_key" => nexus::set_key(&s("key")?)?,
         "nexus_sso" => nexus::sso(&nexus::open_in_browser)?,
         "nexus_forget_key" => json!(nexus::forget_key()?),
+        "link_plan" => json!(rmm_core::web::plan(&s("url")?)?),
+        "link_download" => json!(rmm_core::web::download(&inst, &s("url")?, a["file"].as_str())?),
+        "link_updates" => json!(rmm_core::web::check_updates(&inst, None)?),
+        "link_skip" => json!(rmm_core::web::skip(&inst, &s("id")?, &s("version")?)?),
+        "browser_downloads" => json!(rmm_core::web::browser_downloads(a["since"].as_u64().unwrap_or(0))),
+        "take_browser_download" => json!(rmm_core::web::take_browser_download(&inst, Path::new(&s("path")?), a["page"].as_str())?),
+        "open_page" => {
+            let url = s("url")?;
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                anyhow::bail!("not a web link: {url}");
+            }
+            json!(nexus::open_in_browser(&url)?)
+        }
         "check_updates" => json!(nexus::check_updates(&inst, &nexus::Client::from_env()?, None)?),
         "identify_downloads" => json!(nexus::identify(&inst, &nexus::Client::from_env()?, &serde_json::from_value::<Vec<String>>(a["names"].clone()).unwrap_or_default())?),
         "hold_updates" => json!(nexus::hold_updates(&inst, &serde_json::from_value::<Vec<String>>(a["ids"].clone())?, serde_json::from_value(a["hold"].clone())?)?),
