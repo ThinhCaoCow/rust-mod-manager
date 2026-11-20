@@ -141,9 +141,16 @@ namespace rmm
 			return error;
 		}
 
-		void reply(std::int64_t a_id, const std::string& a_error)
+		// "out" is the error when there is one, else what the command printed.
+		void reply(std::int64_t a_id, const std::string& a_error, const std::string& a_out = {})
 		{
-			send({ { "ev", "result" }, { "id", a_id }, { "ok", a_error.empty() }, { "out", a_error } });
+			send({ { "ev", "result" }, { "id", a_id }, { "ok", a_error.empty() }, { "out", a_error.empty() ? a_out : a_error } });
+		}
+
+		std::string console(const std::string& a_line)
+		{
+			std::string out;
+			return game.console(a_line, out);
 		}
 
 		void handle(const nlohmann::json& a_cmd)
@@ -151,12 +158,16 @@ namespace rmm
 			const auto id = a_cmd.value("id", std::int64_t{ 0 });
 			const auto cmd = a_cmd.value("cmd", std::string{});
 			if (cmd == "console") {
-				game.on_main_thread([id, line = a_cmd.value("line", std::string{})] { reply(id, game.console(line)); });
+				game.on_main_thread([id, line = a_cmd.value("line", std::string{})] {
+					std::string out;
+					const auto  error = game.console(line, out);
+					reply(id, error, out);
+				});
 			} else if (cmd == "load_save") {
 				game.on_main_thread([id, name = a_cmd.value("name", std::string{})] { reply(id, game.load_save(name)); });
 			} else if (cmd == "quit") {
 				reply(id, "");
-				game.on_main_thread([] { game.console("qqq"); });
+				game.on_main_thread([] { console("qqq"); });
 			} else if (cmd == "screenshot") {
 				reply(id, capture(a_cmd.value("path", std::string{})));
 			} else {
@@ -192,7 +203,7 @@ namespace rmm
 				}
 				sock = s;
 				up = true;
-				send_line(nlohmann::json{ { "ev", "hello" }, { "token", a_token }, { "runtime", a_runtime } }.dump() + "\n");
+				send_line(nlohmann::json{ { "ev", "hello" }, { "token", a_token }, { "runtime", a_runtime }, { "console_output", game.console_output } }.dump() + "\n");
 				for (const auto& line : backlog) {
 					send_line(line);
 				}

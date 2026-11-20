@@ -6,9 +6,9 @@
 //! game from the main menu) while sampling FPS, then quit. The port and a one-time token reach the plugin as the environment
 //! variables `RMM_HARNESS_PORT` and `RMM_HARNESS_TOKEN`, which the loader passes on to the game.
 //! The protocol is JSON lines:
-//!   plugin -> rmm  {"ev":"hello","token":"…","runtime":"1.6.1170"}  {"ev":"data_loaded"}
+//!   plugin -> rmm  {"ev":"hello","token":"…","runtime":"1.6.1170","console_output":true}  {"ev":"data_loaded"}
 //!                  {"ev":"main_menu"}  {"ev":"game_loaded","save":"…"} (a loading screen closed in the world)  {"ev":"heartbeat","fps":58.2,"cell":"…"}
-//!                  {"ev":"result","id":N,"ok":true,"out":"…"}
+//!                  {"ev":"result","id":N,"ok":true,"out":"…"} (what a console line printed, when the hello says console_output; else why it failed)
 //!   rmm -> plugin  {"id":N,"cmd":"load_save","name":"…"}
 //!                  {"id":N,"cmd":"console","line":"coc Riverwood"}  {"id":N,"cmd":"screenshot","path":"…png"}
 //!                  {"id":N,"cmd":"quit"}
@@ -76,8 +76,10 @@ pub enum Step {
     /// starts the game there.
     Cell(String),
     /// Run a console command: player.moveto, movetoqt, setstage, startquest, player.placeatme,
-    /// player.additem, player.addspell, tgm, tai, fw, set gamehour to 22... Its text output isn't
-    /// read back: follow it with wait and screenshot to see what it did.
+    /// player.additem, player.addspell, tgm, tai, fw, set gamehour to 22... What it prints comes
+    /// back as the step's output, so queries work too: getstage <quest>, player.getav health,
+    /// player.getpos x, sqv <quest>, help <word> (with a harness plugin built with console output;
+    /// an older one gives none).
     Console(String),
     /// Let the game run this many seconds (at most 600), sampling FPS.
     Wait(u64),
@@ -100,6 +102,9 @@ pub struct StepResult {
     pub cell: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot: Option<std::path::PathBuf>,
+    /// What a console step printed ("" when it printed nothing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -456,7 +461,7 @@ fn shot(c: &mut Conn, dir: Option<&Path>, name: &str, alive: &dyn Fn() -> bool, 
 
 /// Do one step; its failure is in the result.
 fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, alive: &dyn Fn() -> bool) -> StepResult {
-    let mut res = StepResult { step: step.clone(), ok: true, error: None, fps: None, cell: None, screenshot: None };
+    let mut res = StepResult { step: step.clone(), ok: true, error: None, fps: None, cell: None, screenshot: None, output: None };
     let console = |c: &mut Conn, line: String| c.command(json!({ "cmd": "console", "line": line }), Duration::from_secs(60), alive);
     let done = match step {
         // A cell that doesn't exist never loads; the console doesn't say so.
@@ -464,7 +469,11 @@ fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, 
             .and_then(|_| c.until("game_loaded", timeout, alive).map_err(|e| if alive() { anyhow::anyhow!("{cell} didn't load") } else { e }))
             .map(drop),
         Step::Load(save) => c.command(json!({ "cmd": "load_save", "name": save }), Duration::from_secs(30), alive).and_then(|_| c.until("game_loaded", Duration::from_secs(300), alive)).map(drop),
-        Step::Console(line) => console(c, line.clone()).map(drop),
+        Step::Console(line) => console(c, line.clone()).map(|v| {
+            if c.console_output {
+                res.output = Some(v["out"].as_str().unwrap_or("").trim_end().to_owned());
+            }
+        }),
         Step::Wait(n) => c.sample(Duration::from_secs((*n).min(600)), alive).map(|f| res.fps = fps(&f)),
         Step::Screenshot(name) => match shots {
             Some(dir) => screenshot(c, dir, name, alive).map(|f| res.screenshot = Some(f)),
@@ -638,6 +647,7 @@ impl Server {
                     let mut c = Conn::new(stream)?;
                     let Some(hello) = c.read(Duration::from_secs(10))? else { continue };
                     if hello["ev"] == "hello" && hello["token"] == self.token.as_str() {
+                        c.console_output = hello["console_output"] == true;
                         return Ok((c, hello["runtime"].as_str().map(str::to_owned)));
                     }
                 }
@@ -670,11 +680,13 @@ pub struct Conn {
     notes: Vec<String>,
     /// The player's cell in the last heartbeat.
     cell: Option<String>,
+    /// The plugin sends back what console lines print.
+    console_output: bool,
 }
 
 impl Conn {
     fn new(stream: TcpStream) -> Result<Self> {
-        Ok(Conn { writer: stream.try_clone()?, reader: BufReader::new(stream), next: 1, fps: vec![], early: vec![], notes: vec![], cell: None })
+        Ok(Conn { writer: stream.try_clone()?, reader: BufReader::new(stream), next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false })
     }
 
     /// The next event, or None when nothing came within `wait`.
@@ -785,7 +797,7 @@ mod tests {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
             let mut rd = BufReader::new(s.try_clone().unwrap());
             let mut send = |v: Value| writeln!(s, "{v}").unwrap();
-            send(json!({"ev": "hello", "token": token, "runtime": "1.6.1170"}));
+            send(json!({"ev": "hello", "token": token, "runtime": "1.6.1170", "console_output": true}));
             send(json!({"ev": "data_loaded"}));
             send(json!({"ev": "main_menu"}));
             let mut seen = vec![];
@@ -809,7 +821,8 @@ mod tests {
                         if !cmd["line"].as_str().unwrap().ends_with(fail_cell) {
                             send(json!({"ev": "game_loaded", "save": ""}));
                         }
-                        send(json!({"ev": "result", "id": id, "ok": true, "out": ""}));
+                        let out = if cmd["line"] == "player.getav health" { "GetActorValue: Health >> 120.00\n" } else { "" };
+                        send(json!({"ev": "result", "id": id, "ok": true, "out": out}));
                     }
                     "screenshot" => send(json!({"ev": "result", "id": id, "ok": true})),
                     "quit" => {
@@ -832,17 +845,19 @@ mod tests {
         let alive = || !plugin.is_finished(); // the game quits when the plugin is told to
         let (conn, runtime) = server.accept(Duration::from_secs(10), &alive).unwrap();
         assert_eq!(runtime.as_deref(), Some("1.6.1170"));
-        let steps = vec![Step::Console("tgm".into()), Step::Wait(1), Step::Screenshot("after tgm".into())];
+        let steps = vec![Step::Console("tgm".into()), Step::Wait(1), Step::Screenshot("after tgm".into()), Step::Console("player.getav health".into())];
         let s = Scenario { cells: vec!["Riverwood".into(), "Nowhere".into()], dwell: Some(1), timeout: Some(2), steps, ..Default::default() };
         let mut r = TestRun::default();
         drive(conn, &s, Instant::now(), Some(Path::new("shots")), &alive, &mut r);
-        assert_eq!(plugin.join().unwrap(), ["console coc Riverwood", "screenshot", "console coc Nowhere", "console tgm", "screenshot", "quit"]);
+        assert_eq!(plugin.join().unwrap(), ["console coc Riverwood", "screenshot", "console coc Nowhere", "console tgm", "screenshot", "console player.getav health", "quit"]);
         assert_eq!(r.screenshots, [Path::new("shots").join("Riverwood.png"), Path::new("shots").join("after_tgm.png")]);
         assert!(!r.passed);
         assert_eq!(r.summary, "couldn't go to Nowhere");
         assert!(r.steps.iter().all(|s| s.ok && s.cell.as_deref() == Some("x")), "{:?}", r.steps);
         let json = serde_json::to_value(&s.steps).unwrap();
-        assert_eq!(json, serde_json::json!([{"console": "tgm"}, {"wait": 1}, {"screenshot": "after tgm"}]), "steps read as the docs say");
+        assert_eq!(json, serde_json::json!([{"console": "tgm"}, {"wait": 1}, {"screenshot": "after tgm"}, {"console": "player.getav health"}]), "steps read as the docs say");
+        let out: Vec<Option<&str>> = r.steps.iter().map(|s| s.output.as_deref()).collect();
+        assert_eq!(out, [Some(""), None, None, Some("GetActorValue: Health >> 120.00")], "console steps carry what they printed");
         assert_eq!(r.cells[0].fps, Some(Fps { avg: 52.8, min: 45.5, samples: 2 }));
         assert_eq!(r.cells[1].error.as_deref(), Some("Nowhere didn't load"));
         assert!(["data_loaded", "main_menu", "game_loaded"].iter().all(|k| r.timings.contains_key(*k)), "{:?}", r.timings);

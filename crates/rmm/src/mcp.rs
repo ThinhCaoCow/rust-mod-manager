@@ -1272,7 +1272,7 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; its text output isn't read back), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window; open it to see the game), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell and the screenshot's path. If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
+    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window; open it to see the game), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
     async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<String, String> {
         let mut slot = self.session.lock().unwrap();
         let Some(session) = slot.as_mut() else {
@@ -1515,11 +1515,12 @@ The game runs in a small window behind the user's windows, so you see it only th
    - Items and magic: player.additem <form id> 1, player.equipitem <form id>, player.addspell <form id>; wait, screenshot.
    - World: fw <weather form id>, set gamehour to 22, set timescale to 200 to let time pass; wait.
    - Scripts: wait long enough for them to run (30 to 60 seconds) and read the Papyrus log at the end.
+   - Checks: console queries answer in the step's output. getstage <quest editor id> (did the quest advance), player.getav <actor value>, player.getitemcount <form id>, player.getpos x/y/z, getglobalvalue <global>, sqv <quest editor id> (its stage, aliases and variables), help <word> 4 (find an id by name). Prefer these to a screenshot when the answer is a number.
 2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Open every screenshot before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
 3. If the game closes, the step's answer ends the session with the crash log read back to the mods it names: report that to the lead and stop.
 4. test_session_stop when done: crash, Papyrus errors with their mods, FPS.
 5. Report per mechanic: worked, didn't, or couldn't tell, with the screenshots; crashes and script errors with the mods behind them; the lowest FPS and where. Don't change the setup: fixing is the installer's job.
-Limits: console commands run, but their text output isn't read back, and you can't press keys or walk except through the console (coc, player.moveto, player.setpos).";
+Limits: you can't press keys or walk except through the console (coc, player.moveto, player.setpos). A console step without output means the harness plugin predates console output.";
 
 const LEAD: &str = "\
 You lead rmm's mod team for this {game} setup. The user wants: {request}

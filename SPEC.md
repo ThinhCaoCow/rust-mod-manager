@@ -377,18 +377,23 @@ Sorting uses the `libloot` crate (0.29, pure Rust, GPL-3.0-or-later).
 `harness/skse` (CommonLibSSE-NG) and `harness/f4se` (CommonLibF4) are two small C++ plugins, `rmm_harness.dll`, with their shared part in `harness/common`. `harness/README.md` says how to build them. The user installs the DLL as a mod (`SKSE/Plugins` or `F4SE/Plugins`). `test_run` sets `RMM_HARNESS_PORT` and `RMM_HARNESS_TOKEN` for the game, which the loader passes on. The plugin then connects back over **TCP 127.0.0.1**, which works through Proton, unlike named pipes. Without those variables it does nothing. The protocol is JSON lines:
 
 - **Plugin → manager:**
-  - `{"ev":"hello","token":"…","runtime":"1.6.1170"}` (a wrong token is turned away)
+  - `{"ev":"hello","token":"…","runtime":"1.6.1170","console_output":true}` (a wrong token is turned away; `console_output` says results of console lines carry what they printed)
   - `{"ev":"data_loaded"}`
   - `{"ev":"main_menu"}`
   - `{"ev":"game_loaded","save":"…"}`: a loading screen closed with the player in the world, after a save or a `coc`
   - `{"ev":"heartbeat","fps":58.2,"cell":"…"}`, every second
   - `{"ev":"note","what":"MainMenu opened"}`: a step on the way (a menu opening or closing, data starting to load). rmm keeps the last 12 and names them when a wait gives up, so a timeout says where the game stopped
-  - `{"ev":"result","id":N,"ok":true,"out":"…"}`
+  - `{"ev":"result","id":N,"ok":true,"out":"…"}`: `out` is why it failed, or what a console line printed
 - **Manager → plugin**, run on the game's main thread:
   - `{"id":N,"cmd":"load_save","name":"…"}`
   - `{"id":N,"cmd":"console","line":"coc Riverwood"}`
   - `{"id":N,"cmd":"screenshot","path":"…png"}`: a PNG of the game's window, read with `PrintWindow`, so it works while other windows cover the game
   - `{"id":N,"cmd":"quit"}`
+
+**Console output.** A console line's result carries the text it printed, and the step's result has it as `output` (`""` when nothing was printed; missing with a plugin that predates this). The line runs in console mode, as if typed, since some commands print only then.
+- Skyrim: every printed line goes through `ConsoleLog::VPrint` (Address Library 50180 / 51110). In a game rmm started, the plugin puts a detour on it: a 5-byte jump to its own function, which copies the lines printed on the main thread while rmm's line runs, then calls the original through a stub holding the moved first instruction. It does this only when the function starts with the 16 bytes it has on 1.6.1170 (the ones Console Link checks for), so another runtime or another plugin's hook there is left alone. Then it falls back to the text the console log's buffer gained during the line. Which one is in use is a note at the start (`console output: hooked`).
+- Fallout 4: the text `ConsoleLog::buffer` gained while `Console::ExecuteCommand` ran.
+- Checked in Skyrim AE 1.6.1170 (SKSE 2.2.6) on the 50-mod test setup: in Riverwood, `player.getav health`, `getstage MQ101`, `player.getpos x`, `getglobalvalue gamehour`, `player.getitemcount f`, a 150-line `help riverwood 4` and an unknown command ("Script command … not found.") each came back with exactly their own lines. Not checked yet: the Skyrim fallback (the buffer, while the console is closed), and Fallout 4, whose buffer may be capped (a capped buffer that drops its oldest text would lose output).
 
 `test_run` (CLI `rmm test-run`) goes through these steps:
 1. Deploy.
@@ -403,7 +408,7 @@ The game runs in a small window behind the others, so a run doesn't take over th
 A scenario can also carry `steps`, a test plan run after the save and the cells. Each step is one of:
 
 - `{"cell": id}`: `coc`, then wait for the load.
-- `{"console": line}`: any console command. Its text output isn't read back.
+- `{"console": line}`: any console command. What it prints is the step's `output`, so queries such as `getstage`, `player.getav`, `player.getpos` and `sqv` answer.
 - `{"wait": seconds}`: let the game run, sampling FPS.
 - `{"screenshot": name}`: a PNG of the window.
 - `{"load": save}`: load a save and wait for it.
