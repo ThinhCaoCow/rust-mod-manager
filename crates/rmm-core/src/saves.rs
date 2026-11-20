@@ -279,7 +279,7 @@ impl Needs {
     }
 }
 
-fn ext(game: Game) -> &'static str {
+pub(crate) fn ext(game: Game) -> &'static str {
     match game.base() {
         Game::Fallout4 => "fos",
         _ => "ess",

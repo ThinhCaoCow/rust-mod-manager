@@ -322,6 +322,22 @@ fn fps(samples: &[f64]) -> Option<Fps> {
 }
 
 /// The harness plugin's DLL, relative to Data.
+/// Refuse to load a save the game doesn't have: Skyrim takes the name without a word and the
+/// step would wait minutes for a load that never comes.
+pub fn check_saves(inst: &Instance, steps: &[Step]) -> Result<()> {
+    let Some(dir) = crate::profile_ini::save_dir(inst, &inst.profile()?).filter(|d| d.is_dir()) else { return Ok(()) };
+    let ext = crate::saves::ext(inst.config.game);
+    for step in steps {
+        if let Step::Load(name) = step
+            && !dir.join(format!("{name}.{ext}")).is_file()
+            && !dir.join(name).is_file()
+        {
+            bail!("there's no save named '{name}' in {} (name it without .{ext})", dir.display());
+        }
+    }
+    Ok(())
+}
+
 pub fn harness_dll(game: Game) -> &'static str {
     if game.base() == Game::SkyrimSe { "SKSE/Plugins/rmm_harness.dll" } else { "F4SE/Plugins/rmm_harness.dll" }
 }
@@ -381,6 +397,7 @@ struct Run {
 
 impl Run {
     fn begin(inst: &Instance, s: &Scenario) -> Result<Run> {
+        check_saves(inst, s.save.iter().map(|x| Step::Load(x.clone())).chain(s.steps.iter().cloned()).collect::<Vec<_>>().as_slice())?;
         let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().saturating_sub(2);
         let before = logs::crash_logs(inst).into_iter().map(|l| l.path).collect();
         let mut r = TestRun::default();
@@ -944,7 +961,9 @@ impl Server {
 }
 
 pub struct Conn {
-    reader: BufReader<TcpStream>,
+    /// Lines from the game, read as they come by a thread of rmm's: a socket left unread fills,
+    /// and the plugin's next send would then hold up the game's main thread.
+    lines: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     writer: TcpStream,
     next: u64,
     /// FPS from heartbeats seen while waiting for something else.
@@ -962,18 +981,39 @@ pub struct Conn {
     events: Vec<Value>,
 }
 
+impl Drop for Conn {
+    /// Ends the reading thread with the connection.
+    fn drop(&mut self) {
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 impl Conn {
     fn new(stream: TcpStream) -> Result<Self> {
-        Ok(Conn { writer: stream.try_clone()?, reader: BufReader::new(stream), next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![] })
+        let writer = stream.try_clone()?;
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = Vec::new();
+                let got = reader.read_until(b'\n', &mut line);
+                let end = !matches!(got, Ok(n) if n > 0);
+                if tx.send(got.map(|_| line)).is_err() || end {
+                    return;
+                }
+            }
+        });
+        Ok(Conn { writer, lines, next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![] })
     }
 
     /// The next event, or None when nothing came within `wait`.
     fn read(&mut self, wait: Duration) -> Result<Option<Value>> {
-        self.reader.get_ref().set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => bail!("the game closed the harness connection"),
-            Ok(_) => {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.lines.recv_timeout(wait) {
+            Ok(Ok(line)) if line.is_empty() => bail!("the game closed the harness connection"),
+            Err(RecvTimeoutError::Disconnected) => bail!("the game closed the harness connection"),
+            Ok(Ok(line)) => {
+                let line = String::from_utf8_lossy(&line).into_owned();
                 let v: Value = serde_json::from_str(line.trim()).with_context(|| format!("bad harness message: {line}"))?;
                 if v["ev"] == "heartbeat"
                     && let Some(f) = v["fps"].as_f64()
@@ -996,8 +1036,8 @@ impl Conn {
                 }
                 Ok(Some(v))
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Ok(Err(e)) => Err(e.into()),
         }
     }
 
@@ -1120,6 +1160,31 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn a_message_split_by_a_timeout_comes_whole() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut game = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let mut c = Conn::new(l.accept().unwrap().0).unwrap();
+        game.write_all(br#"{"ev":"res"#).unwrap();
+        assert!(c.read(Duration::from_millis(100)).unwrap().is_none(), "half a message: wait for the rest");
+        game.write_all(b"ult\",\"id\":1}\n").unwrap();
+        assert_eq!(c.read(Duration::from_secs(2)).unwrap().unwrap()["ev"], "result");
+
+        // Between steps (the AI thinking) nothing asks for messages, yet the game's sends go
+        // through: a full socket would hold up its main thread.
+        game.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let beat = format!("{}\n", serde_json::json!({"ev": "heartbeat", "fps": 60.0, "cell": "x".repeat(200)}));
+        for _ in 0..40_000 {
+            game.write_all(beat.as_bytes()).expect("the game's send blocked");
+        }
+        drop(game);
+        let mut n = 0;
+        while c.read(Duration::from_secs(5)).is_ok_and(|v| v.is_some()) {
+            n += 1;
+        }
+        assert_eq!(n, 40_000);
     }
 
     #[test]

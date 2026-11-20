@@ -1357,6 +1357,7 @@ impl Rmm {
         let Some(session) = slot.as_mut() else {
             return Err("no live test is running; start one with test_session_start".into());
         };
+        self.inst().and_then(|i| rmm_core::harness::check_saves(&i, &a.steps)).map_err(|e| format!("{e:#}"))?;
         let steps = session.steps(&a.steps);
         let shots: Vec<_> = steps.iter().filter_map(|s| s.screenshot.as_deref()).filter_map(|p| shot_image(p).ok()).collect();
         let text = if session.alive() {
@@ -1782,6 +1783,7 @@ mod tests {
         assert_eq!(v["link"], "nxm://skyrimspecialedition/mods/9/files/2");
         assert!(v["text"].as_str().unwrap().len() < 2100);
         assert_eq!(v["n"], 3);
+        assert_ne!(chats::Chat::external("a").id, chats::Chat::external("b").id, "two sessions at once keep two chats");
     }
 
     #[test]
