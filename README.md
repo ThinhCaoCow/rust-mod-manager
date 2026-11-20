@@ -155,7 +155,7 @@ It also offers a mod team as four prompts, which clients show as commands:
 - `test_mods`, the tester: plays the game in a small window behind yours, step by step (teleports, fights, quest stages, items), and reports crashes, script errors and FPS.
 - `mod_team`, the lead: runs all three and guides the tester.
 
-Your AI client plays the roles (each with its own helper agent, where it can start them); rmm supplies the tools. Your own instructions for each role go on the window's MCP tab (`ai.role_instructions`).
+Your AI client plays the roles (each with its own helper agent, where it can start them); rmm supplies the tools. In Claude Code, `rmm tester-agent --apply` adds the tester as a helper agent on Haiku, the cheapest Claude model, so live tests (the step-by-step play, with the screenshots coming back as images) cost less; the lead hands them to it. Your own instructions for each role go on the window's MCP tab (`ai.role_instructions`).
 
 ## Layout
 

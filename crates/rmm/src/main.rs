@@ -428,6 +428,18 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// A Claude Code helper agent, rmm-tester, that plays live tests on Haiku, the cheapest Claude
+    /// model (they all see screenshots): the tester prompt and the lead hand it the test. Shows it;
+    /// --apply writes it to your Claude Code agents (~/.claude/agents), or --dir. --server is the
+    /// name rmm's MCP server was added under.
+    TesterAgent {
+        #[arg(long, default_value = "rmm")]
+        server: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Whether Steam may update the game. --hold makes the game's Steam manifest read-only so it
     /// can't (a copy goes to ini-backup/), --release lets Steam update it again.
     SteamUpdates {
@@ -1215,6 +1227,19 @@ fn run() -> Result<()> {
             let inst = open()?;
             let p = profile.unwrap_or_else(|| inst.config.profile.clone());
             print(&rmm_core::launch::shortcut(&inst, &p, &std::env::current_exe()?, dir.as_deref(), !apply)?)
+        }
+        Cmd::TesterAgent { server, dir, apply } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).context("no home folder; pass --dir")?).join(".claude").join("agents"),
+            };
+            let path = dir.join("rmm-tester.md");
+            let text = rmm::mcp::tester_agent(&server);
+            if apply {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(&path, &text)?;
+            }
+            print(&serde_json::json!({ "path": path, "written": apply, "agent": text }))
         }
         Cmd::SteamUpdates { hold: false, release: false } => print(&rmm_core::launch::steam_updates(&open()?)),
         Cmd::SteamUpdates { hold, .. } => print(&rmm_core::launch::hold_steam_updates(&open()?, hold)?),

@@ -4308,8 +4308,10 @@ name = "rmm"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "getrandom 0.3.4",
+ "png",
  "rmcp",
  "rmm-core",
  "schemars 1.2.3",

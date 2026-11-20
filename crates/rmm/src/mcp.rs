@@ -8,7 +8,7 @@ use rmcp::{
         tool::ToolCallContext,
         wrapper::Parameters,
     },
-    model::{CallToolRequestParams, CallToolResponse, Implementation, PromptMessage, Role, ServerCapabilities, ServerConfig},
+    model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, PromptMessage, Role, ServerCapabilities, ServerConfig},
     prompt, prompt_handler, prompt_router,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -687,6 +687,65 @@ fn out<T: Serialize>(r: anyhow::Result<T>) -> Result<String, String> {
     r.and_then(|v| Ok(serde_json::to_string_pretty(&v)?)).map_err(|e| format!("{e:#}"))
 }
 
+/// Widest screenshot an AI is sent; wider ones (a fullscreen run) are scaled down, which keeps
+/// each image near 1,200 tokens.
+const SHOT_WIDTH: u32 = 1280;
+
+/// A screenshot as an image for the AI, scaled down to `SHOT_WIDTH` when wider.
+fn shot_image(path: &std::path::Path) -> anyhow::Result<ContentBlock> {
+    use base64::Engine;
+    let bytes = std::fs::read(path)?;
+    let png = shrink_png(&bytes)?.unwrap_or(bytes);
+    Ok(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"))
+}
+
+/// The PNG scaled down by a whole factor (averaging each block of pixels) to at most
+/// `SHOT_WIDTH` wide, or None when it already fits.
+fn shrink_png(bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info()?;
+    let (w, h) = (reader.info().width, reader.info().height);
+    if w <= SHOT_WIDTH {
+        return Ok(None);
+    }
+    let mut buf = vec![0; reader.output_buffer_size().ok_or_else(|| anyhow::anyhow!("screenshot too large"))?];
+    let info = reader.next_frame(&mut buf)?;
+    let ch = info.color_type.samples();
+    let f = w.div_ceil(SHOT_WIDTH) as usize;
+    let (nw, nh) = (w as usize / f, h as usize / f);
+    let mut out = Vec::with_capacity(nw * nh * ch);
+    for y in 0..nh {
+        for x in 0..nw {
+            for c in 0..ch {
+                let sum: usize = (0..f).flat_map(|dy| (0..f).map(move |dx| (dy, dx))).map(|(dy, dx)| buf[((y * f + dy) * w as usize + x * f + dx) * ch + c] as usize).sum();
+                out.push((sum / (f * f)) as u8);
+            }
+        }
+    }
+    let mut png_out = Vec::new();
+    let mut enc = png::Encoder::new(&mut png_out, nw as u32, nh as u32);
+    enc.set_color(info.color_type);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header()?;
+    writer.write_image_data(&out)?;
+    writer.finish()?;
+    Ok(Some(png_out))
+}
+
+/// A Claude Code helper agent that plays live tests on Haiku, the cheapest Claude model (every
+/// Claude model reads images, so it sees the screenshots). `server` is the name rmm's MCP server
+/// was added under (`claude mcp add rmm ...`).
+pub fn tester_agent(server: &str) -> String {
+    let tools = ["test_session_start", "test_session_step", "test_session_stop", "plugin_records", "mod_reviews", "nexus_mod_info", "read_crash_log", "read_papyrus_log"]
+        .map(|t| format!("mcp__{server}__{t}"))
+        .join(", ");
+    let body = TESTER.replace("{game}", "game's").replace("{focus}", "what the lead asks for").replace("{save}", "what the lead says, or a cell from the main menu");
+    format!(
+        "---\nname: rmm-tester\ndescription: Plays the modded game through rmm's live test (test_session_start, test_session_step, test_session_stop) and reports what worked, crashes, script errors and FPS. Give it the test plan: the mods, what to test, where, the save. Use it for every live test: it runs on a cheaper model that sees the screenshots.\ntools: {tools}, Read\nmodel: haiku\n---\n\n{body}\n\nYou are a helper agent: the lead's message is your plan (it has asked the user about starting the game), and your final message is the report it reads.\n"
+    )
+}
+
 // ponytail: tools call blocking core functions directly; fine for one client on stdio.
 // Move to spawn_blocking if the UI ever hosts this over HTTP for several clients.
 #[tool_router]
@@ -1272,18 +1331,22 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window; open it to see the game), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
-    async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<String, String> {
+    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window, which comes back as an image after the results, in step order, at most 1280 wide), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
+    async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<CallToolResult, String> {
         let mut slot = self.session.lock().unwrap();
         let Some(session) = slot.as_mut() else {
             return Err("no live test is running; start one with test_session_start".into());
         };
         let steps = session.steps(&a.steps);
-        if session.alive() {
-            return out(Ok(serde_json::json!({ "steps": steps })));
-        }
-        let session = slot.take().expect("checked above");
-        out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": "the game closed", "run": session.stop(&i)? }))))
+        let shots: Vec<_> = steps.iter().filter_map(|s| s.screenshot.as_deref()).filter_map(|p| shot_image(p).ok()).collect();
+        let text = if session.alive() {
+            out(Ok(serde_json::json!({ "steps": steps })))?
+        } else {
+            let session = slot.take().expect("checked above");
+            out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": "the game closed", "run": session.stop(&i)? }))))?
+        };
+        // The screenshots come along as images, after the steps, in their order.
+        Ok(CallToolResult::success(std::iter::once(ContentBlock::text(text)).chain(shots).collect()))
     }
 
     #[tool(description = "End the live test: quit the game and report the whole session: every step, timings, FPS, screenshots, a crash log read back to mods, and the Papyrus log's errors with their mods. The INIs changed for the small window are put back.")]
@@ -1519,11 +1582,14 @@ The game runs in a small window behind the user's windows, so you see it only th
    - State: {\"state\": {\"quests\": [...], \"refs\": [...]}} gives the player, open menus, the nearest actors and objects with their refs, and what you ask about. Every step's answer also lists the game's events since the last one (deaths, the player's activations, combat, quest stages). {\"wait_for\": {\"dead\": \"<ref>\"}} (or stage, menu, menu_closed, in_combat, near, cell) waits for a condition instead of guessing a wait.
    - Playing: {\"move_to\": \"<ref>\"} walks there (or moves the player when something is in the way, and says so), {\"activate\": \"<ref>\"} opens doors and containers and starts conversations, {\"face\": \"<ref>\"}. {\"call\": {\"class\": \"Actor\", \"fn\": \"StartCombat\", \"self\": \"<ref>\", \"args\": [\"player\"]}} calls any Papyrus function and returns its value.
    - Skyrim only: {\"dialogue\": {}} lists the topics, {\"choose\": \"words\"} picks one and waits for the answer; {\"button\": 1} answers a message box; {\"attack\": {\"target\": \"<ref>\"}} swings at it (move_to first: 100 units is in reach); {\"press\": {\"control\": \"Jump\"}}.
-2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Open every screenshot before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
+2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Look at every screenshot (they come back as images with the step's answer) before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
 3. If the game closes, the step's answer ends the session with the crash log read back to the mods it names: report that to the lead and stop.
 4. test_session_stop when done: crash, Papyrus errors with their mods, FPS.
 5. Report per mechanic: worked, didn't, or couldn't tell, with the screenshots; crashes and script errors with the mods behind them; the lowest FPS and where. Don't change the setup: fixing is the installer's job.
 Limits: move_to walks in a straight line (no pathfinding). Fallout 4 has no dialogue, menu, attack or key steps yet: use the console and Papyrus calls there. A console step without output, or a step the plugin calls unknown, means the harness plugin is older than this rmm.";
+
+/// Where the client can start helper agents, the live test goes to a cheaper one.
+const HAND_OFF: &str = "If you can start helper agents and one named rmm-tester is available (Claude Code, after `rmm tester-agent --apply`), make the plan yourself and give the live test to it: it runs on Haiku, the cheapest Claude model, and sees the screenshots. Read its report and send it follow-ups. Otherwise run the test yourself.";
 
 const LEAD: &str = "\
 You lead rmm's mod team for this {game} setup. The user wants: {request}
@@ -1531,7 +1597,7 @@ You lead rmm's mod team for this {game} setup. The user wants: {request}
 The team has three roles, each with its own prompt on this server: researcher (find_mods), installer (install_safely) and tester (test_mods). Play each role yourself with its prompt, or hand it to a helper agent of your own if you can start them, giving it everything it needs from you.
 1. Researcher: a ranked list of candidates with confidence scores. Show it to the user, who picks. Never pick for them.
 2. Installer, for each pick: download, safety review (or the saved one), placement, deploy.
-3. Tester, guided by you: from the new mods' reviews, pages and plugin_records, decide what to test and where: combat, quests, items, magic, NPCs, weather and world, interface, and performance in heavy places (cities, big battles). Send the tester the plan, read its reports and screenshots, and send follow-up steps (another place, the next quest stage, a bigger fight) until each mechanic works or clearly fails.
+3. Tester, guided by you: from the new mods' reviews, pages and plugin_records, decide what to test and where: combat, quests, items, magic, NPCs, weather and world, interface, and performance in heavy places (cities, big battles). Send the tester the plan (in Claude Code the rmm-tester agent, on Haiku, when it is installed: `rmm tester-agent --apply`), read its reports and screenshots, and send follow-up steps (another place, the next quest stage, a bigger fight) until each mechanic works or clearly fails.
 4. Failures: a crash or script errors point at mods (read_crash_log, read_papyrus_log). Have the installer fix the order or rules or disable the culprit, or ask the user, then test again.
 5. Report to the user: what was installed, the review verdicts, order changes, what was tested and how it went.
 Ask the user before: downloads that need their click, starting the game (it uses their Steam account), and removing mods they had before.";
@@ -1579,7 +1645,9 @@ impl Rmm {
     async fn test_mods(&self, Parameters(a): Parameters<TestPromptArgs>) -> Vec<PromptMessage> {
         let focus = a.focus.unwrap_or_else(|| "the mods installed last".into());
         let save = a.save.unwrap_or_else(|| "a cell, from the main menu".into());
-        self.role("tester", TESTER, &[("focus", &focus), ("save", &save)])
+        let mut m = self.role("tester", TESTER, &[("focus", &focus), ("save", &save)]);
+        m.push(PromptMessage::new_text(Role::User, HAND_OFF));
+        m
     }
 
     #[prompt(description = "Lead: run the whole mod team for a request: research, the user's pick, install and review, then guide the tester through each mechanic.")]
@@ -1656,4 +1724,43 @@ fn app_name(peer: &Peer<RoleServer>) -> Option<String> {
 pub async fn serve(root: PathBuf) -> anyhow::Result<()> {
     Rmm::new(root).recorded_if_set().serve(stdio()).await?.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_of(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        let mut v = Vec::new();
+        let mut e = png::Encoder::new(&mut v, w, h);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        let mut wr = e.write_header().unwrap();
+        wr.write_image_data(&rgb.repeat((w * h) as usize)).unwrap();
+        wr.finish().unwrap();
+        v
+    }
+
+    #[test]
+    fn screenshots_shrink_to_the_ai_width() {
+        assert!(shrink_png(&png_of(960, 540, [1, 2, 3])).unwrap().is_none());
+        let small = shrink_png(&png_of(2560, 1440, [10, 200, 30])).unwrap().unwrap();
+        let mut r = png::Decoder::new(std::io::Cursor::new(&small)).read_info().unwrap();
+        assert_eq!((r.info().width, r.info().height), (1280, 720));
+        let mut buf = vec![0; r.output_buffer_size().unwrap()];
+        r.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..3], &[10, 200, 30]);
+        // 2600 wide takes a factor of 3.
+        let odd = shrink_png(&png_of(2600, 30, [0, 0, 0])).unwrap().unwrap();
+        assert_eq!(png::Decoder::new(std::io::Cursor::new(&odd)).read_info().unwrap().info().width, 866);
+    }
+
+    #[test]
+    fn the_tester_agent_names_the_servers_tools() {
+        let a = tester_agent("rmm");
+        assert!(a.starts_with("---\nname: rmm-tester\n"));
+        assert!(a.contains("\nmodel: haiku\n"));
+        assert!(a.contains("mcp__rmm__test_session_step"));
+        assert!(!a.contains("{focus}") && !a.contains("{game}"));
+    }
 }

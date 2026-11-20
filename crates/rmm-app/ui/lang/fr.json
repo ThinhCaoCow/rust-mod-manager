@@ -1738,5 +1738,6 @@
  "#{0} INI": "{0} INI",
  "#{0} INIs": "{0} INI",
  "#{0} matches": "{0} résultats",
- "1 match": "1 résultat"
+ "1 match": "1 résultat",
+ "Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:": "Claude Code : un testeur sur Haiku, le modèle Claude le moins cher, pour les tests en direct :"
 }

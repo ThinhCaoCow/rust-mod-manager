@@ -3630,17 +3630,21 @@ const snippet = (label, text) => `<p class="small">${label} <button class="small
 
 function drawMcp() {
   const json = server => JSON.stringify({ mcpServers: { rmm: server } }, null, 2);
+  // A helper agent the tester prompt hands live tests to (its tools are named after the server: rmm).
+  const tester = snippet('Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:', 'rmm tester-agent --apply');
   $('#mcp-http').innerHTML = mcpOn
     ? `<div class="row"><span class="pill win">On</span> <code>${esc(mcpOn.url)}</code><div class="spacer"></div><button data-mcp="off">Turn off</button></div>
        ${snippet('Claude Code:', `claude mcp add --transport http rmm ${mcpOn.url} --header "Authorization: Bearer ${mcpOn.token}"`)}
        ${snippet('Other apps (JSON settings):', json({ type: 'http', url: mcpOn.url, headers: { Authorization: `Bearer ${mcpOn.token}` } }))}
+       ${tester}
        <p class="muted small">It serves this instance on 127.0.0.1 with a private token, kept in your user folder. Anyone with the token can change this instance, so keep it to yourself. It stays on for the next window.</p>`
     : `<div class="row"><span class="muted">Off.</span><div class="spacer"></div><button class="primary" data-mcp="on">Turn on</button></div>
        <p class="muted small">For apps that connect to a running server. It serves the open instance on 127.0.0.1 with a private token, only while this window is open.</p>`;
   const root = S?.info?.root ?? '';
   $('#mcp-stdio').innerHTML = `<p class="muted small">For apps that start rmm themselves; nothing needs to be on here. They run <code>rmm mcp</code>, which the installer puts on PATH.</p>
     ${snippet('Claude Code:', `claude mcp add rmm -- rmm mcp -i "${root}"`)}
-    ${snippet('Claude Desktop, Cursor and other apps (JSON settings):', json({ command: 'rmm', args: ['mcp', '-i', root] }))}`;
+    ${snippet('Claude Desktop, Cursor and other apps (JSON settings):', json({ command: 'rmm', args: ['mcp', '-i', root] }))}
+    ${tester}`;
 }
 
 $('#pane-mcp').onclick = async e => {
