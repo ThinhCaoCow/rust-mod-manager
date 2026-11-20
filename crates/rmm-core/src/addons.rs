@@ -260,7 +260,16 @@ fn host_op(ctx: &Ctx, input: &str) -> Result<Value> {
                 (None, Some(t)) => t.as_bytes().to_vec(),
                 _ => bail!("give 'base64' or 'text'"),
             };
-            let path = inst.mod_dir(crate::instance::OVERWRITE).join(inside(s("path")?)?);
+            let rel = inside(s("path")?)?;
+            // Code the game or Windows would run is out of an add-on's reach: no files beside the
+            // game's exe (root/), no programs or plugins.
+            let ext = rel.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if rel.components().next().is_some_and(|c| c.as_os_str().eq_ignore_ascii_case("root"))
+                || ["dll", "exe", "asi", "bat", "cmd", "ps1", "vbs", "js", "com", "scr", "msi", "lnk"].contains(&ext.as_str())
+            {
+                bail!("add-ons can't write '{}': no root/ files or programs", rel.display());
+            }
+            let path = inst.mod_dir(crate::instance::OVERWRITE).join(rel);
             fs::create_dir_all(path.parent().unwrap())?;
             fs::write(path, data)?;
             Value::Null

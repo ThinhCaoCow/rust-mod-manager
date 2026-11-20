@@ -73,9 +73,14 @@ pub(crate) fn run(inst: &Instance, root: &Path, name: &str) -> Result<Outcome> {
     fs::write(work.join("shim.cs"), SHIM.replace("/*CALL*/", call))?;
     fs::write(work.join("script.cs"), code)?;
     fs::write(work.join("host.cs"), HOST)?;
+    fs::write(work.join("contract.cs"), CONTRACT)?;
     let csc = compiler()?;
-    compile(&csc, &work, &["/target:library", "/out:script.dll", "shim.cs", "script.cs"]).context("the mod's installer script doesn't compile")?;
-    compile(&csc, &work, &["/target:winexe", "/out:host.exe", "/r:script.dll", "host.cs"]).context("rmm's script host doesn't compile")?;
+    // The host never sees the script's types: compiled against script.dll, a type or extension
+    // method the script declares could take the place of one the host names, and run with the
+    // host's full trust.
+    compile(&csc, &work, &["/target:library", "/out:contract.dll", "contract.cs"]).context("rmm's script contract doesn't compile")?;
+    compile(&csc, &work, &["/target:library", "/out:script.dll", "/r:contract.dll", "shim.cs", "script.cs"]).context("the mod's installer script doesn't compile")?;
+    compile(&csc, &work, &["/target:winexe", "/out:host.exe", "/r:contract.dll", "host.cs"]).context("rmm's script host doesn't compile")?;
     fs::write(work.join("info.txt"), info(inst, name)?)?;
 
     crate::progress::report("running the mod's installer", 0, 0);
@@ -203,25 +208,6 @@ public struct SelectOption
     public SelectOption(string item, string preview, string desc) { Item = item; Preview = preview; Desc = desc; }
 }
 
-public interface IRmmBridge
-{
-    bool Install(string from, string to);
-    bool InstallAll();
-    string[] ModFiles();
-    byte[] ModFile(string path);
-    string[] DataFiles(string path, string pattern, bool all);
-    bool DataExists(string path);
-    byte[] DataFile(string path);
-    bool Generate(string path, byte[] data);
-    int Message(string text, string title, int buttons, string details);
-    int[] Select(string[] items, string[] previews, string[] descs, string title, bool many);
-    string Version(string what);
-    string[] Plugins(bool active);
-    void Activate(string plugin, bool on);
-    string IniGet(string file, string section, string key);
-    bool IniSet(string file, string section, string key, string value);
-}
-
 public class BaseScript
 {
     internal static IRmmBridge B;
@@ -290,14 +276,46 @@ public class BaseScript
     public static bool EditPrefsINI(string section, string key, string value, bool saveOld) { return B.IniSet("prefs", section, key, value); }
 }
 
-public class RmmLoader : MarshalByRefObject
+public class RmmLoader : MarshalByRefObject, IRmmLoader
 {
+    // Nothing the script throws leaves the sandbox: an exception crossing to the host would be
+    // rebuilt there, by the script's own code, with the host's trust.
     public string Run(IRmmBridge bridge)
     {
-        BaseScript.B = bridge;
-        try { return /*CALL*/ ? "ok" : "declined"; }
-        catch (Exception e) { return "error\n" + e; }
+        try
+        {
+            BaseScript.B = bridge;
+            try { return /*CALL*/ ? "ok" : "declined"; }
+            catch (Exception e) { return "error\n" + e; }
+        }
+        catch (Exception e) { return "error\n" + e.GetType().FullName; }
     }
+}
+"#;
+
+/// What the host and the script share, and nothing else of the script's: the calls each way.
+const CONTRACT: &str = r#"public interface IRmmLoader
+{
+    string Run(IRmmBridge bridge);
+}
+
+public interface IRmmBridge
+{
+    bool Install(string from, string to);
+    bool InstallAll();
+    string[] ModFiles();
+    byte[] ModFile(string path);
+    string[] DataFiles(string path, string pattern, bool all);
+    bool DataExists(string path);
+    byte[] DataFile(string path);
+    bool Generate(string path, byte[] data);
+    int Message(string text, string title, int buttons, string details);
+    int[] Select(string[] items, string[] previews, string[] descs, string title, bool many);
+    string Version(string what);
+    string[] Plugins(bool active);
+    void Activate(string plugin, bool on);
+    string IniGet(string file, string section, string key);
+    bool IniSet(string file, string section, string key, string value);
 }
 "#;
 
@@ -476,7 +494,7 @@ static class Host
             grant.AddPermission(new UIPermission(PermissionState.Unrestricted));
             var setup = new AppDomainSetup { ApplicationBase = work };
             var sandbox = AppDomain.CreateDomain("mod installer script", null, setup, grant);
-            var loader = (RmmLoader)sandbox.CreateInstanceAndUnwrap("script", "RmmLoader");
+            var loader = (IRmmLoader)sandbox.CreateInstanceAndUnwrap("script", "RmmLoader");
             result = loader.Run(bridge);
         }
         catch (Exception e) { result = "error\n" + e; }

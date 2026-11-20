@@ -68,6 +68,23 @@ fn mcp_over_http() {
     let text = rmm::chats::load_chat(&root, &chats[0].id).unwrap().transcript(10_000);
     assert!(text.contains("Call list_mods {}") && text.contains("AI: Checked the mods.\nNothing left.") && !text.contains("save_chat_note"), "{text}");
 
+    // A live test start gets as far as the missing harness plugin: the slot it holds while
+    // starting doesn't count as a test already running.
+    let start = json!({ "jsonrpc": "2.0", "id": "c3", "method": "tools/call", "params": { "name": "test_session_start", "arguments": { "dry_run": false, "scenario": {} } } });
+    let (_, _, r) = send(&addr, "POST", &[host, auth, session], &start);
+    let text = r["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+    assert!(text.contains("harness plugin") && !text.contains("a live test is running"), "{r}");
+
+    // Many calls at once, each giving up its worker while it runs, all come back.
+    let slow = json!({ "jsonrpc": "2.0", "id": "c4", "method": "tools/call", "params": { "name": "list_mods", "arguments": {} } });
+    let calls: Vec<_> = (0..32)
+        .map(|_| {
+            let (addr, sid, slow) = (addr.clone(), sid.clone(), slow.clone());
+            std::thread::spawn(move || send(&addr, "POST", &[("Host", addr.as_str()), ("Authorization", "Bearer t0ken"), ("Mcp-Session-Id", sid.as_str())], &slow).0)
+        })
+        .collect();
+    assert!(calls.into_iter().all(|c| c.join().unwrap() == 200));
+
     assert_eq!(send(&addr, "DELETE", &[host, auth, session], &Value::Null).0, 200);
     assert_eq!(send(&addr, "POST", &[host, auth, session], &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).0, 404, "ended");
     drop(server);

@@ -706,6 +706,13 @@ fn bain_packages_install_the_sub_packages_picked() {
     let defaults = install::install(&inst, &src.join("Pack"), Some("Pack defaults"), true, Some(&Choices::default())).unwrap();
     assert_eq!(read(&inst.mod_dir(&defaults.id).join("textures/a.dds")), "core");
 
+    // A sub-package that keeps its files in a Data folder installs them at the top, not Data/Data.
+    let nested = src.join("Nested");
+    write(&nested.join("00 Core/Data/Core.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&nested.join("10 Extra/Data/textures/e.dds"), "e");
+    let r = install::install(&inst, &nested, Some("Nested"), true, Some(&Choices::default())).unwrap();
+    assert_eq!(inst.mod_files(&r.id).unwrap(), ["Core.esp"]);
+
     // A folder that isn't Data-like means it isn't BAIN: the old guess stays.
     write(&src.join("Loose/One/textures/x.dds"), "x");
     write(&src.join("Loose/Two/notes.txt"), "n");
@@ -760,6 +767,21 @@ class Script : Fallout3BaseScript {
     let err = csharp::allowing(true, || install::install(&inst, &src.join("Escape"), None, true, None)).unwrap_err().to_string();
     assert!(err.contains("outside the mod"), "{err}");
     assert!(!escape.exists());
+
+    // Nor by a type of its own that the host would name: a global PermissionSet runs in the host
+    // if the host is compiled against the script.
+    write(&src.join("Hijack/a.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Hijack/fomod/script.cs"), format!(
+        r#"class Script : BaseScript {{ public static bool OnActivate() {{ return PerformBasicInstall(); }} }}
+public class PermissionSet {{
+    public PermissionSet(System.Security.Permissions.PermissionState s) {{ System.IO.File.WriteAllText(@"{}", "x"); }}
+    public System.Security.IPermission AddPermission(System.Security.IPermission p) {{ return p; }}
+    public static implicit operator System.Security.PermissionSet(PermissionSet p) {{ return new System.Security.PermissionSet(System.Security.Permissions.PermissionState.Unrestricted); }}
+}}"#,
+        escape.display()
+    ));
+    let _ = csharp::allowing(true, || install::install(&inst, &src.join("Hijack"), None, true, None));
+    assert!(!escape.exists(), "the script's type ran in the host");
 }
 
 /// A mod's INI tweaks, once on, reach My Games at deploy: a setting the Prefs INI has goes there,
@@ -2707,6 +2729,10 @@ fn lockfile_round_trip_keeps_user_mods() {
     assert_eq!((dry.install.join(" "), dry.kept.join(" ")), ("Alpha B-1".into(), "Mine".into()));
     assert_eq!(dry.missing[0].url.as_deref(), Some("https://www.nexusmods.com/skyrimspecialedition/mods/5?tab=files&file_id=6"));
     assert!(!two.mod_dir("Alpha").exists());
+    // A lockfile's ids become folders in mods/: one that climbs out is refused.
+    let mut bad = lock.clone();
+    bad.mods[0].id = "..\\..\\x".into();
+    assert!(lockfile::apply(&two, &bad, std::slice::from_ref(&dl), true).unwrap_err().to_string().contains("isn't a folder name"));
 
     let r = lockfile::apply(&two, &lock, std::slice::from_ref(&dl), false).unwrap();
     assert!(r.warnings.is_empty(), "{r:?}");

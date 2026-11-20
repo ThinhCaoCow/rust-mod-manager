@@ -271,6 +271,7 @@ enum Cmd {
     },
     /// Add or remove category labels on mods (like MO2's categories).
     Category {
+        #[arg(required = true)]
         ids: Vec<String>,
         #[arg(long)]
         add: Vec<String>,
@@ -300,9 +301,9 @@ enum Cmd {
         /// Move this plugin, to just after --after or just before --before.
         #[arg(long = "move", requires = "place")]
         moving: Option<String>,
-        #[arg(long, group = "place")]
+        #[arg(long, group = "place", requires = "moving")]
         after: Option<String>,
-        #[arg(long, group = "place")]
+        #[arg(long, group = "place", requires = "moving")]
         before: Option<String>,
     },
     /// Pairs of enabled plugins that change the same records, and which wins.
@@ -360,10 +361,10 @@ enum Cmd {
     Rule {
         plugin: Option<String>,
         /// Plugin this one loads after (repeatable).
-        #[arg(long)]
+        #[arg(long, requires = "plugin")]
         after: Vec<String>,
         /// LOOT group from the masterlist.
-        #[arg(long)]
+        #[arg(long, requires = "plugin")]
         group: Option<String>,
     },
     /// LOOT's groups and what each loads after; with a group, set the groups it loads after
@@ -371,9 +372,9 @@ enum Cmd {
     /// it out of the userlist.
     Group {
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "name")]
         after: Vec<String>,
-        #[arg(long)]
+        #[arg(long, requires = "name")]
         remove: bool,
     },
     /// Pack a mod's loose files into archives named after its plugin (Skyrim SE .bsa, Fallout 4
@@ -392,7 +393,7 @@ enum Cmd {
     /// For a new game: a save that already uses the plugin loses what it added. Undoable.
     Light {
         plugin: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "plugin")]
         off: bool,
     },
     /// The game's common settings as the game reads them; with a section, key and value, set one.
@@ -517,13 +518,13 @@ enum Cmd {
     ModRule {
         id: Option<String>,
         /// Mod it loads after, i.e. wins conflicts against (repeatable).
-        #[arg(long)]
+        #[arg(long, requires = "id")]
         after: Vec<String>,
         /// Mod that must be enabled with it (repeatable).
-        #[arg(long)]
+        #[arg(long, requires = "id")]
         requires: Vec<String>,
         /// Mod that must not be enabled with it (repeatable).
-        #[arg(long)]
+        #[arg(long, requires = "id")]
         incompatible: Vec<String>,
     },
     /// Reorder mods to satisfy the mod rules; --apply saves the order (undoable).

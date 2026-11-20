@@ -173,7 +173,7 @@ namespace
 			for (const auto& q : a_cmd["quests"]) {
 				const auto quest = q.is_string() ? quest_named(q.get<std::string>()) : nullptr;
 				// QUEST_DATA flags: 1 running, 2 completed.
-				quests[q.is_string() ? q.get<std::string>() : q.dump()] = quest ? json{ { "stage", quest->currentStage }, { "running", (quest->data.flags & 1) != 0 }, { "completed", (quest->data.flags & 2) != 0 } } : json(nullptr);
+				quests[q.is_string() ? q.get<std::string>() : q.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)] = quest ? json{ { "stage", quest->currentStage }, { "running", (quest->data.flags & 1) != 0 }, { "completed", (quest->data.flags & 2) != 0 } } : json(nullptr);
 			}
 			out["quests"] = quests;
 		}
@@ -181,7 +181,7 @@ namespace
 			json refs = json::object();
 			for (const auto& r : a_cmd["refs"]) {
 				const auto ref = ref_of(r);
-				refs[r.is_string() ? r.get<std::string>() : r.dump()] = ref ? ref_info(ref) : json(nullptr);
+				refs[r.is_string() ? r.get<std::string>() : r.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)] = ref ? ref_info(ref) : json(nullptr);
 			}
 			out["refs"] = refs;
 		}
@@ -301,7 +301,7 @@ namespace
 		void CallCanceled() override { reply("the game canceled the call", ""); }
 		void StartMultiDispatch() override {}
 		void EndMultiDispatch() override {}
-		void operator()(Variable a_result) override { reply("", json{ { "value", from_variable(a_result) } }.dump()); }
+		void operator()(Variable a_result) override { reply("", json{ { "value", from_variable(a_result) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)); }
 
 		Reply reply;
 	};
@@ -368,7 +368,7 @@ namespace
 		const bool   method = a_cmd.contains("self") && !a_cmd["self"].is_null();
 		RE::TESForm* self = method ? form_of(a_cmd["self"]) : nullptr;
 		if (method && !self) {
-			return a_reply("no form " + a_cmd["self"].dump(), "");
+			return a_reply("no form " + a_cmd["self"].dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 		}
 		std::string owner;
 		const auto  f = find_function(cls, fn, !method, owner);
@@ -391,7 +391,7 @@ namespace
 				if (!a.is_null()) {
 					const auto form = form_of(a);
 					if (!form || !pack(v, form)) {
-						return a_reply(std::format("argument {} ({}): no form {}", i + 1, name.c_str(), a.dump()), "");
+						return a_reply(std::format("argument {} ({}): no form {}", i + 1, name.c_str(), a.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)), "");
 					}
 				}
 			} else if (t.GetRawType() == R::kInt && a.is_number()) {
@@ -401,7 +401,7 @@ namespace
 			} else if (t.GetRawType() == R::kBool) {
 				v = a.is_boolean() ? a.get<bool>() : a.is_number() && a.get<double>() != 0.0;
 			} else if (t.GetRawType() == R::kString) {
-				v = RE::BSFixedString(a.is_string() ? a.get<std::string>() : a.dump());
+				v = RE::BSFixedString(a.is_string() ? a.get<std::string>() : a.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			} else {
 				return a_reply(std::format("argument {} ({}) doesn't fit: {}", i + 1, name.c_str(), signature(f)), "");
 			}
@@ -426,7 +426,7 @@ namespace
 			              Papyrus::detail::DispatchStaticCallOG(v.get(), RE::BSFixedString(owner), RE::BSFixedString(fn), args.get(), cb);
 		}
 		if (!ok) {
-			a_reply(std::format("the game refused the call to {} (is {} a {}?)", signature(f), a_cmd.value("self", json()).dump(), cls), "");
+			a_reply(std::format("the game refused the call to {} (is {} a {}?)", signature(f), a_cmd.value("self", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), cls), "");
 		}
 	}
 
@@ -460,7 +460,7 @@ namespace
 	{
 		const auto ref = ref_of(a_cmd.value("target", json()));
 		if (!ref) {
-			return a_reply("no reference " + a_cmd.value("target", json()).dump(), "");
+			return a_reply("no reference " + a_cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 		}
 		const auto within = a_cmd.value("within", 150.0f);
 		const auto limit = std::chrono::seconds(std::clamp(a_cmd.value("timeout", 60), 1, 600));
@@ -523,7 +523,7 @@ namespace
 				out["moved_from"] = std::round(stuck);
 				out["note"] = "something was in the way, so the player was moved there";
 			}
-			a_reply(error, error.empty() ? out.dump() : "");
+			a_reply(error, error.empty() ? out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) : "");
 		}).detach();
 	}
 
@@ -542,7 +542,7 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESDeathEvent& a_e, RE::BSTEventSource<RE::TESDeathEvent>*) override
 		{
 			if (a_e.dead) {
-				rmm::game_event(json{ { "what", "death" }, { "actor", who(a_e.actorDying) }, { "killer", who(a_e.actorKiller) } }.dump());
+				rmm::game_event(json{ { "what", "death" }, { "actor", who(a_e.actorDying) }, { "killer", who(a_e.actorKiller) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -550,7 +550,7 @@ namespace
 		{
 			// Only the player's: NPCs open doors all over the world all the time.
 			if (a_e.actionRef && a_e.actionRef.get() == RE::PlayerCharacter::GetSingleton()) {
-				rmm::game_event(json{ { "what", "activate" }, { "target", who(a_e.objectActivated) }, { "by", who(a_e.actionRef) } }.dump());
+				rmm::game_event(json{ { "what", "activate" }, { "target", who(a_e.objectActivated) }, { "by", who(a_e.actionRef) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -559,7 +559,7 @@ namespace
 			// Hits the player gives or takes: the fight a test starts.
 			const auto player = RE::PlayerCharacter::GetSingleton();
 			if (a_e.target.get() == player || a_e.cause.get() == player) {
-				rmm::game_event(json{ { "what", "hit" }, { "target", who(a_e.target) }, { "by", who(a_e.cause) } }.dump());
+				rmm::game_event(json{ { "what", "hit" }, { "target", who(a_e.target) }, { "by", who(a_e.cause) } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -585,7 +585,7 @@ namespace play
 				return a_reply("not in the game yet (load a save or coc first)", "");
 			}
 			if (name == "state") {
-				a_reply("", state(cmd).dump());
+				a_reply("", state(cmd).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			} else if (name == "papyrus") {
 				papyrus(cmd, a_reply);
 			} else if (name == "walk") {
@@ -595,14 +595,14 @@ namespace play
 				if (ref) {
 					face(ref);
 				}
-				a_reply(ref ? "" : "no reference " + cmd.value("target", json()).dump(), "");
+				a_reply(ref ? "" : "no reference " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 			} else if (name == "activate") {
 				const auto ref = ref_of(cmd.value("target", json()));
 				if (!ref) {
-					return a_reply("no reference " + cmd.value("target", json()).dump(), "");
+					return a_reply("no reference " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 				}
 				const auto done = ref->ActivateRef(RE::PlayerCharacter::GetSingleton(), nullptr, 1, false, false, false);
-				a_reply(done ? "" : "the game didn't activate " + cmd.value("target", json()).dump(), json{ { "activated", true } }.dump());
+				a_reply(done ? "" : "the game didn't activate " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), json{ { "activated", true } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 			} else {
 				a_reply("dialogue, choose, button, menu_call, menu_get, attack and press are Skyrim-only for now; in Fallout 4 the harness has state, wait_for, call (Papyrus), move_to, activate and face, plus console commands", "");
 			}

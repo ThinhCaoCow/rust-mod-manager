@@ -35,6 +35,10 @@ namespace
 				menu_open = true;
 				main_menu_when_ready();
 			}
+			// A question (missing content, a damaged save) stops a load until it's answered.
+			if (a_event.opening && name == "MessageBoxMenu") {
+				rmm::event("message_box", {});
+			}
 			// Closing a loading screen in the world is a finished load: of a save, or of a coc,
 			// which also starts a game from the main menu (and fires no load message).
 			const auto player = RE::PlayerCharacter::GetSingleton();

@@ -27,6 +27,11 @@ pub struct PluginInfo {
     pub path: PathBuf,
 }
 
+/// The plugins the game loads whatever the profile says (the base game's, Creation Club's).
+pub(crate) fn implicit(inst: &Instance) -> Result<Vec<String>> {
+    Ok(settings(inst)?.implicitly_active_plugins().to_vec())
+}
+
 fn settings(inst: &Instance) -> Result<GameSettings> {
     let c = &inst.config;
     GameSettings::with_local_path(c.game.lo_id(), &c.game_path, &c.local_path).map_err(|e| match &e {
@@ -135,6 +140,9 @@ pub fn write_plugins_txt(inst: &Instance, profile: &Profile) -> Result<()> {
     crate::profile_ini::keep_plugins_txt(inst, settings.active_plugins_file())?;
     let mut lo = settings.into_load_order();
     lo.load()?;
+    // A plugin the game can't read can't be ordered either: one stops the whole list (health
+    // names it).
+    let infos: Vec<&PluginInfo> = infos.iter().filter(|p| p.error.is_none()).collect();
     let names: Vec<&str> = infos.iter().map(|p| p.name.as_str()).collect();
     lo.set_load_order(&names)?;
     let active: Vec<&str> = infos.iter().filter(|p| p.enabled).map(|p| p.name.as_str()).collect();

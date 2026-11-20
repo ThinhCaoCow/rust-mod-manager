@@ -322,6 +322,33 @@ fn fps(samples: &[f64]) -> Option<Fps> {
 }
 
 /// The harness plugin's DLL, relative to Data.
+/// Refuse to load a save the game doesn't have: Skyrim takes the name without a word and the
+/// step would wait minutes for a load that never comes.
+pub fn check_saves(inst: &Instance, steps: &[Step]) -> Result<()> {
+    let Some(dir) = crate::profile_ini::save_dir(inst, &inst.profile()?).filter(|d| d.is_dir()) else { return Ok(()) };
+    let ext = crate::saves::ext(inst.config.game);
+    for step in steps {
+        if let Step::Load(name) = step
+            && !dir.join(format!("{name}.{ext}")).is_file()
+            && !dir.join(name).is_file()
+        {
+            bail!("there's no save named '{name}' in {} (name it without .{ext})", dir.display());
+        }
+    }
+    // A save that needs plugins the profile doesn't load makes the game ask before loading.
+    let loads: Vec<&String> = steps.iter().filter_map(|s| if let Step::Load(n) = s { Some(n) } else { None }).collect();
+    if !loads.is_empty() {
+        for save in crate::saves::list(inst)?.saves {
+            let stem = save.file.rsplit_once('.').map_or(save.file.as_str(), |(s, _)| s);
+            if !save.missing.is_empty() && loads.iter().any(|n| n.eq_ignore_ascii_case(stem) || n.eq_ignore_ascii_case(&save.file)) {
+                let names: Vec<&str> = save.missing.iter().take(8).map(|m| m.plugin.as_str()).collect();
+                bail!("'{stem}' needs plugins this profile doesn't load ({}{}), so the game would ask before loading it; enable them or load another save", names.join(", "), if save.missing.len() > 8 { ", …" } else { "" });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn harness_dll(game: Game) -> &'static str {
     if game.base() == Game::SkyrimSe { "SKSE/Plugins/rmm_harness.dll" } else { "F4SE/Plugins/rmm_harness.dll" }
 }
@@ -381,6 +408,7 @@ struct Run {
 
 impl Run {
     fn begin(inst: &Instance, s: &Scenario) -> Result<Run> {
+        check_saves(inst, s.save.iter().map(|x| Step::Load(x.clone())).chain(s.steps.iter().cloned()).collect::<Vec<_>>().as_slice())?;
         let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().saturating_sub(2);
         let before = logs::crash_logs(inst).into_iter().map(|l| l.path).collect();
         let mut r = TestRun::default();
@@ -703,7 +731,17 @@ fn wait_for(c: &mut Conn, w: &WaitFor, alive: &dyn Fn() -> bool) -> Result<Value
     let timeout = Duration::from_secs(w.timeout.unwrap_or(60).min(600));
     let start = Instant::now();
     loop {
-        let state = c.command(query.clone(), Duration::from_secs(30), alive)?["data"].take();
+        let state = match c.command(query.clone(), Duration::from_secs(30), alive) {
+            Ok(mut v) => v["data"].take(),
+            // The game gone ends the wait; anything else (a loading screen, a slow frame) is a
+            // condition not met yet.
+            Err(e) if !alive() => return Err(e),
+            Err(_) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            Err(e) => return Err(e.context(format!("the state wasn't readable within {} seconds", timeout.as_secs()))),
+        };
         let open = |m: &str| state["menus"].as_array().is_some_and(|ms| ms.iter().any(|x| x.as_str().is_some_and(|x| x.eq_ignore_ascii_case(m))));
         let mut unmet = vec![];
         if let Some(r) = &w.dead
@@ -911,7 +949,7 @@ impl Server {
                 Ok((stream, _)) => {
                     stream.set_nonblocking(false)?;
                     let mut c = Conn::new(stream)?;
-                    let Some(hello) = c.read(Duration::from_secs(10))? else { continue };
+                    let Ok(Some(hello)) = c.read(Duration::from_secs(10)) else { continue };
                     if hello["ev"] == "hello" && hello["token"] == self.token.as_str() {
                         c.console_output = hello["console_output"] == true;
                         return Ok((c, hello["runtime"].as_str().map(str::to_owned)));
@@ -934,7 +972,9 @@ impl Server {
 }
 
 pub struct Conn {
-    reader: BufReader<TcpStream>,
+    /// Lines from the game, read as they come by a thread of rmm's: a socket left unread fills,
+    /// and the plugin's next send would then hold up the game's main thread.
+    lines: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     writer: TcpStream,
     next: u64,
     /// FPS from heartbeats seen while waiting for something else.
@@ -952,18 +992,39 @@ pub struct Conn {
     events: Vec<Value>,
 }
 
+impl Drop for Conn {
+    /// Ends the reading thread with the connection.
+    fn drop(&mut self) {
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 impl Conn {
     fn new(stream: TcpStream) -> Result<Self> {
-        Ok(Conn { writer: stream.try_clone()?, reader: BufReader::new(stream), next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![] })
+        let writer = stream.try_clone()?;
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = Vec::new();
+                let got = reader.read_until(b'\n', &mut line);
+                let end = !matches!(got, Ok(n) if n > 0);
+                if tx.send(got.map(|_| line)).is_err() || end {
+                    return;
+                }
+            }
+        });
+        Ok(Conn { writer, lines, next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![] })
     }
 
     /// The next event, or None when nothing came within `wait`.
     fn read(&mut self, wait: Duration) -> Result<Option<Value>> {
-        self.reader.get_ref().set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => bail!("the game closed the harness connection"),
-            Ok(_) => {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.lines.recv_timeout(wait) {
+            Ok(Ok(line)) if line.is_empty() => bail!("the game closed the harness connection"),
+            Err(RecvTimeoutError::Disconnected) => bail!("the game closed the harness connection"),
+            Ok(Ok(line)) => {
+                let line = String::from_utf8_lossy(&line).into_owned();
                 let v: Value = serde_json::from_str(line.trim()).with_context(|| format!("bad harness message: {line}"))?;
                 if v["ev"] == "heartbeat"
                     && let Some(f) = v["fps"].as_f64()
@@ -986,22 +1047,31 @@ impl Conn {
                 }
                 Ok(Some(v))
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Ok(Err(e)) => Err(e.into()),
         }
     }
 
     /// Wait for an event, failing on timeout or when the game goes away.
     fn until(&mut self, ev: &str, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<Value> {
+        // A load the game stops to ask about (a save that needs missing content, a damaged one)
+        // never finishes on its own.
+        let asks = |v: &Value| ev == "game_loaded" && v["ev"] == "message_box";
+        if self.early.iter().any(asks) {
+            bail!("the game asked a question instead of loading (a save that needs plugins that aren't loaded asks first); answer it with a button step, or load another save");
+        }
         if let Some(i) = self.early.iter().position(|v| v["ev"] == ev) {
             return Ok(self.early.remove(i));
         }
         let start = Instant::now();
         loop {
-            if let Some(v) = self.read(Duration::from_millis(500))?
-                && v["ev"] == ev
-            {
-                return Ok(v);
+            if let Some(v) = self.read(Duration::from_millis(500))? {
+                if v["ev"] == ev {
+                    return Ok(v);
+                }
+                if asks(&v) {
+                    bail!("the game asked a question instead of loading (a save that needs plugins that aren't loaded asks first); answer it with a button step, or load another save");
+                }
             }
             let last = if self.notes.is_empty() { String::new() } else { format!(" (the game's last steps: {})", self.notes.join(", ")) };
             if !alive() {
@@ -1018,21 +1088,22 @@ impl Conn {
         let id = self.next;
         self.next += 1;
         cmd["id"] = json!(id);
+        // What came since the last step (a load that finished after it) belongs to that step.
+        while self.read(Duration::from_millis(1))?.is_some() {}
         self.early.clear();
         writeln!(self.writer, "{cmd}")?;
         let start = Instant::now();
         loop {
             if let Some(v) = self.read(Duration::from_millis(500))? {
-                if v["ev"] != "result" || v["id"] != id {
-                    if v["ev"] != "heartbeat" {
-                        self.early.push(v);
+                if v["ev"] == "result" && v["id"] == id {
+                    if v["ok"] == true {
+                        return Ok(v);
                     }
-                    continue;
+                    bail!("{}", v["out"].as_str().unwrap_or("the command failed"));
                 }
-                if v["ok"] == true {
-                    return Ok(v);
+                if v["ev"] != "heartbeat" {
+                    self.early.push(v);
                 }
-                bail!("{}", v["out"].as_str().unwrap_or("the command failed"));
             }
             if !alive() {
                 bail!("the game closed during {}", cmd["cmd"]);
@@ -1109,6 +1180,37 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn a_message_split_by_a_timeout_comes_whole() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut game = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let mut c = Conn::new(l.accept().unwrap().0).unwrap();
+        game.write_all(br#"{"ev":"res"#).unwrap();
+        assert!(c.read(Duration::from_millis(100)).unwrap().is_none(), "half a message: wait for the rest");
+        game.write_all(b"ult\",\"id\":1}\n").unwrap();
+        assert_eq!(c.read(Duration::from_secs(2)).unwrap().unwrap()["ev"], "result");
+
+        // A load the game stops to ask about fails at once, not at the timeout.
+        game.write_all(b"{\"ev\":\"message_box\"}\n").unwrap();
+        let t = Instant::now();
+        let err = c.until("game_loaded", Duration::from_secs(60), &|| true).unwrap_err().to_string();
+        assert!(err.contains("asked a question") && t.elapsed() < Duration::from_secs(5), "{err}");
+
+        // Between steps (the AI thinking) nothing asks for messages, yet the game's sends go
+        // through: a full socket would hold up its main thread.
+        game.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let beat = format!("{}\n", serde_json::json!({"ev": "heartbeat", "fps": 60.0, "cell": "x".repeat(200)}));
+        for _ in 0..40_000 {
+            game.write_all(beat.as_bytes()).expect("the game's send blocked");
+        }
+        drop(game);
+        let mut n = 0;
+        while c.read(Duration::from_secs(5)).is_ok_and(|v| v.is_some()) {
+            n += 1;
+        }
+        assert_eq!(n, 40_000);
     }
 
     #[test]

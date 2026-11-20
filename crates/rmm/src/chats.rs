@@ -58,7 +58,15 @@ pub struct Chat {
 impl Chat {
     /// An AI app's session over MCP: its tool calls and the notes it saves.
     pub fn external(app: &str) -> Chat {
-        Chat { id: now_ms().to_string(), title: format!("{app} over MCP"), provider: MCP.into(), model: app.into(), updated: now_ms() / 1000, ..Default::default() }
+        // Two sessions opened in the same millisecond would share a file: each id is later than
+        // the last.
+        static LAST: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+        let id = {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            *last = now_ms().max(*last + 1);
+            *last
+        };
+        Chat { id: id.to_string(), title: format!("{app} over MCP"), provider: MCP.into(), model: app.into(), updated: now_ms() / 1000, ..Default::default() }
     }
 
     pub fn save(&self, root: &Path) -> Result<()> {

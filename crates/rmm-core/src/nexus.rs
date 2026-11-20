@@ -707,13 +707,21 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         let checked = cache.checked.get(&n.mod_id).copied();
         let stale = match checked {
             None => true,
-            Some(t) => recent.get(&n.mod_id).is_some_and(|&u| u >= t) || now().saturating_sub(t) > crate::settings::get().nexus.recheck_days * 86400,
+            // updated.json covers a month: a cache older than that can't be trusted to know.
+            Some(t) => recent.get(&n.mod_id).is_some_and(|&u| u >= t) || now().saturating_sub(t) > crate::settings::get().nexus.recheck_days.min(30) * 86400,
         };
         if stale || !cache.files.contains_key(&n.mod_id) {
             let files = match client.get(&format!("/v1/games/{domain}/mods/{}/files.json", n.mod_id)) {
                 Ok(f) => f,
                 Err(e) => {
-                    let gone = e.downcast::<NotThere>()?; // any other error stops the check
+                    let gone = match e.downcast::<NotThere>() {
+                        Ok(g) => g,
+                        // Any other error stops the check; what was read so far is kept.
+                        Err(e) => {
+                            let _ = fs::write(&cache_path, serde_json::to_string(&cache)?);
+                            return Err(e);
+                        }
+                    };
                     out.unavailable.push(Unavailable { id: id.clone(), name: meta.name.clone(), mod_id: n.mod_id, reason: gone.0 });
                     continue;
                 }
@@ -760,8 +768,8 @@ fn newer(id: &str, name: &str, n: &crate::instance::NexusRef, files: &Value, dom
         // No file id (an MO2 import, say): the newest main file, if its version differs.
         None => {
             let main = newest_main(files)?;
-            let v = main["version"].as_str();
-            if v.is_none() || v == n.version.as_deref() {
+            let v = main["version"].as_str()?;
+            if n.version.as_deref().is_some_and(|have| !version_after(v, have)) {
                 return None;
             }
             main
@@ -778,6 +786,25 @@ fn newer(id: &str, name: &str, n: &crate::instance::NexusRef, files: &Value, dom
         file_name: target["file_name"].as_str().or(target["name"].as_str()).unwrap_or_default().to_string(),
         url: format!("https://www.nexusmods.com/{domain}/mods/{}?tab=files&file_id={fid}", n.mod_id),
     })
+}
+
+/// Whether Nexus's `latest` is a different version from `have`: plain numbers compare as numbers
+/// ("1.4.25.0" is "1.4.25"; an older one isn't newer), anything else ("1.2b") as text.
+fn version_after(latest: &str, have: &str) -> bool {
+    let plain = |v: &str| {
+        let v = v.trim().trim_start_matches(['v', 'V']);
+        (!v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')).then(|| {
+            let mut k = ver_key(v);
+            while k.last() == Some(&0) {
+                k.pop();
+            }
+            k
+        })
+    };
+    match (plain(latest), plain(have)) {
+        (Some(l), Some(h)) => l > h,
+        _ => latest.trim() != have.trim(),
+    }
 }
 
 /// A mod's newest main file in its files.json.
@@ -1244,6 +1271,16 @@ pub fn handler_command() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn versions_compare_as_numbers_when_plain() {
+        assert!(!super::version_after("1.4.25.0", "1.4.25"));
+        assert!(!super::version_after("1.2.0", "1.2.1.0"));
+        assert!(super::version_after("1.10", "1.9"));
+        assert!(super::version_after("v2", "1.9.9"));
+        assert!(super::version_after("1.2b", "1.2a"));
+        assert!(!super::version_after("1.2b", "1.2b"));
+    }
+
     use super::*;
 
     #[test]

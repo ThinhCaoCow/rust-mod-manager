@@ -454,6 +454,13 @@ pub fn apply(inst: &Instance, lock: &Lockfile, downloads: &[PathBuf], dry_run: b
     if lock.game != inst.config.game {
         bail!("the lockfile is for {:?}, this instance for {:?}", lock.game, inst.config.game);
     }
+    // A lockfile comes from someone else: its ids become folder names in mods/.
+    if let Some(m) = lock.mods.iter().filter(|m| !is_separator(&m.id)).find(|m| {
+        let mut c = std::path::Path::new(&m.id).components();
+        m.id.contains(['/', '\\', ':']) || !matches!((c.next(), c.next()), (Some(std::path::Component::Normal(_)), None))
+    }) {
+        bail!("the lockfile names a mod '{}', which isn't a folder name", m.id);
+    }
     let mut r = ApplyReport { dry_run, ..Default::default() };
     r.warnings = env_warnings(&lock.env, &env(inst));
     let packed = match &lock.pack {

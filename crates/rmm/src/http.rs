@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -55,8 +56,13 @@ impl Drop for Http {
     }
 }
 
+/// A client silent this long has gone without saying so: its session is closed.
+const IDLE: Duration = Duration::from_secs(4 * 3600);
+
 struct Session {
     to_server: tokio::sync::Mutex<WriteHalf<DuplexStream>>,
+    /// The client's last request.
+    seen: Mutex<Instant>,
     /// Requests waiting for their answer, by JSON-RPC id.
     waiting: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
 }
@@ -179,10 +185,11 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 async fn connection(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
-    let req = match read_request(&mut stream).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return Ok(()),
-        Err(e) => return respond(&mut stream, 400, &[], &error(&format!("{e:#}"))).await,
+    // A client that opens a connection and sends nothing (or a byte a minute) doesn't keep it.
+    let req = match tokio::time::timeout(Duration::from_secs(30), read_request(&mut stream)).await {
+        Ok(Ok(Some(r))) => r,
+        Ok(Ok(None)) | Err(_) => return Ok(()),
+        Ok(Err(e)) => return respond(&mut stream, 400, &[], &error(&format!("{e:#}"))).await,
     };
     let h = |k: &str| req.headers.get(k).map(String::as_str);
     if h("origin").is_some() {
@@ -217,13 +224,29 @@ async fn connection(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
     if !msg.is_object() {
         return respond(&mut stream, 400, &[], &error("send one JSON-RPC message per request")).await;
     }
+    // What rmcp can't read it drops, or answers without the request's id, so a request would wait
+    // for an answer that never comes: refuse it here, before it opens a session.
+    if let Err(e) = serde_json::from_value::<rmcp::model::ClientJsonRpcMessage>(msg.clone()) {
+        return match msg.get("id") {
+            Some(id) => respond(&mut stream, 400, &[], &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32600, "message": format!("not a JSON-RPC message rmm reads: {e}") } })).await,
+            None => respond(&mut stream, 202, &[], &Value::Null).await,
+        };
+    }
     let method = msg["method"].as_str().map(str::to_owned);
     let (sid, session) = if method.as_deref() == Some("initialize") {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
         let sid: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let session = open_session(&shared);
-        shared.sessions.lock().unwrap().insert(sid.clone(), session.clone());
+        let idle: Vec<Arc<Session>> = {
+            let mut all = shared.sessions.lock().unwrap();
+            let gone: Vec<String> = all.iter().filter(|(_, s)| s.seen.lock().unwrap().elapsed() > IDLE && s.waiting.lock().unwrap().is_empty()).map(|(k, _)| k.clone()).collect();
+            all.insert(sid.clone(), session.clone());
+            gone.iter().filter_map(|k| all.remove(k)).collect()
+        };
+        for s in idle {
+            let _ = s.to_server.lock().await.shutdown().await;
+        }
         (sid, session)
     } else {
         let Some(sid) = sid else {
@@ -232,6 +255,7 @@ async fn connection(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
         let Some(session) = shared.sessions.lock().unwrap().get(&sid).cloned() else {
             return respond(&mut stream, 404, &[], &error("unknown session: initialize again")).await;
         };
+        *session.seen.lock().unwrap() = Instant::now();
         (sid, session)
     };
     let id = msg.get("id").filter(|_| method.is_some()).map(Value::to_string);
@@ -256,11 +280,14 @@ async fn connection(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
 fn open_session(shared: &Shared) -> Arc<Session> {
     let (ours, theirs) = tokio::io::duplex(1 << 20);
     // Each session keeps its own chat.
-    let server = shared.rmm.clone().recorded_if_set();
+    let server = shared.rmm.clone().for_new_client().recorded_if_set();
+    let gone = server.clone();
     tokio::spawn(async move {
         if let Ok(running) = server.serve(tokio::io::split(theirs)).await {
             let _ = running.waiting().await;
         }
+        // The session ended (DELETE, idle, the server stopping): its live test goes with it.
+        let _ = tokio::task::spawn_blocking(move || gone.client_gone()).await;
     });
     let (from_server, to_server) = tokio::io::split(ours);
     let waiting: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> = Default::default();
@@ -277,5 +304,5 @@ fn open_session(shared: &Shared) -> Arc<Session> {
             }
         }
     });
-    Arc::new(Session { to_server: tokio::sync::Mutex::new(to_server), waiting })
+    Arc::new(Session { to_server: tokio::sync::Mutex::new(to_server), seen: Mutex::new(Instant::now()), waiting })
 }

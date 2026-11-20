@@ -32,8 +32,11 @@ pub struct Rmm {
     /// Background tool runs by tool id. In memory only; a finished run's report is also in
     /// tools/<id>/last-run.json.
     jobs: Arc<Mutex<BTreeMap<String, Job>>>,
-    /// The live test (test_session_*); dropping it closes the game.
-    session: Arc<Mutex<Option<harness::Session>>>,
+    /// The live test (test_session_*) and the client that started it; dropping it closes the
+    /// game. One game runs at a time, so every client of this server shares the slot.
+    session: Arc<Mutex<Option<(u64, harness::Session)>>>,
+    /// This client, among the ones the HTTP server serves (0 for stdio's one).
+    client: u64,
     /// Some when the client's calls are kept as a chat (an AI app's session; see `recorded`).
     log: Option<Arc<Mutex<Option<chats::Chat>>>>,
     tool_router: ToolRouter<Self>,
@@ -699,6 +702,19 @@ fn shot_image(path: &std::path::Path) -> anyhow::Result<ContentBlock> {
     Ok(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"))
 }
 
+/// A tool call's arguments as a chat keeps them: long text cut, and nxm links without their
+/// download key.
+fn for_chat(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(t) if t.starts_with("nxm://") => Value::String(t.split('?').next().unwrap_or_default().to_owned()),
+        Value::String(t) => Value::String(chats::cut(&t, 2000)),
+        Value::Array(a) => Value::Array(a.into_iter().map(for_chat).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, for_chat(v))).collect()),
+        v => v,
+    }
+}
+
 /// The PNG scaled down by a whole factor (averaging each block of pixels) to at most
 /// `SHOT_WIDTH` wide, or None when it already fits.
 fn shrink_png(bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
@@ -706,7 +722,7 @@ fn shrink_png(bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = dec.read_info()?;
     let (w, h) = (reader.info().width, reader.info().height);
-    if w <= SHOT_WIDTH {
+    if w <= SHOT_WIDTH || h < w.div_ceil(SHOT_WIDTH) {
         return Ok(None);
     }
     let mut buf = vec![0; reader.output_buffer_size().ok_or_else(|| anyhow::anyhow!("screenshot too large"))?];
@@ -754,13 +770,24 @@ impl Rmm {
         Instance::open(&self.root)
     }
 
-    /// The instance for a change: refused while a background tool run owns the game folder.
+    /// The instance for a change: refused while a background tool run owns the game folder, or a
+    /// live test's game is running on it.
     fn inst_mut(&self) -> anyhow::Result<Instance> {
+        self.no_job()?;
+        // A step holds the lock while it plays, so a locked session is a running one.
+        if self.session.try_lock().map_or(true, |s| s.is_some()) {
+            anyhow::bail!("a live test is running; end it (test_session_stop) before changing the setup");
+        }
+        self.inst()
+    }
+
+    /// Refused while a background tool run owns the game folder.
+    fn no_job(&self) -> anyhow::Result<()> {
         let jobs = self.jobs.lock().unwrap();
         if let Some((id, _)) = jobs.iter().find(|(_, j)| matches!(j, Job::Running { .. })) {
             anyhow::bail!("tool '{id}' is running in the background; wait for it (tool_job) before changing the setup");
         }
-        self.inst()
+        Ok(())
     }
 
     fn inst_for(&self, dry_run: bool) -> anyhow::Result<Instance> {
@@ -806,17 +833,17 @@ impl Rmm {
 
     #[tool(description = "Enable the installed mods and plugins a save needs (those list_saves names with a mod), as one undoable change. Returns the plugins enabled. Deploy afterwards.")]
     async fn enable_save_plugins(&self, Parameters(a): Parameters<SaveArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| saves::enable_missing(&i, &a.file)))
+        out(self.inst_mut().and_then(|i| saves::enable_missing(&i, &a.file)))
     }
 
     #[tool(description = "Copy or move saves of the active profile into another profile's save folder, each with its script extender co-save. Profiles share one save folder unless they have their own saves (set_profile_options, new_playthrough); a save of that name already there stops it. Returns the folder and the files.")]
     async fn transfer_saves(&self, Parameters(a): Parameters<TransferSavesArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| saves::transfer(&i, &a.files, &a.profile, !a.move_them)))
+        out(self.inst_mut().and_then(|i| saves::transfer(&i, &a.files, &a.profile, !a.move_them)))
     }
 
     #[tool(description = "Delete saves of the active profile: each save and its script extender co-save move to the instance's trash (emptying the trash deletes them for good). Ask the user first. Returns the files moved.")]
     async fn delete_saves(&self, Parameters(a): Parameters<DeleteSavesArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| saves::delete(&i, &a.files)))
+        out(self.inst_mut().and_then(|i| saves::delete(&i, &a.files)))
     }
 
     #[tool(description = "Archives in the instance's downloads folder (where Nexus downloads go), newest first, with the mods installed from each.", annotations(read_only_hint = true))]
@@ -1066,7 +1093,7 @@ impl Rmm {
 
     #[tool(description = "Pack a mod's loose files into archives named after one of its plugins (Skyrim SE: <plugin>.bsa and <plugin> - Textures.bsa; Fallout 4: <plugin> - Main.ba2 and <plugin> - Textures.ba2), as MO2's packer does. Script extender plugins and other files the game only reads loose stay loose. Packed files lose to every loose file, so `loses` lists those another mod has loose that this mod wins now. dry_run defaults to true. One undo step; takes effect at the next deploy.")]
     async fn pack_mod(&self, Parameters(a): Parameters<PackArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::pack::pack(&i, &a.id, a.plugin.as_deref(), a.dry_run.unwrap_or(true))))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::pack::pack(&i, &a.id, a.plugin.as_deref(), a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Plugins that could be flagged light (ESL): their new records fit a light plugin's form ids and they add no cells or worldspaces. Flagging frees full load-order slots.", annotations(read_only_hint = true))]
@@ -1076,7 +1103,7 @@ impl Rmm {
 
     #[tool(description = "Flag a mod's plugin light (ESL), or clear the flag (light false). Only light_candidates can be flagged. Ask the user first: a save that already uses the plugin loses what it added, so it's for a new game. One undo step; takes effect at the next deploy.")]
     async fn set_light_flag(&self, Parameters(a): Parameters<LightArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::plugins::set_light(&i, &a.plugin, a.light)))
+        out(self.inst_mut().and_then(|i| rmm_core::plugins::set_light(&i, &a.plugin, a.light)))
     }
 
     #[tool(description = "The game's common settings (display, interface, controls, saves, mod-related and Papyrus logging) as the game reads them from its INIs, with kinds, ranges and defaults.", annotations(read_only_hint = true))]
@@ -1086,7 +1113,7 @@ impl Rmm {
 
     #[tool(description = "Set one of game_settings' settings, in the INI that holds it now (else the Prefs INI). Kept in Edits, so it can be put back. Takes effect when the game next starts.")]
     async fn set_game_setting(&self, Parameters(a): Parameters<SettingArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::ini_form::set(&i, &a.section, &a.key, &a.value, "AI")))
+        out(self.inst_mut().and_then(|i| rmm_core::ini_form::set(&i, &a.section, &a.key, &a.value, "AI")))
     }
 
     #[tool(description = "Download the latest LOOT masterlist and prelude now. Returns warnings, if any.")]
@@ -1129,7 +1156,7 @@ impl Rmm {
     async fn steam_updates(&self, Parameters(a): Parameters<SteamUpdatesArgs>) -> Result<String, String> {
         match a.hold {
             None => out(self.inst().map(|i| rmm_core::launch::steam_updates(&i))),
-            Some(hold) => out(self.inst().and_then(|i| rmm_core::launch::hold_steam_updates(&i, hold))),
+            Some(hold) => out(self.inst_mut().and_then(|i| rmm_core::launch::hold_steam_updates(&i, hold))),
         }
     }
 
@@ -1137,7 +1164,9 @@ impl Rmm {
     async fn desktop_shortcut(&self, Parameters(a): Parameters<ShortcutArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| {
             let p = a.profile.clone().unwrap_or_else(|| i.config.profile.clone());
-            rmm_core::launch::shortcut(&i, &p, &std::env::current_exe()?, None, a.dry_run.unwrap_or(true))
+            let me = std::env::current_exe()?;
+            let cli = me.with_file_name(if cfg!(windows) { "rmm.exe" } else { "rmm" });
+            rmm_core::launch::shortcut(&i, &p, if cli.is_file() { &cli } else { &me }, None, a.dry_run.unwrap_or(true))
         }))
     }
 
@@ -1323,10 +1352,10 @@ impl Rmm {
         if slot.is_some() {
             return Err("a live test is running; end it with test_session_stop first".into());
         }
-        out(self.inst_mut().and_then(|i| {
+        out(self.no_job().and_then(|_| self.inst()).and_then(|i| {
             let session = harness::Session::start(&i, &a.scenario)?;
             let report = serde_json::to_value(session.progress())?;
-            *slot = Some(session);
+            *slot = Some((self.client, session));
             Ok(report)
         }))
     }
@@ -1334,15 +1363,19 @@ impl Rmm {
     #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window, which comes back as an image after the results, in step order, at most 1280 wide), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
     async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<CallToolResult, String> {
         let mut slot = self.session.lock().unwrap();
-        let Some(session) = slot.as_mut() else {
+        let Some((owner, session)) = slot.as_mut() else {
             return Err("no live test is running; start one with test_session_start".into());
         };
+        if *owner != self.client {
+            return Err("another AI app's live test is running; end it with test_session_stop first".into());
+        }
+        self.inst().and_then(|i| rmm_core::harness::check_saves(&i, &a.steps)).map_err(|e| format!("{e:#}"))?;
         let steps = session.steps(&a.steps);
         let shots: Vec<_> = steps.iter().filter_map(|s| s.screenshot.as_deref()).filter_map(|p| shot_image(p).ok()).collect();
         let text = if session.alive() {
             out(Ok(serde_json::json!({ "steps": steps })))?
         } else {
-            let session = slot.take().expect("checked above");
+            let (_, session) = slot.take().expect("checked above");
             out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": "the game closed", "run": session.stop(&i)? }))))?
         };
         // The screenshots come along as images, after the steps, in their order.
@@ -1351,7 +1384,8 @@ impl Rmm {
 
     #[tool(description = "End the live test: quit the game and report the whole session: every step, timings, FPS, screenshots, a crash log read back to mods, and the Papyrus log's errors with their mods. The INIs changed for the small window are put back.")]
     async fn test_session_stop(&self) -> Result<String, String> {
-        let Some(session) = self.session.lock().unwrap().take() else {
+        // Any client may end it: the one that started it may be gone.
+        let Some((_, session)) = self.session.lock().unwrap().take() else {
             return Err("no live test is running".into());
         };
         out(self.inst().and_then(|i| session.stop(&i)))
@@ -1384,7 +1418,7 @@ impl Rmm {
 
     #[tool(description = "Download a file from Nexus with the user's account into the instance's downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording its Nexus ids. Give an nxm:// link, a mod page link, or a mod id (the newest main file unless file_id names one). Without Premium, Nexus only allows downloads through an nxm:// link from the website's button. Needs the user signed in (nexus_status). dry_run defaults to true: shows the file.")]
     async fn install_from_nexus(&self, Parameters(a): Parameters<NexusInstallArgs>) -> Result<String, String> {
-        let inst = self.inst_mut().map_err(|e| format!("{e:#}"))?;
+        let inst = self.inst_for(a.dry_run.unwrap_or(true)).map_err(|e| format!("{e:#}"))?;
         let what = match (&a.link, a.mod_id, a.file_id) {
             (Some(l), _, _) => Ok(l.clone()),
             (None, Some(m), Some(f)) => Ok(format!("{m}/{f}")),
@@ -1421,7 +1455,7 @@ impl Rmm {
 
     #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly; free accounts: the user downloads each file listed in to_download from its page first, then the install goes ahead): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. Into a profile that has an earlier revision (update_from in the result) it is an update: mods with a newer file are updated in place (or installed beside the old one when another profile has that on), mods the revision dropped are turned off (turned_off, still installed), and the user's own mods (yours), the collection's mods they turned off (kept_off) and plugins they changed stay as they are. Without a link it updates the active profile's collection. A big collection takes a long time. dry_run defaults to true: lists what would be installed or updated, the download size, optional mods left out and the curator's notes.")]
     async fn install_collection(&self, Parameters(a): Parameters<CollectionArgs>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|mut i| {
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|mut i| {
             let client = nexus::Client::from_env()?;
             rmm_core::collection::install(&mut i, &client, a.link.as_deref().unwrap_or(""), a.revision, a.optional.unwrap_or(false), a.new_profile.as_deref(), a.dry_run.unwrap_or(true), a.sort.unwrap_or(true))
         }))
@@ -1429,27 +1463,27 @@ impl Rmm {
 
     #[tool(description = "Generated output that is out of date, and the tools to run again: xLODGen, TexGen, DynDOLOD, Pandora, BodySlide, Synthesis and PGPatcher outputs record the mods and load order they were made from, and are stale once those change. Lists the tools in the order to run them, with why (dry_run defaults to true); dry_run=false runs them one after another and waits for each, and TexGen, DynDOLOD, xLODGen and PGPatcher need the user to click through, so for those prefer run_tool with background, in the listed order.")]
     async fn rebuild_outputs(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::tools::rebuild(&i, a.dry_run.unwrap_or(true), None)))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::tools::rebuild(&i, a.dry_run.unwrap_or(true), None)))
     }
 
     #[tool(description = "Clean every enabled plugin LOOT's cached masterlist knows as dirty (identical-to-master records, deleted references) with xEdit QuickAutoClean, one tool run each, each its own undo step with the clean copy in a \"Cleaned <plugin>\" mod (one_mod: all in \"Cleaned plugins\"). Needs a tool from the xedit-qac preset (add_tool); plugins with only deleted navmeshes are listed for xEdit by hand. Runs xEdit, which takes a while per plugin. dry_run defaults to true: lists the plugins.")]
     async fn clean_dirty_plugins(&self, Parameters(a): Parameters<CleanArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true), a.one_mod)))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| rmm_core::tools::clean_dirty(&i, a.dry_run.unwrap_or(true), a.one_mod)))
     }
 
     #[tool(description = "Hide files or folders of a mod, or show them again (show). Hidden files move to the mod's .rmm-hidden folder, out of deploys, file conflicts and the plugin list (MO2's .mohidden; hiding a plugin is MO2's optional ESP), and stay hidden through reinstalls and updates. The mod's meta.hidden (get_mod) lists them. One undo step. Takes effect at the next deploy.")]
     async fn hide_files(&self, Parameters(a): Parameters<HideArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| install::hide_files(&i, &a.id, &a.paths, !a.show.unwrap_or(false))))
+        out(self.inst_mut().and_then(|i| install::hide_files(&i, &a.id, &a.paths, !a.show.unwrap_or(false))))
     }
 
     #[tool(description = "Move files or folders from one mod into another, \"<overwrite>\" included: MCM settings or a tool's output from Overwrite into the mod they belong with. Files the target has already are refused unless replace. One undo step, which brings the target's replaced copies back too. Takes effect at the next deploy.")]
     async fn move_files(&self, Parameters(a): Parameters<MoveFilesArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| install::move_files(&i, &a.from, &a.paths, &a.to, a.replace.unwrap_or(false))))
+        out(self.inst_mut().and_then(|i| install::move_files(&i, &a.from, &a.paths, &a.to, a.replace.unwrap_or(false))))
     }
 
     #[tool(description = "Creation Club content as mods: the plugins the game's .ccc file lists that are in its Data folder, with their archives, move into mods (one per Creation) on at the top of every profile, as MO2's Curation Club does, so each can be turned off and Purge leaves them out; deploy links them back. restore purges and puts them back in Data. Not an undo step. dry_run defaults to true.")]
     async fn creation_club(&self, Parameters(a): Parameters<CreationsArgs>) -> Result<String, String> {
-        out(self.inst().and_then(|i| {
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| {
             let dry = a.dry_run.unwrap_or(true);
             if a.restore.unwrap_or(false) { rmm_core::import::restore_creations(&i, dry) } else { rmm_core::import::adopt_creations(&i, dry) }
         }))
@@ -1474,14 +1508,14 @@ impl Rmm {
     async fn import_mo2(&self, Parameters(a): Parameters<Mo2Args>) -> Result<String, String> {
         let (dir, dry) = (std::path::Path::new(&a.dir), a.dry_run.unwrap_or(true));
         match a.all {
-            true => out(self.inst_mut().and_then(|i| import::import_mo2_all(&i, dir, dry))),
-            false => out(self.inst_mut().and_then(|i| import::import_mo2(&i, dir, a.profile.as_deref(), dry))),
+            true => out(self.inst_for(dry).and_then(|i| import::import_mo2_all(&i, dir, dry))),
+            false => out(self.inst_for(dry).and_then(|i| import::import_mo2(&i, dir, a.profile.as_deref(), dry))),
         }
     }
 
     #[tool(description = "Bring in a Vortex profile from Vortex's live state (the state.v2 folder; read from a copy, ask the user to close Vortex first) or a state backup: mods from the staging folder (dinput/enb mods go under root/), names, Nexus ids, FOMOD choices, enabled state, and Vortex's rules as mod rules, which then order the list; plugins from plugins.txt/loadorder.txt and Vortex's LOOT userlist. dry_run defaults to true. Purge Vortex's deployment before rmm deploys.")]
     async fn import_vortex(&self, Parameters(a): Parameters<VortexArgs>) -> Result<String, String> {
-        out(self.inst_mut().and_then(|i| {
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| {
             import::import_vortex(&i, std::path::Path::new(&a.backup), a.staging.as_deref().map(std::path::Path::new), a.profile.as_deref(), a.dry_run.unwrap_or(true))
         }))
     }
@@ -1506,7 +1540,7 @@ impl Rmm {
     #[tool(description = "Rebuild a setup from a lockfile or pack: install missing mods from archives in `downloads` (matched by name, checked by sha256, with the locked FOMOD choices) or from the pack, list what still has to be downloaded (with Nexus links), then set order, enabled state, colours, plugin order and mod rules, and fill in notes and Nexus ids the mods lack. Mods the profile has that the lockfile doesn't list are kept after the mod they followed. Warns when the game or script extender version differs from the lockfile's. dry_run defaults to true.")]
     async fn apply_lockfile(&self, Parameters(a): Parameters<ApplyLockArgs>) -> Result<String, String> {
         let downloads: Vec<std::path::PathBuf> = a.downloads.iter().map(std::path::PathBuf::from).collect();
-        out(self.inst_mut().and_then(|i| lockfile::apply(&i, &lockfile::read(std::path::Path::new(&a.path))?, &downloads, a.dry_run.unwrap_or(true))))
+        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| lockfile::apply(&i, &lockfile::read(std::path::Path::new(&a.path))?, &downloads, a.dry_run.unwrap_or(true))))
     }
 
     #[tool(description = "Undo the last change to the profile. Returns its label, or null if nothing to undo.")]
@@ -1663,7 +1697,13 @@ impl ServerHandler for Rmm {
         // An app's calls go to its session's chat; save_chat_note adds its note itself.
         let call = (self.log.is_some() && request.name != "save_chat_note")
             .then(|| (request.name.to_string(), request.arguments.clone().map(serde_json::Value::Object).unwrap_or_default(), app_name(&context.peer)));
-        let r = self.tool_router.call(ToolCallContext::new(self, request, context)).await;
+        // Tools do their work (deploys, downloads, a live test's steps) without awaiting: on a
+        // worker of its own, so other requests (another app's, a session's next) aren't held up.
+        let run = self.tool_router.call(ToolCallContext::new(self, request, context));
+        let r = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| h.block_on(run)),
+            _ => run.await,
+        };
         if let Some((name, args, app)) = call {
             let (ok, text) = match &r {
                 Ok(CallToolResponse::Complete(res)) => (res.is_error != Some(true), res.content.iter().filter_map(|c| c.as_text()).map(|t| t.text.as_str()).collect::<Vec<_>>().join("\n")),
@@ -1671,7 +1711,7 @@ impl ServerHandler for Rmm {
                 Err(e) => (false, e.message.to_string()),
             };
             self.session_chat(app, |c| {
-                c.log.push(Event::Call { name: name.clone(), args });
+                c.log.push(Event::Call { name: name.clone(), args: for_chat(args) });
                 c.log.push(Event::Result { name, ok, text: chats::cut(&text, 2000) });
             });
         }
@@ -1687,13 +1727,35 @@ impl ServerHandler for Rmm {
 
 impl Rmm {
     pub fn new(root: PathBuf) -> Rmm {
-        Rmm { root, jobs: Default::default(), session: Default::default(), log: None, tool_router: Rmm::tool_router(), prompt_router: Rmm::prompt_router() }
+        Rmm { root, jobs: Default::default(), session: Default::default(), client: 0, log: None, tool_router: Rmm::tool_router(), prompt_router: Rmm::prompt_router() }
     }
 
     /// This server for one outside AI app's session: its calls are kept as a chat in the instance.
     pub fn recorded(mut self) -> Rmm {
         self.log = Some(Default::default());
         self
+    }
+
+    /// This server for a client of its own: the HTTP server's sessions each get one.
+    pub fn for_new_client(mut self) -> Rmm {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.client = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// The client is gone: end the live test it started, so its game doesn't run on with no one
+    /// to stop it. Blocks while the game quits.
+    pub fn client_gone(&self) {
+        let mine = {
+            let mut slot = self.session.lock().unwrap();
+            if slot.as_ref().is_some_and(|(owner, _)| *owner == self.client) { slot.take() } else { None }
+        };
+        if let Some((_, session)) = mine {
+            match self.inst() {
+                Ok(i) => drop(session.stop(&i)),
+                Err(_) => drop(session),
+            }
+        }
     }
 
     /// `recorded` unless the user turned keeping sessions off (mcp.record_sessions).
@@ -1753,6 +1815,16 @@ mod tests {
         // 2600 wide takes a factor of 3.
         let odd = shrink_png(&png_of(2600, 30, [0, 0, 0])).unwrap().unwrap();
         assert_eq!(png::Decoder::new(std::io::Cursor::new(&odd)).read_info().unwrap().info().width, 866);
+    }
+
+    #[test]
+    fn short_screenshots_and_chat_arguments() {
+        assert!(shrink_png(&png_of(2600, 2, [0, 0, 0])).unwrap().is_none(), "too short to scale: sent as it is");
+        let v = for_chat(serde_json::json!({ "link": "nxm://skyrimspecialedition/mods/9/files/2?key=SECRET&expires=5", "text": "x".repeat(5000), "n": 3 }));
+        assert_eq!(v["link"], "nxm://skyrimspecialedition/mods/9/files/2");
+        assert!(v["text"].as_str().unwrap().len() < 2100);
+        assert_eq!(v["n"], 3);
+        assert_ne!(chats::Chat::external("a").id, chats::Chat::external("b").id, "two sessions at once keep two chats");
     }
 
     #[test]

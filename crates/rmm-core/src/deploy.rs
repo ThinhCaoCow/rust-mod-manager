@@ -350,6 +350,12 @@ pub fn purge(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
         capture_played(inst, &man, &mut plan, dry_run)?;
         for e in man.files.values() {
             let path = game.join(&e.target);
+            let backup = inst.root.join("backup").join(&e.target);
+            // A purge that stopped half-way already put this one back: the file there is the
+            // original, not a change to keep.
+            if e.backed_up && !backup.exists() && path.exists() && !is_ours(inst, e, &path) {
+                continue;
+            }
             plan.remove.push(e.target.clone());
             if path.exists() && !is_ours(inst, e, &path) {
                 plan.external_changes.push(e.target.clone());
@@ -360,7 +366,7 @@ pub fn purge(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
             if !dry_run {
                 remove_file_if_exists(&path)?;
                 if e.backed_up {
-                    move_file(&inst.root.join("backup").join(&e.target), &path)?;
+                    move_file(&backup, &path)?;
                 }
             }
         }
@@ -417,6 +423,8 @@ fn purge_by_identity(inst: &Instance, dry_run: bool) -> Result<DeployPlan> {
                 move_file(&backup.join(&rel), &path)?;
             }
         }
+    }
+    if !dry_run {
         remove_file_if_exists(&game.join(OWNER))?;
     }
     Ok(plan)

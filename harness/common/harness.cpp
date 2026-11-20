@@ -50,9 +50,9 @@ namespace rmm
 		{
 			std::lock_guard lock(writing);
 			if (up) {
-				send_line(a_json.dump() + "\n");
+				send_line(a_json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n");
 			} else if (sock == INVALID_SOCKET) {
-				backlog.push_back(a_json.dump() + "\n");
+				backlog.push_back(a_json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n");
 			}
 		}
 
@@ -183,7 +183,7 @@ namespace rmm
 			} else if (cmd == "screenshot") {
 				reply(id, capture(a_cmd.value("path", std::string{})));
 			} else if (game.command) {
-				game.on_main_thread([id, raw = a_cmd.dump()] {
+				game.on_main_thread([id, raw = a_cmd.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)] {
 					game.command(raw, [id](const std::string& a_error, const std::string& a_data) { reply_data(id, a_error, a_data); });
 				});
 			} else {
@@ -219,7 +219,7 @@ namespace rmm
 				}
 				sock = s;
 				up = true;
-				send_line(nlohmann::json{ { "ev", "hello" }, { "token", a_token }, { "runtime", a_runtime }, { "console_output", game.console_output } }.dump() + "\n");
+				send_line(nlohmann::json{ { "ev", "hello" }, { "token", a_token }, { "runtime", a_runtime }, { "console_output", game.console_output } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n");
 				for (const auto& line : backlog) {
 					send_line(line);
 				}

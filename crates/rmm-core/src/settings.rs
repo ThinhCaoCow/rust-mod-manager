@@ -236,8 +236,13 @@ pub fn set(s: &Settings) -> Result<()> {
     s.check()?;
     let f = crate::config_file("settings.json").context("no config folder to keep the settings in")?;
     std::fs::create_dir_all(f.parent().unwrap_or(&f))?;
-    std::fs::write(f, serde_json::to_string_pretty(s)?)?;
-    Ok(())
+    // A file get() couldn't read was replaced by defaults: keep it rather than lose it.
+    if let Ok(old) = std::fs::read_to_string(&f)
+        && serde_json::from_str::<Settings>(&old).is_err()
+    {
+        std::fs::copy(&f, f.with_extension("json.unreadable"))?;
+    }
+    crate::instance::write_atomic(&f, &serde_json::to_string_pretty(s)?)
 }
 
 /// Change one setting by its dotted name (`deploy.method`), from text: a string setting takes the

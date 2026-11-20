@@ -539,7 +539,7 @@ function matchText(m, f) {
 
 /** Filter text: "#tag" matches tags and categories, anything else the name or the notes. */
 function matches(m, f) {
-  if (f.startsWith('#')) return f.length > 1 && [...(m.tags ?? []), ...(m.categories ?? [])].some(t => t.toLowerCase().startsWith(f.slice(1)));
+  if (f.startsWith('#')) return f.length > 1 && [...(m.tags ?? []), ...(m.categories ?? [])].some(t => t.toLowerCase().replace(/\s+/g, '_').startsWith(f.slice(1)));
   return m.name.toLowerCase().includes(f) || !!m.notes?.toLowerCase().includes(f);
 }
 
@@ -839,9 +839,10 @@ async function moveFiles(from, files) {
   if (!paths?.length) return;
   const to = idByName.get($('#mf-to').value.trim()) ?? ($('#mf-to').value.trim().toLowerCase() === 'overwrite' ? OVERWRITE_ID : null);
   if (!to) return toast('Pick one of your mods by its name.', 'error');
-  let r = await call('move_files', { from, to, paths }).catch(e => String(e));
+  let r = await act('Moving the files', () => call('move_files', { from, to, paths }).catch(e => String(e)), { reload: false });
+  if (!r || r === true) return;
   if (typeof r === 'string') {
-    if (!r.includes('of these already') || !await confirmBox('Replace files?', `${esc(r.replace(/^.*?: /, ''))}.`, 'Replace')) return toast(r, 'error');
+    if (!r.includes('of these already') || !await confirmBox('Replace files?', `${r.replace(/^.*?: /, '')}.`, 'Replace')) return toast(r, 'error');
     r = await act('Moving the files', () => call('move_files', { from, to, paths, replace: true }), { reload: false });
     if (!r || r === true) return;
   }
@@ -1153,8 +1154,11 @@ function pickPlugin(name, { shift = false, ctrl = false } = {}) {
 async function loadDetails() {
   const id = oneMod()?.id;
   if (!id) return;
-  try { details = await call('details', { id }); } catch { details = null; }
-  if (oneMod()?.id === id) renderDetails();
+  let d;
+  try { d = await call('details', { id }); } catch { d = null; }
+  if (oneMod()?.id !== id) return;
+  details = d;
+  renderDetails();
 }
 
 // ---- Selection ------------------------------------------------------------------------------
@@ -2188,7 +2192,7 @@ document.addEventListener('keydown', e => {
   }
   if (e.ctrlKey && low === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
   else if (e.ctrlKey && (low === 'y' || (low === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
-  else if (!(e.target.closest('button') && (k === ' ' || k === 'Enter'))) {
+  else if (!(e.target.closest('button, summary, a[href]') && (k === ' ' || k === 'Enter'))) {
     if (plugVis() && (side === 'plugins' || !shown('mods'))) pluginKeys(e);
     else if (shown('mods')) modKeys(e);
   }
@@ -2246,7 +2250,8 @@ $('#mods tbody').addEventListener('click', e => {
     filterChanged();
   } else if (e.target.closest('.cat') && !e.shiftKey && !e.ctrlKey) {
     // A category label filters the list to its mods, like MO2's category filter.
-    $('#filter').value = `#${e.target.closest('.cat').dataset.cat.toLowerCase()}`;
+    // Words split the filter, so "Armor and Clothing" is one word: #armor_and_clothing.
+    $('#filter').value = `#${e.target.closest('.cat').dataset.cat.toLowerCase().replace(/\s+/g, '_')}`;
     filterChanged();
   } else if (!e.target.closest('.grip')) pick(id, { shift: e.shiftKey, ctrl: e.ctrlKey });
 });
@@ -2994,7 +2999,7 @@ async function shareOrder(cur) {
   const v = await dialog({
     title: 'Share another profile’s order',
     body: `<p>${esc(cur)} takes the other profile’s mod and plugin order now, and from then on moving a mod in either moves it in both. Each keeps its own mods and plugins turned on or off, so one list can serve, say, a light and a heavy setup.</p>
-      <label class="field">Profile <select id="share-with">${others.map(p => `<option>${esc(p)}</option>`).join('')}</select></label>
+      <label class="field">Profile <select id="share-with">${others.map(p => `<option value="${esc(p)}" translate="no">${esc(p)}</option>`).join('')}</select></label>
       <p class="muted small">Undo puts ${esc(cur)}’s order back.</p>`,
     actions: [['cancel', 'Cancel'], ['ok', 'Share its order', 'primary']],
   });
