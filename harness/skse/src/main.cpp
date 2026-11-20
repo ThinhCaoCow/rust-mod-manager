@@ -1,5 +1,6 @@
 // rmm's harness for Skyrim SE/AE (CommonLibSSE-NG): the game side of `test_run`.
 #include "harness.h"
+#include "play.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -145,6 +146,7 @@ namespace
 				}
 				static MenuWatch watch;
 				RE::UI::GetSingleton()->AddEventSink<RE::MenuOpenCloseEvent>(&watch);
+				play::watch_events();
 				rmm::event("data_loaded");
 				break;
 			}
@@ -167,6 +169,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	game.on_main_thread = [](std::function<void()> a_task) { SKSE::GetTaskInterface()->AddTask(std::move(a_task)); };
 	game.console = console;
 	game.console_output = true;
+	game.command = play::command;
 	game.load_save = [](const std::string& a_name) -> std::string {
 		const auto saves = RE::BGSSaveLoadManager::GetSingleton();
 		if (!saves) {

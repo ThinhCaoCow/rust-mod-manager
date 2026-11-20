@@ -4,7 +4,7 @@
 
 The plugin does nothing unless rmm started the game: it needs `RMM_HARNESS_PORT` and `RMM_HARNESS_TOKEN` in its environment.
 
-Status: both build with MSVC 19.50 (Visual Studio 2026). The SKSE plugin has run in Skyrim AE 1.6.1170 (SKSE 2.2.6): windowed behind other windows, `coc` through cells with FPS, screenshots and quit all work; under Proton in WSL it loads and connects back to rmm. The F4SE plugin has run in Fallout 4 1.10.163 (F4SE 0.6.23) the same way: main menu, `coc` into RedRocketExt and Vault111Ext with FPS, screenshots and quit. Console output (each console line's result carries what it printed) works in Skyrim 1.6.1170; the Fallout 4 side builds but hasn't run in the game yet.
+Status: both build with MSVC 19.50 (Visual Studio 2026). The SKSE plugin has run in Skyrim AE 1.6.1170 (SKSE 2.2.6): windowed behind other windows, `coc` through cells with FPS, screenshots and quit all work; under Proton in WSL it loads and connects back to rmm. The F4SE plugin has run in Fallout 4 1.10.163 (F4SE 0.6.23) the same way: main menu, `coc` into RedRocketExt and Vault111Ext with FPS, screenshots and quit. Console output (each console line's result carries what it printed) works in Skyrim 1.6.1170 and Fallout 4 1.10.163. The playing commands (state, Papyrus calls, walking, activating, facing, and in Skyrim dialogue, menus, attacks and controls; see SPEC.md, "In-game test harness") have run in both games.
 
 ## Build (Windows)
 

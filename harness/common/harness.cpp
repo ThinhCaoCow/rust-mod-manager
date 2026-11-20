@@ -147,6 +147,15 @@ namespace rmm
 			send({ { "ev", "result" }, { "id", a_id }, { "ok", a_error.empty() }, { "out", a_error.empty() ? a_out : a_error } });
 		}
 
+		void reply_data(std::int64_t a_id, const std::string& a_error, const std::string& a_data)
+		{
+			nlohmann::json j{ { "ev", "result" }, { "id", a_id }, { "ok", a_error.empty() }, { "out", a_error } };
+			if (!a_data.empty()) {
+				j["data"] = nlohmann::json::parse(a_data, nullptr, false);
+			}
+			send(j);
+		}
+
 		std::string console(const std::string& a_line)
 		{
 			std::string out;
@@ -159,6 +168,9 @@ namespace rmm
 			const auto cmd = a_cmd.value("cmd", std::string{});
 			if (cmd == "console") {
 				game.on_main_thread([id, line = a_cmd.value("line", std::string{})] {
+					if (game.console_later) {
+						return game.console_later(line, [id](const std::string& a_error, const std::string& a_out) { reply(id, a_error, a_out); });
+					}
 					std::string out;
 					const auto  error = game.console(line, out);
 					reply(id, error, out);
@@ -170,6 +182,10 @@ namespace rmm
 				game.on_main_thread([] { console("qqq"); });
 			} else if (cmd == "screenshot") {
 				reply(id, capture(a_cmd.value("path", std::string{})));
+			} else if (game.command) {
+				game.on_main_thread([id, raw = a_cmd.dump()] {
+					game.command(raw, [id](const std::string& a_error, const std::string& a_data) { reply_data(id, a_error, a_data); });
+				});
 			} else {
 				reply(id, "unknown command '" + cmd + "'");
 			}
@@ -273,5 +289,14 @@ namespace rmm
 	void note(const std::string& a_what)
 	{
 		send({ { "ev", "note" }, { "what", a_what } });
+	}
+
+	void game_event(const std::string& a_json)
+	{
+		auto j = nlohmann::json::parse(a_json, nullptr, false);
+		if (j.is_object()) {
+			j["ev"] = "game";
+			send(j);
+		}
 	}
 }

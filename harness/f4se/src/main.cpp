@@ -1,8 +1,12 @@
 // rmm's harness for Fallout 4 (CommonLibF4): the game side of `test_run`.
 #include "harness.h"
+#include "play.h"
 
 #include <F4SE/F4SE.h>
 #include <RE/Fallout.h>
+
+#include <chrono>
+#include <thread>
 
 namespace
 {
@@ -72,6 +76,32 @@ namespace
 		return {};
 	}
 
+	// The game prints a command's result a few frames after running it: read the log after that.
+	void console_later(const std::string& a_line, std::function<void(const std::string&, const std::string&)> a_done)
+	{
+		const auto        log = RE::ConsoleLog::GetSingleton();
+		const std::size_t before = log ? log->buffer.length() : 0;
+		RE::Console::ExecuteCommand(a_line.c_str());
+		std::thread([before, a_done, line = a_line] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(150));
+			F4SE::GetTaskInterface()->AddTask([before, a_done, line] {
+				const auto  log = RE::ConsoleLog::GetSingleton();
+				std::string out;
+				if (log) {
+					const std::string_view all(log->buffer.c_str(), log->buffer.length());
+					out = all.size() > before ? std::string(all.substr(before)) : std::string{};
+				}
+				// Without the game's echo of the line ("line", "Command: line").
+				for (const auto& echo : { line + "\n", "Command: " + line + "\n" }) {
+					if (out.starts_with(echo)) {
+						out.erase(0, echo.size());
+					}
+				}
+				a_done("", out);
+			});
+		}).detach();
+	}
+
 	void on_message(F4SE::MessagingInterface::Message* a_msg)
 	{
 		switch (a_msg->type) {
@@ -93,6 +123,7 @@ namespace
 				}
 				watch_menus();
 				if (ready && !data_ready.exchange(true)) {
+					play::watch_events();
 					rmm::event("data_loaded");
 					main_menu_when_ready();
 				}
@@ -136,6 +167,8 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 	game.on_main_thread = [](std::function<void()> a_task) { F4SE::GetTaskInterface()->AddTask(std::move(a_task)); };
 	game.console = console;
 	game.console_output = true;
+	game.command = play::command;
+	game.console_later = console_later;
 	game.load_save = [](const std::string& a_name) {
 		std::string out;
 		return console("load \"" + a_name + "\"", out);

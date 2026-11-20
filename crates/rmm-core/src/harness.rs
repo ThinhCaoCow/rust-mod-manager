@@ -60,9 +60,12 @@ pub struct Scenario {
     /// `test-runs/<time>/` in the instance. Harness only.
     #[serde(default)]
     pub screenshots: bool,
-    /// What to do after the save and the cells, in order: a test plan. Each step is one of
-    /// {"cell": "Riverwood"} (coc and wait for the load), {"console": "player.placeatme 00023ABA 2"},
-    /// {"wait": 10} (seconds, sampling FPS), {"screenshot": "name"} or {"load": "save name"}.
+    /// What to do after the save and the cells, in order: a test plan of steps (see Step), such as
+    /// {"cell": "Riverwood"}, {"console": "player.placeatme 00023ABA 2"}, {"wait": 10},
+    /// {"screenshot": "name"}, {"load": "save name"}, {"state": {}}, {"move_to": "<ref>"},
+    /// {"activate": "<ref>"}, {"wait_for": {"dead": "<ref>", "timeout": 60}}, {"call": {...}},
+    /// {"dialogue": {}}, {"choose": "words"}, {"button": 1}, {"attack": {"target": "<ref>"}},
+    /// {"press": {"control": "Jump"}}.
     /// Harness only.
     #[serde(default)]
     pub steps: Vec<Step>,
@@ -87,6 +90,162 @@ pub enum Step {
     Screenshot(String),
     /// Load a save by name (without .ess/.fos) and wait for it.
     Load(String),
+    /// The game's state as data: the player (cell, position, heading, health and
+    /// magicka/stamina or action points as [now, max], level, combat), open menus, the nearest
+    /// actors (ref, name, distance, dead, hostile, health) and objects (doors, containers, items:
+    /// ref, type, name, distance; Fallout 4 lists the player's cell only), plus the quests, items
+    /// (counts the player has; Skyrim) and refs asked for. Every step also carries the game's
+    /// events since the last one: deaths, the player's activations, combat and quest stages
+    /// (Skyrim), hits on or by the player (Fallout 4).
+    State(StateQuery),
+    /// Wait until every condition given holds (polling the state), or fail after `timeout`
+    /// seconds (default 60).
+    WaitFor(WaitFor),
+    /// Call a Papyrus function: {"class": "Actor", "fn": "StartCombat", "self": "<ref>", "args":
+    /// ["player"]}. `self` for methods (a ref, a form, or "player"), none for global functions;
+    /// `args` in the function's order (forms by id or editor id). The step's data is its return
+    /// value. A wrong count or type answers with the function's signature.
+    Call(Call),
+    /// Walk the player straight to a reference (the game's auto-move, turning toward it) until
+    /// 100 units away, up to 120 seconds. When something is in the way the player is moved there
+    /// instead, and the data says so (moved_from, note). No pathfinding: the game's own
+    /// (Actor.PathToReference) doesn't move the player.
+    MoveTo(String),
+    /// Activate a reference as the player does: open a door, a container, pick up an item, start
+    /// talking to an NPC.
+    Activate(String),
+    /// The Dialogue Menu's topics: [{index, text, new}], who's speaking, and whether it's open.
+    /// Skyrim only.
+    Dialogue {},
+    /// Choose a dialogue topic by its index or by words in its text, as a click does, and wait
+    /// for the answer: the data has what the speaker said (when the game shows dialogue
+    /// subtitles) and the topics after it ("then"). Skyrim only.
+    Choose(Choice),
+    /// Press a message box's button by its index (0 first). Skyrim only.
+    Button(u32),
+    /// Call a menu's game callback, as its buttons do: {"menu": "LevelUp Menu", "callback":
+    /// "addHealth", "args": []}; a callback starting with _root calls that ActionScript function
+    /// itself ("_root.DialogueMenu_mc.onCancelPress" leaves a conversation). Skyrim only.
+    MenuCall(MenuCall),
+    /// Read a menu's ActionScript variable: {"menu": "Dialogue Menu", "path":
+    /// "_root.DialogueMenu_mc.eMenuState"}; an object lists its members. Skyrim only.
+    MenuGet(MenuGet),
+    /// The player attacks (facing the target first, drawing the weapon if needed). kind: attack
+    /// (default), power_attack, left_attack, left_power_attack, dual_attack, dual_power_attack,
+    /// release (lets a drawn bow fire), left_release. Skyrim only.
+    Attack(Attack),
+    /// Turn the player to face a reference.
+    Face(String),
+    /// Hold a control for `ms` milliseconds (default 100) as the Controls menu names it: Forward,
+    /// Back, Strafe Left, Strafe Right, Activate, Jump, Sprint, Sneak, Ready Weapon, Right
+    /// Attack/Block, Left Attack/Block, Tween Menu, Journal, Wait. Works behind other windows,
+    /// but held movement is slow and uneven (the key reaches the game on some frames only):
+    /// walk with move_to. Skyrim only.
+    Press(Press),
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Default)]
+pub struct StateQuery {
+    /// Quest editor ids: their stage, running and completed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quests: Vec<String>,
+    /// Items (form ids or editor ids): how many the player has.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+    /// References (ids): where they are, and for actors dead, combat, health.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    /// How far to list actors and objects around the player (game units, default 3000; 0 for none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Default)]
+pub struct WaitFor {
+    /// This reference is dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead: Option<String>,
+    /// This quest has reached at least this stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<StageAt>,
+    /// This menu is open ("Dialogue Menu", "MessageBoxMenu", "ContainerMenu", "LevelUp Menu"...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu: Option<String>,
+    /// This menu is closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_closed: Option<String>,
+    /// The player is (true) or isn't (false) in combat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_combat: Option<bool>,
+    /// The player is within `within` units of this reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<Near>,
+    /// The player is in this cell (editor id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    /// Seconds before giving up (default 60, at most 600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct StageAt {
+    pub quest: String,
+    pub at_least: u32,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct Near {
+    #[serde(rename = "ref")]
+    pub target: String,
+    pub within: f64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct Call {
+    pub class: String,
+    #[serde(rename = "fn")]
+    pub function: String,
+    #[serde(default, rename = "self", skip_serializing_if = "Option::is_none")]
+    pub this: Option<String>,
+    #[serde(default)]
+    pub args: Vec<Value>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum Choice {
+    Index(u32),
+    Text(String),
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct MenuCall {
+    pub menu: String,
+    pub callback: String,
+    #[serde(default)]
+    pub args: Vec<Value>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct MenuGet {
+    pub menu: String,
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Default)]
+pub struct Attack {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct Press {
+    pub control: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -105,6 +264,13 @@ pub struct StepResult {
     /// What a console step printed ("" when it printed nothing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// What the step returned: the state, a function's value, the dialogue topics...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+    /// What happened in the game during the step: deaths, combat starting and ending, quest stages,
+    /// activations.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<Value>,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -461,7 +627,8 @@ fn shot(c: &mut Conn, dir: Option<&Path>, name: &str, alive: &dyn Fn() -> bool, 
 
 /// Do one step; its failure is in the result.
 fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, alive: &dyn Fn() -> bool) -> StepResult {
-    let mut res = StepResult { step: step.clone(), ok: true, error: None, fps: None, cell: None, screenshot: None, output: None };
+    let mut res = StepResult { step: step.clone(), ok: true, error: None, fps: None, cell: None, screenshot: None, output: None, data: None, events: vec![] };
+    c.events.clear();
     let console = |c: &mut Conn, line: String| c.command(json!({ "cmd": "console", "line": line }), Duration::from_secs(60), alive);
     let done = match step {
         // A cell that doesn't exist never loads; the console doesn't say so.
@@ -479,13 +646,112 @@ fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, 
             Some(dir) => screenshot(c, dir, name, alive).map(|f| res.screenshot = Some(f)),
             None => Err(anyhow::anyhow!("screenshots are off for this run")),
         },
+        Step::State(q) => {
+            let mut cmd = serde_json::to_value(q).unwrap_or_default();
+            cmd["cmd"] = json!("state");
+            c.command(cmd, Duration::from_secs(30), alive).map(|v| res.data = data(v))
+        }
+        Step::WaitFor(w) => wait_for(c, w, alive).map(|v| res.data = Some(v)),
+        Step::Call(call) => papyrus(c, call, Duration::from_secs(120), alive).map(|v| res.data = data(v)),
+        Step::MoveTo(target) => move_to(c, target, alive).map(|v| res.data = Some(v)),
+        Step::Activate(target) => c.command(json!({ "cmd": "activate", "target": target }), Duration::from_secs(30), alive).map(|v| res.data = data(v)),
+        Step::Dialogue {} => c.command(json!({ "cmd": "dialogue" }), Duration::from_secs(30), alive).map(|v| res.data = data(v)),
+        Step::Choose(choice) => {
+            let cmd = match choice {
+                Choice::Index(i) => json!({ "cmd": "choose", "index": i }),
+                Choice::Text(t) => json!({ "cmd": "choose", "text": t }),
+            };
+            c.command(cmd, Duration::from_secs(75), alive).map(|v| res.data = data(v))
+        }
+        Step::Button(n) => c.command(json!({ "cmd": "menu_call", "menu": "MessageBoxMenu", "callback": "buttonPress", "args": [n] }), Duration::from_secs(30), alive).map(drop),
+        Step::MenuCall(m) => c.command(json!({ "cmd": "menu_call", "menu": m.menu, "callback": m.callback, "args": m.args }), Duration::from_secs(30), alive).map(drop),
+        Step::MenuGet(m) => c.command(json!({ "cmd": "menu_get", "menu": m.menu, "path": m.path }), Duration::from_secs(30), alive).map(|v| res.data = data(v)),
+        Step::Attack(a) => c.command(json!({ "cmd": "act", "action": a.kind.as_deref().unwrap_or("attack"), "target": a.target }), Duration::from_secs(30), alive).map(drop),
+        Step::Face(target) => c.command(json!({ "cmd": "face", "target": target }), Duration::from_secs(30), alive).map(drop),
+        Step::Press(p) => {
+            let ms = p.ms.unwrap_or(100).min(30_000);
+            c.command(json!({ "cmd": "press", "control": p.control, "ms": ms }), Duration::from_millis(ms + 30_000), alive).map(drop)
+        }
     };
+    res.events = std::mem::take(&mut c.events);
     if let Err(e) = done {
         res.ok = false;
         res.error = Some(format!("{e:#}"));
     }
     res.cell = c.cell.clone();
     res
+}
+
+fn data(v: Value) -> Option<Value> {
+    v.get("data").cloned()
+}
+
+fn papyrus(c: &mut Conn, call: &Call, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<Value> {
+    c.command(json!({ "cmd": "papyrus", "class": call.class, "fn": call.function, "self": call.this, "args": call.args }), timeout, alive)
+}
+
+/// The plugin walks the player straight at the target (Forward held, turning toward it).
+fn move_to(c: &mut Conn, target: &str, alive: &dyn Fn() -> bool) -> Result<Value> {
+    Ok(c.command(json!({ "cmd": "walk", "target": target, "within": 100, "timeout": 120 }), Duration::from_secs(150), alive)?["data"].take())
+}
+
+/// Poll the state until every condition holds; the last state is the result.
+fn wait_for(c: &mut Conn, w: &WaitFor, alive: &dyn Fn() -> bool) -> Result<Value> {
+    let refs: Vec<&String> = w.dead.iter().chain(w.near.as_ref().map(|n| &n.target)).collect();
+    let quests: Vec<&String> = w.stage.as_ref().map(|s| &s.quest).into_iter().collect();
+    let query = json!({ "cmd": "state", "radius": 0, "refs": refs, "quests": quests });
+    let timeout = Duration::from_secs(w.timeout.unwrap_or(60).min(600));
+    let start = Instant::now();
+    loop {
+        let state = c.command(query.clone(), Duration::from_secs(30), alive)?["data"].take();
+        let open = |m: &str| state["menus"].as_array().is_some_and(|ms| ms.iter().any(|x| x.as_str().is_some_and(|x| x.eq_ignore_ascii_case(m))));
+        let mut unmet = vec![];
+        if let Some(r) = &w.dead
+            && state["refs"][r]["dead"] != true
+        {
+            unmet.push(format!("{r} isn't dead"));
+        }
+        if let Some(s) = &w.stage
+            && state["quests"][&s.quest]["stage"].as_u64().is_none_or(|n| n < u64::from(s.at_least))
+        {
+            unmet.push(format!("{} is at stage {}", s.quest, state["quests"][&s.quest]["stage"]));
+        }
+        if let Some(m) = &w.menu
+            && !open(m)
+        {
+            unmet.push(format!("{m} isn't open"));
+        }
+        if let Some(m) = &w.menu_closed
+            && open(m)
+        {
+            unmet.push(format!("{m} is open"));
+        }
+        if let Some(b) = w.in_combat
+            && state["player"]["in_combat"] != b
+        {
+            unmet.push(if b { "the player isn't in combat".into() } else { "the player is in combat".into() });
+        }
+        if let Some(n) = &w.near
+            && state["refs"][&n.target]["distance"].as_f64().is_none_or(|d| d > n.within)
+        {
+            unmet.push(format!("{} is {} away", n.target, state["refs"][&n.target]["distance"]));
+        }
+        if let Some(cell) = &w.cell
+            && !state["player"]["cell"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(cell))
+        {
+            unmet.push(format!("the player is in {}", state["player"]["cell"]));
+        }
+        if unmet.is_empty() {
+            return Ok(state);
+        }
+        if start.elapsed() > timeout {
+            bail!("not within {} seconds: {}", timeout.as_secs(), unmet.join("; "));
+        }
+        let pause = Instant::now();
+        while pause.elapsed() < Duration::from_millis(500) {
+            c.read(Duration::from_millis(100))?;
+        }
+    }
 }
 
 /// Passed when every cell and step worked; the summary names the lowest FPS or what failed.
@@ -682,11 +948,13 @@ pub struct Conn {
     cell: Option<String>,
     /// The plugin sends back what console lines print.
     console_output: bool,
+    /// What happened in the game (deaths, combat, quest stages, activations) since the step began.
+    events: Vec<Value>,
 }
 
 impl Conn {
     fn new(stream: TcpStream) -> Result<Self> {
-        Ok(Conn { writer: stream.try_clone()?, reader: BufReader::new(stream), next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false })
+        Ok(Conn { writer: stream.try_clone()?, reader: BufReader::new(stream), next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![] })
     }
 
     /// The next event, or None when nothing came within `wait`.
@@ -704,6 +972,11 @@ impl Conn {
                 }
                 if v["ev"] == "heartbeat" {
                     self.cell = v["cell"].as_str().filter(|c| !c.is_empty()).map(str::to_owned).or(self.cell.take());
+                }
+                if v["ev"] == "game" && self.events.len() < 200 {
+                    let mut e = v.clone();
+                    e.as_object_mut().map(|o| o.remove("ev"));
+                    self.events.push(e);
                 }
                 if v["ev"] == "note" {
                     if self.notes.len() == 12 {
@@ -861,6 +1134,62 @@ mod tests {
         assert_eq!(r.cells[0].fps, Some(Fps { avg: 52.8, min: 45.5, samples: 2 }));
         assert_eq!(r.cells[1].error.as_deref(), Some("Nowhere didn't load"));
         assert!(["data_loaded", "main_menu", "game_loaded"].iter().all(|k| r.timings.contains_key(*k)), "{:?}", r.timings);
+    }
+
+    /// The playing steps: walk, wait for a death the state
+    /// reports on the second poll, activate, and the game's events attached to the step.
+    #[test]
+    fn plays_through_papyrus_state_and_events() {
+        let server = Server::start().unwrap();
+        let (port, token) = (server.port, server.token.clone());
+        let plugin = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut rd = BufReader::new(s.try_clone().unwrap());
+            writeln!(s, "{}", json!({"ev": "hello", "token": token, "runtime": "1.6.1170", "console_output": true})).unwrap();
+            let (mut calls, mut polls) = (vec![], 0);
+            loop {
+                let mut line = String::new();
+                if rd.read_line(&mut line).unwrap() == 0 {
+                    return calls;
+                }
+                let cmd: Value = serde_json::from_str(&line).unwrap();
+                let id = cmd["id"].clone();
+                let reply = match cmd["cmd"].as_str().unwrap() {
+                    "papyrus" => {
+                        calls.push(format!("{}.{} {}", cmd["class"].as_str().unwrap(), cmd["fn"].as_str().unwrap(), cmd["args"]));
+                        json!({"value": true})
+                    }
+                    "activate" => {
+                        calls.push(format!("activate {}", cmd["target"]));
+                        json!({"activated": true})
+                    }
+                    "walk" => {
+                        calls.push(format!("walk {}", cmd["target"]));
+                        writeln!(s, "{}", json!({"ev": "game", "what": "activate", "target": {"ref": "door"}})).unwrap();
+                        json!({"arrived": true, "distance": 120})
+                    }
+                    "state" => {
+                        polls += 1;
+                        json!({"player": {"cell": "Riverwood"}, "menus": [], "refs": {"wolf": {"dead": polls > 1}}})
+                    }
+                    "quit" => return calls,
+                    _ => json!(null),
+                };
+                writeln!(s, "{}", json!({"ev": "result", "id": id, "ok": true, "out": "", "data": reply})).unwrap();
+            }
+        });
+        let (mut c, _) = server.accept(Duration::from_secs(5), &|| true).unwrap();
+        let alive = || true;
+        let steps: Vec<Step> = serde_json::from_value(json!([{"move_to": "door"}, {"wait_for": {"dead": "wolf", "timeout": 5}}, {"activate": "chest"}, {"dialogue": {}}, {"choose": "Rumors"}, {"choose": 1}])).unwrap();
+        let r: Vec<StepResult> = steps.iter().take(3).map(|st| run_step(&mut c, st, Duration::from_secs(5), None, &alive)).collect();
+        assert!(r.iter().all(|x| x.ok), "{r:?}");
+        assert_eq!(r[0].data, Some(json!({"arrived": true, "distance": 120})));
+        assert_eq!(r[0].events, [json!({"what": "activate", "target": {"ref": "door"}})]);
+        assert_eq!(r[1].data.as_ref().unwrap()["refs"]["wolf"]["dead"], true);
+        assert_eq!(r[2].data, Some(json!({"activated": true})));
+        assert_eq!((&steps[4], &steps[5]), (&Step::Choose(Choice::Text("Rumors".into())), &Step::Choose(Choice::Index(1))));
+        c.command(json!({"cmd": "quit"}), Duration::from_secs(1), &alive).ok();
+        assert_eq!(plugin.join().unwrap(), ["walk \"door\"", "activate \"chest\""]);
     }
 
     #[test]

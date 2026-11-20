@@ -476,7 +476,7 @@ struct SessionStartArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct SessionStepArgs {
-    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}.
+    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}, {"state": {}}, {"wait_for": {...}}, {"call": {...}}, {"move_to": ref}, {"activate": ref}, {"face": ref}; Skyrim also {"dialogue": {}}, {"choose": words or index}, {"button": n}, {"menu_call": {...}}, {"menu_get": {...}}, {"attack": {...}}, {"press": {...}}.
     steps: Vec<harness::Step>,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -1516,11 +1516,14 @@ The game runs in a small window behind the user's windows, so you see it only th
    - World: fw <weather form id>, set gamehour to 22, set timescale to 200 to let time pass; wait.
    - Scripts: wait long enough for them to run (30 to 60 seconds) and read the Papyrus log at the end.
    - Checks: console queries answer in the step's output. getstage <quest editor id> (did the quest advance), player.getav <actor value>, player.getitemcount <form id>, player.getpos x/y/z, getglobalvalue <global>, sqv <quest editor id> (its stage, aliases and variables), help <word> 4 (find an id by name). Prefer these to a screenshot when the answer is a number.
+   - State: {\"state\": {\"quests\": [...], \"refs\": [...]}} gives the player, open menus, the nearest actors and objects with their refs, and what you ask about. Every step's answer also lists the game's events since the last one (deaths, the player's activations, combat, quest stages). {\"wait_for\": {\"dead\": \"<ref>\"}} (or stage, menu, menu_closed, in_combat, near, cell) waits for a condition instead of guessing a wait.
+   - Playing: {\"move_to\": \"<ref>\"} walks there (or moves the player when something is in the way, and says so), {\"activate\": \"<ref>\"} opens doors and containers and starts conversations, {\"face\": \"<ref>\"}. {\"call\": {\"class\": \"Actor\", \"fn\": \"StartCombat\", \"self\": \"<ref>\", \"args\": [\"player\"]}} calls any Papyrus function and returns its value.
+   - Skyrim only: {\"dialogue\": {}} lists the topics, {\"choose\": \"words\"} picks one and waits for the answer; {\"button\": 1} answers a message box; {\"attack\": {\"target\": \"<ref>\"}} swings at it (move_to first: 100 units is in reach); {\"press\": {\"control\": \"Jump\"}}.
 2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Open every screenshot before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
 3. If the game closes, the step's answer ends the session with the crash log read back to the mods it names: report that to the lead and stop.
 4. test_session_stop when done: crash, Papyrus errors with their mods, FPS.
 5. Report per mechanic: worked, didn't, or couldn't tell, with the screenshots; crashes and script errors with the mods behind them; the lowest FPS and where. Don't change the setup: fixing is the installer's job.
-Limits: you can't press keys or walk except through the console (coc, player.moveto, player.setpos). A console step without output means the harness plugin predates console output.";
+Limits: move_to walks in a straight line (no pathfinding). Fallout 4 has no dialogue, menu, attack or key steps yet: use the console and Papyrus calls there. A console step without output, or a step the plugin calls unknown, means the harness plugin is older than this rmm.";
 
 const LEAD: &str = "\
 You lead rmm's mod team for this {game} setup. The user wants: {request}

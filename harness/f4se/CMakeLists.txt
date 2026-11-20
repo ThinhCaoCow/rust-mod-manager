@@ -11,7 +11,7 @@ set(ENABLE_FALLOUT_VR OFF CACHE BOOL "" FORCE)
 add_subdirectory("${COMMONLIB_F4_DIR}/CommonLibF4" CommonLibF4 EXCLUDE_FROM_ALL)
 
 find_package(nlohmann_json CONFIG REQUIRED)
-add_library(rmm_harness SHARED src/main.cpp ../common/harness.cpp)
+add_library(rmm_harness SHARED src/main.cpp src/play.cpp ../common/harness.cpp)
 target_compile_features(rmm_harness PRIVATE cxx_std_23)
 target_include_directories(rmm_harness PRIVATE ../common)
 target_link_libraries(rmm_harness PRIVATE CommonLibF4::CommonLibF4 nlohmann_json::nlohmann_json ws2_32 windowscodecs)
