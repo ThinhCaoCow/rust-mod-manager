@@ -10,10 +10,7 @@ use rmm_core::{Game, Instance, addons, conflicts, deploy, game, harness, health,
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use rmm::agent::{self, Agent, Answer};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 
@@ -60,162 +57,6 @@ async fn app_update(app: tauri::AppHandle, install: bool) -> Result<Value, Strin
         app.restart(); // Windows: the installer has closed rmm already
     }
     Ok(json!({ "current": current, "newer": update.version, "notes": update.body }))
-}
-
-/// The AI tab's chat: the agent (for this instance folder), the window's answer to a change waiting
-/// for approval, and the Stop button.
-#[derive(Default)]
-struct Ai {
-    agent: Arc<Mutex<Option<(PathBuf, Agent)>>>,
-    answer: Mutex<Option<Sender<Answer>>>,
-    stop: Arc<AtomicBool>,
-}
-
-/// Providers, keys, models and settings (`status`, `use`, `key`, `forget`, `models`, `options`),
-/// and the instance's chats (`chats`, `chat`, `delete_chat`).
-#[tauri::command]
-async fn ai(current: tauri::State<'_, Current>, name: String, args: Value) -> Result<Value, String> {
-    let root = current.0.lock().unwrap().clone();
-    let work = move || -> Result<Value> {
-        let s = |k: &str| args[k].as_str().map(str::to_owned);
-        let need = |k: &str| s(k).with_context(|| format!("missing '{k}'"));
-        let root = || root.clone().context("no instance is open");
-        Ok(match name.as_str() {
-            "options" => json!(agent::set_options(&need("provider")?, serde_json::from_value(args["options"].clone())?)?),
-            "chats" => json!(agent::chats(&root()?)?),
-            "chat" => {
-                // The screen's log is enough to draw it; the provider's messages stay on disk.
-                let mut c = agent::load_chat(&root()?, &need("id")?)?;
-                c.messages.clear();
-                json!(c)
-            }
-            "delete_chat" => json!(agent::delete_chat(&root()?, &need("id")?)?),
-            "status" => json!(agent::status()),
-            "use" => json!(agent::configure(&need("provider")?, s("model").as_deref(), s("base").as_deref(), args["switch"] != false)?),
-            "team" => json!(agent::team()),
-            "seat" => json!(agent::set_seat(&need("role")?, &s("provider").unwrap_or_default(), &s("model").unwrap_or_default())?),
-            "key" => json!(agent::set_key(&need("provider")?, &need("key")?)?),
-            "forget" => json!(agent::forget_key(&need("provider")?)?),
-            "models" => json!(agent::Conn::open(s("provider").as_deref(), None)?.models()?),
-            other => bail!("unknown AI call '{other}'"),
-        })
-    };
-    tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())?.map_err(|e| format!("{e:#}"))
-}
-
-/// The window as the agent's screen: events go out as `ai` events, approvals wait for `ai_answer`.
-struct Window {
-    app: tauri::AppHandle,
-    answers: Receiver<Answer>,
-    stop: Arc<AtomicBool>,
-}
-
-impl agent::Ui for Window {
-    fn event(&mut self, e: agent::Event) {
-        let _ = self.app.emit("ai", e);
-    }
-
-    fn approve(&mut self, name: &str, args: &Value) -> Answer {
-        let _ = self.app.emit("ai", json!({ "kind": "approve", "name": name, "args": args }));
-        self.answers.recv().unwrap_or(Answer::No)
-    }
-
-    fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
-    }
-
-    fn exchange(&mut self, x: &agent::Exchange) {
-        let _ = self.app.emit("ai-exchange", x);
-    }
-}
-
-/// Send a message in `chat` (a saved chat's id, or none for a new one). A role's message goes to the
-/// AI chosen for that role in Settings (a role given to the AI app over MCP goes on the team board);
-/// without one, the chat goes on with its own AI, and a new chat gets the provider in use. The turn
-/// runs on its own thread and ends with an `ai` event of kind `done` carrying the chat that ran.
-#[tauri::command]
-fn ai_send(app: tauri::AppHandle, current: tauri::State<'_, Current>, ai: tauri::State<'_, Ai>, text: String, role: Option<String>, images: Vec<String>, chat: Option<String>) -> Result<(), String> {
-    let root = current.0.lock().unwrap().clone().ok_or("no instance is open")?;
-    let (tx, answers) = std::sync::mpsc::channel();
-    *ai.answer.lock().unwrap() = Some(tx);
-    ai.stop.store(false, Ordering::Relaxed);
-    let (slot, stop) = (ai.agent.clone(), ai.stop.clone());
-    // Its own thread, not the async runtime's: the agent runs a runtime of its own for rmm's tools.
-    std::thread::spawn(move || {
-        let mut ui = Window { app: app.clone(), answers, stop };
-        let mut slot = slot.lock().unwrap();
-        let mut ran = false;
-        let mut turn = || -> Result<()> {
-            // Picked in the window (data: URLs) or dropped on it (paths).
-            let images = images.iter().map(|d| if d.starts_with("data:") { agent::Image::from_data_url(d) } else { agent::Image::load(Path::new(d)) }).collect::<Result<Vec<_>>>()?;
-            let role = role.as_deref().filter(|r| !r.is_empty());
-            let seat = role.map(|r| agent::role(r).map(|&(key, ..)| agent::seat(key))).transpose()?;
-            if let (Some(r), Some(s)) = (role, &seat)
-                && s.provider == agent::MCP
-            {
-                agent::Ui::event(&mut ui, agent::Event::Notice { text: agent::hand_to_app(&root, r, &text)? });
-                return Ok(());
-            }
-            let kept = matches!(slot.as_ref(), Some((r, a)) if *r == root && chat.as_deref() == Some(a.chat.id.as_str()));
-            if !kept {
-                *slot = None; // the old chat's tools stop first
-            }
-            let saved = match (&chat, kept) {
-                (Some(id), false) => Some(agent::load_chat(&root, id)?),
-                _ => None,
-            };
-            let on = slot.as_ref().map(|(_, a)| &a.chat).or(saved.as_ref()).map(|c| (c.provider.clone(), c.model.clone()));
-            let conn = match (seat, on) {
-                (Some(s), _) => agent::Conn::for_seat(&s)?,
-                (None, Some((p, m))) => agent::Conn::open(Some(&p), Some(&m))?,
-                (None, None) => agent::Conn::for_seat(&agent::seat("chat"))?,
-            };
-            match slot.as_mut() {
-                Some((_, a)) => {
-                    if a.conn.provider.id != conn.provider.id {
-                        bail!("this chat is with {}; start a new chat for {}", a.conn.provider.name, conn.provider.name);
-                    }
-                    a.conn = conn;
-                }
-                None => {
-                    let a = match saved {
-                        Some(c) => Agent::resume(conn, root.clone(), c)?,
-                        None => Agent::new(conn, root.clone())?,
-                    };
-                    *slot = Some((root.clone(), a));
-                }
-            }
-            let (_, a) = slot.as_mut().context("no chat")?;
-            ran = true;
-            a.send(role, &text, &images, &mut ui)
-        };
-        let error = turn().err().map(|e| format!("{e:#}"));
-        let chat = slot.as_ref().filter(|_| ran).map(|(_, a)| json!({ "id": a.chat.id, "title": a.chat.title, "usage": a.chat.usage, "provider": a.chat.provider, "model": a.chat.model }));
-        let _ = app.emit("ai", json!({ "kind": "done", "error": error, "chat": chat }));
-    });
-    Ok(())
-}
-
-/// The window's answer to the change waiting for approval: yes, no or always.
-#[tauri::command]
-fn ai_answer(ai: tauri::State<'_, Ai>, answer: String) {
-    let a = match answer.as_str() {
-        "yes" => Answer::Yes,
-        "always" => Answer::Always,
-        _ => Answer::No,
-    };
-    if let Some(tx) = ai.answer.lock().unwrap().as_ref() {
-        let _ = tx.send(a);
-    }
-}
-
-/// End the turn after the current step (declining a change that waits).
-#[tauri::command]
-fn ai_stop(ai: tauri::State<'_, Ai>) {
-    ai.stop.store(true, Ordering::Relaxed);
-    if let Some(tx) = ai.answer.lock().unwrap().as_ref() {
-        let _ = tx.send(Answer::No);
-    }
 }
 
 #[tauri::command]
@@ -354,10 +195,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "health" => json!(health::check(&inst)?),
         "lacking_requirements" => json!(nexus::lacking_requirements(&inst, &p)),
         "details" => ops::mod_details(&inst, &s("id")?, 300)?,
-        // A mod's FOMOD installer as it plays out with the window's choices; null when it has none.
+        // A mod's FOMOD installer as it plays out with the window's choices; null when it has none;
+        // {script: true} for a C# installer script, which the window asks before running.
         "fomod" => {
             let path = s("path")?;
             match install::has_fomod(&inst, Path::new(&path))? {
+                _ if install::has_script(&inst, Path::new(&path))? => json!({ "script": true }),
                 true => {
                     let mut v = json!(install::fomod_options(&inst, Path::new(&path), choices()?.as_ref())?);
                     // For the wizard's hints: which option is for this game version.
@@ -386,7 +229,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "install" => {
             let name = a["name"].as_str().map(str::trim).filter(|n| !n.is_empty());
             let at = a["priority"].as_u64().map(|n| n as usize);
-            let r = install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at)?;
+            // run_script: the user agreed, in the window, to run this mod's C# installer script.
+            let r = rmm_core::csharp::allowing(flag("run_script"), || install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at))?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
                 nexus::remember(&inst, &r.id, n)?;
             }
@@ -397,9 +241,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             }
             json!(r)
         }
-        "reinstall" => json!(install::reinstall(&inst, &s("id")?, choices()?.as_ref())?),
+        "reinstall" => json!(rmm_core::csharp::allowing(flag("run_script"), || install::reinstall(&inst, &s("id")?, choices()?.as_ref()))?),
         "update_mod" => {
-            let r = install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref())?;
+            let r = rmm_core::csharp::allowing(flag("run_script"), || install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref()))?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
                 nexus::remember(&inst, &r.id, n)?;
             }
@@ -492,9 +336,17 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "nexus_status" => {
             let mut st = nexus::status();
             // Who opens nxm:// links, and whether it's this instance (`rmm -i "<root>" nxm`).
-            let cmd = nexus::handler_command();
+            let mut cmd = nexus::handler_command();
             let here = format!("-i \"{}\"", inst.root.display()).to_lowercase();
-            st["handler_here"] = json!(cmd.as_deref().is_some_and(|c| c.to_lowercase().contains(&here)));
+            let ours = cmd.as_deref().is_some_and(|c| c.to_lowercase().contains(&here));
+            // Set up before rmm-app took the links itself: rmm.exe opened a console for each.
+            if ours
+                && cmd.as_deref().is_some_and(|c| c.to_lowercase().contains("\\rmm.exe\""))
+                && nexus::register_handler(&std::env::current_exe()?, &inst.root).is_ok()
+            {
+                cmd = nexus::handler_command();
+            }
+            st["handler_here"] = json!(ours);
             st["handler"] = json!(cmd);
             // Signed in: fetch the game's category names once, so Nexus categories show.
             if st["user"].is_object() {
@@ -556,7 +408,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(nexus::open_in_browser(&url)?)
         }
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
-        "nexus_handler" => json!(nexus::register_handler(&cli_exe()?, &inst.root)?),
+        "nexus_handler" => json!(nexus::register_handler(&std::env::current_exe()?, &inst.root)?),
         // Only on the user's click: a file on their Desktop.
         "desktop_shortcut" => json!(launch::shortcut(&inst, &s("profile")?, &cli_exe()?, None, flag("dry_run"))?),
         "addons" => json!(addons::list(&inst)?),
@@ -581,6 +433,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "saves" => json!(saves::list(&inst)?),
         "newest_save_using" => json!(saves::newest_using(&inst, &serde_json::from_value::<Vec<String>>(a["plugins"].clone())?)?),
         "clean_cosaves" => json!(saves::clean_cosaves(&inst, false)?),
+        "delete_saves" => json!(saves::delete(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
         "transfer_saves" => json!(saves::transfer(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?, &s("profile")?, !flag("move"))?),
         "downloads" => json!(install::downloads(&inst)?),
@@ -596,12 +449,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "record_conflicts" => json!(plugins::record_conflicts(&inst, &inst.profile()?, &s("plugin")?)?),
         "restore_preview" => json!(inst.restore_preview(n("n")?)?),
         "restore" => json!(inst.restore(n("n")?)?),
+        "set_ini_tweak" => json!(rmm_core::ini_tweaks::set(&inst, &s("id")?, &s("file")?, flag("on"))?),
         "set_note" => json!(ops::set_mod_note(&inst, &s("id")?, &s("note")?)?),
-        "ide_list" => json!(workspace::list(&inst, a["path"].as_str().unwrap_or(""))?),
-        "ide_read" => json!(workspace::read(&inst, &s("path")?)?),
-        "ide_write" => json!(workspace::write(&inst, &s("path")?, &s("text")?, a["expect"].as_str(), "you")?),
-        "ide_edits" => json!(workspace::edits(&inst)?),
-        "ide_revert" => json!(workspace::revert(&inst, n("n")?)?),
+        "read_file" => json!(workspace::read(&inst, &s("path")?)?),
         "categories" => {
             let list = |k: &str| serde_json::from_value::<Vec<String>>(a[k].clone()).unwrap_or_default();
             json!(ops::edit_categories(&inst, &ids()?, &list("add"), &list("remove"))?)
@@ -660,12 +510,21 @@ fn main() {
         .and_then(|i| args.get(i + 1).cloned())
         .or_else(|| std::env::var("RMM_INSTANCE").ok())
         .map(PathBuf::from);
+    // `rmm-app -i <dir> nxm <link>`: Windows runs this for the website's "Mod manager download"
+    // buttons (`nexus_handler`). The link goes to the instance's window; this process becomes that
+    // window only when none has the instance open.
+    let link = args.iter().position(|a| a == "nxm").and_then(|i| args.get(i + 1));
+    if let (Some(root), Some(link)) = (&start, link) {
+        // ponytail: a link that fails here (malformed, unwritable instance) just opens the window.
+        if matches!(nexus::take_link_at_start(root, link), Ok(false)) {
+            return;
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Current(Mutex::new(start)))
         .manage(Mcp(Mutex::new(None)))
-        .manage(Ai::default())
         .setup(|app| {
             // Long jobs report progress; send the window at most ~10 updates a second.
             let handle = app.handle().clone();
@@ -705,7 +564,7 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![call, mcp, ai, ai_send, ai_answer, ai_stop, app_update])
+        .invoke_handler(tauri::generate_handler![call, mcp, app_update])
         .run(tauri::generate_context!())
         .expect("error while running rmm");
 }

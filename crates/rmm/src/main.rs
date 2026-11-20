@@ -1,4 +1,4 @@
-use rmm::{agent, http, mcp};
+use rmm::{http, mcp};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -58,6 +58,10 @@ enum Cmd {
         /// FOMOD choices as JSON, or @file holding it; '{}' takes the installer's defaults.
         #[arg(long)]
         choices: Option<String>,
+        /// Run the mod's C# installer script (fomod/script.cs), a program from the mod, in rmm's
+        /// sandbox. Only for mods from a source you trust.
+        #[arg(long)]
+        run_script: bool,
     },
     /// Show a FOMOD installer's steps and options; --choices previews a selection.
     Fomod {
@@ -71,6 +75,10 @@ enum Cmd {
         id: String,
         #[arg(long)]
         choices: Option<String>,
+        /// Run the mod's C# installer script (fomod/script.cs), a program from the mod, in rmm's
+        /// sandbox. Only for mods from a source you trust.
+        #[arg(long)]
+        run_script: bool,
     },
     /// Update a mod in place from a newer archive or folder: it keeps its id, place, notes,
     /// categories, colour and rules. The old files go to trash/; undo swaps them back.
@@ -80,6 +88,10 @@ enum Cmd {
         /// FOMOD choices as JSON (default: the stored ones).
         #[arg(long)]
         choices: Option<String>,
+        /// Run the mod's C# installer script (fomod/script.cs), a program from the mod, in rmm's
+        /// sandbox. Only for mods from a source you trust.
+        #[arg(long)]
+        run_script: bool,
     },
     /// Rename a mod (its id and folder stay). Prints the previous name.
     Rename { id: String, name: String },
@@ -141,7 +153,7 @@ enum Cmd {
         /// Move them instead.
         #[arg(long, value_name = "PROFILE", conflicts_with = "fix", requires = "files")]
         move_to: Option<String>,
-        /// Save file names, for --copy-to and --move-to.
+        /// Save file names, for --copy-to, --move-to and --delete.
         files: Vec<String>,
         /// Move script extender co-saves whose save is gone into the instance's trash (shows
         /// them without --apply).
@@ -149,6 +161,9 @@ enum Cmd {
         clean_cosaves: bool,
         #[arg(long, requires = "clean_cosaves")]
         apply: bool,
+        /// Move the saves named (file names), with their co-saves, into the instance's trash.
+        #[arg(long, conflicts_with_all = ["fix", "copy_to", "move_to", "clean_cosaves"], requires = "files")]
+        delete: bool,
     },
     /// Archives in the instance's downloads folder and the mods installed from them.
     Downloads {
@@ -216,8 +231,8 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Edits made to mod files, overwrite/ and INIs through rmm (the window's IDE and AI
-    /// tools), newest first.
+    /// Edits made to mod files, overwrite/ and INIs through rmm (AI apps' file tools over MCP),
+    /// newest first.
     Edits {
         /// Put back the file as it was before edit N.
         #[arg(long)]
@@ -240,6 +255,15 @@ enum Cmd {
     },
     /// Set a mod's notes ("" clears them).
     Note { id: String, text: String },
+    /// A mod's INI tweaks (the .ini files in its INI Tweaks folder), or turn one on or off. The
+    /// next deploy writes the enabled ones into the game's INIs; the one after takes them out.
+    IniTweak {
+        id: String,
+        /// The tweak's file name: turns it on (off with --off).
+        file: Option<String>,
+        #[arg(long, requires = "file")]
+        off: bool,
+    },
     /// Add or remove category labels on mods (like MO2's categories).
     Category {
         ids: Vec<String>,
@@ -468,9 +492,9 @@ enum Cmd {
     /// Nexus Mods: API key, update checks, downloads.
     #[command(subcommand)]
     Nexus(NexusCmd),
-    /// What the website's "Mod manager download" button runs, once `rmm nexus register-handler`
-    /// has been run: hands the nxm:// link to the rmm window for the instance, starting it if it's
-    /// closed, where FOMOD installers show their options. Without the window program beside rmm,
+    /// What the website's "Mod manager download" button runs where rmm-app isn't installed (rmm-app
+    /// takes the same arguments): hands the nxm:// link to the rmm window for the instance,
+    /// starting it if it's closed, where FOMOD installers show their options. Without the window program beside rmm,
     /// it downloads and installs the file here (`rmm nexus install` always does).
     Nxm { link: String },
     /// For the installer: put its folder on the user's PATH, or --remove it.
@@ -488,88 +512,12 @@ enum Cmd {
     /// The undo history, newest first, with each step's time and what it changed; when this
     /// instance last deployed and played; and the steps Redo brings back.
     History,
-    /// rmm's own AI with your API key: OpenRouter, Claude, OpenAI (GPT), Kimi, DeepSeek or Qwen.
-    #[command(subcommand)]
-    Ai(AiCmd),
     /// Serve the Model Context Protocol on stdio for AI clients.
     Mcp {
         /// Serve over HTTP on this address instead (e.g. 127.0.0.1:47823), at /mcp. Clients
         /// send `Authorization: Bearer <token>`; the token is printed on start.
         #[arg(long)]
         http: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum AiCmd {
-    /// The providers, each with its model, server and whether a key is there.
-    Status,
-    /// Use this provider from now on. --model and --server change its model or API address
-    /// ("" puts back the default).
-    Use {
-        provider: String,
-        #[arg(long)]
-        model: Option<String>,
-        /// Another address for its API, such as Qwen's China region or a proxy.
-        #[arg(long)]
-        server: Option<String>,
-    },
-    /// Save a provider's API key, after checking it with the provider. Reads it from stdin, so it
-    /// stays out of your shell history.
-    Key { provider: String },
-    /// Delete a provider's saved key.
-    Forget { provider: String },
-    /// The models the key can use (default: the provider in use).
-    Models { provider: Option<String> },
-    /// A provider's request settings; each one given replaces the saved one ("" clears it).
-    Options {
-        provider: String,
-        /// Added to rmm's own instructions for the AI.
-        #[arg(long)]
-        instructions: Option<String>,
-        /// Claude: low, medium, high (default), xhigh or max. Others: their reasoning effort.
-        #[arg(long)]
-        effort: Option<String>,
-        /// 0 to 2 (not Claude).
-        #[arg(long)]
-        temperature: Option<String>,
-        #[arg(long)]
-        max_tokens: Option<String>,
-    },
-    /// Who does each mod team role. With a role (lead, researcher, installer, tester) and a
-    /// provider, give it that provider (--model for another than its own), `mcp` for the AI app
-    /// connected over MCP, or "" for the provider in use.
-    Team {
-        role: Option<String>,
-        provider: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// This instance's saved chats, newest first.
-    Chats,
-    /// Chat with the AI about this instance, through rmm's tools. Reads and dry runs run straight
-    /// away; each change waits for your y (yes), n (no) or a (yes to all in this chat). After each
-    /// answer, type the next message; an empty line ends.
-    Chat {
-        /// The first message; without it, the first line you type.
-        words: Vec<String>,
-        /// A mod team role for the first message (lead, researcher, installer, tester): it goes to
-        /// the AI set for that role (`rmm ai team`) unless --provider says otherwise.
-        #[arg(long)]
-        role: Option<String>,
-        /// A picture (PNG, JPEG, GIF, WebP) to send with the first message; repeat for more.
-        #[arg(long)]
-        image: Vec<PathBuf>,
-        #[arg(long)]
-        provider: Option<String>,
-        #[arg(long)]
-        model: Option<String>,
-        /// Run changes without asking.
-        #[arg(long)]
-        yes: bool,
-        /// Go on with a saved chat (an id from `rmm ai chats`).
-        #[arg(long)]
-        resume: Option<String>,
     },
 }
 
@@ -766,8 +714,9 @@ enum NexusCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Make nxm:// links open `rmm nxm` for this instance. Changes the system's handler for
-    /// nxm links (HKCU\Software\Classes\nxm on Windows, xdg-mime on Linux).
+    /// Make nxm:// links open rmm for this instance: the window program (rmm-app) where it is next
+    /// to rmm, else `rmm nxm`. Changes the system's handler for nxm links
+    /// (HKCU\Software\Classes\nxm on Windows, xdg-mime on Linux).
     RegisterHandler,
 }
 
@@ -968,21 +917,21 @@ fn run() -> Result<()> {
         }
         Cmd::Mods => print(&ops::list_mods(&open()?)?),
         Cmd::Show { id } => print(&ops::mod_details(&open()?, &id, usize::MAX)?),
-        Cmd::Install { path, name, at, disabled, choices } => {
+        Cmd::Install { path, name, at, disabled, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&install::install_at(&open()?, &path, name.as_deref(), !disabled, choices.as_ref(), at)?)
+            print(&rmm_core::csharp::allowing(run_script, || install::install_at(&open()?, &path, name.as_deref(), !disabled, choices.as_ref(), at))?)
         }
         Cmd::Fomod { path, choices } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
             print(&install::fomod_options(&open()?, &path, choices.as_ref())?)
         }
-        Cmd::Reinstall { id, choices } => {
+        Cmd::Reinstall { id, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&install::reinstall(&open()?, &id, choices.as_ref())?)
+            print(&rmm_core::csharp::allowing(run_script, || install::reinstall(&open()?, &id, choices.as_ref()))?)
         }
-        Cmd::Update { id, path, choices } => {
+        Cmd::Update { id, path, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&install::update(&open()?, &id, &path, choices.as_ref())?)
+            print(&rmm_core::csharp::allowing(run_script, || install::update(&open()?, &id, &path, choices.as_ref()))?)
         }
         Cmd::Rename { id, name } => print(&serde_json::json!({ "previous": ops::rename_mod(&open()?, &id, &name)? })),
         Cmd::Uninstall { ids } => done(install::uninstall_mods(&open()?, &ids)),
@@ -1022,6 +971,7 @@ fn run() -> Result<()> {
             print(&conflicts::data_view(&inst, &inst.profile()?, &q)?)
         }
         Cmd::Saves { clean_cosaves: true, apply, .. } => print(&serde_json::json!({ "co_saves": saves::clean_cosaves(&open()?, !apply)?, "moved": apply })),
+        Cmd::Saves { delete: true, files, .. } => print(&serde_json::json!({ "to_trash": saves::delete(&open()?, &files)? })),
         Cmd::Saves { fix: Some(file), .. } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
         Cmd::Saves { copy_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, true)?),
         Cmd::Saves { move_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, false)?),
@@ -1062,6 +1012,8 @@ fn run() -> Result<()> {
         Cmd::Edits { revert: None } => print(&rmm_core::workspace::edits(&open()?)?),
         Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),
         Cmd::Trash { empty: true } => print(&install::empty_trash(&open()?)?),
+        Cmd::IniTweak { id, file: None, .. } => print(&rmm_core::ini_tweaks::list(&open()?, &id)?),
+        Cmd::IniTweak { id, file: Some(file), off } => done(rmm_core::ini_tweaks::set(&open()?, &id, &file, !off)),
         Cmd::Note { id, text } => print(&serde_json::json!({ "previous": ops::set_mod_note(&open()?, &id, &text)? })),
         Cmd::Category { ids, add, remove } => print(&ops::edit_categories(&open()?, &ids, &add, &remove)?),
         Cmd::Color { id, color } => done(ops::set_color(&open()?, &id, &color)),
@@ -1314,89 +1266,14 @@ fn run() -> Result<()> {
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;
-            println!("{}", nexus::register_handler(&std::env::current_exe()?, &inst.root)?);
+            // The window program where it's installed: it takes links without opening a console.
+            let cli = std::env::current_exe()?;
+            let app = cli.with_file_name(if cfg!(windows) { "rmm-app.exe" } else { "rmm-app" });
+            println!("{}", nexus::register_handler(if app.is_file() { &app } else { &cli }, &inst.root)?);
             Ok(())
         }
         #[cfg(target_os = "linux")]
         Cmd::Vfs => rmm_core::vfs::serve(&open()?, |data| eprintln!("Mounted the profile over {}. Ctrl+C unmounts.", data.display())),
-        Cmd::Ai(AiCmd::Status) => print(&agent::status()),
-        Cmd::Ai(AiCmd::Use { provider, model, server }) => print(&agent::configure(&provider, model.as_deref(), server.as_deref(), true)?),
-        Cmd::Ai(AiCmd::Key { provider }) => {
-            let p = agent::provider(&provider)?;
-            eprint!("Paste your {} API key: ", p.name);
-            let mut key = String::new();
-            std::io::stdin().read_line(&mut key)?;
-            let n = agent::set_key(p.id, &key)?;
-            eprintln!("Saved. {} took the key ({n} models).", p.name);
-            Ok(())
-        }
-        Cmd::Ai(AiCmd::Forget { provider }) => print(&serde_json::json!({ "forgot": agent::forget_key(&provider)? })),
-        Cmd::Ai(AiCmd::Models { provider }) => print(&agent::Conn::open(provider.as_deref(), None)?.models()?),
-        Cmd::Ai(AiCmd::Options { provider, instructions, effort, temperature, max_tokens }) => {
-            let id = agent::provider(&provider)?.id;
-            let mut o = agent::status().into_iter().find(|s| s.id == id).map(|s| s.options).unwrap_or_default();
-            let num = |v: &str| -> Result<Option<f64>> { Ok(if v.trim().is_empty() { None } else { Some(v.trim().parse().context("not a number")?) }) };
-            if let Some(v) = instructions {
-                o.instructions = v;
-            }
-            if let Some(v) = effort {
-                o.effort = Some(v);
-            }
-            if let Some(v) = temperature {
-                o.temperature = num(&v)?;
-            }
-            if let Some(v) = max_tokens {
-                o.max_tokens = num(&v)?.map(|n| n as u32);
-            }
-            print(&agent::set_options(id, o)?.options)
-        }
-        Cmd::Ai(AiCmd::Team { role, provider, model }) => match (role, provider) {
-            (Some(r), Some(p)) => {
-                agent::set_seat(&r, &p, model.as_deref().unwrap_or(""))?;
-                print(&agent::team())
-            }
-            (None, None) => print(&agent::team()),
-            _ => anyhow::bail!("give a role and a provider (mcp for the AI app connected over MCP, \"\" for the provider in use)"),
-        },
-        Cmd::Ai(AiCmd::Chats) => print(&agent::chats(&open()?.root)?),
-        Cmd::Ai(AiCmd::Chat { words, role, image, provider, model, yes, resume }) => {
-            let inst = open()?;
-            let saved = resume.map(|id| agent::load_chat(&inst.root, &id)).transpose()?;
-            // A role goes to its AI unless the provider is named; the AI app over MCP gets it as a team task.
-            let seat = match (&provider, &saved, &role) {
-                (None, None, Some(r)) => Some(agent::seat(agent::role(r)?.0)),
-                _ => None,
-            };
-            if seat.as_ref().is_some_and(|s| s.provider == agent::MCP) {
-                eprintln!("{}", agent::hand_to_app(&inst.root, role.as_deref().unwrap_or_default(), &words.join(" "))?);
-                return Ok(());
-            }
-            let conn = match seat {
-                Some(s) => agent::Conn::for_seat(&s)?,
-                None => agent::Conn::open(provider.as_deref().or(saved.as_ref().map(|c| c.provider.as_str())), model.as_deref())?,
-            };
-            let mut images = image.iter().map(|p| agent::Image::load(p)).collect::<Result<Vec<_>>>()?;
-            eprintln!("{} · {}. An empty line ends the chat.", conn.provider.name, conn.model);
-            let mut ai = match saved {
-                Some(chat) => agent::Agent::resume(conn, inst.root.clone(), chat)?,
-                None => agent::Agent::new(conn, inst.root.clone())?,
-            };
-            ai.trusted = yes;
-            let (mut text, mut role) = (words.join(" "), role);
-            loop {
-                if text.trim().is_empty() {
-                    eprint!("you> ");
-                    text.clear();
-                    if std::io::stdin().read_line(&mut text)? == 0 || text.trim().is_empty() {
-                        return Ok(());
-                    }
-                }
-                if let Err(e) = ai.send(role.take().as_deref(), text.trim(), &std::mem::take(&mut images), &mut Term) {
-                    eprintln!("error: {e:#}");
-                }
-                text.clear();
-            }
-        }
         Cmd::Undo => print(&open()?.undo()?),
         Cmd::Redo => print(&open()?.redo()?),
         Cmd::History => print(&ops::history(&open()?)?),
@@ -1415,40 +1292,6 @@ fn run() -> Result<()> {
                 }
             }
             tokio::runtime::Runtime::new()?.block_on(mcp::serve(dir))
-        }
-    }
-}
-
-/// The chat in a terminal: the AI's words on stdout, its tool calls on stderr.
-struct Term;
-
-fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    match line.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &line[..i]),
-        None => line.into(),
-    }
-}
-
-impl agent::Ui for Term {
-    fn event(&mut self, e: agent::Event) {
-        match e {
-            agent::Event::User { .. } => {}
-            agent::Event::Text { text } => println!("{text}\n"),
-            agent::Event::Call { name, args } => eprintln!("> {name} {}", first_line(&args.to_string(), 160)),
-            agent::Event::Result { ok, text, .. } => eprintln!("  {} {}", if ok { "ok:" } else { "failed:" }, first_line(&text, 160)),
-            agent::Event::Notice { text } => eprintln!("! {text}"),
-        }
-    }
-
-    fn approve(&mut self, name: &str, args: &serde_json::Value) -> agent::Answer {
-        eprint!("Run {name} {args}? [y]es, [n]o, [a]ll changes in this chat: ");
-        let mut a = String::new();
-        let _ = std::io::stdin().read_line(&mut a);
-        match a.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => agent::Answer::Yes,
-            "a" | "all" => agent::Answer::Always,
-            _ => agent::Answer::No,
         }
     }
 }

@@ -29,6 +29,37 @@ struct State {
     /// rmm has written plugins.txt; whether the user had one (kept in ini-backup/).
     #[serde(default)]
     plugins_txt: Option<bool>,
+    /// Settings the enabled mods' INI tweaks wrote, with the value each had before.
+    #[serde(default)]
+    tweaks: Vec<Applied>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Applied {
+    /// The INI in My Games.
+    file: String,
+    section: String,
+    key: String,
+    before: Option<String>,
+    /// The INI had no such section: putting it back removes the header rmm added.
+    #[serde(default)]
+    new_section: bool,
+}
+
+fn section_of(line: &[u8]) -> Option<String> {
+    let t = String::from_utf8_lossy(line);
+    t.trim().strip_prefix('[').and_then(|t| t.strip_suffix(']')).map(|s| s.trim().to_lowercase())
+}
+
+/// `ini` without the `[section]` header when no setting follows it.
+fn drop_empty_section(ini: Vec<u8>, section: &str) -> Vec<u8> {
+    let lines: Vec<&[u8]> = ini.split_inclusive(|b| *b == b'\n').collect();
+    let Some(at) = lines.iter().position(|l| section_of(l).as_deref() == Some(&section.to_lowercase())) else { return ini };
+    let empty = lines[at + 1..].iter().take_while(|l| section_of(l).is_none()).all(|l| l.trim_ascii().is_empty());
+    if !empty {
+        return ini;
+    }
+    lines.iter().enumerate().filter(|(i, _)| *i != at).flat_map(|(_, l)| l.iter().copied()).collect()
 }
 
 /// A struct, not `Option<Option<_>>`: JSON can't tell `Some(None)` from `None`.
@@ -75,7 +106,37 @@ pub fn apply(inst: &Instance, p: &Profile) -> Result<()> {
         st.saves = Some(Saves { before: ini_get(&String::from_utf8_lossy(&text), "General", "sLocalSavePath") });
         fs::write(&path, ini_set(&text, &[("General", "sLocalSavePath", Some(format!("Saves\\{cur}\\")))]))?;
     }
+    apply_tweaks(inst, p, &mut st)?;
     save(inst, &st)
+}
+
+/// Write the enabled mods' INI tweaks into My Games, keeping each value they replace. A setting
+/// goes to the Prefs INI when that already has it, otherwise to the main INI; an INI the game
+/// hasn't made yet is left alone.
+fn apply_tweaks(inst: &Instance, p: &Profile, st: &mut State) -> Result<()> {
+    let want = crate::ini_tweaks::wanted(inst, p);
+    if want.is_empty() {
+        return Ok(());
+    }
+    let main = inst.config.game.ini_name().to_string();
+    let prefs = main.replace(".ini", "Prefs.ini");
+    let prefs_text = fs::read(my_games(inst, &prefs)).map(|t| String::from_utf8_lossy(&t).into_owned()).unwrap_or_default();
+    for name in [main, prefs.clone()] {
+        let path = my_games(inst, &name);
+        let Ok(text) = fs::read(&path) else { continue };
+        let lossy = String::from_utf8_lossy(&text).into_owned();
+        let mine: Vec<_> = want.iter().filter(|s| ini_get(&prefs_text, &s.section, &s.key).is_some() == (name == prefs)).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        for s in &mine {
+            let new_section = !text.split_inclusive(|b| *b == b'\n').any(|l| section_of(l).as_deref() == Some(&s.section.to_lowercase()));
+            st.tweaks.push(Applied { file: name.clone(), section: s.section.clone(), key: s.key.clone(), before: ini_get(&lossy, &s.section, &s.key), new_section });
+        }
+        let set: Vec<(&str, &str, Option<String>)> = mine.iter().map(|s| (s.section.as_str(), s.key.as_str(), Some(s.value.clone()))).collect();
+        fs::write(&path, ini_set(&text, &set))?;
+    }
+    Ok(())
 }
 
 /// Give My Games back to the user: the game's changes go to their profile, the user's own INIs,
@@ -123,6 +184,16 @@ pub fn renamed(inst: &Instance, from: &str, to: &str) -> Result<()> {
 /// sLocalSavePath back as it was, then the INIs in My Games back to the profile they belong to
 /// (unless it was deleted since).
 fn put_back(inst: &Instance, st: &mut State) -> Result<()> {
+    let mut files: Vec<String> = st.tweaks.iter().map(|a| a.file.clone()).collect();
+    files.dedup();
+    for name in files {
+        if let Ok(text) = fs::read(my_games(inst, &name)) {
+            let set: Vec<(&str, &str, Option<String>)> = st.tweaks.iter().filter(|a| a.file == name).map(|a| (a.section.as_str(), a.key.as_str(), a.before.clone())).collect();
+            let added = st.tweaks.iter().filter(|a| a.file == name && a.new_section).map(|a| a.section.as_str());
+            fs::write(my_games(inst, &name), added.fold(ini_set(&text, &set), drop_empty_section))?;
+        }
+    }
+    st.tweaks.clear();
     if let Some(Saves { before }) = st.saves.take() {
         let path = my_games(inst, inst.config.game.ini_name());
         if let Ok(text) = fs::read(&path) {
@@ -206,7 +277,7 @@ fn load(inst: &Instance) -> Result<State> {
 
 fn save(inst: &Instance, st: &State) -> Result<()> {
     let path = inst.root.join(STATE);
-    if st.profile.is_none() && st.files.is_empty() && st.saves.is_none() && st.plugins_txt.is_none() {
+    if st.profile.is_none() && st.files.is_empty() && st.saves.is_none() && st.plugins_txt.is_none() && st.tweaks.is_empty() {
         if path.exists() {
             fs::remove_file(path)?;
         }

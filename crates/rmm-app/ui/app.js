@@ -56,23 +56,20 @@ prefs.cols ??= { conflicts: true, tags: false, notes: false, installed: false, f
 prefs.cols.category ??= true;
 prefs.widths ??= {};
 // This window's look and habits (Settings, "This window").
-const WIN = { theme: 'system', density: 'comfortable', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true, tabSize: 4, spaces: false, wrap: false, enterSends: true };
+const WIN = { theme: 'system', density: 'comfortable', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
 const W = prefs.win = { ...WIN, ...prefs.win };
 function applyWin() {
   if (W.theme === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = W.theme;
   document.body.classList.toggle('compact', W.density === 'compact');
   document.body.classList.toggle('simple', W.simple); // hides .adv
   T.webview.getCurrentWebview().setZoom(W.zoom).catch(() => {});
-  for (const el of [$('#ide-text'), $('#ide-gutter')]) el.style.tabSize = W.tabSize;
-  $('#ide-text').wrap = W.wrap ? 'soft' : 'off';
-  $('#ide-gutter').style.display = W.wrap ? 'none' : ''; // its numbers count unwrapped lines
-  // Simple view: the tabs a beginner doesn't need yet (AI access is on Tools, the editor on AI).
+  // Simple view: the tabs a beginner doesn't need yet.
   for (const t of SIMPLE_HIDES) $(`.tabs [data-tab="${t}"]`).hidden = W.simple;
   visibleTabs().forEach((t, i) => { $(`.tabs [data-tab="${t}"]`).title = i < 9 ? `Ctrl+${i + 1}` : 'Ctrl+,'; });
   if (W.simple && SIMPLE_HIDES.includes(tab)) { tab = 'mods'; if (!$('#app').hidden) showTab('mods'); }
   if (S) renderStart();
 }
-const SIMPLE_HIDES = ['data', 'tools', 'ai'];
+const SIMPLE_HIDES = ['data', 'tools', 'mcp'];
 const visibleTabs = () => $$('.tabs [data-tab]').filter(b => !b.hidden).map(b => b.dataset.tab);
 // `w`: the default width in pixels, as style.css sets it for `cls`.
 const COLS = {
@@ -313,7 +310,7 @@ async function rmmUpdateOnStart() {
 
 // The last tab, filter and state chips come back with the window.
 const START = W.startTab === 'last' ? prefs.tab : W.startTab;
-tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'ai', 'settings'].includes(START) ? START : 'mods';
+tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings'].includes(START) ? START : 'mods';
 $('#filter').value = prefs.filter ?? '';
 filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, update: 1, endorsed: 1, tracked: 1, problems: 1 }));
 
@@ -896,7 +893,8 @@ function renderDetails() {
     ${d?.nexus_id ? needsBlock(d.needs) : ''}
     ${m.nexus_id && nexus.user ? accountBlock(m) : ''}
     ${d?.meta?.nexus ? nexusBlock(d.meta.nexus.mod_id) : ''}
-    ${d?.docs?.length ? `<h3>Read me and settings</h3><div class="files">${d.docs.map(f => `<button class="link" data-doc="${esc(f)}" title="Open in the editor (AI tab)">${esc(f)}</button>`).join('<br>')}</div>` : ''}
+    ${d?.docs?.length ? `<h3>Read me and settings</h3><div class="files">${d.docs.map(f => `<button class="link" data-doc="${esc(f)}" title="Read it">${esc(f)}</button>`).join('<br>')}</div>` : ''}
+    ${d?.ini_tweaks?.length ? tweaksBlock(d.ini_tweaks) : ''}
     ${d?.images?.length ? `<h3>Pictures (${d.images.length})</h3>${modPics.has(m.id)
       ? `<div class="pics">${modPics.get(m.id).map(([f, url]) => url ? `<img src="${url}" alt="${esc(f)}" title="${esc(f)}" data-pic="${esc(f)}">` : `<span class="muted small">${esc(f)}: can’t be shown</span>`).join('')}</div>`
       : '<div class="row"><button data-act="mod-pics">Show them</button></div>'}` : ''}
@@ -928,6 +926,15 @@ function renderDetails() {
     n.focus();
     n.setSelectionRange(draft[1], draft[2]);
   }
+}
+
+/** The mod's INI tweaks (its INI Tweaks folder). One that's on goes into the game's INIs at the next deploy. */
+function tweaksBlock(tweaks) {
+  const sets = t => t.settings.map(s => `${s.key}=${s.value}`);
+  return `<h3>INI tweaks</h3><div class="stack">${tweaks.map(t => `<label class="row" style="margin:0" title="${esc(t.settings.map(s => `[${s.section}] ${s.key}=${s.value}`).join('\n'))}">
+      <input type="checkbox" data-tweak="${esc(t.file)}"${t.enabled ? ' checked' : ''}> ${esc(t.file.replace(/\.ini$/i, ''))}
+      <span class="muted small">${esc(sets(t).slice(0, 3).join(', '))}${sets(t).length > 3 ? ` and ${sets(t).length - 3} more` : ''}</span></label>`).join('')}</div>
+    <p class="muted small">A tweak that’s on is written into the game’s INIs at the next deploy or Play. Turn it off and it comes out again.</p>`;
 }
 
 /** What the mod's Nexus page lists as required, and whether this setup has each. */
@@ -1309,8 +1316,13 @@ async function editsOk(d, verb) {
   const ed = d?.edited ?? [];
   if (!ed.length) return true;
   const which = ed.length === 1 ? ed[0] : `${ed.length} of its files (${ed.slice(0, 4).join(', ')}${ed.length > 4 ? '…' : ''})`;
-  return confirmBox(`${verb} ${nameOf(d.id)}?`, `You edited ${which} in rmm. ${verb === 'Update' ? 'Updating' : 'Reinstalling'} puts the archive’s files in their place. Undo brings your edited ones back; Edits… in the file editor shows what you changed.`, `${verb} anyway`, 'primary');
+  return confirmBox(`${verb} ${nameOf(d.id)}?`, `You edited ${which} in rmm. ${verb === 'Update' ? 'Updating' : 'Reinstalling'} puts the archive’s files in their place. Undo brings your edited ones back; “rmm edits” lists what changed.`, `${verb} anyway`, 'primary');
 }
+
+/** A C# installer script is a program from the mod: it runs only when the user says so. */
+const scriptOk = path => confirmBox(`Run ${basename(path)}’s installer?`,
+  'This mod’s installer is a C# script: a small program its author wrote, which asks about its options in windows of its own and says which files to install. rmm runs it in a sandbox where it can read the mod’s files and the game’s Data and nothing else, then installs what it picked. It is still code from the download: run it only for a mod from a source you trust.',
+  'Run the installer', 'primary');
 
 /** Install a mod again from where it came from; a FOMOD installer opens with its stored choices. */
 async function reinstall(id) {
@@ -1324,13 +1336,16 @@ async function reinstall(id) {
   }, { reload: false });
   if (!walk) return;
   if (!await editsOk(d, 'Reinstall')) return;
-  if (walk === true) {
+  const run_script = !!walk.script;
+  if (run_script) {
+    if (!await scriptOk(path)) return;
+  } else if (walk === true) {
     if (!await confirmBox(`Reinstall ${nameOf(id)}?`, `Its files are read again from ${path}. The old files go to the instance's trash folder, and Undo puts them back.`, 'Reinstall', 'primary')) return;
   } else {
     choices = await fomodWizard(path, walk);
     if (!choices) return;
   }
-  const r = await act(`Reinstalling ${nameOf(id)}`, () => call('reinstall', { id, choices }));
+  const r = await act(`Reinstalling ${nameOf(id)}`, () => call('reinstall', { id, choices, run_script }));
   if (r) toast(`Reinstalled ${r.name} (${plural(r.files, 'file')}).${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
 }
 
@@ -1345,11 +1360,14 @@ async function updateMod(id, path, nx = null) {
   }, { reload: false, problem: true });
   if (!walk) return;
   let choices;
-  if (walk !== true) {
+  const run_script = !!walk.script;
+  if (run_script) {
+    if (!await scriptOk(path)) return;
+  } else if (walk !== true) {
     choices = walk.steps.length ? await fomodWizard(path, walk) : walk.choices;
     if (!choices) return;
   }
-  const r = await act(`Updating ${nameOf(id)}`, () => call('update_mod', { id, path, choices, nexus: nx?.nexus }), { problem: true });
+  const r = await act(`Updating ${nameOf(id)}`, () => call('update_mod', { id, path, choices, nexus: nx?.nexus, run_script }), { problem: true });
   if (r && r !== true) toast(`Updated ${r.name} from ${basename(path)} (${plural(r.files, 'file')}). Undo puts the old files back.${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
 }
 
@@ -1554,7 +1572,7 @@ function showTab(t) {
   savePrefs();
   const split = wasSplit = splitOn();
   $$('.tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
-  for (const p of ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'ai', 'settings']) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
+  for (const p of ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings']) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
   $('main').classList.toggle('split', split && t === 'mods');
   $('#split').hidden = innerWidth < 1500;
   $('#split').setAttribute('aria-pressed', split);
@@ -1570,8 +1588,8 @@ function showTab(t) {
   if (t === 'data' && !dataLoaded) loadData();
   if (t === 'saves') loadSaves(); // the game writes them; read them each time
   if (t === 'downloads' && !downloadsData) loadDownloads();
-  if (t === 'ai') ideInit();
-  if (t === 'settings') { aiLoad(); drawMore(); }
+  if (t === 'mcp') { drawMcp(); drawMore(); }
+  if (t === 'settings') drawMore();
 }
 $$('.tabs [data-tab]').forEach(b => { b.onclick = () => showTab(b.dataset.tab); });
 $('#recheck').onclick = runHealth;
@@ -1592,7 +1610,7 @@ async function crashLog(path) {
     ${rows ? `<p>Named in the log, most likely first:</p><table class="fc">${rows}</table>` : '<p class="muted">The log names nothing that mods provide.</p>'}
     ${r.next_steps.length ? `<h3>What to try</h3><ul>${r.next_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
     ${r.call_stack.length ? `<details><summary>Call stack</summary><pre>${esc(r.call_stack.join('\n'))}</pre></details>` : ''}
-    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><button type="button" id="find-culprit" title="Turn off half of the mods at a time and play, until one is left">Find the culprit…</button>${W.simple ? '' : '<button type="button" id="ask-ai" title="rmm’s AI reads the log and your setup, and says what it thinks and what to try; it changes nothing without asking">Ask AI about it</button>'}<span class="muted small" id="crash-note" role="status"></span></div>
+    <div class="row"><button type="button" id="copy-report" title="A report to paste into a forum post or chat, without your Windows user name">Copy report</button><button type="button" id="save-bundle" title="A zip of the setup and its logs to attach to a post, without your Windows user name">Save support bundle…</button><button type="button" id="find-culprit" title="Turn off half of the mods at a time and play, until one is left">Find the culprit…</button><span class="muted small" id="crash-note" role="status"></span></div>
     ${others.length ? `<label class="field">Older crash logs<select id="older"><option value="">Choose…</option>${others.map(o => `<option value="${esc(o.path)}">${esc(basename(o.path))} · ${esc(when(o.modified))}</option>`).join('')}</select></label>` : ''}
     <p class="muted small" style="margin-top:10px">A name in a crash log is a lead, not a verdict: the mod that crashed often isn't the one at fault.</p>`;
   const done = dialog({ title: 'Crash log', body, actions: [['cancel', 'Close']] });
@@ -1607,10 +1625,6 @@ async function crashLog(path) {
     if (b) note(`Saved ${b.path}`);
   };
   $('#find-culprit').onclick = () => { $('#dlg').close(); setTimeout(() => startBisect(r)); };
-  $('#ask-ai')?.addEventListener('click', () => {
-    $('#dlg').close();
-    setTimeout(() => askAi(`My game crashed. Read the crash log ${r.path} with read_crash_log, then tell me in plain words what most likely caused it and what I should try first. Change nothing until I say so.`));
-  });
   await done;
   $('#dlg').onclick = null;
 }
@@ -1619,16 +1633,6 @@ $('#support-bundle').onclick = async () => {
   const b = await saveBundle(null, t => toast(t, 'error'));
   if (b) toast(`Saved ${b.path}. Your Windows user name is taken out; look inside before you share it.`);
 };
-
-/** Start a new chat with rmm's AI about `text` (on the AI tab, which says what's missing to set up). */
-async function askAi(text) {
-  showTab('ai');
-  if (aiRunning) return toast('The AI is still busy; stop it or wait, then ask again.');
-  if (!aiProviders) await aiLoad();
-  if (aiChat) aiNewChat();
-  $('#ai-text').value = text;
-  $('#ai-form').requestSubmit();
-}
 
 /** Copy text; the fallback selects it in a text box inside `box` (an open dialog stays modal). */
 async function copyText(text, box = document.body) {
@@ -2084,8 +2088,7 @@ $('#details').addEventListener('click', async e => {
   } else if (t.dataset.unhide) {
     hideFiles(id, [t.dataset.unhide], true);
   } else if (t.dataset.doc) {
-    if (W.simple) showDoc(id, t.dataset.doc); // the editor is in the AI tab, which Simple hides
-    else { showTab('ai'); ideOpen(`mods/${id}/${t.dataset.doc}`); }
+    showDoc(id, t.dataset.doc);
   } else if (t.dataset.pic) {
     const url = t.src;
     dialog({ title: t.dataset.pic, body: `<img src="${url}" alt="" style="max-width:100%">`, actions: [['ok', 'Close', 'primary']] });
@@ -2157,6 +2160,7 @@ $('#details').addEventListener('change', e => {
   }
   if (t.id === 'loot-group') return setLootRule({ group: t.value.trim() || null });
   if (t.dataset.act === 'color') act('Changing the colour', () => call('edit_separator', { id, color: t.value }));
+  if (t.dataset.tweak !== undefined) return act(t.checked ? 'Turning the INI tweak on' : 'Turning the INI tweak off', () => call('set_ini_tweak', { id, file: t.dataset.tweak, on: t.checked }));
   if (t.dataset.act === 'mod-color') act('Changing the colour', () => call('set_color', { id, color: t.value }));
   if (t.classList.contains('cat-add') && t.value.trim()) return editCategories(selIds().filter(i => !isSep(i)), [t.value.trim()], []);
   if (t.dataset.act === 'lock') act(t.checked ? 'Locking the plugin' : 'Unlocking the plugin', () => call('lock_plugin', { name: selPlugin, lock: t.checked }));
@@ -2758,7 +2762,7 @@ async function renderStart() {
   const done = steps.filter(s => s[0]).length;
   card.hidden = done === steps.length;
   if (card.hidden) return;
-  card.innerHTML = `<div class="start-head"><b>Getting started</b><span class="muted small">${done} of ${steps.length} done${W.simple ? ' · The Simple view hides the Data, Tools and AI tabs until you turn it off in Settings.' : ''}</span><div class="spacer"></div><button class="link" data-start="hide">Hide</button></div>
+  card.innerHTML = `<div class="start-head"><b>Getting started</b><span class="muted small">${done} of ${steps.length} done${W.simple ? ' · The Simple view hides the Data, Tools and MCP tabs until you turn it off in Settings.' : ''}</span><div class="spacer"></div><button class="link" data-start="hide">Hide</button></div>
     <ul>${steps.map(([ok, what, note, b]) => `<li class="${ok ? 'ok' : ''}"><span class="tick">${ok ? '✓' : '○'}</span><span>${esc(what)} <span class="muted small">${esc(note)}</span></span>${b ? `<button data-start="${b[0]}">${esc(b[1])}</button>` : ''}</li>`).join('')}</ul>`;
 }
 $('#start-card').onclick = async e => {
@@ -2811,7 +2815,7 @@ function handlerNow() {
   if (nexus.handler_here) return 'Nexus links open with rmm, into this instance.';
   if (!nexus.handler) return 'No program opens Nexus links now.';
   const exe = basename(nexus.handler.match(/^"?([^"]+)/)?.[1] ?? nexus.handler);
-  const app = { 'nxmhandler.exe': 'Mod Organizer 2', 'vortex.exe': 'Vortex', 'rmm.exe': 'rmm, for another instance' }[exe.toLowerCase()] ?? exe;
+  const app = { 'nxmhandler.exe': 'Mod Organizer 2', 'vortex.exe': 'Vortex', 'rmm.exe': 'rmm, for another instance', 'rmm-app.exe': 'rmm, for another instance' }[exe.toLowerCase()] ?? exe;
   return `Nexus links open with ${app} now.`;
 }
 
@@ -3154,12 +3158,12 @@ $('#addons').onclick = async () => {
   if (ok && await act('Installing the add-on', () => call('addon_install', { path, dry_run: false }), { reload: false })) toast(`Installed ${a.name}.`);
 };
 
-// ---- AI access (MCP over HTTP) ----------------------------------------------------------------
+// ---- MCP tab: AI apps use rmm's tools ---------------------------------------------------------
 
-let mcpOn = null;   // { url, token } while the window serves MCP
+let mcpOn = null;   // { url, token } while the window serves MCP over HTTP
 let mcpRoot = null; // the instance it serves
 
-/** Start or stop the server; quiet unless it fails. */
+/** Start or stop the HTTP server; quiet unless it fails. */
 async function setMcp(on) {
   try {
     const r = await T.core.invoke('mcp', { on });
@@ -3167,26 +3171,37 @@ async function setMcp(on) {
     mcpRoot = mcpOn ? S.info.root : null;
   } catch (e) {
     mcpOn = null;
-    toast(`AI access: ${e}`, 'error');
+    toast(`MCP: ${e}`, 'error');
   }
   prefs.mcp = !!mcpOn;
   savePrefs();
-  $('#ai-access').setAttribute('aria-pressed', !!mcpOn);
+  if (tab === 'mcp') drawMcp();
 }
 
-$('#ai-access').onclick = async () => {
-  const conf = m => esc(JSON.stringify({ mcpServers: { rmm: { type: 'http', url: m.url, headers: { Authorization: `Bearer ${m.token}` } } } }, null, 2));
-  const body = () => mcpOn
-    ? `<p>AI clients on this computer can use rmm's tools on this instance while the window is open. Their changes show up here and can be undone.</p>
-       <p class="small">Claude Code:</p><pre class="sel">claude mcp add --transport http rmm ${esc(mcpOn.url)} --header "Authorization: Bearer ${esc(mcpOn.token)}"</pre>
-       <p class="small">Other clients (JSON settings):</p><pre class="sel">${conf(mcpOn)}</pre>
-       <p class="muted small">The token is kept in your user folder. Anyone with it can change this instance, so keep it to yourself.</p>`
-    : `<p>Serve rmm's tools to AI clients on this computer, over HTTP on 127.0.0.1 with a private token. Clients that start programs themselves can use <code>rmm mcp</code> instead and need nothing here.</p>`;
-  const r = await dialog({ title: 'AI access (MCP)', body: body(), actions: mcpOn ? [['cancel', 'Close'], ['off', 'Turn off']] : [['cancel', 'Cancel'], ['on', 'Turn on', 'primary']] });
-  if (r === 'on' || r === 'off') {
-    await setMcp(r === 'on');
-    if (mcpOn) $('#ai-access').click();
-  }
+/** A snippet to paste into an AI app's settings, with a Copy button. */
+const snippet = (label, text) => `<p class="small">${label} <button class="small" data-copy="${esc(text)}">Copy</button></p><pre class="sel">${esc(text)}</pre>`;
+
+function drawMcp() {
+  const json = server => JSON.stringify({ mcpServers: { rmm: server } }, null, 2);
+  $('#mcp-http').innerHTML = mcpOn
+    ? `<div class="row"><span class="pill win">On</span> <code>${esc(mcpOn.url)}</code><div class="spacer"></div><button data-mcp="off">Turn off</button></div>
+       ${snippet('Claude Code:', `claude mcp add --transport http rmm ${mcpOn.url} --header "Authorization: Bearer ${mcpOn.token}"`)}
+       ${snippet('Other apps (JSON settings):', json({ type: 'http', url: mcpOn.url, headers: { Authorization: `Bearer ${mcpOn.token}` } }))}
+       <p class="muted small">It serves this instance on 127.0.0.1 with a private token, kept in your user folder. Anyone with the token can change this instance, so keep it to yourself. It stays on for the next window.</p>`
+    : `<div class="row"><span class="muted">Off.</span><div class="spacer"></div><button class="primary" data-mcp="on">Turn on</button></div>
+       <p class="muted small">For apps that connect to a running server. It serves the open instance on 127.0.0.1 with a private token, only while this window is open.</p>`;
+  const root = S?.info?.root ?? '';
+  $('#mcp-stdio').innerHTML = `<p class="muted small">For apps that start rmm themselves; nothing needs to be on here. They run <code>rmm mcp</code>, which the installer puts on PATH.</p>
+    ${snippet('Claude Code:', `claude mcp add rmm -- rmm mcp -i "${root}"`)}
+    ${snippet('Claude Desktop, Cursor and other apps (JSON settings):', json({ command: 'rmm', args: ['mcp', '-i', root] }))}`;
+}
+
+$('#pane-mcp').onclick = async e => {
+  const b = e.target.closest('button[data-mcp], button[data-copy]');
+  if (!b) return;
+  if (b.dataset.mcp) return setMcp(b.dataset.mcp === 'on');
+  b.textContent = await copyText(b.dataset.copy) ? 'Copied' : 'Couldn’t copy';
+  setTimeout(() => { b.textContent = 'Copy'; }, 1500);
 };
 
 // ---- Import, lockfiles ------------------------------------------------------------------------
@@ -3579,16 +3594,42 @@ $('#saves tbody').addEventListener('click', e => {
   const file = e.target.closest('tr[data-file]')?.dataset.file;
   if (file && e.target.closest('[data-missing]')) savePlugins(file);
 });
+$('#saves tbody').addEventListener('contextmenu', e => {
+  const file = e.target.closest('tr[data-file]')?.dataset.file;
+  if (!file) return;
+  e.preventDefault();
+  ctxMenu(e, [['Delete…', () => deleteSaves(file), 'danger']]);
+});
 $('#saves-reload').onclick = loadSaves;
+
+/** The profile's saves as ticks, with an All box (#st-all, #st-saves); `ticked` start ticked. */
+const saveChecklist = (saves, ticked = []) => `<label class="row" style="margin:12px 0 4px"><input type="checkbox" id="st-all"> All ${plural(saves.length, 'save')}</label>
+  <div class="stack" id="st-saves" style="max-height:40vh;overflow:auto">${saves.map(s => `<label class="row" style="margin:0" title="${esc(s.file)}"><input type="checkbox" value="${esc(s.file)}"${ticked.includes(s.file) ? ' checked' : ''}> ${esc(s.player || s.file)}${s.level ? `, level ${s.level}` : ''}${s.location ? `, ${esc(s.location)}` : ''} <span class="muted small">${esc(when(s.modified))}</span></label>`).join('')}</div>`;
+
+/** Delete saves: they and their co-saves go to the instance's trash. `file` starts ticked. */
+async function deleteSaves(file) {
+  const saves = savesData?.saves ?? [];
+  if (!saves.length) return toast('This profile has no saves.');
+  const done = dialog({ title: 'Delete saves', body: `${saveChecklist(saves, file ? [file] : [])}
+    <p class="muted small" style="margin-top:10px">Each save goes with its script extender co-save to the instance’s trash, which Empty the trash deletes for good.</p>`,
+    actions: [['cancel', 'Cancel'], ['delete', 'Move to the trash', 'danger']] });
+  $('#st-all').onchange = e => $$('#st-saves input').forEach(c => { c.checked = e.target.checked; });
+  const r = await done;
+  const files = $$('#st-saves input:checked').map(c => c.value);
+  if (r !== 'delete') return;
+  if (!files.length) return toast('No saves were ticked.');
+  const moved = await act('Deleting the saves', () => call('delete_saves', { files }), { reload: false });
+  if (Array.isArray(moved)) toast(`Moved ${plural(files.length, 'save')} to the trash${moved.length > files.length ? (files.length === 1 ? ', with its co-save' : ', with their co-saves') : ''}.`);
+  loadSaves();
+}
+$('#saves-delete').onclick = () => deleteSaves();
 
 $('#saves-transfer').onclick = async () => {
   const cur = S.info.profile, others = S.profiles.filter(p => p !== cur), saves = savesData?.saves ?? [];
   if (!others.length) return toast('There’s no other profile yet. New playthrough… in the profile menu makes one with saves of its own.');
   if (!saves.length) return toast('This profile has no saves to copy or move.');
-  const row = s => `<label class="row" style="margin:0" title="${esc(s.file)}"><input type="checkbox" value="${esc(s.file)}"> ${esc(s.player || s.file)}${s.level ? `, level ${s.level}` : ''}${s.location ? `, ${esc(s.location)}` : ''} <span class="muted small">${esc(when(s.modified))}</span></label>`;
   const body = `<label class="field">To the profile<select id="st-to">${others.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select></label>
-    <label class="row" style="margin:12px 0 4px"><input type="checkbox" id="st-all"> All ${plural(saves.length, 'save')}</label>
-    <div class="stack" id="st-saves" style="max-height:40vh;overflow:auto">${saves.map(row).join('')}</div>
+    ${saveChecklist(saves)}
     <p class="muted small" style="margin-top:10px">Each save goes with its script extender co-save. A save the other profile already has stops it.</p>`;
   const done = dialog({ title: 'Copy or move saves', body, actions: [['cancel', 'Cancel'], ['move', 'Move'], ['copy', 'Copy', 'primary']] });
   $('#st-all').onchange = e => $$('#st-saves input').forEach(c => { c.checked = e.target.checked; });
@@ -3728,13 +3769,16 @@ async function install(paths, at = null, nx0 = null) {
     // Unpacks the archive once; the install below reuses it.
     const walk = await act(`Reading ${basename(path)}`, () => call('fomod', { path }), { reload: false, problem: true });
     if (!walk) continue;
-    let choices, name = nx?.name ?? undefined;
-    if (walk !== true) { // it has a FOMOD installer, which names the mod better than most file names
+    let choices, name = nx?.name ?? undefined, run_script = false;
+    if (walk.script) {
+      if (!await scriptOk(path)) continue;
+      run_script = true;
+    } else if (walk !== true) { // it has a FOMOD installer, which names the mod better than most file names
       choices = walk.steps.length ? await fomodWizard(path, walk) : walk.choices;
       if (!choices) continue;
       name = walk.module;
     }
-    const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus }), { problem: true });
+    const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus, run_script }), { problem: true });
     if (!r) continue;
     if (at !== null) at++;
     plugins += r.plugins.length;
@@ -3752,7 +3796,6 @@ function offerLoot(n) {
 
 T.webview.getCurrentWebview().onDragDropEvent(async e => {
   const type = e.payload.type;
-  if (tab === 'ai') return aiDrop(e.payload);
   if (type === 'enter' || type === 'over') {
     $('#dropzone').hidden = !S || busy;
     // Over a mod row: install right after it (a separator: at the end of its group).
@@ -3943,132 +3986,6 @@ function fomodWizard(path, first) {
   });
 }
 
-// ---- AI tab: the IDE ---------------------------------------------------------------------------
-// Files (mods, overwrite/, the game's INIs) with an editor, saved chats, and rmm's own AI
-// (agent.rs in the rmm crate) with the user's API key. The AI works through the same tools AI
-// clients get over MCP: reads and dry runs run at once, each change waits for Allow here, and
-// edit_file shows as a diff. The Inspector shows each request, its tokens and cost.
-
-const aiCall = (name, args = {}) => T.core.invoke('ai', { name, args });
-const ROLES = { find_mods: 'Researcher', install_safely: 'Installer', test_mods: 'Tester', mod_team: 'Lead' };
-const PICTURE = /\.(png|jpe?g|gif|webp)$/i;
-let aiProviders = null;     // status of each provider, once the tab was opened
-let aiRunning = false;
-let aiChat = null;          // { id, provider, model, title, app } of the chat on screen; null: a new one
-let aiPics = [];            // attached pictures: data: URLs (picked) or file paths (dropped)
-let aiLastCall = null;      // { el, name, args } of the tool call running now
-let aiExchanges = [];       // requests of the chat on screen, since it was opened here
-let aiCtx = null;           // { path, from, to, text }: editor context for the next message
-let ideReady = false;        // the instance root the tab was filled for
-const ide = { files: [], cur: null }; // open files: { path, text, saved, hash, editable, note }
-
-const num = n => (n ?? 0).toLocaleString();
-const tokens = u => `${num(u.input + u.cache_read + u.cache_write)} in${u.cache_read ? ` (${num(u.cache_read)} cached)` : ''} · ${num(u.output)} out${u.cost != null ? ` · $${u.cost.toFixed(u.cost < 0.1 ? 4 : 2)}` : ''}`;
-const provName = id => aiProviders?.find(p => p.id === id)?.name ?? id;
-
-function ideInit() {
-  if (!aiProviders) aiLoad();
-  // Files and chats belong to the open instance; another one starts the tab over.
-  const root = S?.info?.root ?? null;
-  if (ideReady !== root) {
-    ideReady = root;
-    ide.files = [];
-    ide.cur = null;
-    ideShow(null);
-    ideDir('', $('#ide-tree'), 0);
-    if (aiChat && !aiRunning) aiNewChat();
-    aiChats();
-  }
-  $('#ai-text').focus();
-}
-
-// -- Providers, keys and the mod team (the Settings tab)
-
-const ROLE_WHAT = { chat: 'A message without a role', lead: 'Runs the team for a request', researcher: 'Finds mods on Nexus that fit', installer: 'Installs a mod and reviews it', tester: 'Plays the game to try mods' };
-let aiTeam = null;          // each role and who does it
-const aiModels = {};        // each provider's model ids, fetched once
-
-/** Who answers a message with `role` (a prompt name, or '' for none): the role's AI, else the open
- *  chat's, else the provider in use. */
-function aiWho(role) {
-  if (role) return aiTeam?.find(r => r.prompt === role)?.seat ?? null;
-  if (aiChat && !aiChat.app) return { provider: aiChat.provider, model: aiChat.model ?? '' };
-  const p = aiProviders?.find(p => p.current);
-  return p ? { provider: p.id, model: '' } : null;
-}
-const seatName = s => !s?.provider ? 'nobody yet' : s.provider === 'mcp' ? 'your AI app' : provName(s.provider);
-
-async function aiLoad() {
-  try { [aiProviders, aiTeam] = await Promise.all([aiCall('status'), aiCall('team')]); } catch (e) { return toast(String(e), 'error'); }
-  const p = aiProviders.find(p => p.current);
-  $('#ai-note').textContent = !p ? 'Pick an AI and add your API key in Settings.' : !p.key ? `Add your ${p.name} API key in Settings.` : '';
-  // The role picker says who answers each.
-  $$('#ai-role option').forEach(o => {
-    o.dataset.label ??= o.textContent;
-    o.textContent = `${o.dataset.label} · ${seatName(o.value ? aiTeam.find(r => r.prompt === o.value)?.seat : p && { provider: p.id })}`;
-  });
-  if (tab === 'settings') drawSettings();
-}
-
-function drawSettings() {
-  if (!aiProviders) return;
-  const cur = aiProviders.find(p => p.current);
-  const models = id => (aiModels[id] ?? []).map(m => `<option value="${esc(m)}">`).join('');
-  $('#set-providers').innerHTML = '<tr><th>Provider</th><th>API key</th><th>Model</th><th></th></tr>' + aiProviders.map(p => `<tr data-id="${esc(p.id)}">
-      <td><b>${esc(p.name)}</b></td>
-      <td>${p.key ? `<span class="pill win">${p.key === 'saved' ? 'Saved' : `From ${esc(p.key)}`}</span>` : '<span class="muted small">No key</span>'}
-        <button class="small" data-act="key">${p.key ? 'Change…' : 'Add…'}</button></td>
-      <td><input class="model" list="models-${esc(p.id)}" value="${esc(p.model)}" spellcheck="false" aria-label="${esc(p.name)} model" title="Any model id ${esc(p.name)} offers"><datalist id="models-${esc(p.id)}">${models(p.id)}</datalist></td>
-      <td><button class="small" data-act="options" title="Your instructions, effort, temperature and reply length">Options…</button></td></tr>`).join('');
-  const pick = (role, sel) => aiProviders.map(p => `<option value="${esc(p.id)}"${sel === p.id ? ' selected' : ''}>${esc(p.name)}${p.key ? '' : ' (no key)'}</option>`).join('')
-    + (role === 'chat' ? '' : `<option value="mcp"${sel === 'mcp' ? ' selected' : ''}>Your AI app, over MCP</option>`);
-  const rows = [{ role: 'chat', name: 'Chat', seat: { provider: cur?.id ?? '', model: '' }, set: !!cur }, ...aiTeam];
-  $('#set-team').innerHTML = '<tr><th>Role</th><th>AI</th><th>Model</th></tr>' + rows.map(r => {
-    const first = r.role === 'chat' ? (cur ? '' : '<option value="">Pick a provider…</option>') : `<option value="">Same as Chat${cur ? ` (${esc(cur.name)})` : ''}</option>`;
-    const own = r.set && r.role !== 'chat' && r.seat.provider !== 'mcp';
-    const model = own
-      ? `<input class="seat-model" list="models-${esc(r.seat.provider)}" value="${esc(r.seat.model)}" placeholder="${esc(aiProviders.find(p => p.id === r.seat.provider)?.model ?? '')}" spellcheck="false" aria-label="${esc(r.name)}'s model" title="Empty: the provider's model above">`
-      : `<span class="muted small">${r.set && r.seat.provider === 'mcp' ? "The app's own" : esc(cur?.model ?? '')}</span>`;
-    return `<tr data-role="${esc(r.role)}"><td><b>${esc(r.name)}</b><br><span class="muted small">${esc(ROLE_WHAT[r.role])}</span></td>
-      <td><select class="seat" aria-label="${esc(r.name)}'s AI">${first}${pick(r.role, r.set ? r.seat.provider : null)}</select></td><td>${model}</td></tr>`;
-  }).join('');
-}
-
-/** Suggest a provider's models in its list, fetched once (with a key). */
-async function fillModels(id) {
-  if (!id || aiModels[id] || !aiProviders?.find(p => p.id === id)?.key) return;
-  try { aiModels[id] = await aiCall('models', { provider: id }); } catch { return; }
-  const list = document.getElementById(`models-${id}`);
-  if (list) list.innerHTML = aiModels[id].map(m => `<option value="${esc(m)}">`).join('');
-}
-
-$('#set-providers').onclick = e => {
-  const b = e.target.closest('button[data-act]');
-  if (b) (b.dataset.act === 'key' ? aiKey : aiOptions)(b.closest('tr').dataset.id);
-};
-$('#set-providers').onchange = async e => {
-  if (!e.target.matches('input.model')) return;
-  try { await aiCall('use', { provider: e.target.closest('tr').dataset.id, model: e.target.value.trim(), switch: false }); } catch (err) { toast(String(err), 'error'); }
-  aiLoad();
-};
-$('#set-team').onchange = async e => {
-  const tr = e.target.closest('tr'), role = tr.dataset.role, provider = $('select.seat', tr).value;
-  if (role === 'chat' && !provider) return;
-  try {
-    if (role === 'chat') await aiCall('use', { provider });
-    else await aiCall('seat', { role, provider, model: e.target.matches('.seat-model') ? e.target.value.trim() : '' });
-  } catch (err) { toast(String(err), 'error'); }
-  await aiLoad();
-  if (provider && provider !== 'mcp' && !aiProviders.find(p => p.id === provider)?.key) aiKey(provider);
-};
-for (const t of ['#set-providers', '#set-team']) {
-  $(t).addEventListener('focusin', e => {
-    const tr = e.target.closest('tr');
-    fillModels(e.target.matches('input.model') ? tr.dataset.id : e.target.matches('.seat-model') ? $('select.seat', tr).value : null);
-  });
-}
-$('#set-access').onclick = () => $('#ai-access').click();
-
 // rmm's own version, and updates from its signed releases.
 T.app.getVersion().then(v => { $('#set-version').textContent = `rmm ${v}`; }).catch(() => {});
 $('#set-update').onclick = async () => {
@@ -4092,14 +4009,15 @@ async function loadConf() {
   return conf;
 }
 const LANGS = [['en', 'English'], ['de', 'Deutsch'], ['es', 'Español'], ['fr', 'Français'], ['it', 'Italiano'], ['ja', '日本語'], ['ko', '한국어'], ['pl', 'Polski'], ['pt_BR', 'Português (Brasil)'], ['ru', 'Русский'], ['sv', 'Svenska'], ['uk', 'Українська'], ['zh_CN', '中文']];
-const TABS = [['mods', 'Mods'], ['plugins', 'Plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['ai', 'AI']];
+const TABS = [['mods', 'Mods'], ['plugins', 'Plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['mcp', 'MCP']];
+const MCP_OPTIONS = 'Options', MCP_ROLES = 'Your instructions for each role';
 // [key, label, kind, options or [min, max, step], help]. Keys with "win." are this window's.
 const SETTINGS = [
   ['This window', 'Kept by this window on this computer.', [
     ['win.theme', 'Theme', 'select', [['system', 'Follow Windows'], ['light', 'Light'], ['dark', 'Dark']]],
     ['win.density', 'Rows', 'select', [['comfortable', 'Comfortable'], ['compact', 'Compact']]],
     ['win.zoom', 'Size', 'select', [[0.8, '80%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.25, '125%'], [1.5, '150%']]],
-    ['win.simple', 'Simple view', 'bool', null, 'Hides the Data, Tools and AI tabs, the advanced filters, separators, lockfiles, imports, and the AI, editor and test-run settings.'],
+    ['win.simple', 'Simple view', 'bool', null, 'Hides the Data, Tools and MCP tabs, the advanced filters, separators, lockfiles, imports, and the tool and test-run settings.'],
     ['win.gettingStarted', 'Show the getting-started list on the Mods tab until it’s all done', 'bool'],
     ['win.startTab', 'Open on', 'select', [['last', 'The last tab'], ...TABS]],
     ['win.poll', 'Look for changes made by the CLI or AI apps', 'select', [[1.5, 'Every 1.5 seconds'], [5, 'Every 5 seconds'], [15, 'Every 15 seconds'], [0, 'Never']]],
@@ -4107,10 +4025,6 @@ const SETTINGS = [
     ['win.recentDays', 'The Recent filter shows mods installed in the last', 'num', [1, 365], 'days'],
     ['win.confirmDrop', 'Ask before installing files dropped on the window', 'bool'],
     ['win.deployPreview', 'Show what a deploy changes before it runs', 'bool'],
-    ['win.tabSize', 'Editor tab width', 'num', [1, 16]],
-    ['win.spaces', 'The Tab key inserts spaces in the editor', 'bool'],
-    ['win.wrap', 'Wrap long lines in the editor', 'bool', null, 'Hides the line numbers.'],
-    ['win.enterSends', 'Enter sends an AI message', 'bool', null, 'Otherwise Ctrl+Enter sends. Shift+Enter is always a new line.'],
   ]],
   ['Deploy', 'How mod files reach the game folder.', [
     ['deploy.method', 'Files in the game folder', 'select', [['link', 'Hard links (copies across drives)'], ['copy', 'Copies']], 'Copies take space, and nothing the game does to them reaches the mod. The next deploy redoes links as copies.'],
@@ -4132,7 +4046,7 @@ const SETTINGS = [
     ['loot.sort_after_tools', 'Place the plugins a tool run adds where LOOT would', 'bool', null, 'Every other plugin keeps its place.'],
     ['loot.refresh_hours', 'Download the masterlist again after', 'num', [1, 8760], 'hours'],
   ]],
-  ['Problems', 'What the Problems tab and the AI’s health check report.', [
+  ['Problems', 'What the Problems tab and AI apps’ health check report.', [
     ['health.hidden', 'Report', 'kinds'],
     ['health.low_space_gb', 'Warn when a drive has less free space than', 'num', [0, 10000], 'GB (0: never)'],
     ['health.ba2_limit', 'Fallout 4’s limit on BA2 archives', 'select', [[0, 'Work it out (1,024, a warning above 256)'], [256, '256 (before the August 2025 update)'], [1024, '1,024']]],
@@ -4149,18 +4063,15 @@ const SETTINGS = [
     ['nexus.recheck_days', 'Ask Nexus again about a mod it hasn’t listed as updated after', 'num', [1, 365], 'days'],
   ]],
   ['Tools', '', [['tools.timeout_mins', 'Stop a tool run from the window after', 'num', [0, 1440], 'minutes; 0: never.']]],
-  ['rmm’s AI', '', [
-    ['ai.max_steps', 'Steps in one turn before it pauses', 'num', [1, 500]],
-    ['ai.budget', 'Stop a chat once it has cost', 'num', [0, 100000, 0.5], 'US dollars; 0: no limit. Only Claude and OpenRouter report costs, so chats with other AIs aren’t limited.'],
-    ['ai.auto_allow', 'Tools it may run without asking', 'lines', null, 'One tool name a line (deploy, sort_plugins…), on top of reads and previews.'],
-    ['ai.role_instructions.lead', 'Your instructions for the Lead', 'area'],
+  [MCP_OPTIONS, '', [
+    ['mcp.port', 'HTTP port on 127.0.0.1', 'num', [1024, 65535], 'AI apps’ settings name this port; change them too.'],
+    ['mcp.record_sessions', 'Keep each AI app’s session in the instance', 'bool', null, 'As a chat any AI app can read later (list_chats, read_chat).'],
+  ]],
+  [MCP_ROLES, 'rmm gives AI apps four prompts: find_mods (Researcher), install_safely (Installer), test_mods (Tester) and mod_team (Lead). What you write here is added to each.', [
+    ['ai.role_instructions.lead', 'For the Lead', 'area'],
     ['ai.role_instructions.researcher', 'For the Researcher', 'area'],
     ['ai.role_instructions.installer', 'For the Installer', 'area'],
-    ['ai.role_instructions.tester', 'For the Tester', 'area', null, 'Added to the role’s prompt, for rmm’s AI and for AI apps over MCP.'],
-  ]],
-  ['AI access (MCP)', '', [
-    ['mcp.port', 'Port on 127.0.0.1', 'num', [1024, 65535], 'AI apps’ settings name this port; change them too.'],
-    ['mcp.record_sessions', 'Keep each AI app’s session as a chat rmm’s AI can read', 'bool'],
+    ['ai.role_instructions.tester', 'For the Tester', 'area'],
   ]],
 ];
 const pathGet = (o, k) => k.split('.').reduce((v, p) => v?.[p], o);
@@ -4185,16 +4096,14 @@ async function drawMore() {
   };
   const section = ([title, about, fields]) => `<h2>${esc(title)}</h2>${about ? `<p class="muted small">${esc(about)}</p>` : ''}
     <table class="set">${fields.map(f => `<tr><td>${esc(f[1])}</td><td>${control(f)}${f[4] ? `<span class="muted small">${esc(f[4])}</span>` : ''}</td></tr>`).join('')}</table>`;
-  const ai = s => s[0] === 'rmm’s AI' || s[0] === 'AI access (MCP)';
-  // Simple view leaves out the AI, the editor, tools and test runs, which it hides elsewhere too.
-  const EDITOR = ['win.tabSize', 'win.spaces', 'win.wrap', 'win.enterSends'];
-  const shown = SETTINGS.filter(s => !W.simple || !(ai(s) || ['Test runs', 'Tools'].includes(s[0]))).map(([t, a, f]) => [t, a, W.simple ? f.filter(x => !EDITOR.includes(x[0])) : f]);
-  $('#set-more').innerHTML = shown.filter(s => !ai(s)).map(section).join('');
-  $('#set-more-ai').innerHTML = shown.filter(ai).map(section).join('')
-    + `<p class="set-reset"><button data-act="reset">Reset all settings…</button> <span class="muted small">rmm’s settings are in settings.json in your user folder, also changed with <code>rmm settings</code>.</span></p>`;
+  const mcp = s => s[0] === MCP_OPTIONS || s[0] === MCP_ROLES;
+  // Simple view leaves out tools and test runs, which it hides elsewhere too (and the MCP tab).
+  const shown = SETTINGS.filter(s => !W.simple || !['Test runs', 'Tools'].includes(s[0]));
+  $('#set-more').innerHTML = shown.filter(s => !mcp(s)).map(section).join('');
+  $('#set-mcp').innerHTML = shown.filter(mcp).map(section).join('');
 }
 
-$('#set-more').onchange = $('#set-more-ai').onchange = async e => {
+$('#set-more').onchange = $('#set-mcp').onchange = async e => {
   const el = e.target.closest('[data-key]');
   if (!el) return;
   const { key, kind } = el.dataset;
@@ -4215,11 +4124,11 @@ $('#set-more').onchange = $('#set-more-ai').onchange = async e => {
   try { conf = await call('set_settings', { settings: next }); } catch (err) { toast(String(err), 'error'); return drawMore(); }
   if (key === 'mcp.port' && mcpOn) setMcp(true);
 };
-$('#set-more').onclick = $('#set-more-ai').onclick = async e => {
+$('#set-more').onclick = $('#set-reset').onclick = async e => {
   const b = e.target.closest('button[data-act]');
   if (!b) return;
   if (b.dataset.act === 'reset') {
-    if (!await confirmBox('Reset all settings', 'Put every setting on this page back to its default? The AI providers, keys and mod team stay.', 'Reset')) return;
+    if (!await confirmBox('Reset all settings', 'Put every setting on this page and the MCP tab back to its default?', 'Reset')) return;
     try { conf = await call('reset_settings'); } catch (err) { toast(String(err), 'error'); }
     Object.assign(W, WIN);
     savePrefs();
@@ -4231,552 +4140,6 @@ $('#set-more').onclick = $('#set-more-ai').onclick = async e => {
   }
   drawMore();
 };
-$('#ai-to-settings').onclick = () => showTab('settings');
-
-async function aiKey(id) {
-  const p = aiProviders?.find(p => p.id === id);
-  if (!p) return;
-  const body = `<p>Paste your ${esc(p.name)} API key. rmm checks it with ${esc(p.name)}, then keeps it in your user folder, never in the instance.</p>
-    <input id="ai-key-input" type="password" autocomplete="off" spellcheck="false" placeholder="API key" aria-label="API key">
-    <p class="muted small">Your messages, pictures, open-file context and what rmm's tools answer go to ${esc(p.name)}, billed to your account. API address (change it for another region or a proxy):</p>
-    <input id="ai-base" type="text" spellcheck="false" aria-label="API address" value="${esc(p.base)}">`;
-  const done = dialog({ title: `${p.name} API key`, body, actions: [['cancel', 'Cancel'], ...(p.key === 'saved' ? [['forget', 'Delete key']] : []), ['ok', 'Save', 'primary']] });
-  $('#ai-key-input').focus();
-  $('#ai-key-input').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('#dlg').close('ok'); } };
-  const how = await done;
-  const key = $('#ai-key-input').value, base = $('#ai-base').value.trim();
-  $('#ai-key-input').value = '';
-  if (how === 'forget') {
-    try { await aiCall('forget', { provider: p.id }); toast(`Deleted the ${p.name} key from this computer.`); } catch (e) { toast(String(e), 'error'); }
-  } else if (how === 'ok') {
-    if (base !== p.base) await aiCall('use', { provider: p.id, base, switch: false }).catch(e => toast(String(e), 'error'));
-    if (key.trim()) {
-      toast(`Checking the key with ${p.name}…`);
-      try { toast(`${p.name} took the key (${plural(await aiCall('key', { provider: p.id, key }), 'model')}).`); } catch (e) { toast(String(e), 'error'); }
-    }
-  }
-  aiLoad();
-}
-
-async function aiOptions(id) {
-  const p = aiProviders?.find(p => p.id === id);
-  if (!p) return;
-  const o = p.options ?? {}, claude = p.api === 'anthropic';
-  const effort = claude
-    ? `<select id="o-effort"><option value="">rmm's default (high)</option>${['low', 'medium', 'high', 'xhigh', 'max'].map(v => `<option${o.effort === v ? ' selected' : ''}>${v}</option>`).join('')}</select>`
-    : `<input id="o-effort" spellcheck="false" placeholder="the model's default" value="${esc(o.effort ?? '')}"><span class="muted small">Sent as reasoning_effort; models that reason take low, medium or high (Kimi: low, high, max).</span>`;
-  const body = `<label class="field">Instructions for the AI <span class="muted small">Added to rmm's own, in every chat with ${esc(p.name)}.</span><textarea id="o-ins" rows="6">${esc(o.instructions ?? '')}</textarea></label>
-    <label class="field">Effort ${effort}</label>
-    ${claude ? '' : `<label class="field">Temperature <input id="o-temp" type="number" min="0" max="2" step="0.1" placeholder="the model's default" value="${o.temperature ?? ''}"></label>`}
-    <label class="field">Most output tokens per reply <input id="o-max" type="number" min="1" max="128000" step="1" placeholder="${claude ? '16000' : "the model's default"}" value="${o.max_tokens ?? ''}"></label>`;
-  if (await dialog({ title: `${p.name} options`, body, actions: [['cancel', 'Cancel'], ['ok', 'Save', 'primary']] }) !== 'ok') return;
-  const n = sel => { const v = $(sel)?.value.trim(); return v ? Number(v) : null; };
-  const options = { instructions: $('#o-ins').value, effort: $('#o-effort').value.trim() || null, temperature: claude ? null : n('#o-temp'), max_tokens: n('#o-max') };
-  try { await aiCall('options', { provider: p.id, options }); toast('Saved; they apply from your next message.'); } catch (e) { toast(String(e), 'error'); }
-  aiLoad();
-}
-
-// -- Side panel: files and chats
-
-$$('.ide-side .seg button').forEach(b => {
-  b.onclick = () => {
-    $$('.ide-side .seg button').forEach(x => x.setAttribute('aria-selected', x === b));
-    $('#ide-files').hidden = b.dataset.side !== 'files';
-    $('#ide-chats').hidden = b.dataset.side !== 'chats';
-    if (b.dataset.side === 'chats') aiChats();
-  };
-});
-
-/** Fill `box` with the folder at `path`, one level down from `depth`. */
-async function ideDir(path, box, depth) {
-  let list;
-  try { list = await call('ide_list', { path }); } catch (e) { box.innerHTML = `<div class="node muted small" style="padding-left:${10 + depth * 14}px">${esc(e)}</div>`; return; }
-  const label = e => path === 'mods' ? nameOf(e.name) : e.name === 'ini' && depth === 0 ? 'INI files (My Games)' : e.name;
-  box.innerHTML = list.map(e => `<div class="node${e.dir ? ' dir' : ''}" role="treeitem" data-path="${esc(e.path)}" data-depth="${depth}" style="padding-left:${10 + depth * 14}px" title="${esc(e.path)}"${e.dir ? ' aria-expanded="false"' : ''}><span class="tw">${e.dir ? '▸' : ''}</span>${esc(label(e))}${e.dir ? '' : ` <span class="muted small">${bytes(e.size)}</span>`}</div>${e.dir ? '<div class="kids" role="group" hidden></div>' : ''}`).join('')
-    || `<div class="node muted small" style="padding-left:${10 + depth * 14}px">Empty</div>`;
-}
-
-async function ideToggle(node, open) {
-  const kids = node.nextElementSibling;
-  open ??= kids.hidden;
-  if (open && !kids.dataset.loaded) {
-    kids.dataset.loaded = '1';
-    await ideDir(node.dataset.path, kids, +node.dataset.depth + 1);
-  }
-  kids.hidden = !open;
-  node.setAttribute('aria-expanded', open);
-  $('.tw', node).textContent = open ? '▾' : '▸';
-}
-
-$('#ide-tree').onclick = e => {
-  const node = e.target.closest('.node[data-path]');
-  if (!node) return;
-  if (node.classList.contains('dir')) ideToggle(node);
-  else ideOpen(node.dataset.path);
-};
-
-$('#ide-find').oninput = async () => {
-  const q = $('#ide-find').value.trim().toLowerCase();
-  const mods = $('#ide-tree .node[data-path="mods"]');
-  if (mods && q) await ideToggle(mods, true);
-  $$('#ide-tree .node[data-depth="1"][data-path^="mods/"]').forEach(n => {
-    const hide = q && !n.textContent.toLowerCase().includes(q);
-    n.hidden = hide;
-    if (n.nextElementSibling?.classList.contains('kids') && hide) n.nextElementSibling.hidden = true;
-  });
-};
-
-async function aiChats() {
-  let list = [];
-  try { list = await aiCall('chats'); } catch (e) { return toast(String(e), 'error'); }
-  $('#ide-chat-list').innerHTML = list.map(c => `<div class="chat${c.id === aiChat?.id ? ' on' : ''}" data-id="${esc(c.id)}" tabindex="0">
-      <div class="t">${esc(c.title || 'Chat')}</div>
-      <div class="muted small">${c.provider === 'mcp' ? `${esc(c.model)} over MCP` : `${esc(provName(c.provider))} · ${esc(c.model)}`}<br>${when(c.updated)}${c.usage?.cost != null ? ` · $${c.usage.cost.toFixed(2)}` : ''}</div>
-      <button class="x" data-del="${esc(c.id)}" title="Delete this chat" aria-label="Delete this chat">×</button></div>`).join('')
-    || '<p class="muted small">No chats yet. They are kept in this instance, in ai/chats.</p>';
-}
-
-$('#ide-chat-list').onclick = async e => {
-  const del = e.target.closest('[data-del]'), row = e.target.closest('.chat');
-  if (del) {
-    if (!await confirmBox('Delete this chat?', 'The conversation is deleted from this instance. Changes the AI made stay.', 'Delete')) return;
-    try { await aiCall('delete_chat', { id: del.dataset.del }); } catch (err) { toast(String(err), 'error'); }
-    if (aiChat?.id === del.dataset.del) aiNewChat();
-    aiChats();
-  } else if (row) aiOpenChat(row.dataset.id);
-};
-$('#ide-chat-list').onkeydown = e => { if (e.key === 'Enter' && e.target.classList.contains('chat')) aiOpenChat(e.target.dataset.id); };
-
-function aiNewChat() {
-  if (aiRunning) return toast('Stop the AI first.');
-  aiChat = null;
-  aiExchanges = [];
-  $('#ai-log').innerHTML = '';
-  $('#ai-empty').hidden = false;
-  $('#ai-usage').textContent = '';
-  aiInspect();
-  $$('#ide-chat-list .chat').forEach(c => c.classList.remove('on'));
-  $('#ai-text').focus();
-}
-$('#ai-new').onclick = aiNewChat;
-
-async function aiOpenChat(id) {
-  if (aiRunning) return toast('Stop the AI first.');
-  let c;
-  try { c = await aiCall('chat', { id }); } catch (e) { return toast(String(e), 'error'); }
-  // An AI app's session over MCP (its calls and notes) can't be resumed, only read by a new chat.
-  const app = c.provider === 'mcp' ? c.model : null;
-  aiChat = { id: c.id, provider: c.provider, model: c.model, title: c.title, app };
-  aiExchanges = [];
-  $('#ai-log').innerHTML = '';
-  $('#ai-empty').hidden = c.log.length > 0;
-  for (const e of c.log) aiEvent(e, true);
-  if (app) aiAdd('note', `${esc(app)}'s session over MCP: rmm kept its tool calls${c.log.some(e => e.kind === 'text') ? ' and the notes it saved' : ''}, not the conversation. A message here starts a new chat that reads this session first.`);
-  $('#ai-usage').textContent = c.usage ? tokens(c.usage) : '';
-  aiInspect();
-  aiChats();
-}
-
-// -- Editor
-
-const dirty = f => (f === ide.cur ? $('#ide-text').value : f.text) !== f.saved;
-
-function ideTabs() {
-  $('#ide-tabs').innerHTML = ide.files.map((f, i) => `<div class="ide-tab${f === ide.cur ? ' on' : ''}" role="tab" aria-selected="${f === ide.cur}" data-i="${i}" title="${esc(f.path)}">${esc(basename(f.path))}${dirty(f) ? ' <b aria-label="unsaved">•</b>' : ''}<button class="x" data-close="${i}" aria-label="Close ${esc(basename(f.path))}">×</button></div>`).join('');
-}
-
-function ideGutter() {
-  const n = $('#ide-text').value.split('\n').length;
-  if (+$('#ide-gutter').dataset.n === n) return;
-  $('#ide-gutter').dataset.n = n;
-  $('#ide-gutter').textContent = Array.from({ length: n }, (_, i) => i + 1).join('\n');
-}
-
-function ideShow(f) {
-  if (ide.cur && ide.cur !== f) ide.cur.text = $('#ide-text').value;
-  ide.cur = f;
-  const has = !!f;
-  $('#ide-filebar').hidden = $('#ide-code').hidden = !has;
-  $('#ide-empty').hidden = has;
-  const t = $('#ide-text');
-  if (f) t.value = f.text; // before the tabs, which compare it with the saved text
-  ideTabs();
-  if (!f) return;
-  t.readOnly = !f.editable;
-  t.scrollTop = 0;
-  $('#ide-path').textContent = f.path + (f.note ? ` · ${f.note}` : '');
-  $('#ide-save').disabled = !f.editable;
-  ideGutter();
-}
-
-async function ideOpen(path, reload = false) {
-  let f = ide.files.find(f => f.path === path);
-  if (!f || reload) {
-    let d;
-    try { d = await call('ide_read', { path }); } catch (e) { return toast(String(e), 'error'); }
-    // A textarea holds \n only: Windows' \r\n go back in on save, so the file keeps them.
-    const crlf = d.text.includes('\r\n'), text = d.text.replace(/\r\n/g, '\n');
-    const fresh = { path, text, saved: text, crlf, hash: d.hash, editable: d.editable, note: d.note };
-    if (f) Object.assign(f, fresh); else ide.files.push(f = fresh);
-    if (f === ide.cur) { ide.cur = null; } // shown again below without keeping the old text
-  }
-  ideShow(f);
-}
-
-/** After a change on disk (an AI edit, a revert): reload the file if it's open and unsaved work won't be lost. */
-function ideChanged(path) {
-  const f = ide.files.find(f => f.path === path);
-  if (!f) return;
-  if (dirty(f)) toast(`${path} changed on disk. Your unsaved changes are still in the editor; Reload shows the file as it is now.`);
-  else ideOpen(path, true);
-}
-
-async function ideSave() {
-  const f = ide.cur;
-  if (!f?.editable) return;
-  const text = $('#ide-text').value, disk = f.crlf ? text.replace(/\n/g, '\r\n') : text;
-  try {
-    await call('ide_write', { path: f.path, text: disk, expect: f.hash });
-  } catch (e) {
-    if (!String(e).includes('changed since')) return toast(String(e), 'error');
-    if (!await confirmBox('The file changed', `${f.path} changed on disk since you opened it (an AI edit or another program?). Save yours over it? The other version is kept in Edits….`, 'Save over it')) return;
-    try { await call('ide_write', { path: f.path, text: disk }); } catch (err) { return toast(String(err), 'error'); }
-  }
-  try { f.hash = (await call('ide_read', { path: f.path })).hash; } catch {}
-  f.saved = f.text = text;
-  ideTabs();
-  toast(`Saved ${basename(f.path)}.`);
-}
-
-$('#ide-tabs').onclick = async e => {
-  const close = e.target.closest('[data-close]'), tab = e.target.closest('.ide-tab');
-  if (close) {
-    const i = +close.dataset.close, f = ide.files[i];
-    if (dirty(f) && !await confirmBox('Close without saving?', `${f.path} has changes that aren't saved.`, 'Close')) return;
-    ide.files.splice(i, 1);
-    if (ide.cur === f) { ide.cur = null; ideShow(ide.files[Math.min(i, ide.files.length - 1)] ?? null); } else ideTabs();
-  } else if (tab) ideShow(ide.files[+tab.dataset.i]);
-};
-
-$('#ide-text').oninput = () => {
-  ideGutter();
-  const was = $('#ide-tabs .ide-tab.on b') !== null;
-  if (was !== dirty(ide.cur)) ideTabs();
-};
-$('#ide-text').onscroll = () => { $('#ide-gutter').scrollTop = $('#ide-text').scrollTop; };
-$('#ide-text').onkeydown = e => {
-  if (e.ctrlKey && e.key.toLowerCase() === 's') { e.preventDefault(); ideSave(); }
-  else if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.target.readOnly) { e.preventDefault(); document.execCommand('insertText', false, W.spaces ? ' '.repeat(W.tabSize) : '\t'); }
-  else if (e.key === 'Escape') e.target.blur(); // then Tab moves on
-};
-$('#ide-save').onclick = ideSave;
-$('#ide-reload').onclick = async () => {
-  const f = ide.cur;
-  if (f && (!dirty(f) || await confirmBox('Reload?', 'Your unsaved changes are lost.', 'Reload'))) ideOpen(f.path, true);
-};
-$('#ide-ask').onclick = () => {
-  const t = $('#ide-text'), f = ide.cur;
-  if (!f) return;
-  const [a, b] = [t.selectionStart, t.selectionEnd];
-  const line = i => t.value.slice(0, i).split('\n').length;
-  aiCtx = a === b ? { path: f.path } : { path: f.path, from: line(a), to: line(b), text: t.value.slice(a, b).slice(0, 8000) };
-  aiCtxDraw();
-  $('#ai-text').focus();
-};
-
-function aiCtxDraw() {
-  $('#ai-ctx').hidden = !aiCtx;
-  if (aiCtx) $('#ai-ctx').innerHTML = `<span class="pill plain">${esc(aiCtx.path)}${aiCtx.from ? `, lines ${aiCtx.from}–${aiCtx.to}` : ''}</span><button type="button" class="link small" id="ai-ctx-x">Remove</button>`;
-  $('#ai-ctx-x')?.addEventListener('click', () => { aiCtx = null; aiCtxDraw(); });
-}
-
-$('#ide-edits').onclick = async () => {
-  let list;
-  try { list = await call('ide_edits'); } catch (e) { return toast(String(e), 'error'); }
-  const rows = list.slice(0, 300).map(e => `<tr><td>${esc(e.path)}</td><td>#${e.n} ${esc(e.by)}</td><td class="muted">${when(e.at)}</td><td class="muted">${e.created ? 'new file' : `${num(e.lines_before)} → ${num(e.lines_after)} lines`}</td><td><button type="button" data-revert="${e.n}">Revert</button></td></tr>`).join('');
-  const done = dialog({ title: 'File edits', body: list.length ? `<table class="fc">${rows}</table><p class="muted small">Revert puts a file back as it was before that edit. A revert is an edit too, so it can be reverted.</p>` : '<p>No edits yet.</p>', actions: [['cancel', 'Close']] });
-  $('#dlg').classList.add('wide');
-  $$('#dlg [data-revert]').forEach(b => {
-    b.onclick = async () => {
-      try {
-        const r = await call('ide_revert', { n: +b.dataset.revert });
-        toast(`Put back ${r.path} as it was before edit #${b.dataset.revert}.`);
-        $('#dlg').close();
-        ideChanged(r.path);
-      } catch (e) { toast(String(e), 'error'); }
-    };
-  });
-  await done;
-};
-
-// -- Diffs for the AI's edits
-
-function diffHtml(a, b) {
-  const x = a ? a.split('\n') : [], y = b.split('\n');
-  let s = 0;
-  while (s < x.length && s < y.length && x[s] === y[s]) s++;
-  let e = 0;
-  while (e < x.length - s && e < y.length - s && x[x.length - 1 - e] === y[y.length - 1 - e]) e++;
-  const xm = x.slice(s, x.length - e), ym = y.slice(s, y.length - e), n = xm.length, m = ym.length;
-  const ops = [];
-  if (n * m > 4e6) {
-    // ponytail: too big for the line table; shown as all removed, then all added.
-    xm.forEach(l => ops.push(['-', l]));
-    ym.forEach(l => ops.push(['+', l]));
-  } else {
-    const w = m + 1, dp = new Uint32Array((n + 1) * w);
-    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i * w + j] = xm[i] === ym[j] ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
-    let i = 0, j = 0;
-    while (i < n && j < m) {
-      if (xm[i] === ym[j]) { ops.push([' ', xm[i++]]); j++; }
-      else if (dp[(i + 1) * w + j] >= dp[i * w + j + 1]) ops.push(['-', xm[i++]]);
-      else ops.push(['+', ym[j++]]);
-    }
-    while (i < n) ops.push(['-', xm[i++]]);
-    while (j < m) ops.push(['+', ym[j++]]);
-  }
-  const line = ([k, t]) => `<span class="${k === '+' ? 'add' : k === '-' ? 'del' : ''}">${k} ${esc(t)}</span>`;
-  const around = [...x.slice(Math.max(0, s - 3), s).map(t => [' ', t]), ...ops, ...x.slice(x.length - e, x.length - e + 3).map(t => [' ', t])];
-  const adds = ops.filter(o => o[0] === '+').length, dels = ops.filter(o => o[0] === '-').length;
-  return `<p class="muted small">${a ? `From line ${Math.max(1, s - 2)}` : 'A new file'}: ${plural(adds, 'line')} added, ${plural(dels, 'line')} removed.</p><pre class="diff">${around.map(line).join('')}</pre>`;
-}
-
-async function editPreview(args) {
-  let cur = null;
-  try { cur = (await call('ide_read', { path: args.path })).text; } catch {}
-  if (args.old == null) return diffHtml(cur ?? '', args.new ?? '');
-  const i = cur?.indexOf(args.old) ?? -1;
-  if (i < 0) return '<p class="small bad">The text to replace isn\'t in the file, so this edit will fail.</p>';
-  return diffHtml(cur, cur.slice(0, i) + args.new + cur.slice(i + args.old.length));
-}
-
-// -- Chat
-
-function aiAdd(cls, html) {
-  $('#ai-empty').hidden = true;
-  const el = document.createElement('div');
-  el.className = 'ai-msg ' + cls;
-  el.innerHTML = html;
-  $('#ai-log').append(el);
-  $('#ai-scroll').scrollTop = $('#ai-scroll').scrollHeight;
-  return el;
-}
-
-function aiBusy(on) {
-  aiRunning = on;
-  $('#ai-send').disabled = on;
-  $('#ai-stop').hidden = !on;
-  $('#ai-status').textContent = on ? 'Working…' : '';
-}
-
-const argsLine = a => { const s = JSON.stringify(a ?? {}); return s === '{}' ? '' : s.length > 120 ? s.slice(0, 120) + '…' : s; };
-const userHtml = (text, role, pics) => `${role ? `<span class="pill plain">${esc(ROLES[role] ?? role)}</span> ` : ''}${esc(text)}${pics}`;
-
-/** One event of a turn, live or from a saved chat (`replay`). */
-function aiEvent(e, replay = false) {
-  if (e.kind === 'user') { if (replay) aiAdd('me', userHtml(e.text, e.role, e.pictures ? ` <span class="pill plain">${plural(e.pictures, 'picture')}</span>` : '')); }
-  else if (e.kind === 'text') aiAdd('bot', esc(e.text));
-  else if (e.kind === 'notice') aiAdd('note', esc(e.text));
-  else if (e.kind === 'call') {
-    const el = aiAdd('tool', `<details><summary><span class="pill plain">${esc(e.name)}</span> <span class="muted small">${esc(argsLine(e.args))}</span> <span class="ai-state muted small">${replay ? '' : 'running…'}</span></summary><pre class="sel">${esc(JSON.stringify(e.args, null, 2))}</pre></details>`);
-    aiLastCall = { el, name: e.name, args: e.args };
-  } else if (e.kind === 'result' && aiLastCall) {
-    const st = $('.ai-state', aiLastCall.el);
-    st.textContent = e.ok ? 'done' : 'failed';
-    st.className = `ai-state small ${e.ok ? 'muted' : 'bad'}`;
-    $('details', aiLastCall.el).insertAdjacentHTML('beforeend', `<pre class="sel">${esc(e.text)}</pre>`);
-    if (!replay && e.ok && aiLastCall.name === 'edit_file') ideChanged(String(aiLastCall.args?.path ?? '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''));
-    if (!replay && e.ok && aiLastCall.name === 'revert_edit') { try { ideChanged(JSON.parse(e.text).path); } catch {} }
-    aiLastCall = null;
-  }
-}
-
-// What a change the AI asks to make does, in plain words, and how it's undone. The tool and its
-// arguments fold away under Details.
-const UNDO = 'You can undo this.';
-const modName = id => byId?.get(id) ? nameOf(id) : String(id ?? '');
-const someMods = (ids = []) => ids.length > 3 ? `${ids.slice(0, 3).map(modName).join(', ')} and ${ids.length - 3} more` : ids.map(modName).join(', ');
-const PLAIN = {
-  install_mod: a => [`Install ${basename(String(a.path ?? ''))}`, UNDO],
-  reinstall_mod: a => [`Reinstall ${modName(a.id)}`, UNDO],
-  update_mod: a => [`Update ${modName(a.id)}`, 'Undo puts the old files back.'],
-  rename_mod: a => [`Rename ${modName(a.id)} to “${a.name}”`, UNDO],
-  uninstall_mods: a => [`Uninstall ${someMods(a.ids)}`, 'Their files go to the trash; Undo brings them back.'],
-  overwrite_to_mod: a => [`Make the files in Overwrite into the mod “${a.name}”`, UNDO],
-  clear_overwrite: () => ['Clear Overwrite', 'Its files go to the trash; Undo brings them back.'],
-  desktop_shortcut: a => [`Put a shortcut to ${a.profile ? `“${a.profile}”` : 'this profile'} on the Desktop`, 'It switches to the profile, deploys and starts the game.'],
-  rebuild_outputs: () => ['Run again the tools whose output is out of date', 'Each run is its own undo step.'],
-  clean_dirty_plugins: a => ['Clean the dirty plugins with xEdit QuickAutoClean', `${a.one_mod ? 'The clean copies go into one mod, “Cleaned plugins”' : 'Each clean copy goes into its own mod'}; Undo brings the originals back.`],
-  hide_files: a => [`${a.show ? 'Show' : 'Hide'} ${plural(a.paths?.length ?? 0, 'file')} in ${nameOf(a.id)}`, a.show ? '' : 'They stay out of the game until shown again.'],
-  move_files: a => [`Move ${plural(a.paths?.length ?? 0, 'file')} from ${a.from === OVERWRITE_ID ? 'Overwrite' : nameOf(a.from)} into ${a.to === OVERWRITE_ID ? 'Overwrite' : nameOf(a.to)}`, a.replace ? 'Files it replaces go to the trash.' : ''],
-  creation_club: a => [a.restore ? 'Put the Creation Club content back into the game’s Data folder' : 'Make the game’s Creation Club content mods', 'This moves the game’s own files; the other way round undoes it.'],
-  set_mods_enabled: a => [`${a.enabled ? 'Turn on' : 'Turn off'} ${someMods(a.ids)}`, UNDO],
-  move_mods: a => [`Move ${someMods(a.ids)} in the mod list`, UNDO],
-  set_mod_order: () => ['Reorder the mod list', UNDO],
-  add_separator: a => [`Add the separator “${a.name}”`, UNDO],
-  edit_separator: a => [`Change the separator ${modName(a.id)}`, UNDO],
-  set_mod_note: a => [`Change ${modName(a.id)}’s notes`, ''],
-  set_mod_categories: a => [`Change ${modName(a.id)}’s categories`, ''],
-  set_color: () => ['Change a row’s colour', UNDO],
-  set_plugin_enabled: a => [`${a.enabled ? 'Turn on' : 'Turn off'} ${(a.names ?? [a.name]).filter(Boolean).join(', ')}`, UNDO],
-  lock_plugin: a => [`${a.lock === false ? 'Unlock' : 'Lock'} ${a.name} at its place in the load order`, UNDO],
-  set_plugin_order: () => ['Reorder your plugins', UNDO],
-  sort_plugins: () => ['Sort your plugins with LOOT', UNDO],
-  sort_mods: () => ['Reorder your mods by the mod rules', UNDO],
-  set_loot_rule: a => [`Change LOOT’s rules for ${a.plugin}`, ''],
-  set_mod_rule: a => [`Change the mod rules for ${modName(a.id)}`, ''],
-  update_masterlist: () => ['Download LOOT’s newest masterlist', ''],
-  deploy: () => ['Deploy: put your mods into the game folder', 'Purge takes them out again.'],
-  purge: () => ['Purge: take the mods out of the game folder', 'Deploy puts them back.'],
-  launch_game: a => a.without_mods ? ['Start the game without mods', 'It purges them; the next Play puts them back.'] : ['Start the game', 'It deploys your changes first.'],
-  steam_updates: a => [a.hold ? 'Stop Steam updating the game (its manifest becomes read-only)' : 'Let Steam update the game again', ''],
-  add_tool: a => [`Add the tool ${a.id}`, ''],
-  run_tool: a => [`Run ${a.id}`, 'What it makes becomes a mod; Undo takes it out.'],
-  create_profile: a => [`Make the profile “${a.name}”`, ''],
-  new_playthrough: a => [`Start a new playthrough, “${a.name}”`, 'Your current profile and its saves stay as they are.'],
-  switch_profile: a => [`Switch to the profile “${a.name}”`, ''],
-  rename_profile: a => [`Rename the profile “${a.from}” to “${a.to}”`, ''],
-  delete_profile: a => [`Delete the profile “${a.name}”`, 'It’s kept in profiles\\.deleted.'],
-  set_profile_options: () => ['Change whether this profile has its own INIs or saves', UNDO],
-  transfer_saves: a => [`${a.move_them ? 'Move' : 'Copy'} ${plural(a.files?.length ?? 0, 'save')} to “${a.profile}”`, ''],
-  enable_save_plugins: a => [`Turn on the plugins ${a.file} needs`, UNDO],
-  test_run: () => ['Start the game for a test run', ''],
-  test_session_start: () => ['Start the game to test it step by step', ''],
-  bisect: () => ['Turn off half of the suspects to find the culprit', UNDO],
-  hold_updates: a => [`${a.hold === false ? 'Stop holding back' : 'Hold back'} updates for ${someMods(a.ids)}`, ''],
-  install_from_nexus: () => ['Download a mod from Nexus and install it', UNDO],
-  install_collection: () => ['Install a Nexus collection', ''],
-  import_mo2: () => ['Import your setup from MO2', UNDO],
-  import_vortex: () => ['Import your setup from Vortex', UNDO],
-  apply_lockfile: () => ['Apply a lockfile to this profile', UNDO],
-  undo: () => ['Undo the last change', 'Redo brings it back.'],
-  redo: () => ['Redo the change you undid', ''],
-  restore: () => ['Go back to an earlier point in History', UNDO],
-  revert_edit: () => ['Put an edited file back as it was', ''],
-  support_bundle: () => ['Save a support bundle', ''],
-  export_lockfile: a => [a.format === 'pack' ? 'Save a pack of this setup' : a.format === 'markdown' ? 'Save a readable list of your mods' : 'Save a lockfile', ''],
-  call_addon: a => [`Run the add-on ${a.addon}`, ''],
-};
-function plainCall(name, args) {
-  try { const p = PLAIN[name]?.(args ?? {}); if (p) return p; } catch { /* the fallback */ }
-  const words = name.replace(/_/g, ' ');
-  return [words[0].toUpperCase() + words.slice(1), 'It changes your setup or starts something.'];
-}
-
-T.event.listen('ai', async ({ payload: e }) => {
-  if (e.kind === 'approve') {
-    const edit = e.name === 'edit_file';
-    const [what, undo] = edit ? [`Edit ${e.args?.path}`, 'Edits…, by the file editor, puts it back.'] : plainCall(e.name, e.args);
-    const el = aiAdd('ask', `<p><b>${esc(what)}?</b> <span class="muted small">${esc(undo)}</span></p>
-      <div class="ai-body">${edit ? '<p class="muted small">Reading the file…</p>' : `<details><summary class="muted small">Details: ${esc(e.name)}</summary><pre class="sel">${esc(JSON.stringify(e.args, null, 2))}</pre></details>`}</div>
-      <div class="row">${edit ? '<button type="button" class="link" data-open>Open the file</button><span class="spacer"></span>' : ''}<button data-a="no">Decline</button><button data-a="always" title="Allow every change for the rest of this chat">Allow all in this chat</button><button data-a="yes" class="primary">Allow</button></div>`);
-    $$('.row [data-a]', el).forEach(b => {
-      b.onclick = () => {
-        T.core.invoke('ai_answer', { answer: b.dataset.a });
-        const said = { yes: 'Allowed.', always: 'Allowed, and every change for the rest of this chat.', no: 'Declined.' }[b.dataset.a];
-        $('.row', el).outerHTML = `<p class="muted small">${said}</p>`;
-      };
-    });
-    $('[data-open]', el)?.addEventListener('click', () => ideOpen(String(e.args.path)));
-    $('button.primary', el).focus();
-    if (edit) $('.ai-body', el).innerHTML = await editPreview(e.args);
-  } else if (e.kind === 'done') {
-    aiBusy(false);
-    $$('#ai-log .ask .row').forEach(r => { r.outerHTML = '<p class="muted small">Stopped.</p>'; });
-    if (e.error) aiAdd('note bad', esc(e.error));
-    if (e.chat) {
-      aiChat = { id: e.chat.id, provider: e.chat.provider, model: e.chat.model };
-      $('#ai-usage').textContent = tokens(e.chat.usage);
-      if (!$('#ide-chats').hidden) aiChats();
-    }
-  } else aiEvent(e);
-});
-
-T.event.listen('ai-exchange', ({ payload: x }) => {
-  aiExchanges.push(x);
-  if (!$('#ai-inspect').hidden) aiInspect();
-});
-
-function aiInspect() {
-  const pretty = v => esc(JSON.stringify(v, null, 2));
-  $('#ai-inspect').innerHTML = aiExchanges.length
-    ? aiExchanges.slice().reverse().map(x => `<details class="ix"><summary><b>${new Date(x.at).toLocaleTimeString()}</b> · ${esc(x.model)} · ${(x.ms / 1000).toFixed(1)} s<br><span class="muted small">${tokens(x.usage)}</span></summary>
-        <p class="muted small">${esc(x.url)}</p><h4>Request</h4><pre class="sel">${pretty(x.request)}</pre><h4>Response</h4><pre class="sel">${pretty(x.response)}</pre></details>`).join('')
-    : '<p class="empty">Each request to the provider shows here once you send a message: the request (tools counted, earlier messages and pictures left out), the response, tokens and, for Claude and OpenRouter, the cost.</p>';
-}
-
-$$('.ide-ai .seg button').forEach(b => {
-  b.onclick = () => {
-    $$('.ide-ai .seg button').forEach(x => x.setAttribute('aria-selected', x === b));
-    const inspect = b.dataset.view === 'inspect';
-    $('#ai-scroll').hidden = inspect;
-    $('#ai-inspect').hidden = !inspect;
-    if (inspect) aiInspect();
-  };
-});
-
-function drawPics() {
-  $('#ai-pics').innerHTML = aiPics.map((p, i) => `<button type="button" class="ai-pic" data-i="${i}" title="Remove this picture">${p.startsWith('data:') ? `<img src="${p}" alt="Picture ${i + 1}">` : esc(basename(p))} ×</button>`).join('');
-  $$('#ai-pics .ai-pic').forEach(b => { b.onclick = () => { aiPics.splice(+b.dataset.i, 1); drawPics(); }; });
-}
-
-$('#ai-attach').onclick = () => $('#ai-file').click();
-$('#ai-file').onchange = async () => {
-  for (const f of $('#ai-file').files) {
-    if (f.size > 3750000) { toast(`${f.name} is over 3.75 MB, more than the providers take.`, 'error'); continue; }
-    aiPics.push(await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = bad; r.readAsDataURL(f); }));
-  }
-  $('#ai-file').value = '';
-  drawPics();
-};
-
-/** Pictures dropped on the AI tab are attached, not installed. */
-function aiDrop(p) {
-  const over = p.type === 'enter' || p.type === 'over';
-  $('#dropzone').hidden = !over;
-  $('#drop-text').textContent = over ? 'Drop pictures to attach' : 'Drop to install';
-  if (p.type !== 'drop') return;
-  const pics = (p.paths ?? []).filter(f => PICTURE.test(f));
-  if (pics.length < (p.paths ?? []).length) toast('Only PNG, JPEG, GIF and WebP pictures can be attached.');
-  aiPics.push(...pics);
-  drawPics();
-}
-
-$('#ai-text').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && (W.enterSends || e.ctrlKey)) { e.preventDefault(); $('#ai-form').requestSubmit(); } };
-$('#ai-form').onsubmit = async ev => {
-  ev.preventDefault();
-  const typed = $('#ai-text').value.trim(), role = $('#ai-role').value;
-  if (aiRunning || (!typed && !role)) return;
-  const who = aiWho(role), p = aiProviders?.find(x => x.id === who?.provider);
-  if (who?.provider !== 'mcp' && !p?.key) { toast(p ? `Add your ${p.name} API key in Settings.` : 'Pick an AI in Settings first.', 'error'); return showTab('settings'); }
-  // A role on another AI than this chat's starts a new chat: a chat keeps its provider's format.
-  if (role && who.provider !== 'mcp' && aiChat && !aiChat.app && aiChat.provider !== who.provider) aiNewChat();
-  const f = aiCtx && ide.files.find(f => f.path === aiCtx.path);
-  const unsaved = f && dirty(f) ? ' The editor has unsaved changes to it, so the file on disk is older.' : '';
-  const ctx = !aiCtx ? '' : aiCtx.text
-    ? `In ${aiCtx.path}, lines ${aiCtx.from}–${aiCtx.to}:${unsaved}\n\`\`\`\n${aiCtx.text}\n\`\`\`\n\n`
-    : `(About ${aiCtx.path}, open in the editor.${unsaved})\n\n`;
-  const from = aiChat?.app ? aiChat : null;
-  const carry = from ? `Carry on from ${from.app}'s session over MCP, "${from.title}" (chat ${from.id}): read it first with read_chat.\n\n` : '';
-  const text = carry + ctx + typed;
-  const pics =aiPics.map(p => p.startsWith('data:') ? `<img src="${p}" alt="">` : ` <span class="pill plain">${esc(basename(p))}</span>`).join('');
-  aiAdd('me', userHtml(text, role, pics));
-  aiBusy(true);
-  try {
-    await T.core.invoke('ai_send', { text, role: role || null, images: aiPics, chat: from ? null : aiChat?.id ?? null });
-    $('#ai-text').value = '';
-    $('#ai-role').value = '';
-    aiPics = [];
-    aiCtx = null;
-    drawPics();
-    aiCtxDraw();
-  } catch (e) {
-    aiBusy(false);
-    aiAdd('note bad', esc(e));
-  }
-};
-$('#ai-stop').onclick = () => { $('#ai-status').textContent = 'Stopping after this step…'; T.core.invoke('ai_stop'); };
-
 // ---- Dialogs and toasts ---------------------------------------------------------------------
 
 /** Modal dialog. actions: [[value, label, class]]. Resolves to the chosen value (the input's
@@ -4784,7 +4147,7 @@ $('#ai-stop').onclick = () => { $('#ai-status').textContent = 'Stopping after th
 /** A mod's read-me, wrapped, to read in a dialog. */
 async function showDoc(id, doc) {
   let d;
-  try { d = await call('ide_read', { path: `mods/${id}/${doc}` }); } catch (e) { return toast(String(e), 'error'); }
+  try { d = await call('read_file', { path: `mods/${id}/${doc}` }); } catch (e) { return toast(String(e), 'error'); }
   const shown = dialog({ title: doc.split('/').pop(), body: `<pre class="doc-view">${esc(d.text)}</pre>`, actions: [['ok', 'Close', 'primary']] });
   $('#dlg').classList.add('wide');
   await shown;

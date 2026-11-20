@@ -655,6 +655,146 @@ fn playthrough_and_moving_saves() {
     assert!(saves::transfer(&inst, &["a.ess".into()], "Shared", true).unwrap_err().to_string().contains("share one save folder"));
 }
 
+/// A Wrye Bash BAIN package installs through the installer dialog: its sub-packages are one
+/// step's options, `00…` ticked by default, and a later sub-package wins a file. Folders that
+/// aren't all Data-like aren't BAIN.
+#[test]
+fn bain_packages_install_the_sub_packages_picked() {
+    isolate();
+    use rmm_core::fomod::Choices;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src) = (tmp.path().join("game"), tmp.path().join("src"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let pack = src.join("Pack/Pack 1.2");
+    write(&pack.join("00 Core/Pack.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&pack.join("00 Core/textures/a.dds"), "core");
+    write(&pack.join("10 Option A/textures/a.dds"), "A");
+    write(&pack.join("20 Option B/meshes/b.nif"), "B");
+    write(&pack.join("Docs/readme.txt"), "read me");
+    write(&pack.join("package.txt"), "about");
+    let inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+
+    assert!(install::has_fomod(&inst, &src.join("Pack")).unwrap());
+    let w = install::fomod_options(&inst, &src.join("Pack"), None).unwrap();
+    let opts: Vec<(String, bool)> = w.steps[0].groups[0].options.iter().map(|o| (o.name.clone(), o.selected)).collect();
+    assert_eq!(opts, [("00 Core".into(), true), ("10 Option A".into(), false), ("20 Option B".into(), false)]);
+    assert!(install::install(&inst, &src.join("Pack"), None, true, None).is_err(), "it asks for choices, like a FOMOD");
+
+    let pick: Choices = serde_json::from_str(r#"{"options":[{"name":"Sub-packages","groups":[{"name":"Sub-packages","choices":[{"name":"00 Core"},{"name":"10 Option A"}]}]}]}"#).unwrap();
+    let r = install::install(&inst, &src.join("Pack"), None, true, Some(&pick)).unwrap();
+    assert_eq!(inst.mod_files(&r.id).unwrap(), ["Pack.esp", "textures/a.dds"]);
+    assert_eq!(read(&inst.mod_dir(&r.id).join("textures/a.dds")), "A", "the later sub-package wins");
+    assert_eq!(r.plugins, ["Pack.esp"]);
+    let defaults = install::install(&inst, &src.join("Pack"), Some("Pack defaults"), true, Some(&Choices::default())).unwrap();
+    assert_eq!(read(&inst.mod_dir(&defaults.id).join("textures/a.dds")), "core");
+
+    // A folder that isn't Data-like means it isn't BAIN: the old guess stays.
+    write(&src.join("Loose/One/textures/x.dds"), "x");
+    write(&src.join("Loose/Two/notes.txt"), "n");
+    assert!(!install::has_fomod(&inst, &src.join("Loose")).unwrap());
+}
+
+/// A C# script installer runs only when the user allows it. It is compiled with FOMM's names,
+/// runs sandboxed, and installs what it asks for: files from the archive, files it makes, and its
+/// INI settings as an INI tweak that starts on. Writing outside the sandbox fails the install.
+#[cfg(windows)]
+#[test]
+fn csharp_scripts_install_what_they_ask_for_in_a_sandbox() {
+    isolate();
+    use rmm_core::{csharp, ini_tweaks};
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, src) = (tmp.path().join("game"), tmp.path().join("src"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    write(&game.join("Data/textures/base.dds"), "base");
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    inst.config.ini_path = Some(tmp.path().join("My Games"));
+    write(&src.join("Scripted/Main.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Scripted/Optional/b.dds"), "b");
+    write(&src.join("Scripted/Unused/c.dds"), "c");
+    write(&src.join("Scripted/fomod/script.cs"), r#"using System;
+using fomm.Scripting;
+class Script : Fallout3BaseScript {
+    public static bool OnActivate() {
+        InstallFileFromFomod("Main.esp");
+        if (DataFileExists("textures/base.dds") && GetExistingDataFile("textures/base.dds").Length == 4) CopyDataFile("Optional/b.dds", "textures/b.dds");
+        GenerateDataFile("made/hello.txt", System.Text.Encoding.UTF8.GetBytes("hi " + GetModFileList().Length));
+        EditFalloutINI("Grass", "bAllowCreateGrass", "0", true);
+        return true;
+    }
+}
+"#);
+    assert!(install::has_script(&inst, &src.join("Scripted")).unwrap());
+    let refused = install::install(&inst, &src.join("Scripted"), None, true, None).unwrap_err().to_string();
+    assert!(refused.contains("Only you can start it"), "{refused}");
+
+    let r = csharp::allowing(true, || install::install(&inst, &src.join("Scripted"), None, true, None)).unwrap();
+    assert_eq!(inst.mod_files(&r.id).unwrap(), ["INI Tweaks/Installer script.ini", "Main.esp", "made/hello.txt", "textures/b.dds"]);
+    assert_eq!(read(&inst.mod_dir(&r.id).join("made/hello.txt")), "hi 4");
+    let t = ini_tweaks::list(&inst, &r.id).unwrap();
+    assert_eq!((t[0].file.as_str(), t[0].enabled, t[0].settings[0].key.as_str()), ("Installer script.ini", true, "bAllowCreateGrass"));
+    assert_eq!(r.plugins, ["Main.esp"]);
+
+    // The sandbox: a script that writes a file of its own fails, and the file isn't there.
+    let escape = tmp.path().join("escape.txt");
+    write(&src.join("Escape/a.esp"), plugin_bytes(&["Skyrim.esm"], false));
+    write(&src.join("Escape/fomod/script.cs"), format!("class Script : BaseScript {{ public static bool OnActivate() {{ System.IO.File.WriteAllText(@\"{}\", \"x\"); return PerformBasicInstall(); }} }}", escape.display()));
+    let err = csharp::allowing(true, || install::install(&inst, &src.join("Escape"), None, true, None)).unwrap_err().to_string();
+    assert!(err.contains("outside the mod"), "{err}");
+    assert!(!escape.exists());
+}
+
+/// A mod's INI tweaks, once on, reach My Games at deploy: a setting the Prefs INI has goes there,
+/// the rest to the main INI, and a mod lower in the list wins. Turning one off and deploying, or
+/// purging, gives the INIs back byte for byte.
+#[test]
+fn ini_tweaks_apply_at_deploy_and_come_out() {
+    isolate();
+    use rmm_core::ini_tweaks;
+    let tmp = tempfile::tempdir().unwrap();
+    let (game, ini, src) = (tmp.path().join("game"), tmp.path().join("My Games"), tmp.path().join("src"));
+    write(&game.join("SkyrimSE.exe"), "exe");
+    write(&game.join("Data/Skyrim.esm"), plugin_bytes(&[], true));
+    let (main, prefs) = ("[General]\r\nsLanguage=ENGLISH\r\n[Grass]\r\nbAllowCreateGrass=1\r\n", "[Display]\r\nfShadowDistance=8000\r\n");
+    write(&ini.join("Skyrim.ini"), main);
+    write(&ini.join("SkyrimPrefs.ini"), prefs);
+    write(&src.join("Grass/INI Tweaks/Grass Off.ini"), "; fewer grass\n[Grass]\nbAllowCreateGrass=0\n[Display]\nfShadowDistance=4000\n[Papyrus]\nbEnableLogging=1\n");
+    write(&src.join("Grass/textures/g.dds"), "g");
+    write(&src.join("Shadows/Ini Tweaks/Short.ini"), "[Display]\nfShadowDistance=2000\n");
+    write(&src.join("Shadows/textures/s.dds"), "s");
+    let mut inst = Instance::create(&tmp.path().join("inst"), Game::SkyrimSe, &game, &tmp.path().join("local")).unwrap();
+    inst.config.ini_path = Some(ini.clone());
+    let g = install::install(&inst, &src.join("Grass"), None, true, None).unwrap().id;
+    let s = install::install(&inst, &src.join("Shadows"), None, true, None).unwrap().id;
+
+    let t = ini_tweaks::list(&inst, &g).unwrap();
+    assert_eq!((t.len(), t[0].file.as_str(), t[0].enabled, t[0].settings.len()), (1, "Grass Off.ini", false, 3));
+    assert!(ini_tweaks::set(&inst, &g, "nope.ini", true).is_err());
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!((read(&ini.join("Skyrim.ini")), read(&ini.join("SkyrimPrefs.ini"))), (main.into(), prefs.into()), "off until turned on");
+
+    ini_tweaks::set(&inst, &g, "grass off.ini", true).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&ini.join("Skyrim.ini")), "[General]\r\nsLanguage=ENGLISH\r\n[Grass]\r\nbAllowCreateGrass=0\r\n[Papyrus]\r\nbEnableLogging=1\r\n");
+    assert_eq!(read(&ini.join("SkyrimPrefs.ini")), "[Display]\r\nfShadowDistance=4000\r\n");
+
+    ini_tweaks::set(&inst, &s, "Short.ini", true).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&ini.join("SkyrimPrefs.ini")), "[Display]\r\nfShadowDistance=2000\r\n", "the lower mod wins");
+
+    ini_tweaks::set(&inst, &g, "Grass Off.ini", false).unwrap();
+    ops::set_mods_enabled(&inst, std::slice::from_ref(&s), false).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!((read(&ini.join("Skyrim.ini")), read(&ini.join("SkyrimPrefs.ini"))), (main.into(), prefs.into()), "off again: back as they were");
+
+    ops::set_mods_enabled(&inst, &[s], true).unwrap();
+    deploy::deploy(&inst, false).unwrap();
+    assert_eq!(read(&ini.join("SkyrimPrefs.ini")), "[Display]\r\nfShadowDistance=2000\r\n");
+    deploy::purge(&inst, false).unwrap();
+    assert_eq!((read(&ini.join("Skyrim.ini")), read(&ini.join("SkyrimPrefs.ini"))), (main.into(), prefs.into()), "a purge puts them back");
+}
+
 /// A full plugin whose new records fit a light plugin is an ESL candidate.
 #[test]
 fn profile_inis_and_saves() {
@@ -2213,7 +2353,8 @@ fn imports_an_mo2_instance() {
     write(&mo2.join("mods/A/textures/a.dds"), "A");
     write(&mo2.join("mods/A/meta.ini"), "[General]\r\nmodid=123\r\nversion=1.0\r\ninstallationFile=A-123-1-0.7z\r\ncomments=keep this\r\nnotes=\"<html><head><style>p, li { white-space: pre-wrap; }</style></head><body>\\n<p>Use the <b>2K</b> option &amp; skip the rest.</p></body></html>\"\r\ncategory=\"12,1,\"\r\nnexusCategory=29\r\n[installedFiles]\r\n1\\modid=123\r\n1\\fileid=456\r\nsize=1\r\n");
     write(&mo2.join("categories.dat"), "1|Animations|51,4|0\r\n12|Weapons|3|0\r\n");
-    write(&mo2.join("mods/B/meta.ini"), "[General]\r\nmodid=7\r\ncategory=\"-1,\"\r\nnexusCategory=29\r\n");
+    write(&mo2.join("mods/B/meta.ini"), "[General]\r\nmodid=7\r\ncategory=\"-1,\"\r\nnexusCategory=29\r\n[INI%20Tweaks]\r\n1\\name=Grass.ini\r\nsize=1\r\n");
+    write(&mo2.join("mods/B/INI Tweaks/Grass.ini"), "[Grass]\r\nbAllowCreateGrass=0\r\n");
     write(&mo2.join("mods/B/B.esp"), plugin_bytes(&["Skyrim.esm"], false));
     write(&mo2.join("mods/B/textures/a.dds"), "B");
     write(&mo2.join("mods/B/Root/enbseries.ini"), "enb");
@@ -2235,10 +2376,12 @@ fn imports_an_mo2_instance() {
     assert_eq!((dry.overwrite, dry.copy_bytes, dry.after.len()), (1, 0, 0), "one overwrite file; the same drive links");
 
     let r = import::import_mo2(&inst, &mo2, None, false).unwrap();
-    assert_eq!(r.linked + r.copied, 6, "{r:?}"); // 5 mod files and the overwrite file; meta.ini stays behind
+    assert_eq!(r.linked + r.copied, 7, "{r:?}"); // 6 mod files and the overwrite file; meta.ini stays behind
+    let t = rmm_core::ini_tweaks::list(&inst, "B").unwrap();
+    assert_eq!((t[0].file.as_str(), t[0].enabled), ("Grass.ini", true), "MO2's INI tweak stays on");
     assert_eq!(dry.files, r.files, "the preview counts the files the import brings"); 
     assert_eq!(order(&inst), "A sep:Visuals B+ C");
-    assert_eq!(inst.mod_files("B").unwrap(), ["B.esp", "root/enbseries.ini", "textures/a.dds"]);
+    assert_eq!(inst.mod_files("B").unwrap(), ["B.esp", "INI Tweaks/Grass.ini", "root/enbseries.ini", "textures/a.dds"]);
     let meta = inst.mod_meta("A");
     assert_eq!((meta.notes.as_deref(), meta.nexus.as_ref().map(|n| (n.mod_id, n.file_id, n.version.clone()))), (Some("keep this\n\nUse the 2K option & skip the rest."), Some((123, Some(456), Some("1.0".into())))));
     assert!(meta.source.unwrap().replace('\\', "/").ends_with("mo2/downloads/A-123-1-0.7z"));

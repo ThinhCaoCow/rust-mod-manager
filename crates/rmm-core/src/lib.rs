@@ -4,11 +4,13 @@ pub mod archives;
 pub mod bisect;
 pub mod collection;
 pub mod conflicts;
+pub mod csharp;
 pub mod deploy;
 pub mod fomod;
 pub mod game;
 pub mod harness;
 pub mod import;
+pub mod ini_tweaks;
 pub mod inspect;
 pub mod lockfile;
 pub mod nexus;
@@ -33,6 +35,16 @@ pub mod workspace;
 pub mod vfs;
 
 pub use game::Game;
+
+/// A command for a console program (curl, PowerShell, tar…) that runs without a console window:
+/// started from the desktop app, Windows would otherwise open one for it.
+pub fn hidden(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
 
 /// Progress of long jobs (deploys, LOOT sorts, installs, health checks) for a front end to show.
 /// The CLI and MCP server don't set a hook; the window does.

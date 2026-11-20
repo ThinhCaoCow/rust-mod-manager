@@ -1,6 +1,6 @@
 //! MCP server: the same operations as the CLI, as tools an AI can call.
 //! Every mutation lands in undo history; game-folder writes default to dry runs.
-use crate::agent::{self, Event};
+use crate::chats::{self, Event};
 use rmcp::{
     ErrorData, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::{
@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// What every AI working on the instance is told: outside apps get it as the server's instructions, and
-/// rmm's own AI reads it from there into its system prompt.
+/// What every AI app working on the instance is told, as the server's instructions.
 const INSTRUCTIONS: &str = include_str!("ai-guide.md");
 
 #[derive(Clone)]
@@ -36,7 +35,7 @@ pub struct Rmm {
     /// The live test (test_session_*); dropping it closes the game.
     session: Arc<Mutex<Option<harness::Session>>>,
     /// Some when the client's calls are kept as a chat (an AI app's session; see `recorded`).
-    log: Option<Arc<Mutex<Option<agent::Chat>>>>,
+    log: Option<Arc<Mutex<Option<chats::Chat>>>>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -365,9 +364,22 @@ struct TransferSavesArgs {
     move_them: bool,
 }
 #[derive(Deserialize, JsonSchema)]
+struct DeleteSavesArgs {
+    /// Save file names, as list_saves gives them.
+    files: Vec<String>,
+}
+#[derive(Deserialize, JsonSchema)]
 struct SaveArgs {
     /// The save's file name, as list_saves gives it.
     file: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct IniTweakArgs {
+    id: String,
+    /// The tweak's file name, as mod_details' ini_tweaks lists it.
+    file: String,
+    /// true turns it on, false off.
+    on: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 struct NoteArgs {
@@ -457,20 +469,6 @@ struct EditFileArgs {
     old: Option<String>,
     /// The replacement for `old`, or the whole file.
     new: String,
-}
-#[derive(Deserialize, JsonSchema)]
-struct TeammateArgs {
-    /// researcher, installer or tester.
-    role: String,
-    /// What to do, with everything the teammate needs to know.
-    task: String,
-}
-#[derive(Deserialize, JsonSchema)]
-struct FinishTaskArgs {
-    /// The task's number, from team_tasks.
-    n: usize,
-    /// Your report: what you did and found.
-    answer: String,
 }
 #[derive(Deserialize, JsonSchema)]
 struct ChatNoteArgs {
@@ -696,6 +694,11 @@ impl Rmm {
         out(self.inst().and_then(|i| saves::transfer(&i, &a.files, &a.profile, !a.move_them)))
     }
 
+    #[tool(description = "Delete saves of the active profile: each save and its script extender co-save move to the instance's trash (emptying the trash deletes them for good). Ask the user first. Returns the files moved.")]
+    async fn delete_saves(&self, Parameters(a): Parameters<DeleteSavesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| saves::delete(&i, &a.files)))
+    }
+
     #[tool(description = "Archives in the instance's downloads folder (where Nexus downloads go), newest first, with the mods installed from each.", annotations(read_only_hint = true))]
     async fn list_downloads(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| install::downloads(&i)))
@@ -711,7 +714,7 @@ impl Rmm {
         out(self.inst().and_then(|i| inspect::read_file(&i, &a.id, &a.path, a.offset.unwrap_or(0), a.limit.unwrap_or(400))))
     }
 
-    #[tool(description = "The folders and files the IDE and edit_file work on: mods/<mod id>/... (each installed mod's folder), overwrite/... (what tools and the game wrote) and ini (the INI files the game reads, in My Games). Give a folder's path; empty lists those three.", annotations(read_only_hint = true))]
+    #[tool(description = "The folders and files read_file and edit_file work on: mods/<mod id>/... (each installed mod's folder), overwrite/... (what tools and the game wrote) and ini (the INI files the game reads, in My Games). Give a folder's path; empty lists those three.", annotations(read_only_hint = true))]
     async fn list_files(&self, Parameters(a): Parameters<ListFilesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| workspace::list(&i, &a.path)))
     }
@@ -734,7 +737,7 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Edits made to files (by the user in the IDE, an AI, or a revert), newest first: number, path, when, by whom, lines before and after.", annotations(read_only_hint = true))]
+    #[tool(description = "Edits made to files (by an AI, or a revert), newest first: number, path, when, by whom, lines before and after.", annotations(read_only_hint = true))]
     async fn file_edits(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| workspace::edits(&i)))
     }
@@ -744,36 +747,17 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| workspace::revert(&i, a.n)))
     }
 
-    #[tool(description = "rmm's mod team: who does each role (one of rmm's AI providers with the user's key, or \"mcp\": the AI app connected over MCP; the user picks in rmm's Settings), and the team board: steps handed to a teammate, newest first, with their answers. A task waiting for you (an AI app over MCP) is yours: do it with its role's prompt, then finish_team_task.", annotations(read_only_hint = true))]
-    async fn team_tasks(&self) -> Result<String, String> {
-        out(agent::tasks(&self.root).map(|mut t| {
-            t.reverse();
-            serde_json::json!({ "team": agent::team(), "tasks": t })
-        }))
-    }
-
-    #[tool(description = "Hand a step to a teammate the user gave to one of rmm's AI providers (team_tasks shows who): the researcher, installer or tester works on it in the background with its role's prompt, and its answer comes in team_tasks. It can read and preview but not change anything, so it reports changes for you to make. Give it all it needs: the request, the mod picked, what to test.")]
-    async fn ask_teammate(&self, peer: Peer<RoleServer>, Parameters(a): Parameters<TeammateArgs>) -> Result<String, String> {
-        let from = app_name(&peer).unwrap_or_else(|| "an AI app".into());
-        agent::start_teammate(self.root.clone(), &a.role, &a.task, &from).map_err(|e| format!("{e:#}"))
-    }
-
-    #[tool(description = "Finish a team task that waited for you (team_tasks): your report goes on the board for the lead.")]
-    async fn finish_team_task(&self, Parameters(a): Parameters<FinishTaskArgs>) -> Result<String, String> {
-        agent::finish_task(&self.root, a.n, &a.answer).map(|()| format!("Team task {} is done.", a.n)).map_err(|e| format!("{e:#}"))
-    }
-
-    #[tool(description = "Saved chats in this instance, newest first: rmm's own AI chats and the sessions of AI apps connected over MCP (provider \"mcp\", model: the app). read_chat shows one.", annotations(read_only_hint = true))]
+    #[tool(description = "Saved chats in this instance, newest first: the sessions of AI apps connected over MCP (provider \"mcp\", model: the app), and any from rmm's former built-in AI. read_chat shows one.", annotations(read_only_hint = true))]
     async fn list_chats(&self) -> Result<String, String> {
-        out(agent::chats(&self.root))
+        out(chats::chats(&self.root))
     }
 
     #[tool(description = "A saved chat as text: the user's and the AI's words (for an MCP app, the notes it saved), each tool call and the start of its answer. A long chat keeps its end. Read an earlier session before carrying on from it.", annotations(read_only_hint = true))]
     async fn read_chat(&self, Parameters(a): Parameters<ChatIdArgs>) -> Result<String, String> {
-        agent::load_chat(&self.root, &a.id).map(|c| c.transcript(40_000)).map_err(|e| format!("{e:#}"))
+        chats::load_chat(&self.root, &a.id).map(|c| c.transcript(40_000)).map_err(|e| format!("{e:#}"))
     }
 
-    #[tool(description = "For AI apps connected over MCP: rmm keeps your tool calls as a chat in the instance, but not the conversation. When a task ends, save a short note to it: what the user asked for, what you did and decided, and what's left. rmm's own AI and later sessions read it with read_chat.")]
+    #[tool(description = "For AI apps connected over MCP: rmm keeps your tool calls as a chat in the instance, but not the conversation. When a task ends, save a short note to it: what the user asked for, what you did and decided, and what's left. Later sessions read it with read_chat.")]
     async fn save_chat_note(&self, peer: Peer<RoleServer>, Parameters(a): Parameters<ChatNoteArgs>) -> Result<String, String> {
         let text = a.text.trim().to_string();
         if text.is_empty() {
@@ -787,7 +771,7 @@ impl Rmm {
             c.log.push(Event::Text { text });
         })
         .map(|id| format!("Saved to chat {id}."))
-        .ok_or_else(|| "nothing to save to: rmm's own AI keeps its chats itself, and outside an instance there are none".into())
+        .ok_or_else(|| "nothing to save to: keeping sessions is off (the window's MCP tab, mcp.record_sessions), or there is no instance here".into())
     }
 
     #[tool(description = "Record conflicts between enabled plugins (what xEdit shows): each pair of plugins that change the same records, how many, which one's version the game uses (the later in load order, `wins`), and whether the later one is a patch for the earlier (has it as a master, so the override is intended). The base game, DLC and Creation Club are left out, since every mod overrides them. With plugin: only its pairs. Where a plugin should go: compare with sort_plugins (dry run, LOOT's order) and the masters in list_plugins; loose-file and archive conflicts between mods are in list_conflicts.", annotations(read_only_hint = true))]
@@ -888,6 +872,11 @@ impl Rmm {
     #[tool(description = "Rename a separator and/or set its colour. Returns its id, which follows the name.")]
     async fn edit_separator(&self, Parameters(a): Parameters<EditSeparatorArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| ops::edit_separator(&i, &a.id, a.name.as_deref(), a.color.as_deref())))
+    }
+
+    #[tool(description = "Turn one of a mod's INI tweaks on or off (mod_details' ini_tweaks lists them, from the mod's INI Tweaks folder, with what each sets). The next deploy writes the settings of the enabled mods' tweaks into the game's INIs in My Games (a mod lower in the list wins a setting), and the deploy after, or a purge, puts the old values back. Not in undo history.")]
+    async fn set_ini_tweak(&self, Parameters(a): Parameters<IniTweakArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| rmm_core::ini_tweaks::set(&i, &a.id, &a.file, a.on)))
     }
 
     #[tool(description = "Set or clear a mod's notes (shown in the mod list). Not in undo history; returns the previous notes.")]
@@ -1395,7 +1384,7 @@ Every change is in history and can be undone.";
 
 const TESTER: &str = "\
 You are the tester in rmm's mod team for this {game} setup. Test: {focus}. Start from: {save}.
-The lead (the user, or the lead agent) says what to test; follow its plan and report back to it.
+The lead (the user, or the AI leading the team) says what to test; follow its plan and report back to it.
 
 The game runs in a small window behind the user's windows, so you see it only through screenshots. Ask the user before starting the game: it uses their Steam account. test_session_start says if the harness plugin isn't deployed.
 
@@ -1415,7 +1404,7 @@ Limits: console commands run, but their text output isn't read back, and you can
 const LEAD: &str = "\
 You lead rmm's mod team for this {game} setup. The user wants: {request}
 
-The team has three roles, each with its own prompt on this server: researcher (find_mods), installer (install_safely) and tester (test_mods). The user gives each role to an AI in rmm's Settings (team_tasks shows who): hand a role's steps to it with ask_teammate, with everything it needs from you, and play the roles given to you yourself.
+The team has three roles, each with its own prompt on this server: researcher (find_mods), installer (install_safely) and tester (test_mods). Play each role yourself with its prompt, or hand it to a helper agent of your own if you can start them, giving it everything it needs from you.
 1. Researcher: a ranked list of candidates with confidence scores. Show it to the user, who picks. Never pick for them.
 2. Installer, for each pick: download, safety review (or the saved one), placement, deploy.
 3. Tester, guided by you: from the new mods' reviews, pages and plugin_records, decide what to test and where: combat, quests, items, magic, NPCs, weather and world, interface, and performance in heavy places (cities, big battles). Send the tester the plan, read its reports and screenshots, and send follow-up steps (another place, the next quest stage, a bigger fight) until each mechanic works or clearly fails.
@@ -1491,7 +1480,7 @@ impl ServerHandler for Rmm {
             };
             self.session_chat(app, |c| {
                 c.log.push(Event::Call { name: name.clone(), args });
-                c.log.push(Event::Result { name, ok, text: agent::cut(&text, 2000) });
+                c.log.push(Event::Result { name, ok, text: chats::cut(&text, 2000) });
             });
         }
         r
@@ -1510,25 +1499,24 @@ impl Rmm {
     }
 
     /// This server for one outside AI app's session: its calls are kept as a chat in the instance.
-    /// rmm's own AI uses `new`, as it keeps its chats itself.
     pub fn recorded(mut self) -> Rmm {
         self.log = Some(Default::default());
         self
     }
 
-    /// `recorded` unless the user turned keeping sessions off (Settings).
+    /// `recorded` unless the user turned keeping sessions off (mcp.record_sessions).
     pub fn recorded_if_set(self) -> Rmm {
         if rmm_core::settings::get().mcp.record_sessions { self.recorded() } else { self }
     }
 
     /// Changes the session's chat (made on first use, in an instance only) and saves it; None when
     /// nothing is kept. Keeping it never fails a call.
-    fn session_chat(&self, app: Option<String>, change: impl FnOnce(&mut agent::Chat)) -> Option<String> {
+    fn session_chat(&self, app: Option<String>, change: impl FnOnce(&mut chats::Chat)) -> Option<String> {
         let mut log = self.log.as_ref()?.lock().unwrap();
         if log.is_none() {
             Instance::open(&self.root).ok()?;
         }
-        let chat = log.get_or_insert_with(|| agent::Chat::external(app.as_deref().unwrap_or("An AI app")));
+        let chat = log.get_or_insert_with(|| chats::Chat::external(app.as_deref().unwrap_or("An AI app")));
         change(chat);
         chat.updated = now();
         chat.save(&self.root).ok()?;

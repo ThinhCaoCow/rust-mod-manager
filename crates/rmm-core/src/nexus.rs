@@ -93,26 +93,16 @@ pub enum Handed {
 /// installs it like a dropped file: FOMOD installers show their options, and a newer version of
 /// an installed mod is offered as an update.
 pub fn hand_to_window(root: &Path, link: &str, app: &Path) -> Result<Handed> {
-    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     parse_nxm(link)?;
     let open = window_open(root);
     if !open && !app.is_file() {
         return Ok(Handed::NoWindow);
     }
-    let inbox = root.join(INBOX);
-    fs::create_dir_all(&inbox)?;
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = format!("{:020}-{}-{seq}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(), std::process::id());
-    fs::write(inbox.join(format!("{name}.tmp")), link.trim())?;
-    fs::rename(inbox.join(format!("{name}.tmp")), inbox.join(format!("{name}.nxm")))?; // never read half-written
+    leave_link(root, link)?;
     if open {
         return Ok(Handed::ToWindow);
     }
-    // Several links clicked while no window is open start one.
-    let starting = inbox.join(".starting");
-    let recent = fs::metadata(&starting).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e < Duration::from_secs(30));
-    if !recent {
-        fs::write(&starting, "")?;
+    if first_to_start(root)? {
         Command::new(app)
             .arg("--instance")
             .arg(root)
@@ -123,6 +113,38 @@ pub fn hand_to_window(root: &Path, link: &str, app: &Path) -> Result<Handed> {
             .with_context(|| format!("cannot start {}", app.display()))?;
     }
     Ok(Handed::OpenedWindow)
+}
+
+/// The window program started for an nxm link (`rmm-app -i <instance> nxm <link>`, the link
+/// handler on Windows, so no console opens): leaves the link for the instance's window. True when
+/// this process should go on to be that window; false when another window takes it (one has the
+/// instance open, or another click started one moments ago), so this process can quit.
+pub fn take_link_at_start(root: &Path, link: &str) -> Result<bool> {
+    parse_nxm(link)?;
+    leave_link(root, link)?;
+    Ok(!window_open(root) && first_to_start(root)?)
+}
+
+/// Put a link in the instance's inbox, where its window picks it up (`take_links`).
+fn leave_link(root: &Path, link: &str) -> Result<()> {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let inbox = root.join(INBOX);
+    fs::create_dir_all(&inbox)?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("{:020}-{}-{seq}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(), std::process::id());
+    fs::write(inbox.join(format!("{name}.tmp")), link.trim())?;
+    fs::rename(inbox.join(format!("{name}.tmp")), inbox.join(format!("{name}.nxm")))?; // never read half-written
+    Ok(())
+}
+
+/// Several links clicked while no window is open start one: true for the first in 30 seconds.
+fn first_to_start(root: &Path) -> Result<bool> {
+    let starting = root.join(INBOX).join(".starting");
+    let recent = fs::metadata(&starting).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|e| e < Duration::from_secs(30));
+    if !recent {
+        fs::write(&starting, "")?;
+    }
+    Ok(!recent)
 }
 
 /// How many links wait for the window.
@@ -229,7 +251,7 @@ impl Client {
             args.extend(["-H", t.as_str(), "-H", "Expect:", "--data-binary", b]);
         }
         args.extend(["--", &url]);
-        let mut child = Command::new("curl").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("cannot run curl")?;
+        let mut child = crate::hidden("curl").args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("cannot run curl")?;
         child.stdin.take().unwrap().write_all(config.as_bytes())?;
         let out = child.wait_with_output()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -798,14 +820,12 @@ fn fetch_sized(url: &str, dest: &Path, size: Option<u64>, stage: &str) -> Result
         if size.is_some_and(|s| len(&tmp) == s) {
             break; // finished last time, short of the rename
         }
-        let mut cmd = Command::new("curl");
+        let mut cmd = crate::hidden("curl");
         cmd.args(["-fsSL", "--proto", "=http,https", "--proto-redir", "=http,https", "--retry", "2"]);
         if resume {
             cmd.args(["-C", "-"]); // carry on from what .part has
         }
         cmd.arg("-o").arg(&tmp).args(["--", &url]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // no console window
         let mut child = cmd.spawn().context("cannot run curl")?;
         let status = loop {
             if let Some(s) = child.try_wait()? {
@@ -948,14 +968,12 @@ pub fn identify(inst: &Instance, client: &Client, names: &[String]) -> Result<Id
 
 /// A file's MD5, which Nexus finds files by: certutil on Windows, md5sum elsewhere.
 fn md5_file(path: &Path) -> Result<String> {
-    let mut cmd = if cfg!(windows) { Command::new("certutil") } else { Command::new("md5sum") };
+    let mut cmd = crate::hidden(if cfg!(windows) { "certutil" } else { "md5sum" });
     if cfg!(windows) {
         cmd.arg("-hashfile").arg(path).arg("MD5");
     } else {
         cmd.arg(path);
     }
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
     let out = cmd.output().context("cannot run certutil")?;
     let hex = |w: &str| w.len() == 32 && w.bytes().all(|b| b.is_ascii_hexdigit());
     // certutil: the hash on the second line (with spaces between bytes before Windows 10);
@@ -1140,11 +1158,12 @@ fn urlencode(s: &str) -> String {
 /// The page where users make a personal API key.
 pub const KEYS_PAGE: &str = "https://next.nexusmods.com/settings/api-keys";
 
-/// Make nxm:// links open `rmm nxm <link>` for this instance. Only when the user asks: it changes
+/// Make nxm:// links open `<exe> -i <instance> nxm <link>`: `exe` is rmm's window program where it
+/// is installed (a windowed program, so no console opens), else `rmm`. Only when the user asks: it changes
 /// which program the system opens these links with (HKCU\Software\Classes\nxm on Windows, an
 /// xdg-mime default on Linux). Returns what it set.
-pub fn register_handler(rmm_exe: &Path, instance: &Path) -> Result<String> {
-    let command = format!("\"{}\" -i \"{}\" nxm \"%1\"", rmm_exe.display(), instance.display());
+pub fn register_handler(exe: &Path, instance: &Path) -> Result<String> {
+    let command = format!("\"{}\" -i \"{}\" nxm \"%1\"", exe.display(), instance.display());
     #[cfg(windows)]
     {
         use winreg::RegKey;

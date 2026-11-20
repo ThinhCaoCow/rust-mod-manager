@@ -90,7 +90,7 @@ pub fn update_masterlist(inst: &Instance, force: bool) -> Result<Vec<String>> {
 fn download(url: &str, dest: &Path) -> Result<()> {
     let mut tmp = dest.as_os_str().to_owned();
     tmp.push(".part");
-    let out = std::process::Command::new("curl")
+    let out = crate::hidden("curl")
         .args(["-fsSL", "--retry", "2", "--max-time", "120", "-o"])
         .arg(&tmp)
         .arg(url)

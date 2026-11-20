@@ -231,7 +231,7 @@ fn defender(dir: &Path) -> Defender {
         return Defender { ran: false, threats: vec![], note: "Windows Defender's scanner (MpCmdRun.exe) isn't here".into() };
     };
     crate::progress::report("Windows Defender is scanning the mod", 0, 0);
-    let out = std::process::Command::new(exe).args(["-Scan", "-ScanType", "3", "-DisableRemediation", "-File"]).arg(dir).output();
+    let out = crate::hidden(exe).args(["-Scan", "-ScanType", "3", "-DisableRemediation", "-File"]).arg(dir).output();
     let Ok(out) = out else {
         return Defender { ran: false, threats: vec![], note: "couldn't start Windows Defender's scanner".into() };
     };

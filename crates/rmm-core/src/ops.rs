@@ -212,6 +212,7 @@ pub fn mod_details(inst: &Instance, id: &str, max_files: usize) -> Result<Value>
         "review": crate::inspect::reviews(inst, Some(id))?.pop(),
         // Files edited through rmm that an update or reinstall would replace.
         "edited": crate::workspace::live_edits(inst, id).unwrap_or_default(),
+        "ini_tweaks": crate::ini_tweaks::list(inst, id).unwrap_or_default(),
     }))
 }
 

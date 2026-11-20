@@ -193,6 +193,26 @@ pub struct OptionView {
 }
 
 impl Installer {
+    /// A Wrye Bash BAIN package as an installer: one step whose options are its sub-packages
+    /// (the folders `packages`, each installed as Data, a later one winning), any number of them.
+    /// Those named `00…` start ticked, as in MO2.
+    pub fn bain(module: &str, packages: &[String]) -> Installer {
+        let plugins = packages
+            .iter()
+            .map(|p| Plugin {
+                name: p.clone(),
+                description: String::new(),
+                image: None,
+                files: vec![FileItem { source: p.clone(), destination: String::new(), folder: true, priority: 0, always: false, if_usable: false }],
+                flags: vec![],
+                default: if p.starts_with("00") { Kind::Recommended } else { Kind::Optional },
+                patterns: vec![],
+            })
+            .collect();
+        let group = Group { name: "Sub-packages".into(), kind: GroupKind::SelectAny, plugins };
+        Installer { module: module.into(), deps: None, required: vec![], steps: vec![Step { name: "Sub-packages".into(), visible: None, groups: vec![group] }], conditional: vec![] }
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Installer> {
         let text = decode(bytes);
         // The declaration may name an encoding the text no longer has; it carries nothing else.
