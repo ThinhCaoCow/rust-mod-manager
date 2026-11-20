@@ -3416,8 +3416,11 @@ async function checkUpdates(quiet) {
     r.length ? (premium ? 'Update downloads the new file and updates the mod in place, with the FOMOD choices it was installed with; Undo puts the old files back.' : 'Free accounts download from the website: Files tab opens the mod’s, where “Mod manager download” brings the file back here as an update (once Nexus links open rmm).') : '',
     gh.length ? 'A GitHub update downloads the latest release and updates the mod in place; Undo puts the old files back.' : '',
     gh.length && !nexus.user && S.mods.some(m => m.nexus_id) ? 'Sign in to Nexus Mods to check your Nexus mods too.' : '',
+    r.length && !premium && gh.length ? 'Update all updates the GitHub ones.' : '',
   ].filter(Boolean).join(' ');
-  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close']] });
+  // Update all: what downloads here (GitHub, and Nexus with Premium), one mod after another.
+  const auto = (premium ? r.length : 0) + gh.length;
+  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close'], ...(auto > 1 ? [['all', 'Update all', 'primary']] : [])] });
   $('#dlg').classList.add('wide');
   let changed = false;
   $('#dlg').onclick = async e => {
@@ -3444,9 +3447,16 @@ async function checkUpdates(quiet) {
       b.parentElement.textContent = b.dataset.hold === 'pin' ? 'Held' : 'Skipped';
     } catch (err) { toast(`Holding the update failed.\n${err}`, 'error'); }
   };
-  await done;
+  const v = await done;
   $('#dlg').onclick = null;
-  if (changed) load();
+  if (v === 'all') {
+    // The rows still offering an update (not skipped, held or queued), read before another dialog replaces them.
+    const left = $$('#dlg tr[data-id]').filter(tr => $('button[data-get], button[data-gh-get]', tr));
+    const fromGh = left.filter(tr => tr.dataset.gh !== undefined).map(tr => [gh[+tr.dataset.gh], gh[+tr.dataset.gh].file ?? $('select[data-gh-file]', tr).value]);
+    const fromNexus = premium ? left.filter(tr => tr.dataset.gh === undefined).map(tr => tr.dataset.id) : [];
+    for (const [u, file] of fromGh) await updateFromLink(u, file);
+    fromNexus.forEach(updateFromNexus); // the download queue takes them one at a time
+  } else if (changed) load();
 }
 
 /** Download a mod's newer GitHub release and update it in place. */
