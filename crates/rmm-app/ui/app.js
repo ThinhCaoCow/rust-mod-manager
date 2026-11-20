@@ -2815,7 +2815,7 @@ function handlerNow() {
   if (nexus.handler_here) return 'Nexus links open with rmm, into this instance.';
   if (!nexus.handler) return 'No program opens Nexus links now.';
   const exe = basename(nexus.handler.match(/^"?([^"]+)/)?.[1] ?? nexus.handler);
-  const app = { 'nxmhandler.exe': 'Mod Organizer 2', 'vortex.exe': 'Vortex', 'rmm.exe': 'rmm, for another instance' }[exe.toLowerCase()] ?? exe;
+  const app = { 'nxmhandler.exe': 'Mod Organizer 2', 'vortex.exe': 'Vortex', 'rmm.exe': 'rmm, for another instance', 'rmm-app.exe': 'rmm, for another instance' }[exe.toLowerCase()] ?? exe;
   return `Nexus links open with ${app} now.`;
 }
 

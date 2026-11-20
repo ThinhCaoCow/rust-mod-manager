@@ -234,7 +234,7 @@ pub fn shortcut(inst: &Instance, profile: &str, cli: &Path, dir: Option<&Path>, 
         // in them needs quoting.
         let script = "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:RMM_LNK); $s.TargetPath = $env:RMM_LNK_TARGET; \
                       $s.Arguments = $env:RMM_LNK_ARGS; $s.WorkingDirectory = $env:RMM_LNK_DIR; $s.IconLocation = $env:RMM_LNK_ICON; $s.Save()";
-        let out = Command::new("powershell")
+        let out = crate::hidden("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("RMM_LNK", &r.path)
             .env("RMM_LNK_TARGET", cli)

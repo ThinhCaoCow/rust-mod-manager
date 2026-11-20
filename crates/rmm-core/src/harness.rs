@@ -594,7 +594,7 @@ fn close(exe: &Path) {
         // Windows reports the path with backslashes; game_path may have forward ones.
         let path = exe.display().to_string().replace('/', "\\").replace('\'', "''");
         let script = format!("Get-Process | Where-Object {{ $_.Path -eq '{path}' }} | Stop-Process -Force");
-        let _ = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
+        let _ = crate::hidden("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
     }
     #[cfg(not(windows))]
     {

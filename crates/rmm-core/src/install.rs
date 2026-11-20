@@ -862,11 +862,8 @@ pub(crate) fn extract(source: &Path, dest: &Path) -> Result<()> {
 fn extract_rar(source: &Path, dest: &Path) -> Result<()> {
     let tar = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("tar.exe")).filter(|t| t.is_file()).unwrap_or_else(|| "bsdtar".into());
     fs::create_dir_all(dest)?;
-    let mut cmd = std::process::Command::new(&tar);
+    let mut cmd = crate::hidden(&tar);
     cmd.arg("-xf").arg(source).arg("-C").arg(dest);
-    // CREATE_NO_WINDOW: no console flashes up over the desktop app.
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
     let out = cmd.output().with_context(|| format!("RAR needs {}", tar.display()))?;
     if !out.status.success() {
         bail!("RAR: {}", String::from_utf8_lossy(&out.stderr).trim());

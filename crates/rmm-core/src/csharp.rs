@@ -135,10 +135,8 @@ fn compiler() -> Result<PathBuf> {
 }
 
 fn compile(csc: &Path, work: &Path, args: &[&str]) -> Result<()> {
-    let mut cmd = std::process::Command::new(csc);
+    let mut cmd = crate::hidden(csc);
     cmd.current_dir(work).arg("/nologo").args(args);
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000); // no console window
     let out = cmd.output().context("cannot run the C# compiler")?;
     if !out.status.success() {
         let text = String::from_utf8_lossy(&out.stdout);

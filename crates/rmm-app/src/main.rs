@@ -336,9 +336,17 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "nexus_status" => {
             let mut st = nexus::status();
             // Who opens nxm:// links, and whether it's this instance (`rmm -i "<root>" nxm`).
-            let cmd = nexus::handler_command();
+            let mut cmd = nexus::handler_command();
             let here = format!("-i \"{}\"", inst.root.display()).to_lowercase();
-            st["handler_here"] = json!(cmd.as_deref().is_some_and(|c| c.to_lowercase().contains(&here)));
+            let ours = cmd.as_deref().is_some_and(|c| c.to_lowercase().contains(&here));
+            // Set up before rmm-app took the links itself: rmm.exe opened a console for each.
+            if ours
+                && cmd.as_deref().is_some_and(|c| c.to_lowercase().contains("\\rmm.exe\""))
+                && nexus::register_handler(&std::env::current_exe()?, &inst.root).is_ok()
+            {
+                cmd = nexus::handler_command();
+            }
+            st["handler_here"] = json!(ours);
             st["handler"] = json!(cmd);
             // Signed in: fetch the game's category names once, so Nexus categories show.
             if st["user"].is_object() {
@@ -400,7 +408,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             json!(nexus::open_in_browser(&url)?)
         }
         // Only on the user's click: it makes this rmm the system's program for nxm:// links.
-        "nexus_handler" => json!(nexus::register_handler(&cli_exe()?, &inst.root)?),
+        "nexus_handler" => json!(nexus::register_handler(&std::env::current_exe()?, &inst.root)?),
         // Only on the user's click: a file on their Desktop.
         "desktop_shortcut" => json!(launch::shortcut(&inst, &s("profile")?, &cli_exe()?, None, flag("dry_run"))?),
         "addons" => json!(addons::list(&inst)?),
@@ -502,6 +510,16 @@ fn main() {
         .and_then(|i| args.get(i + 1).cloned())
         .or_else(|| std::env::var("RMM_INSTANCE").ok())
         .map(PathBuf::from);
+    // `rmm-app -i <dir> nxm <link>`: Windows runs this for the website's "Mod manager download"
+    // buttons (`nexus_handler`). The link goes to the instance's window; this process becomes that
+    // window only when none has the instance open.
+    let link = args.iter().position(|a| a == "nxm").and_then(|i| args.get(i + 1));
+    if let (Some(root), Some(link)) = (&start, link) {
+        // ponytail: a link that fails here (malformed, unwritable instance) just opens the window.
+        if matches!(nexus::take_link_at_start(root, link), Ok(false)) {
+            return;
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

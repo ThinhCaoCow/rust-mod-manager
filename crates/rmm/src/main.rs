@@ -492,9 +492,9 @@ enum Cmd {
     /// Nexus Mods: API key, update checks, downloads.
     #[command(subcommand)]
     Nexus(NexusCmd),
-    /// What the website's "Mod manager download" button runs, once `rmm nexus register-handler`
-    /// has been run: hands the nxm:// link to the rmm window for the instance, starting it if it's
-    /// closed, where FOMOD installers show their options. Without the window program beside rmm,
+    /// What the website's "Mod manager download" button runs where rmm-app isn't installed (rmm-app
+    /// takes the same arguments): hands the nxm:// link to the rmm window for the instance,
+    /// starting it if it's closed, where FOMOD installers show their options. Without the window program beside rmm,
     /// it downloads and installs the file here (`rmm nexus install` always does).
     Nxm { link: String },
     /// For the installer: put its folder on the user's PATH, or --remove it.
@@ -714,8 +714,9 @@ enum NexusCmd {
         #[arg(long)]
         apply: bool,
     },
-    /// Make nxm:// links open `rmm nxm` for this instance. Changes the system's handler for
-    /// nxm links (HKCU\Software\Classes\nxm on Windows, xdg-mime on Linux).
+    /// Make nxm:// links open rmm for this instance: the window program (rmm-app) where it is next
+    /// to rmm, else `rmm nxm`. Changes the system's handler for nxm links
+    /// (HKCU\Software\Classes\nxm on Windows, xdg-mime on Linux).
     RegisterHandler,
 }
 
@@ -1265,7 +1266,10 @@ fn run() -> Result<()> {
         }
         Cmd::Nexus(NexusCmd::RegisterHandler) => {
             let inst = open()?;
-            println!("{}", nexus::register_handler(&std::env::current_exe()?, &inst.root)?);
+            // The window program where it's installed: it takes links without opening a console.
+            let cli = std::env::current_exe()?;
+            let app = cli.with_file_name(if cfg!(windows) { "rmm-app.exe" } else { "rmm-app" });
+            println!("{}", nexus::register_handler(if app.is_file() { &app } else { &cli }, &inst.root)?);
             Ok(())
         }
         #[cfg(target_os = "linux")]
