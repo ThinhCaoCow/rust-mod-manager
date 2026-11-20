@@ -38,6 +38,7 @@ let selPlugin = null;       // the plugin the panel shows: the one clicked last
 let plugSel = new Set();    // selected plugin names
 let plugAnchor = null;      // where a Shift-click range starts
 let lootRules = null;       // { rules, groups } once a plugin was selected; null = reload
+let whyData = null;         // { name, r }: plugin_why for the plugin panel
 let recordData = null;      // { name, rows }: record_conflicts for the plugin panel; null = reload
 let toolsData = null;       // { tools, presets }
 let ignored = new Set();    // health findings ignored in this instance ("kind|subject")
@@ -52,12 +53,17 @@ let dropAt = null;          // { id, priority } while a file is dragged over a m
 const PREFS = 'rmm.prefs';
 const prefs = (() => { try { return JSON.parse(localStorage.getItem(PREFS)) ?? {}; } catch { return {}; } })();
 const savePrefs = () => { try { localStorage.setItem(PREFS, JSON.stringify(prefs)); } catch {} };
-prefs.cols ??= { conflicts: true, tags: false, notes: false, installed: false, files: true, priority: true };
+prefs.cols ??= { conflicts: true, tags: true, notes: false, installed: false, files: true, priority: true };
 prefs.cols.category ??= true;
 prefs.widths ??= {};
+prefs.floating ??= {}; // tab -> { x, y, w, h }: tabs pulled out into windows inside rmm's window
+prefs.docked ??= {}; // tab -> 'left' | 'right' | 'bottom': those of them docked at an edge
+prefs.dockSize ??= { left: 360, right: 360, bottom: 260 };
 // This window's look and habits (Settings, "This window").
-const WIN = { theme: 'system', density: 'comfortable', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
+const WIN = { theme: 'system', density: 'compact', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
 const W = prefs.win = { ...WIN, ...prefs.win };
+if (!prefs.compactOnce) { prefs.compactOnce = true; W.density = 'compact'; } // compact became the default
+if (!prefs.contentOnce) { prefs.contentOnce = true; prefs.cols.tags = true; } // the Content column became a default
 function applyWin() {
   if (W.theme === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = W.theme;
   document.body.classList.toggle('compact', W.density === 'compact');
@@ -70,12 +76,16 @@ function applyWin() {
   if (S) renderStart();
 }
 const SIMPLE_HIDES = ['data', 'tools', 'mcp'];
+const MAIN_ONLY = ['mods', 'plugins']; // side by side in the main window, never pulled out
+const TAB_IDS = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings'];
+const tabLabel = t => $(`.tabs [data-tab="${t}"]`).firstChild.textContent.trim();
+let winTop = 30; // the front window's z-index; menus (40) and toasts (60) stay above
 const visibleTabs = () => $$('.tabs [data-tab]').filter(b => !b.hidden).map(b => b.dataset.tab);
 // `w`: the default width in pixels, as style.css sets it for `cls`.
 const COLS = {
   conflicts: { title: 'Conflicts', cls: 'conf-col', w: 200 },
   category: { title: 'Category', cls: 'cat-col', w: 140, tip: 'Click a category to show only its mods' },
-  tags: { title: 'Tags', cls: 'tags-col', w: 160 },
+  tags: { title: 'Content', cls: 'tags-col', w: 160, tip: 'What the mod holds; click one to show only mods with it' },
   notes: { title: 'Notes', cls: 'notes-col', w: 200 },
   installed: { title: 'Installed', cls: 'date-col', w: 96 },
   version: { title: 'Version', cls: 'ver-col', w: 90, tip: 'The installed version, as Nexus names it' },
@@ -83,8 +93,12 @@ const COLS = {
   priority: { title: '#', cls: 'num', w: 64, tip: 'Priority: higher wins file conflicts' },
 };
 const shownCols = () => Object.keys(COLS).filter(k => prefs.cols[k]);
-const splitOn = () => prefs.split !== false && innerWidth >= 1500;
-const pluginSide = () => tab === 'plugins' || (tab === 'mods' && splitOn() && side === 'plugins' && !!selPlugin);
+const splitOn = () => true; // the plugins always show beside the mods; they have no tab of their own
+/** The tab shows: the main window's, or one pulled out into a window of its own. */
+const shown = t => tab === t || !!prefs.floating[t];
+/** The plugin list shows: its own tab, a window, or beside the mods. */
+const plugVis = () => shown('plugins') || (tab === 'mods' && splitOn());
+const pluginSide = () => (tab === 'plugins' && !shown('mods')) || (plugVis() && side === 'plugins' && !!selPlugin);
 const nameOf = id => names.get(id) ?? id;
 const isSep = id => !!byId.get(id)?.separator;
 
@@ -179,6 +193,7 @@ async function load() {
   if (run !== loadRun) return;
   S = s;
   stamp = st;
+  lightCands = null;
   names = new Map(S.mods.map(m => [m.id, m.name]));
   byId = new Map(S.mods.map(m => [m.id, m]));
   idByName = new Map();
@@ -195,23 +210,26 @@ async function load() {
   for (const n of plugSel) if (!S.plugins.some(p => p.name === n)) plugSel.delete(n);
   lootRules = null;
   recordData = null;
-  if (tab === 'plugins' && selPlugin) loadLootRules();
-  if (tab === 'tools' || toolsData) loadTools();
+  if (shown('plugins') && selPlugin) loadLootRules();
+  if (shown('tools') || toolsData) loadTools();
   issuesStale = true;
   historyData = null;
-  if (tab === 'history') loadHistory();
+  if (shown('history')) loadHistory();
   dataLoaded = false;
-  if (tab === 'data') loadData(false);
-  if (tab === 'saves') loadSaves();
-  if (tab === 'downloads' || downloadsData) loadDownloads();
+  if (shown('data')) loadData(false);
+  if (shown('saves')) loadSaves();
+  if (shown('downloads') || downloadsData) loadDownloads();
   render();
   refreshPlan();
   renderStart();
   // The health check reads every plugin; re-run it once a burst of changes settles.
   clearTimeout(healthTimer);
-  healthTimer = setTimeout(runHealth, tab === 'problems' ? 0 : 800);
+  healthTimer = setTimeout(runHealth, shown('problems') ? 0 : 800);
   if (oneMod()) loadDetails();
+  // Windows that came back with the app have nothing in them until the first load.
+  if (!winsFilled) { winsFilled = true; Object.keys(prefs.floating).forEach(fillPane); }
 }
+let winsFilled = false;
 
 /** Per-load lookups: conflicts by mod, broken rules, mods whose plugins miss masters, and the
  *  separator groups (a separator owns the mods after it, up to the next separator). */
@@ -310,7 +328,12 @@ async function rmmUpdateOnStart() {
 
 // The last tab, filter and state chips come back with the window.
 const START = W.startTab === 'last' ? prefs.tab : W.startTab;
-tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings'].includes(START) ? START : 'mods';
+tab = TAB_IDS.includes(START) && START !== 'plugins' ? START : 'mods';
+for (const t of Object.keys(prefs.floating)) {
+  if (TAB_IDS.includes(t) && !MAIN_ONLY.includes(t) && !(W.simple && SIMPLE_HIDES.includes(t))) makeWin(t);
+  else { delete prefs.floating[t]; delete prefs.docked[t]; }
+}
+if (prefs.floating[tab]) tab = TAB_IDS.find(t => !prefs.floating[t] && !(W.simple && SIMPLE_HIDES.includes(t))) ?? 'mods';
 $('#filter').value = prefs.filter ?? '';
 filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, update: 1, endorsed: 1, tracked: 1, problems: 1 }));
 
@@ -500,12 +523,18 @@ function modView() {
   let head = null;
   for (const m of S.mods) {
     if (m.separator) head = m;
-    else if ((!f || matches(m, f)) && crit.every(c => c(m))) {
+    else if ((!f || matchText(m, f)) && (!crit.length || (prefs.anyChips ? crit.some(c => c(m)) : crit.every(c => c(m))))) {
       if (head) { out.push(head); head = null; }
       out.push(m);
     }
   }
   return out;
+}
+
+/** The filter text: alternatives split by " | ", each a run of words that must all match; a
+ *  word starting with "-" must not. */
+function matchText(m, f) {
+  return f.split(/\s+\|\s+/).some(alt => alt.split(/\s+/).filter(Boolean).every(w => w.length > 1 && w[0] === '-' ? !matches(m, w.slice(1)) : matches(m, w)));
 }
 
 /** Filter text: "#tag" matches tags and categories, anything else the name or the notes. */
@@ -564,7 +593,7 @@ function modRow(m, i) {
   const cell = {
     conflicts: () => `<td class="conf">${relTag}${conflictPills(D.C[m.id])}${masters}</td>`,
     category: () => `<td class="cats" title="${esc(m.categories?.join(', '))}">${(m.categories ?? []).map(c => `<span class="cat" data-cat="${esc(c)}">${esc(c)}</span>`).join('')}</td>`,
-    tags: () => `<td class="muted small" title="${esc(m.tags?.join(', '))}">${esc(m.tags?.join(', '))}</td>`,
+    tags: () => `<td class="content">${(m.tags ?? []).map(t => `<span data-tag="${esc(t)}" title="${esc(CONTENT[t]?.[1] ?? t)}">${CONTENT[t]?.[0] ?? '•'}</span>`).join('')}</td>`,
     notes: () => `<td class="muted" title="${esc(m.notes)}">${esc(m.notes)}</td>`,
     installed: () => `<td class="muted small">${m.installed ? new Date(m.installed * 1000).toLocaleDateString() : ''}</td>`,
     version: () => `<td class="muted small" title="${esc(m.version)}">${esc(m.version)}</td>`,
@@ -733,7 +762,7 @@ function changeText(c, max = 6) {
 
 async function loadHistory() {
   try { historyData = await call('history_details'); } catch { historyData = null; }
-  if (tab === 'history') renderHistory();
+  if (shown('history')) renderHistory();
   loadTrash();
 }
 
@@ -851,7 +880,7 @@ function renderDetails() {
     box.hidden = !selPlugin;
     return selPlugin && renderPluginDetails(box);
   }
-  box.hidden = tab !== 'mods' || !selected.size;
+  box.hidden = !shown('mods') || !selected.size;
   if (box.hidden) return;
   const ids = selIds();
   if (ids.length > 1) return renderBulk(box, ids);
@@ -872,6 +901,7 @@ function renderDetails() {
     <h2>${esc(m.name)}</h2>
     ${m.id !== m.name ? `<div class="muted small">id: ${esc(m.id)}</div>` : ''}
     ${m.version || d?.meta?.nexus ? `<div class="row small">${m.version && !d?.meta?.nexus ? `<span class="muted">Version ${esc(m.version)}</span>` : ''}${d?.meta?.nexus ? '<button class="link" data-act="nexus-page" title="Open its page on Nexus Mods in your browser">Nexus page ↗</button>' : ''}</div>` : ''}
+    ${d?.meta?.web ? `<div class="row small">${d.meta.web.version ? `<span class="muted">Release ${esc(d.meta.web.version)}</span>` : ''}<button class="link" data-act="web-page" title="${esc(d.meta.web.page)}">${esc(new URL(d.meta.web.page).hostname.replace(/^www\./, ''))} page ↗</button></div>` : ''}
     <div class="row">
       <label class="row" style="margin:0"><input type="checkbox" data-act="enable" ${m.enabled ? 'checked' : ''}> Enabled</label>
       <div class="spacer"></div>
@@ -915,7 +945,7 @@ function renderDetails() {
     <p class="muted small">Rules are suggestions: dragging and enabling are never blocked. Problems lists broken ones, and Sort by rules fixes the order.</p>
     <h3>Files (${m.files.toLocaleString()})</h3>
     ${m.plugins.length ? `<p>Plugins: ${esc(m.plugins.join(', '))}</p>` : ''}
-    <div class="row"><button data-act="hide-files" title="Keep chosen files out of the game, through reinstalls and updates (MO2’s hide)">Hide files…</button><button data-act="move-files" title="Move chosen files into another mod">Move files…</button></div>
+    <div class="row"><button data-act="hide-files" title="Keep chosen files out of the game, through reinstalls and updates (MO2’s hide)">Hide files…</button><button data-act="move-files" title="Move chosen files into another mod">Move files…</button>${m.plugins.length ? '<button data-act="pack" class="adv" title="Pack its loose files into archives named after its plugin (MO2’s BSA packer)">Pack into archives…</button>' : ''}</div>
     <div class="files">${d ? d.files.map(esc).join('<br>') + (d.files_truncated ? '<br>…' : '') : '…'}</div>
     ${d?.meta?.hidden?.length ? `<h3>Hidden (${d.meta.hidden.length})</h3><p class="muted small">Kept out of the game, also after a reinstall or update.</p>
       <div class="files">${d.meta.hidden.map(h => `<div class="row"><span>${esc(h)}</span><div class="spacer"></div><button class="link small" data-unhide="${esc(h)}">Show</button></div>`).join('')}</div>` : ''}
@@ -1043,11 +1073,13 @@ function renderPluginDetails(box) {
     ${p.implicit ? '' : `<label class="row"><input type="checkbox" data-act="lock" ${D.locks.has(p.name.toLowerCase()) ? 'checked' : ''}> Lock at this position</label>`}
     ${p.mod_id ? `<p>From <button class="link" data-goto="${esc(p.mod_id)}">${esc(nameOf(p.mod_id))}</button></p>` : `<p class="muted">${p.implicit ? 'Base game' : 'In the Data folder, not from a mod'}</p>`}
     ${p.error ? `<p><span class="pill bad">Unreadable</span> ${esc(p.error)}</p>` : ''}
+    ${lightRow(p)}
     <h3>Masters (${p.masters.length})</h3>
     ${p.masters.length ? '<p class="muted small">The plugins this one is built on. They have to be on and load before it.</p>' : ''}
     ${p.masters.length ? `<ul>${p.masters.map(m => `<li>${!lower.has(m.toLowerCase()) ? '' : loadsLater(m) ? '<span class="pill bad">Loads after it</span>' : '<span class="pill bad">Missing</span>'}<button class="link" data-plugin="${esc(m)}">${esc(m)}</button></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
     ${loaders.length ? `<h3>Needed by (${loaders.length})</h3><ul>${loaders.slice(0, 50).map(x => `<li><button class="link" data-plugin="${esc(x.name)}">${esc(x.name)}</button></li>`).join('')}</ul>` : ''}
     ${p.enabled && !p.implicit ? `<h3>Record conflicts</h3>${recordData?.name === p.name ? recordsBlock(recordData.rows) : `<p class="muted small">Other plugins that change the same records (NPCs, items, cells…): the game uses the version of the one that loads last. Reads every enabled plugin, so it can take a moment.</p><button data-act="records">Show record conflicts</button>`}` : ''}
+    ${p.implicit ? '' : `<h3>LOOT’s order</h3>${whyData?.name === p.name ? whyBlock(whyData.r) : '<p class="muted small">What ties it to the plugins around it: masters, LOOT’s and your rules, groups, shared records. Runs a sort without saving it.</p>'}<div class="row"><button data-act="loot-why">${whyData?.name === p.name ? 'Ask again' : 'Why here?'}</button></div>`}
     <h3>LOOT rule</h3>
     ${!lootRules ? '<p class="muted">Loading…</p>' : `
     <div class="small muted">Loads after</div>
@@ -1451,7 +1483,8 @@ function renderProblems() {
   $('#issues').innerHTML = list.length
     ? list.map(i => {
       const k = keyOf(i), ign = ignored.has(k), to = i.kind && targetOf(i);
-      const acts = (i.kind === 'missing_masters' && !ign ? (i.message.startsWith('loads before') ? '<button class="link ign" data-sort>Sort with LOOT…</button>' : `<button class="link ign" data-off="${esc(i.subject)}">Turn it off</button>`) : '')
+      const acts = (i.kind === 'esl_candidates' && !ign ? '<button class="link ign" data-light>Flag them light…</button>' : '')
+        + (i.kind === 'missing_masters' && !ign ? (i.message.startsWith('loads before') ? '<button class="link ign" data-sort>Sort with LOOT…</button>' : `<button class="link ign" data-off="${esc(i.subject)}">Turn it off</button>`) : '')
         + (i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : '')
         + (failures.includes(i) ? `<button class="link ign" data-dismiss="${failures.indexOf(i)}">Dismiss</button>` : '');
       return `<li class="${esc(i.severity)}${to ? ' link' : ''}${ign ? ' ignored' : ''}" data-key="${esc(k)}" ${to ? `data-mod="${esc(to.mod ?? '')}" data-plugin="${esc(to.plugin ?? '')}" title="Show it in the list"` : ''}>
@@ -1567,21 +1600,27 @@ $('#install-missing').onclick = async () => {
 // ---- Tabs, filters, keys --------------------------------------------------------------------
 
 function showTab(t) {
+  if (t === 'plugins') t = 'mods'; // the plugins show beside the mods
+  if (prefs.floating[t] && $('#win-' + t)) return frontWin(t);
   tab = t;
   prefs.tab = t;
   savePrefs();
   const split = wasSplit = splitOn();
-  $$('.tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
-  for (const p of ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings']) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
+  $$('.tabs [data-tab]').forEach(b => { b.classList.toggle('on', b.dataset.tab === t); b.classList.toggle('floating', !!prefs.floating[b.dataset.tab]); });
+  for (const p of TAB_IDS) if (!prefs.floating[p]) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
   $('main').classList.toggle('split', split && t === 'mods');
-  $('#split').hidden = innerWidth < 1500;
-  $('#split').setAttribute('aria-pressed', split);
-  $('#filter').hidden = t !== 'mods' && t !== 'plugins';
-  if (lists[t]) paint(lists[t]);
+  $('#mp-grip').hidden = t !== 'mods';
+  $('#filter').hidden = !shown('mods') && !shown('plugins');
   if (split && t === 'mods') paint(lists.plugins);
+  renderDetails();
+  fillPane(t);
+}
+
+/** Draw a pane that just came into view, reading what it shows when it needs to. */
+function fillPane(t) {
+  if (lists[t]) paint(lists[t]);
   if (t === 'mods') renderTicks();
   if (t === 'history' && !historyData) loadHistory();
-  renderDetails();
   if (t === 'problems' && issuesStale) runHealth();
   if (t === 'tools' && !toolsData) loadTools();
   if (t === 'plugins' && selPlugin && !lootRules) loadLootRules();
@@ -1591,6 +1630,260 @@ function showTab(t) {
   if (t === 'mcp') { drawMcp(); drawMore(); }
   if (t === 'settings') drawMore();
 }
+
+// ---- Tabs as windows inside rmm's window: drag a tab off the tab bar (or right-click it) to pull
+// it out; the window moves by its title bar and resizes from its corner. Dropped on the left, right
+// or bottom edge it docks there (prefs.docked), its edge dragging to resize; Tab puts it back. ----
+
+const DOCK_MIN = { left: 220, right: 220, bottom: 120 };
+
+/** Keep a window's title bar on screen. */
+function fitWin(r) {
+  const top = $('nav.tabs').getBoundingClientRect().bottom;
+  r.w = Math.min(Math.max(r.w, 320), innerWidth);
+  r.h = Math.min(Math.max(r.h, 200), innerHeight - top);
+  r.x = Math.min(Math.max(r.x, 80 - r.w), innerWidth - 80);
+  r.y = Math.min(Math.max(r.y, top), innerHeight - 32);
+  return r;
+}
+
+function frontWin(t) {
+  const w = $('#win-' + t);
+  if (!w || prefs.docked[t]) return;
+  w.style.zIndex = ++winTop > 39 ? (winTop = 31) : winTop;
+  if (winTop === 31) $$('.float-win').forEach(o => { if (o !== w) o.style.zIndex = 30; });
+}
+
+/** Pull tab `t` out into a window, at `at` (a point) or where it was last; `side` docks it. */
+function floatTab(t, at, side) {
+  if (MAIN_ONLY.includes(t)) return toast('The mods and plugins stay in the main window.');
+  if ($('#win-' + t)) return side ? dockWin(t, side) : frontWin(t);
+  const docked = visibleTabs().filter(x => !prefs.floating[x]);
+  if (docked.length <= 1) return toast('One tab stays in the main window.');
+  const was = prefs.floating[t] ?? prefs.lastWin?.[t];
+  prefs.floating[t] = fitWin(at ? { x: at.x, y: at.y, w: was?.w ?? 760, h: was?.h ?? 480 } : { ...(was ?? { x: 160, y: 140, w: 760, h: 480 }) });
+  if (side) prefs.docked[t] = side;
+  savePrefs();
+  makeWin(t);
+  showTab(tab === t ? docked.find(x => x !== t) : tab);
+}
+
+/** Follow the pointer until the button comes up, wherever the element under it goes meanwhile. */
+function follow(e, move, up) {
+  e.preventDefault();
+  const end = u => { removeEventListener('pointermove', move); removeEventListener('pointerup', end); up(u); };
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', end);
+}
+
+/** The dock area a point is over: near main's left or right edge, or its bottom. */
+function dockSide(x, y) {
+  const m = $('main').getBoundingClientRect(), E = 48;
+  if (y >= m.bottom - E) return 'bottom';
+  if (y > m.top) return x < m.left + E ? 'left' : x > m.right - E ? 'right' : null;
+  return null;
+}
+
+/** Show where a drop docks (side), or nothing (null). */
+function dockHint(side) {
+  let h = $('.dock-hint');
+  if (!side) return h?.remove();
+  h ??= document.body.appendChild(Object.assign(document.createElement('div'), { className: 'dock-hint' }));
+  const reg = $('#dock-' + side), m = $('main').getBoundingClientRect(), s = prefs.dockSize[side];
+  const r = !reg.hidden ? reg.getBoundingClientRect()
+    : side === 'left' ? { left: m.left, top: m.top, width: s, height: m.height }
+    : side === 'right' ? { left: m.right - s, top: m.top, width: s, height: m.height }
+    : { left: m.left, top: m.bottom - s, width: m.width, height: s };
+  Object.assign(h.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+}
+
+function sizeDock(side) {
+  const reg = $('#dock-' + side);
+  const most = side === 'bottom' ? innerHeight - 260 : innerWidth / 2;
+  const s = prefs.dockSize[side] = Math.round(Math.max(DOCK_MIN[side], Math.min(prefs.dockSize[side], most)));
+  reg.style[side === 'bottom' ? 'height' : 'width'] = s + 'px';
+}
+
+/** Put window `t` where prefs say: in its dock area, or floating over the window. */
+function placeWin(t, win = $('#win-' + t)) {
+  const side = prefs.docked[t], r = prefs.floating[t];
+  win.classList.toggle('docked', !!side);
+  $('[data-float]', win).hidden = !side;
+  if (side) {
+    win.removeAttribute('style');
+    $('#dock-' + side).append(win);
+  } else {
+    Object.assign(win.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+    document.body.append(win);
+    frontWin(t);
+  }
+  $$('.dock').forEach(d => { d.hidden = !$('.float-win', d); });
+}
+
+/** Drag window t's edge or corner (`dir`: n, s, e, w or two of them). */
+function resizeWin(t, e, dir) {
+  if (e.button !== 0) return;
+  const r = prefs.floating[t], win = $('#win-' + t), at = { ...r }, x0 = e.clientX, y0 = e.clientY;
+  follow(e, m => {
+    const dx = m.clientX - x0, dy = m.clientY - y0;
+    if (dir.includes('e')) r.w = Math.max(320, at.w + dx);
+    if (dir.includes('s')) r.h = Math.max(200, at.h + dy);
+    if (dir.includes('w')) { r.w = Math.max(320, at.w - dx); r.x = at.x + at.w - r.w; }
+    if (dir.includes('n')) { r.h = Math.max(200, at.h - dy); r.y = Math.max($('nav.tabs').getBoundingClientRect().bottom, at.y + at.h - r.h); r.h = at.y + at.h - r.y; }
+    Object.assign(win.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+  }, savePrefs);
+}
+
+function dockWin(t, side) {
+  prefs.docked[t] = side;
+  savePrefs();
+  placeWin(t);
+}
+
+function makeWin(t) {
+  const win = document.createElement('div');
+  win.className = 'float-win';
+  win.id = 'win-' + t;
+  win.innerHTML = `<div class="float-bar" title="Drag to move; drop on the left, right or bottom edge to dock"><span>${esc(tabLabel(t))}</span><div class="spacer"></div><button type="button" class="link" data-float title="Make it a window again">Window</button><button type="button" class="link" data-dock title="Put it back in the main window as a tab">Tab</button></div>`;
+  const pane = $('#pane-' + t);
+  pane.hidden = false;
+  win.append(pane);
+  win.insertAdjacentHTML('beforeend', ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map(d => `<i class="rz rz-${d}" data-rz="${d}"></i>`).join(''));
+  $$('[data-rz]', win).forEach(h => h.addEventListener('pointerdown', e => resizeWin(t, e, h.dataset.rz)));
+  win.addEventListener('pointerdown', () => frontWin(t), true);
+  $('[data-dock]', win).onclick = () => dockTab(t);
+  $('[data-float]', win).onclick = () => { delete prefs.docked[t]; savePrefs(); placeWin(t); };
+  const bar = $('.float-bar', win);
+  bar.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    const r = prefs.floating[t], x0 = e.clientX, y0 = e.clientY;
+    let dx = x0 - r.x, dy = y0 - r.y, moved = false;
+    follow(e, m => {
+      if (prefs.docked[t]) { // pulled out of its dock area: a window again, under the pointer
+        if (Math.hypot(m.clientX - x0, m.clientY - y0) < 8) return;
+        delete prefs.docked[t];
+        [dx, dy] = [60, 14];
+        placeWin(t);
+      }
+      moved = true;
+      Object.assign(r, fitWin({ ...r, x: m.clientX - dx, y: m.clientY - dy }));
+      win.style.left = r.x + 'px';
+      win.style.top = r.y + 'px';
+      dockHint(dockSide(m.clientX, m.clientY));
+    }, u => {
+      dockHint(null);
+      const side = moved && dockSide(u.clientX, u.clientY);
+      if (side) dockWin(t, side);
+      else savePrefs();
+    });
+  });
+  // Its edges resize it: keep the size, and draw the rows that come into view.
+  let saveSoon;
+  new ResizeObserver(() => {
+    const r = prefs.floating[t];
+    if (!r || !win.isConnected) return;
+    if (!prefs.docked[t]) [r.w, r.h] = [win.offsetWidth, win.offsetHeight];
+    if (lists[t]) paint(lists[t]);
+    clearTimeout(saveSoon);
+    saveSoon = setTimeout(savePrefs, 300);
+  }).observe(win);
+  placeWin(t, win);
+  if (S) fillPane(t);
+}
+
+function dockTab(t) {
+  const win = $('#win-' + t);
+  if (!win) return;
+  (prefs.lastWin ??= {})[t] = prefs.floating[t];
+  delete prefs.floating[t];
+  delete prefs.docked[t];
+  savePrefs();
+  $('main').insertBefore($('#pane-' + t), $('#details'));
+  win.remove();
+  $$('.dock').forEach(d => { d.hidden = !$('.float-win', d); });
+  showTab(t);
+}
+
+// The edge between the mods and the plugins drags to share the width between them.
+const sizePlugins = () => { if (prefs.plugW) $('#pane-plugins').style.flex = `0 1 ${prefs.plugW}px`; };
+sizePlugins();
+$('#mp-grip').addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  const mods = $('#pane-mods').getBoundingClientRect(), right = $('#pane-plugins').getBoundingClientRect().right;
+  follow(e, m => {
+    prefs.plugW = Math.round(Math.min(Math.max(right - m.clientX, 300), right - mods.left - 360));
+    sizePlugins();
+    paint(lists.mods);
+    paint(lists.plugins);
+  }, savePrefs);
+});
+$('#mp-grip').ondblclick = () => { delete prefs.plugW; $('#pane-plugins').style.flex = ''; savePrefs(); paint(lists.mods); paint(lists.plugins); };
+
+// A dock area's inner edge drags to resize it.
+for (const side of ['left', 'right', 'bottom']) {
+  const reg = $('#dock-' + side);
+  sizeDock(side);
+  $('.dock-grip', reg).addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    const r = reg.getBoundingClientRect();
+    follow(e, m => {
+      prefs.dockSize[side] = side === 'left' ? m.clientX - r.left : side === 'right' ? r.right - m.clientX : r.bottom - m.clientY;
+      sizeDock(side);
+    }, savePrefs);
+  });
+}
+
+const DOCK_MENU = t => [['Dock on the left', () => floatTab(t, null, 'left')], ['Dock on the right', () => floatTab(t, null, 'right')], ['Dock at the bottom', () => floatTab(t, null, 'bottom')]];
+
+// Drag a tab off the tab bar to pull it out; a frame shows where its window will go, or the dock
+// area it lands in.
+$$('.tabs [data-tab]').forEach(b => {
+  b.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || prefs.floating[b.dataset.tab] || MAIN_ONLY.includes(b.dataset.tab)) return;
+    const t = b.dataset.tab, x0 = e.clientX, y0 = e.clientY, bar = $('nav.tabs').getBoundingClientRect();
+    let ghost = null;
+    const size = prefs.lastWin?.[t] ?? { w: 760, h: 480 };
+    b.setPointerCapture(e.pointerId); // moves off the button still come here
+    b.onpointermove = m => {
+      if (!ghost && Math.hypot(m.clientX - x0, m.clientY - y0) < 12) return;
+      if (!ghost) {
+        ghost = document.body.appendChild(Object.assign(document.createElement('div'), { className: 'float-ghost' }));
+        ghost.style.width = size.w + 'px';
+        ghost.style.height = size.h + 'px';
+      }
+      const side = dockSide(m.clientX, m.clientY);
+      dockHint(side);
+      ghost.hidden = !!side || m.clientY < bar.bottom; // dropped back on the tab bar: nothing happens
+      ghost.style.left = m.clientX - 60 + 'px';
+      ghost.style.top = m.clientY - 14 + 'px';
+    };
+    b.onpointerup = u => {
+      b.onpointermove = b.onpointerup = null;
+      if (!ghost) return;
+      const side = dockSide(u.clientX, u.clientY), out = side || !ghost.hidden;
+      ghost.remove();
+      dockHint(null);
+      // The click that follows would switch to the tab.
+      b.addEventListener('click', c => c.stopImmediatePropagation(), { capture: true, once: true });
+      if (out) floatTab(t, { x: u.clientX - 60, y: u.clientY - 14 }, side);
+    };
+  });
+  b.addEventListener('contextmenu', e => {
+    const t = b.dataset.tab, out = !!prefs.floating[t];
+    if (MAIN_ONLY.includes(t)) return;
+    const items = out ? [['Put back in the main window', () => dockTab(t)], prefs.docked[t] ? ['Make it a window', () => $(`#win-${t} [data-float]`).click()] : ['Bring to front', () => frontWin(t)]] : [['Open in a window', () => floatTab(t)]];
+    ctxMenu(e, [...items, ...DOCK_MENU(t).filter((_, i) => !out || ['left', 'right', 'bottom'][i] !== prefs.docked[t])]);
+  });
+});
+addEventListener('resize', () => {
+  ['left', 'right', 'bottom'].forEach(sizeDock);
+  for (const [t, r] of Object.entries(prefs.floating)) {
+    const w = $('#win-' + t);
+    if (!w || prefs.docked[t]) continue;
+    fitWin(r);
+    Object.assign(w.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+  }
+});
 $$('.tabs [data-tab]').forEach(b => { b.onclick = () => showTab(b.dataset.tab); });
 $('#recheck').onclick = runHealth;
 
@@ -1785,6 +2078,7 @@ $('#issues').onclick = e => {
   const link = e.target.closest('[data-link]')?.dataset.link;
   if (link) return void act('Opening the page', () => call('open_link', { url: link }), { reload: false });
   if (e.target.closest('[data-sort]')) return void lootSort();
+  if (e.target.closest('[data-light]')) return void flagLight();
   const off = e.target.closest('[data-off]')?.dataset.off;
   if (off) return void setPluginsEnabled([off], false);
   const ign = e.target.closest('[data-ignore]')?.dataset.ignore;
@@ -1825,7 +2119,9 @@ $('#fchips').onclick = e => {
   filterChanged();
 };
 $('#clear-filter').onclick = clearFilters;
-$('#split').onclick = () => { prefs.split = !splitOn(); savePrefs(); showTab('mods'); };
+const drawFmode = () => { $('#fmode').textContent = prefs.anyChips ? 'Any of them' : 'All of them'; };
+drawFmode();
+$('#fmode').onclick = () => { prefs.anyChips = !prefs.anyChips; savePrefs(); drawFmode(); filterChanged(); };
 
 // Columns: right-click the header to choose them; drag a header's right edge to resize it.
 $('#mods thead').addEventListener('contextmenu', async e => {
@@ -1893,8 +2189,8 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey && low === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
   else if (e.ctrlKey && (low === 'y' || (low === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
   else if (!(e.target.closest('button') && (k === ' ' || k === 'Enter'))) {
-    if (tab === 'plugins' || (tab === 'mods' && splitOn() && side === 'plugins')) pluginKeys(e);
-    else if (tab === 'mods') modKeys(e);
+    if (plugVis() && (side === 'plugins' || !shown('mods'))) pluginKeys(e);
+    else if (shown('mods')) modKeys(e);
   }
 });
 
@@ -1945,7 +2241,10 @@ $('#mods tbody').addEventListener('click', e => {
     setEnabled(selected.has(id) && selected.size > 1 ? selIds() : [id], e.target.checked);
   } else if (e.target.closest('.twisty')) toggleGroup(id);
   else if (e.target.closest('[data-update]')) updateFromNexus(id);
-  else if (e.target.closest('.cat') && !e.shiftKey && !e.ctrlKey) {
+  else if (e.target.closest('[data-tag]') && !e.shiftKey && !e.ctrlKey) {
+    $('#filter').value = `#${e.target.closest('[data-tag]').dataset.tag.split(' ')[0]}`;
+    filterChanged();
+  } else if (e.target.closest('.cat') && !e.shiftKey && !e.ctrlKey) {
     // A category label filters the list to its mods, like MO2's category filter.
     $('#filter').value = `#${e.target.closest('.cat').dataset.cat.toLowerCase()}`;
     filterChanged();
@@ -2101,6 +2400,10 @@ $('#details').addEventListener('click', async e => {
     setModRule(id, key, (S.rules.find(r => r.id === id)?.[key] ?? []).filter(a => a !== t.dataset.unrule));
   } else switch (t.dataset.act) {
     case 'records': return loadRecords(selPlugin);
+    case 'light-on': return flagLight([selPlugin]);
+    case 'light-off': return act('Removing the light flag', () => call('set_light', { plugin: selPlugin, light: false })).then(() => { lightCands = null; });
+    case 'pack': return packDialog(id);
+    case 'loot-why': return loadWhy(selPlugin);
     case 'enable':
       if (busy) { busyNote(); return e.preventDefault(); }
       return setEnabled([id], t.checked);
@@ -2122,6 +2425,7 @@ $('#details').addEventListener('click', async e => {
     case 'endorse': case 'abstain': case 'track': case 'untrack': return nexusAccount([id], t.dataset.act);
     case 'unskip': return act('Offering its updates again', () => call('hold_updates', { ids: [id], hold: 'release' }));
     case 'files': return fileConflicts(id);
+    case 'web-page': return call('open_page', { url: details.meta.web.page }).catch(err => toast(String(err), 'error'));
     case 'nexus-page': return call('open_nexus_mod', { mod_id: details.meta.nexus.mod_id, page: true }).catch(err => toast(String(err), 'error'));
     case 'read-needs': return act('Reading its requirements on Nexus', () => call('read_requirements', { mod_id: details.nexus_id }));
     case 'nexus-info': {
@@ -2391,7 +2695,7 @@ $('#mods tbody').addEventListener('contextmenu', e => {
     items.push(['Rename…', () => renameMod(id)], ['Reinstall…', () => reinstall(id)]);
     if (m.update) items.push([`Update from Nexus (${m.update.latest ?? m.update.file_name})`, () => updateFromNexus(id), '', 'Download the newer file and update the mod in place']);
     items.push(['Update from a file…', () => updateFromFile(id), '', 'Install a newer archive of it in its place, keeping its order, rules and notes'], '-');
-    items.push(['File conflicts', () => fileConflicts(id)], ['Hide files…', () => hideFilesDialog(id), '', 'Keep chosen files out of the game (MO2’s hide)'], ['Notes…', () => notesDialog(id)], ['Open folder', () => call('open_mod_folder', { id }).catch(err => toast(String(err), 'error'))]);
+    items.push(['File conflicts', () => fileConflicts(id)], ['Hide files…', () => hideFilesDialog(id), '', 'Keep chosen files out of the game (MO2’s hide)'], ['Notes…', () => notesDialog(id)], ...(m.plugins.length && !W.simple ? [['Pack into archives…', () => packDialog(id), '', 'Pack its loose files into archives named after its plugin']] : []), ['Open folder', () => call('open_mod_folder', { id }).catch(err => toast(String(err), 'error'))]);
   }
   // Nexus: endorse and track the selected mods that have Nexus ids (public, on the account).
   const onNexus = mods.filter(i => byId.get(i)?.nexus_id);
@@ -2435,26 +2739,59 @@ function setAllGroups(open) {
 $('#loot').onclick = () => lootSort();
 
 /** LOOT's order as a preview: only the plugins that really move, each with the plugin it then
- *  loads after; Apply saves it (one undo step). True once the order matches LOOT. */
-async function lootSort(title = 'Sort with LOOT', intro = '') {
+ *  loads after and LOOT's reason; Apply saves it (one undo step). `without`: plugins whose rules
+ *  of the user's this sort leaves out (after a circle of rules). True once the order matches LOOT. */
+async function lootSort(title = 'Sort with LOOT', intro = '', without = []) {
   toast('Sorting with LOOT. The first sort downloads LOOT’s masterlist.');
-  const r = await act('Sorting with LOOT', () => call('sort_plugins', { dry_run: true }), { reload: false });
+  const r = await act('Sorting with LOOT', () => call('sort_plugins', { dry_run: true, without }), { reload: false });
   if (!r) return false;
+  if (r.cycle) return lootCycle(r.cycle, title, intro, without);
   const rest = r.warnings.filter(w => !w.startsWith('LOOT reads which plugins are on'));
   const warnings = rest.length ? `<details><summary>${plural(rest.length, 'warning')}</summary><pre>${esc(rest.join('\n'))}</pre></details>` : '';
   const stale = r.undeployed ? `<p class="small">LOOT saw ${plural(r.undeployed, 'plugin')} on or off differently from this profile, so its rules about other plugins may be off. <b>Deploy, then sort again</b> may fix that.</p>` : '';
+  const left = without.length ? `<p class="small">This sort leaves out your rules for ${esc(without.join(', '))}. They stay saved; change them in the plugin’s panel.</p>` : '';
   const again = r.undeployed ? [['deploy', 'Deploy, then sort again']] : [];
   let choice;
   if (!r.moved.length) {
-    choice = await dialog({ title, body: `${intro}<p>The load order already matches LOOT.</p>${stale}${warnings}`, actions: [...again, ['cancel', 'Close']] });
+    choice = await dialog({ title, body: `${intro}<p>The load order already matches LOOT.</p>${left}${stale}${warnings}`, actions: [...again, ['cancel', 'Close']] });
   } else {
-    const line = m => `${esc(m.name)} <span class="muted">${m.after ? 'moves after' : 'moves to the top'}</span> ${esc(m.after ?? '')}`;
-    const body = `${intro}<p>${plural(r.moved.length, 'plugin')} ${r.moved.length === 1 ? 'moves' : 'move'}; the others keep their order.</p><pre>${r.moved.map(line).join('\n')}</pre>${stale}${warnings}`;
+    const line = m => `<li>${esc(m.name)} <span class="muted">${m.after ? 'moves after' : 'moves to the top'}</span> ${esc(m.after ?? '')}${m.why?.length ? `<details class="small"><summary>Why</summary>${m.why.map(w => `<div>${esc(w)}</div>`).join('')}</details>` : ''}</li>`;
+    const body = `${intro}<p>${plural(r.moved.length, 'plugin')} ${r.moved.length === 1 ? 'moves' : 'move'}; the others keep their order.</p><ul class="moves">${r.moved.map(line).join('')}</ul>${left}${stale}${warnings}`;
     choice = await dialog({ title, body, actions: [['cancel', 'Cancel'], ...again, ['apply', 'Apply order', 'primary']] });
   }
-  if (choice === 'deploy') return !!await act('Deploying', () => call('deploy')) && lootSort(title, intro);
-  if (choice === 'apply') return !!await act('Saving the LOOT order', () => call('sort_plugins', { dry_run: false }));
+  if (choice === 'deploy') return !!await act('Deploying', () => call('deploy')) && lootSort(title, intro, without);
+  if (choice === 'apply') return !!await act('Saving the LOOT order', () => call('sort_plugins', { dry_run: false, without }));
   return !r.moved.length;
+}
+
+/** LOOT's rules go in a circle: show them, and for the user's own rules in it, sort without one
+ *  just this once or remove it. */
+async function lootCycle(c, title, intro, without) {
+  const yours = c.yours.length
+    ? `<p>Your rules for ${esc(c.yours.join(', '))} are part of it. Sort without them just this once (they stay saved), or remove them.</p>`
+    : c.rules.some(r => !/\.es[mpl]$/i.test(r.from)) ? '<p>The circle is in the order of LOOT’s groups; change the group settings involved.</p>'
+    : '<p>None of these rules are yours, so it needs a fix in LOOT’s masterlist or the plugins.</p>';
+  const body = `${intro}<p>LOOT can’t sort: its rules go in a circle.</p><ul class="small">${c.text.map(t => `<li>${esc(t)}</li>`).join('')}</ul>${yours}`;
+  const v = await dialog({ title, body, actions: [['cancel', 'Close'], ...c.yours.flatMap((y, i) => [[`r${i}`, `Remove your rule for ${y}`], [`w${i}`, `Sort without it`, 'primary']])] });
+  const y = v && c.yours[+v.slice(1)];
+  if (!y) return false;
+  if (v[0] === 'w') return lootSort(title, intro, [...without, y]);
+  if (!await act('Removing the LOOT rule', () => call('set_loot_rule', { plugin: y }), { reload: false })) return false;
+  lootRules = null;
+  return lootSort(title, intro, without);
+}
+
+/** Why LOOT puts a plugin where it does, for its panel. */
+async function loadWhy(name) {
+  const r = await act('Sorting with LOOT', () => call('plugin_why', { plugin: name }), { reload: false });
+  if (!r || r === true) return;
+  whyData = { name, r };
+  if (pluginSide()) renderDetails();
+}
+
+function whyBlock(r) {
+  const at = r.profile_position === r.loot_position ? `LOOT puts it here, at ${r.loot_position}.` : `It is at ${r.profile_position ?? '?'}; LOOT would put it at ${r.loot_position}.`;
+  return `<p class="small">${at}</p><ul class="small">${r.why.map(w => `<li>${esc(w)}</li>`).join('')}</ul>`;
 }
 
 // ---- Drag to reorder (pointer events: HTML drag and drop is off so files can be dropped) ----
@@ -3030,7 +3367,7 @@ async function collectionInstalled(args, list) {
   });
 }
 
-const unsorted = '<p class="muted small">The plugins aren’t in LOOT’s order: new ones load last. Sort with LOOT… on the Plugins tab sorts them, showing what moves first.</p>';
+const unsorted = '<p class="muted small">The plugins aren’t in LOOT’s order: new ones load last. Sort with LOOT…, above the plugins, sorts them, showing what moves first.</p>';
 
 /** The profile already has an earlier revision: update it, keeping the user's own changes. */
 async function updateCollection(link, r, list) {
@@ -3068,38 +3405,148 @@ async function checkCollection() {
 $('#updates').onclick = () => checkUpdates(false);
 /** Ask Nexus for newer files; quietly (at start) only says so when there are some. */
 async function checkUpdates(quiet) {
-  if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) return;
-  checkCollection();
-  // The mod list's Update tags come with the reload.
-  const r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
-  if (!Array.isArray(r)) return;
-  if (quiet) return r.length && toast(`${plural(r.length, 'update')} on Nexus; Check for updates lists them.`);
+  // GitHub releases need no account. Without Nexus sign-in, GitHub's updates still show.
+  const fromGh = S.mods.some(m => m.web?.startsWith('https://github.com/'));
+  const g = fromGh ? await (quiet ? call('link_updates').catch(() => null) : act('Checking GitHub for updates', () => call('link_updates'), { reload: false })) : [];
+  const gh = Array.isArray(g) ? g : [];
+  let r = [];
+  if (quiet || nexus.user || !gh.length) {
+    if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) {
+      if (!gh.length) return;
+    } else {
+      checkCollection();
+      // The mod list's Update tags come with the reload.
+      r = quiet ? await call('check_updates').then(async u => (await load(), u)).catch(() => null) : await act('Checking for updates', () => call('check_updates'));
+      if (!Array.isArray(r)) {
+        if (!gh.length) return;
+        r = [];
+      }
+    }
+  }
+  const all = r.length + gh.length;
+  if (quiet) return all && toast(`${plural(all, 'update')} found; Check for updates lists them.`);
   const held = S.mods.filter(m => m.pinned).length;
-  if (!r.length) return toast(`Every mod with Nexus ids is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.`);
+  if (!all) return toast(`Every mod with Nexus ids${fromGh ? ' or a GitHub page' : ''} is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.`);
   const premium = !!nexus.user?.is_premium;
   const rows = r.map(u => `<tr data-id="${esc(u.id)}"><td>${esc(nameOf(u.id))}<details class="changelog" data-mod="${u.mod_id}" data-since="${esc(u.installed ?? '')}"><summary class="small">What’s new</summary><div class="muted small">Loading…</div></details></td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td>
-    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-get title="${premium ? 'Download it and update the mod in place' : 'Open its Files tab: Mod manager download brings it back here as an update'}">${premium ? 'Update' : 'Files tab'}</button></td></tr>`).join('');
-  const done = dialog({ title: `${plural(r.length, 'update')} on Nexus`, body: `<table class="fc">${rows}</table><p class="muted small">${premium ? 'Update downloads the new file and updates the mod in place, with the FOMOD choices it was installed with; Undo puts the old files back.' : 'Free accounts download from the website: Files tab opens the mod’s, where “Mod manager download” brings the file back here as an update (once Nexus links open rmm).'} Skip passes over this file; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close']] });
+    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-get title="${premium ? 'Download it and update the mod in place' : 'Open its Files tab: Mod manager download brings it back here as an update'}">${premium ? 'Update' : 'Files tab'}</button></td></tr>`).join('')
+    + gh.map((u, i) => `<tr data-id="${esc(u.id)}" data-gh="${i}"><td>${esc(nameOf(u.id))} <span class="muted small">GitHub</span>${u.file ? '' : `<br><select data-gh-file aria-label="The release’s file to update from">${u.files.map(f => `<option>${esc(f)}</option>`).join('')}</select>`}</td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest)}</b></td>
+    <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this release; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-gh-get title="Download the release and update the mod in place">Update</button></td></tr>`).join('');
+  const how = [
+    r.length ? (premium ? 'Update downloads the new file and updates the mod in place, with the FOMOD choices it was installed with; Undo puts the old files back.' : 'Free accounts download from the website: Files tab opens the mod’s, where “Mod manager download” brings the file back here as an update (once Nexus links open rmm).') : '',
+    gh.length ? 'A GitHub update downloads the latest release and updates the mod in place; Undo puts the old files back.' : '',
+    gh.length && !nexus.user && S.mods.some(m => m.nexus_id) ? 'Sign in to Nexus Mods to check your Nexus mods too.' : '',
+    r.length && !premium && gh.length ? 'Update all updates the GitHub ones.' : '',
+  ].filter(Boolean).join(' ');
+  // Update all: what downloads here (GitHub, and Nexus with Premium), one mod after another.
+  const auto = (premium ? r.length : 0) + gh.length;
+  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>`, actions: [['cancel', 'Close'], ...(auto > 1 ? [['all', 'Update all', 'primary']] : [])] });
   $('#dlg').classList.add('wide');
   let changed = false;
   $('#dlg').onclick = async e => {
+    const tr = e.target.closest('tr[data-id]');
+    if (!tr) return;
+    const u = tr.dataset.gh !== undefined ? gh[+tr.dataset.gh] : null;
+    if (e.target.closest('button[data-gh-get]')) {
+      const file = u.file ?? $('select[data-gh-file]', tr).value;
+      $('#dlg').close('cancel');
+      return updateFromLink(u, file);
+    }
     const get = e.target.closest('button[data-get]');
     if (get) {
-      updateFromNexus(get.closest('tr').dataset.id);
+      updateFromNexus(tr.dataset.id);
       if (premium) get.replaceWith('Queued');
       return;
     }
     const b = e.target.closest('button[data-hold]');
     if (!b) return;
     try {
-      await call('hold_updates', { ids: [b.closest('tr').dataset.id], hold: b.dataset.hold });
+      if (u && b.dataset.hold === 'skip') await call('link_skip', { id: u.id, version: u.latest });
+      else await call('hold_updates', { ids: [tr.dataset.id], hold: b.dataset.hold });
       changed = true;
       b.parentElement.textContent = b.dataset.hold === 'pin' ? 'Held' : 'Skipped';
     } catch (err) { toast(`Holding the update failed.\n${err}`, 'error'); }
   };
-  await done;
+  const v = await done;
   $('#dlg').onclick = null;
-  if (changed) load();
+  if (v === 'all') {
+    // The rows still offering an update (not skipped, held or queued), read before another dialog replaces them.
+    const left = $$('#dlg tr[data-id]').filter(tr => $('button[data-get], button[data-gh-get]', tr));
+    const fromGh = left.filter(tr => tr.dataset.gh !== undefined).map(tr => [gh[+tr.dataset.gh], gh[+tr.dataset.gh].file ?? $('select[data-gh-file]', tr).value]);
+    const fromNexus = premium ? left.filter(tr => tr.dataset.gh === undefined).map(tr => tr.dataset.id) : [];
+    for (const [u, file] of fromGh) await updateFromLink(u, file);
+    fromNexus.forEach(updateFromNexus); // the download queue takes them one at a time
+  } else if (changed) load();
+}
+
+/** Download a mod's newer GitHub release and update it in place. */
+async function updateFromLink(u, file) {
+  const f = await act(`Downloading ${nameOf(u.id)} ${u.latest}`, () => call('link_download', { url: u.page, file }), { reload: false, problem: true });
+  if (f && f !== true) await updateMod(u.id, f.path);
+}
+
+// ---- From a link: GitHub, ModDB and direct links download here; sites that need the user's
+// sign-in, and pages rmm can't read, open in the browser, and rmm takes the finished file from the
+// Downloads folder. -----------------------------------------------------------------------------
+
+$('#link').onclick = async () => {
+  const url = (await ask('Install from a link', 'Paste a GitHub repository or release, a ModDB page, a LoversLab, AFK Mods or Patreon page, or a link to a .zip, .7z or .rar.', ''))?.trim();
+  if (!url) return;
+  const at = slotAfter(selIds().length === 1 ? selIds()[0] : null);
+  if (/^https?:\/\/([^/]*\.)?nexusmods\.com\//i.test(url)) {
+    if (!await nexusReady('Downloads from Nexus Mods need you signed in.')) return;
+    if (url.includes('/collections/')) return installCollection(url);
+    nxmQueue.push({ link: url, at });
+    return runQueue();
+  }
+  const p = await act('Reading the link', () => call('link_plan', { url }), { reload: false, problem: true });
+  if (!p || p === true) return;
+  if (p.browser) return fromBrowser(p, at);
+  let file = p.files[0].name;
+  if (p.files.length > 1) {
+    const rows = p.files.map((f, i) => `<label class="row"><input type="radio" name="lf" value="${i}" ${i ? '' : 'checked'}> ${esc(f.name)}${f.size ? ` <span class="muted small">${bytes(f.size)}</span>` : ''}</label>`).join('');
+    const what = p.version ? `Its release ${esc(p.version)} has` : 'It has';
+    if (await dialog({ title: `${p.name ?? 'Files'} on ${p.site}`, body: `<p>${what} ${p.files.length} files. Which one?</p>${rows}`, actions: [['cancel', 'Cancel'], ['ok', 'Install', 'primary']] }) !== 'ok') return;
+    file = p.files[+$('#dlg input[name=lf]:checked').value].name;
+  }
+  const f = await act(`Downloading ${file}`, () => call('link_download', { url, file }), { reload: false, problem: true });
+  if (f && f !== true) install([{ path: f.path, nx: { name: f.name ?? undefined } }], at);
+};
+
+/** A page to download in the browser: open it, then list archives that land in the Downloads
+ *  folder until the user picks one, which moves into rmm's downloads folder and installs. */
+async function fromBrowser(p, at) {
+  const since = Math.floor(Date.now() / 1000) - 5;
+  await call('open_page', { url: p.page }).catch(e => toast(String(e), 'error'));
+  const why = p.site === 'link' ? 'rmm can’t download from that page itself' : `${esc(p.site)} needs you signed in`;
+  const body = `<p>${why}, so the page is open in your browser. Download the mod there, and pick the file here once it has finished.</p>
+    <div id="bd-list"><p class="muted">Waiting for a download…</p></div>
+    <label class="row small"><input type="checkbox" id="bd-all"> Show files downloaded earlier</label>
+    <p class="muted small">rmm looks in your Downloads folder and moves the file you pick into its own downloads folder. Your sign-in stays in your browser.</p>`;
+  const done = dialog({ title: `Download from ${p.site === 'link' ? 'the page' : p.site}`, body, actions: [['cancel', 'Cancel']] });
+  $('#dlg').classList.add('wide');
+  let picked = null;
+  const draw = async () => {
+    const list = await call('browser_downloads', { since: $('#bd-all')?.checked ? 0 : since }).catch(() => []);
+    const el = $('#bd-list');
+    if (el) el.innerHTML = list.length ? `<table class="fc">${list.slice(0, 20).map(d => `<tr><td>${esc(d.name)}</td><td class="muted small">${bytes(d.size)}</td><td><button type="button" class="primary" data-path="${esc(d.path)}">Install</button></td></tr>`).join('')}</table>` : '<p class="muted">Waiting for a download…</p>';
+  };
+  draw();
+  const timer = setInterval(draw, 2000);
+  $('#dlg').onclick = e => {
+    const b = e.target.closest('button[data-path]');
+    if (b) {
+      picked = b.dataset.path;
+      $('#dlg').close('ok');
+    }
+    if (e.target.id === 'bd-all') draw();
+  };
+  const v = await done;
+  clearInterval(timer);
+  $('#dlg').onclick = null;
+  if (v !== 'ok' || !picked) return;
+  const path = await act('Taking the download', () => call('take_browser_download', { path: picked, page: p.page }), { reload: false, problem: true });
+  if (typeof path === 'string') install([path], at);
 }
 
 // ---- Add-ons ----------------------------------------------------------------------------------
@@ -3175,7 +3622,7 @@ async function setMcp(on) {
   }
   prefs.mcp = !!mcpOn;
   savePrefs();
-  if (tab === 'mcp') drawMcp();
+  if (shown('mcp')) drawMcp();
 }
 
 /** A snippet to paste into an AI app's settings, with a Copy button. */
@@ -3513,7 +3960,7 @@ async function loadData(top = true) {
   if (run !== dataRun) return; // a newer request is on its way
   const parts = dataDir ? dataDir.split('/') : [];
   $('#data-path').innerHTML = find
-    ? `<span class="muted">${!rows.length ? 'Search results' : `${rows.length >= 1000 ? 'The first 1,000 matches' : `${rows.length.toLocaleString()} match${rows.length === 1 ? '' : 'es'}`}. Click one to open its folder.`}</span>`
+    ? `<span class="muted">${!rows.length ? 'Search results' : `${rows.length >= 1000 ? 'The first 1,000 matches' : rows.length === 1 ? '1 match' : `${rows.length.toLocaleString()} matches`}. Click one to open its folder.`}</span>`
     : [parts.length ? '<button class="link" data-dir="">Data</button>' : '<b>Data</b>',
       ...parts.map((p, i) => i === parts.length - 1 ? `<b>${esc(p)}</b>` : `<button class="link" data-dir="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</button>`)]
       .join('<span class="muted">/</span>');
@@ -3658,7 +4105,7 @@ function renderDownloads() {
   const all = downloadsData, l = dlShown();
   for (const n of dlSel) if (!all.some(d => d.name === n)) dlSel.delete(n);
   $('#n-downloads').textContent = all.length || '';
-  $('#downloads-note').textContent = l.length === all.length ? 'Files you get with From Nexus… land here. Installing one leaves the file, so you can install it again later.' : `${l.length.toLocaleString()} of ${plural(all.length, 'download')}`;
+  $('#downloads-note').textContent = l.length === all.length ? 'Files you get with From Nexus… or From a link… land here. Installing one leaves the file, so you can install it again later.' : `${l.length.toLocaleString()} of ${plural(all.length, 'download')}`;
   $('#downloads tbody').innerHTML = l.map(d => `<tr data-name="${esc(d.name)}"${dlSel.has(d.name) ? ' class="sel"' : ''}>
     <td class="check-col"><input type="checkbox" data-pick ${dlSel.has(d.name) ? 'checked' : ''}></td>
     <td class="name" title="${esc(d.name)}">${esc(d.name)}</td>
@@ -3761,7 +4208,7 @@ async function install(paths, at = null, nx0 = null) {
     const same = await call('same_mod', { path, mod_id: nx?.nexus?.mod_id ?? null }).catch(() => null);
     if (same) {
       const [id, name] = same;
-      const v = await dialog({ title: `Update ${name}?`, body: `<p><b>${esc(basename(path))}</b> looks like another version of <b>${esc(name)}</b>: the same Nexus mod.</p><p class="muted small">Update replaces its files and keeps its place, notes, categories, colour and rules; Undo puts the old files back. Install as a new mod keeps both.</p>`,
+      const v = await dialog({ title: `Update ${name}?`, body: `<p><b>${esc(basename(path))}</b> looks like another version of <b>${esc(name)}</b>: the same mod page.</p><p class="muted small">Update replaces its files and keeps its place, notes, categories, colour and rules; Undo puts the old files back. Install as a new mod keeps both.</p>`,
         actions: [['cancel', 'Cancel'], ['new', 'Install as a new mod'], ['ok', 'Update', 'primary']] });
       if (v === 'ok') await updateMod(id, path, nx);
       if (v !== 'new') continue;
@@ -3800,7 +4247,7 @@ T.webview.getCurrentWebview().onDragDropEvent(async e => {
     $('#dropzone').hidden = !S || busy;
     // Over a mod row: install right after it (a separator: at the end of its group).
     const pos = e.payload.position, r = window.devicePixelRatio || 1;
-    const tr = pos && tab === 'mods' ? document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#mods tr[data-id]') : null;
+    const tr = pos && shown('mods') ? document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#mods tr[data-id]') : null;
     const id = tr?.dataset.id ?? null;
     if (id !== (dropAt?.id ?? null)) {
       dropAt = id ? { id, priority: slotAfter(id) } : null;
@@ -4009,11 +4456,12 @@ async function loadConf() {
   return conf;
 }
 const LANGS = [['en', 'English'], ['de', 'Deutsch'], ['es', 'Español'], ['fr', 'Français'], ['it', 'Italiano'], ['ja', '日本語'], ['ko', '한국어'], ['pl', 'Polski'], ['pt_BR', 'Português (Brasil)'], ['ru', 'Русский'], ['sv', 'Svenska'], ['uk', 'Українська'], ['zh_CN', '中文']];
-const TABS = [['mods', 'Mods'], ['plugins', 'Plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['mcp', 'MCP']];
+const TABS = [['mods', 'Mods and plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['mcp', 'MCP']];
 const MCP_OPTIONS = 'Options', MCP_ROLES = 'Your instructions for each role';
 // [key, label, kind, options or [min, max, step], help]. Keys with "win." are this window's.
 const SETTINGS = [
   ['This window', 'Kept by this window on this computer.', [
+    ['win.lang', 'Language', 'select', Object.entries(I18N.LANGS), 'The window’s own words; mod names, files, and messages from the game and from rmm’s engine stay as they are. Changing it reloads the window.'],
     ['win.theme', 'Theme', 'select', [['system', 'Follow Windows'], ['light', 'Light'], ['dark', 'Dark']]],
     ['win.density', 'Rows', 'select', [['comfortable', 'Comfortable'], ['compact', 'Compact']]],
     ['win.zoom', 'Size', 'select', [[0.8, '80%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.25, '125%'], [1.5, '150%']]],
@@ -4081,7 +4529,7 @@ async function drawMore() {
   if (!conf) await loadConf();
   if (!conf) return;
   dlDir = await call('downloads_dir').catch(() => null);
-  const cur = k => k.startsWith('win.') ? W[k.slice(4)] : pathGet(conf, k);
+  const cur = k => k === 'win.lang' ? I18N.lang : k.startsWith('win.') ? W[k.slice(4)] : pathGet(conf, k);
   const control = ([k, label, kind, opt]) => {
     const v = cur(k), at = `data-key="${k}" data-kind="${kind}" aria-label="${esc(label)}"`;
     if (kind === 'bool') return `<input type="checkbox" ${at} ${v ? 'checked' : ''}>`;
@@ -4113,6 +4561,7 @@ $('#set-more').onchange = $('#set-mcp').onchange = async e => {
     : kind === 'kind' ? $$('input[data-kind="kind"]', $('#set-more')).filter(c => !c.checked).map(c => c.value)
     : kind === 'area' ? el.value.trim() : el.value;
   if (kind === 'select' && el.value !== '' && !isNaN(el.value)) v = Number(el.value);
+  if (key === 'win.lang') return I18N.set(v);
   if (key.startsWith('win.')) {
     W[key.slice(4)] = v;
     savePrefs();
@@ -4198,3 +4647,151 @@ function toast(msg, kind = 'info', action = null) {
 
 applyWin();
 start();
+
+
+// ---- Contents, light plugins, archives, LOOT groups, game settings ------------------------------
+
+const CONTENT = {
+  plugins: ['🧩', 'Plugins'], skse: ['⚙️', 'Script extender plugin (DLL)'], scripts: ['📜', 'Scripts'],
+  meshes: ['🧊', 'Meshes'], textures: ['🖼️', 'Textures'], animations: ['🏃', 'Animations'],
+  interface: ['🖥️', 'Interface (menus)'], sound: ['🔊', 'Sound or music'], archives: ['📦', 'Archives (BSA or BA2)'],
+  root: ['📁', 'Files for the game folder'], ini: ['📝', 'INI settings'], fomod: ['🧙', 'Installed with a FOMOD wizard'],
+  'tool output': ['🛠️', 'A tool’s output'],
+};
+
+let lightCands = null; // plugins that could be flagged light, read when a plugin panel needs them
+function lightRow(p) {
+  if (!p.mod_id || p.implicit || p.error) return '';
+  if (p.light) return p.name.toLowerCase().endsWith('.esl') ? '' : '<p class="small muted">Flagged light (ESL): it takes no full load-order slot. <button class="link" data-act="light-off">Remove the flag</button></p>';
+  if (!lightCands) {
+    lightCands = [];
+    call('light_candidates').then(c => { lightCands = c; if (pluginSide()) renderDetails(); }).catch(() => {});
+    return '';
+  }
+  return lightCands.includes(p.name) ? '<p class="small">It could be a light plugin (ESL), which takes no full load-order slot. <button data-act="light-on">Flag light…</button></p>' : '';
+}
+
+/** Flag plugins light: `names`, or the ones the user picks from every candidate. */
+async function flagLight(names) {
+  const all = names ?? await act('Reading the plugins', () => call('light_candidates'), { reload: false });
+  if (!Array.isArray(all) || !all.length) return toast('No plugin can be flagged light.');
+  const pick = all.length > 1 ? `<div class="checks">${all.map(n => `<label class="row"><input type="checkbox" value="${esc(n)}" checked> ${esc(n)}</label>`).join('')}</div>` : '';
+  const body = `<p>${all.length > 1 ? `These ${all.length} plugins` : esc(all[0])} could be light (ESL): ${all.length > 1 ? 'they then take' : 'it then takes'} no full load-order slot, of which the game has 254. Their new records fit a light plugin’s form ids, and they add no cells or worldspaces.</p>${pick}
+    <p class="small"><b>For a new game.</b> A save that already uses a plugin loses what it added (items, NPCs, quests) once it’s light. Undo takes the flag off again.</p>`;
+  if (await dialog({ title: 'Flag light', body, actions: [['cancel', 'Cancel'], ['ok', 'Flag light', 'primary']] }) !== 'ok') return;
+  const chosen = all.length > 1 ? $$('#dlg .checks input:checked').map(i => i.value) : all;
+  for (const n of chosen) if (!await act(`Flagging ${n} light`, () => call('set_light', { plugin: n, light: true }), { reload: false, problem: true })) break;
+  lightCands = null;
+  load();
+}
+
+/** Pack a mod's loose files into archives, after a preview of what goes in and what changes hands. */
+async function packDialog(id, plugin) {
+  const r = await act('Reading the mod', () => call('pack_mod', { id, plugin, dry_run: true }), { reload: false });
+  if (!r || r === true) return;
+  const files = r.archives.reduce((n, a) => n + a.files, 0), size = r.archives.reduce((n, a) => n + a.bytes, 0);
+  const plugins = byId.get(id)?.plugins ?? [];
+  const pick = plugins.length > 1 ? `<label class="row small">Named after <select id="pack-plugin">${plugins.map(p => `<option ${p === r.plugin ? 'selected' : ''}>${esc(p)}</option>`).join('')}</select></label>` : '';
+  const game = S.info.game === 'fallout4' ? 'Fallout 4' : 'Skyrim';
+  const body = `<p>Packs ${plural(files, 'file')} (${bytes(size)}) into ${r.archives.map(a => `<b>${esc(a.name)}</b>`).join(' and ')}, which ${esc(r.plugin)} loads. The game reads fewer loose files, and the mod’s folder stays tidy.</p>${pick}
+    ${r.kept.length ? `<details><summary class="small">${plural(r.kept.length, 'file')} stay loose</summary><div class="files">${r.kept.map(esc).join('<br>')}</div><p class="muted small">Plugins, script extender plugins and their settings, and files the game reads only loose.</p></details>` : ''}
+    ${r.loses.length ? `<p class="small"><span class="pill bad">${r.loses.length} change hands</span> These win against other mods now; packed, they lose to them, because every loose file beats every archive:</p><div class="files">${r.loses.slice(0, 30).map(esc).join('<br>')}${r.loses.length > 30 ? '<br>…' : ''}</div>` : ''}
+    <p class="muted small">${game === 'Skyrim' ? 'Skyrim’s archives are stored uncompressed. ' : 'Textures go in a texture archive, the rest compressed. '}Undo unpacks it again; Deploy puts it in the game.</p>`;
+  const done = dialog({ title: `Pack ${nameOf(id)}`, body, actions: [['cancel', 'Cancel'], ['ok', 'Pack', 'primary']] });
+  $('#pack-plugin')?.addEventListener('change', e => $('#dlg').close('p:' + e.target.value));
+  const v = await done;
+  if (v?.startsWith('p:')) return packDialog(id, v.slice(2));
+  if (v !== 'ok') return;
+  const out = await act(`Packing ${nameOf(id)}`, () => call('pack_mod', { id, plugin: r.plugin, dry_run: false }), { problem: true });
+  if (out && out !== true) toast(`Packed ${plural(files, 'file')} of ${nameOf(id)} into ${out.archives.map(a => a.name).join(' and ')}. Undo unpacks it.`);
+}
+
+/** LOOT's groups: which load after which, with the user's additions and groups of their own. */
+$('#loot-groups').onclick = async () => {
+  let groups = await act('Reading LOOT’s groups', () => call('loot_groups'), { reload: false });
+  if (!Array.isArray(groups)) return;
+  if (!groups.length) return toast('LOOT’s groups come with its masterlist; Sort with LOOT downloads it.');
+  const draw = () => {
+    const names = groups.map(g => g.name);
+    const rows = groups.map(g => {
+      const others = names.filter(n => n !== g.name && !g.after.includes(n) && !g.yours.includes(n));
+      return `<tr data-g="${esc(g.name)}"><td><b>${esc(g.name)}</b>${g.user_only ? ' <span class="pill plain">yours</span>' : ''}${g.description ? `<div class="muted small">${esc(g.description)}</div>` : ''}<div class="muted small" title="${esc(g.plugins.join(', '))}">${plural(g.plugins.length, 'plugin')}</div></td>
+        <td class="small">${g.after.map(a => `<span class="pill plain" title="LOOT’s masterlist">${esc(a)}</span>`).join(' ')} ${g.yours.map(a => `<span class="pill win">${esc(a)} <button type="button" class="link" data-unafter="${esc(a)}" title="Take your rule away">×</button></span>`).join(' ')}${!g.after.length && !g.yours.length ? '<span class="muted">first</span>' : ''}</td>
+        <td><select data-add aria-label="Load ${esc(g.name)} after another group"><option value="">Load after…</option>${others.map(n => `<option>${esc(n)}</option>`).join('')}</select>${g.user_only ? ' <button type="button" class="link danger" data-drop>Remove</button>' : ''}</td></tr>`;
+    }).join('');
+    $("#lg-body").innerHTML = `<table class="form">${rows}</table>`;
+  };
+  const body = `<p class="small">Each group loads after the groups listed: grey ones are LOOT’s, green ones yours. A plugin’s panel puts it in a group (its LOOT rule).</p><div id="lg-body"></div>
+    <div class="row"><input id="lg-name" placeholder="New group’s name" spellcheck="false"><select id="lg-after"><option value="">after…</option>${groups.map(g => `<option>${esc(g.name)}</option>`).join('')}</select><button type="button" id="lg-new">Make it</button></div>`;
+  const done = dialog({ title: 'LOOT groups', body, actions: [['cancel', 'Close']] });
+  $('#dlg').classList.add('wide');
+  draw();
+  const set = async (name, after, remove = false) => {
+    const r = await act(remove ? `Removing ${name}` : `Saving ${name}`, async () => {
+      await call('set_loot_group', { name, after, remove });
+      return call('loot_groups');
+    }, { reload: false });
+    if (!Array.isArray(r)) return false;
+    groups = r;
+    lootRules = null;
+    draw();
+    $('#lg-after').innerHTML = `<option value="">after…</option>${groups.map(g => `<option>${esc(g.name)}</option>`).join('')}`;
+    return true;
+  };
+  $('#dlg').onchange = e => {
+    const g = groups.find(x => x.name === e.target.closest('tr[data-g]')?.dataset.g);
+    if (g && e.target.matches('[data-add]') && e.target.value) set(g.name, [...g.yours, e.target.value]);
+  };
+  $('#dlg').onclick = e => {
+    if (e.target.id === 'lg-new') {
+      const name = $('#lg-name').value.trim(), after = $('#lg-after').value;
+      if (!name) return toast('Give the group a name.');
+      return set(name, after ? [after] : []).then(ok => { if (ok) $('#lg-name').value = ''; });
+    }
+    const g = groups.find(x => x.name === e.target.closest('tr[data-g]')?.dataset.g);
+    if (!g) return;
+    if (e.target.dataset.unafter) set(g.name, g.yours.filter(a => a !== e.target.dataset.unafter), !g.user_only && g.yours.length === 1);
+    if (e.target.matches('[data-drop]')) set(g.name, [], true);
+  };
+  await done;
+  $('#dlg').onclick = $('#dlg').onchange = null;
+};
+
+/** The game's everyday INI settings as a form. */
+$('#game-settings').onclick = async () => {
+  const list = await act('Reading the game’s INI files', () => call('ini_form'), { reload: false });
+  if (!Array.isArray(list)) return;
+  const groups = [...new Set(list.map(s => s.group))];
+  const control = (s, i) => {
+    const v = s.value ?? s.default, id = `gs-${i}`;
+    if (s.kind === 'bool') return `<input type="checkbox" id="${id}" ${v.trim() === '1' ? 'checked' : ''}>`;
+    if (s.kind === 'choice') return `<select id="${id}">${s.options.map(o => `<option ${o === v.trim() ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
+    if (s.kind === 'int') return `<input type="number" id="${id}" min="${s.min}" max="${s.max}" value="${esc(v)}" style="width:7em">`;
+    return `<input type="range" id="${id}" min="${s.min}" max="${s.max}" step="${s.step}" value="${esc(v)}"> <output class="small">${(+v).toFixed(String(s.step).split('.')[1]?.length ?? 0)}</output>`;
+  };
+  const body = groups.map(g => `<h3>${esc(g)}</h3><table class="form gs"><colgroup><col><col style="width:260px"><col style="width:150px"></colgroup>${list.map((s, i) => s.group !== g ? '' : `<tr><td><label for="gs-${i}">${esc(s.label)}</label>${s.help ? `<div class="muted small">${esc(s.help)}</div>` : ''}</td><td style="white-space:nowrap">${control(s, i)}</td><td class="muted small" title="[${esc(s.section)}] ${esc(s.key)}">${s.file ? esc(s.file) : 'game default'}</td></tr>`).join('')}</table>`).join('')
+    + '<p class="muted small">Saved into the INI that holds each setting now, else the Prefs INI. They take effect when the game starts; the toast after saving can put them back.</p>';
+  const done = dialog({ title: 'Game settings', body, actions: [['cancel', 'Cancel'], ['ok', 'Save', 'primary']] });
+  $('#dlg').classList.add('wide');
+  const now = (s, i) => {
+    const el = $(`#gs-${i}`);
+    return s.kind === 'bool' ? (el.checked ? '1' : '0') : el.value;
+  };
+  const start = list.map(now); // as the controls show them: a slider snaps to its step, which isn't a change
+  $('#dlg').oninput = e => { if (e.target.type === 'range') e.target.nextElementSibling.value = (+e.target.value).toFixed(String(e.target.step).split('.')[1]?.length ?? 0); };
+  const v = await done;
+  $('#dlg').oninput = null;
+  if (v !== 'ok') return;
+  const changed = list.map((s, i) => [s, now(s, i), start[i]]).filter(([, x, was]) => x !== was);
+  if (!changed.length) return;
+  const edits = [];
+  for (const [s, value] of changed) {
+    const e = await act(`Saving ${s.label}`, () => call('ini_form_set', { section: s.section, key: s.key, value }), { reload: false, problem: true });
+    if (!e || e === true) break;
+    edits.push(e.n);
+  }
+  if (edits.length) toast(`Saved ${plural(edits.length, 'setting')}; the game reads them when it starts.`, 'info', ['Put back', async () => {
+    for (const n of edits.reverse()) await call('revert_edit', { n }).catch(err => toast(String(err), 'error'));
+    toast('Put back.');
+  }]);
+};

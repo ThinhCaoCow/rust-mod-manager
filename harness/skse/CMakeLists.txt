@@ -17,7 +17,7 @@ add_commonlibsse_plugin(rmm_harness
 	NAME rmm_harness
 	AUTHOR rmm
 	USE_ADDRESS_LIBRARY
-	SOURCES src/main.cpp ../common/harness.cpp)
+	SOURCES src/main.cpp src/play.cpp ../common/harness.cpp)
 target_compile_features(rmm_harness PRIVATE cxx_std_23)
 target_include_directories(rmm_harness PRIVATE ../common)
 target_link_libraries(rmm_harness PRIVATE nlohmann_json::nlohmann_json ws2_32 windowscodecs)

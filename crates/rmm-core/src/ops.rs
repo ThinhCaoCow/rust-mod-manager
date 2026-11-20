@@ -46,6 +46,9 @@ pub struct ModRow {
     /// Its Nexus mod id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexus_id: Option<u64>,
+    /// The page it came from on another site (GitHub, ModDB, a forum).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web: Option<String>,
     /// The Nexus account's endorsement of it, as last read: "Endorsed" or "Abstained".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endorsed: Option<String>,
@@ -168,6 +171,7 @@ pub fn list_mods(inst: &Instance) -> Result<Vec<ModRow>> {
                 update: found.remove(&m.id).filter(|u| crate::nexus::offered(u, &meta)),
                 pinned: meta.pinned,
                 nexus_id: meta.nexus.as_ref().map(|n| n.mod_id),
+                web: meta.web.as_ref().map(|w| w.page.clone()),
                 endorsed: meta.nexus.as_ref().and_then(|n| account.endorsements.get(&n.mod_id).cloned()),
                 tracked: meta.nexus.as_ref().is_some_and(|n| account.tracked.contains(&n.mod_id)),
                 name: if separator { m.id[4..].to_string() } else { meta.name },

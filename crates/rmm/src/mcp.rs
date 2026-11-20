@@ -16,7 +16,7 @@ use rmcp::{
 };
 use rmm_core::fomod::Choices;
 use rmm_core::tools::ToolSpec;
-use rmm_core::{Instance, addons, conflicts, deploy, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, workspace};
+use rmm_core::{Instance, addons, conflicts, deploy, harness, health, import, inspect, install, lockfile, logs, loot, nexus, ops, plugins, rules, saves, tools, web, workspace};
 use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -251,6 +251,22 @@ struct NexusInstallArgs {
     dry_run: Option<bool>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct LinkInstallArgs {
+    /// A GitHub repository or release link, a ModDB mod or download page, or a direct link to a
+    /// .zip, .7z or .rar.
+    url: String,
+    /// The file to take when the link offers several (the dry run lists them).
+    file: Option<String>,
+    /// Default true: show what the link offers without downloading.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct LinkUpdateArgs {
+    id: String,
+    /// The release's file, when check_link_updates couldn't tell which replaces the old one.
+    file: Option<String>,
+}
+#[derive(Deserialize, JsonSchema)]
 struct CollectionArgs {
     /// The collection's link (nexusmods.com/games/<game>/collections/<id>) or id; default: the
     /// active profile's collection.
@@ -276,6 +292,39 @@ struct HideArgs {
     paths: Vec<String>,
     /// Show them again instead; default false.
     show: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct GroupArgs {
+    /// The group's name.
+    name: String,
+    /// Groups it loads after, on top of the masterlist's.
+    #[serde(default)]
+    after: Vec<String>,
+    /// Take the user's version out of the userlist instead.
+    #[serde(default)]
+    remove: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+struct PackArgs {
+    /// The mod's id.
+    id: String,
+    /// The plugin to name the archives after; the mod's first by default.
+    plugin: Option<String>,
+    /// Default true: only report.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct LightArgs {
+    plugin: String,
+    /// True flags it light, false clears the flag.
+    light: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+struct SettingArgs {
+    /// INI section, as game_settings gives it.
+    section: String,
+    key: String,
+    value: String,
 }
 #[derive(Deserialize, JsonSchema)]
 struct MoveFilesArgs {
@@ -427,7 +476,7 @@ struct SessionStartArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct SessionStepArgs {
-    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}.
+    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}, {"state": {}}, {"wait_for": {...}}, {"call": {...}}, {"move_to": ref}, {"activate": ref}, {"face": ref}; Skyrim also {"dialogue": {}}, {"choose": words or index}, {"button": n}, {"menu_call": {...}}, {"menu_get": {...}}, {"attack": {...}}, {"press": {...}}.
     steps: Vec<harness::Step>,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -550,6 +599,18 @@ struct PluginEnableArgs {
 struct PluginOrderArgs {
     /// Plugin names in the desired order; unlisted plugins keep their order after these.
     names: Vec<String>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct SortArgs {
+    /// Preview only (default true). Set false to save the order to the profile.
+    dry_run: Option<bool>,
+    /// Plugins whose rules of the user's to leave out of this one sort, to get past a circle of
+    /// rules they are part of. Only when the user asks: their rules are theirs.
+    without: Option<Vec<String>>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct PluginArg {
+    plugin: String,
 }
 #[derive(Deserialize, JsonSchema)]
 struct DryRun {
@@ -913,9 +974,15 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| ops::set_plugins_enabled(&i, &names, a.enabled)))
     }
 
-    #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move; otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy.")]
-    async fn sort_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| loot::sort(&i, a.dry_run.unwrap_or(true))))
+    #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move, each with LOOT's reason (why); otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy. When LOOT's rules go in a circle nothing is sorted and the error names each rule in it and the user's rules among them; tell the user, who can change a rule or ask to sort without it (without).")]
+    async fn sort_plugins(&self, Parameters(a): Parameters<SortArgs>) -> Result<String, String> {
+        let dry = a.dry_run.unwrap_or(true);
+        out(self.inst_for(dry).and_then(|i| loot::sort_without(&i, dry, &a.without.unwrap_or_default())))
+    }
+
+    #[tool(description = "Why LOOT puts a plugin where it does: its place now and in LOOT's order, and the rules (masters, masterlist and user rules, groups, record overlaps) tying it to the nearest plugin before and after it. Runs a sort without saving it.", annotations(read_only_hint = true))]
+    async fn explain_plugin_order(&self, Parameters(a): Parameters<PluginArg>) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::why(&i, &a.plugin)))
     }
 
     #[tool(description = "The user's LOOT rules (loot/userlist.yaml) for the profile's plugins: load-after lists and groups.", annotations(read_only_hint = true))]
@@ -926,6 +993,41 @@ impl Rmm {
     #[tool(description = "Replace one plugin's LOOT user rule: the plugins it loads after and its group (from the masterlist). An empty rule removes it. Saved to loot/userlist.yaml in LOOT's format and used by the next sort_plugins. Not in undo history: returns the previous rule, so set that to revert.")]
     async fn set_loot_rule(&self, Parameters(a): Parameters<loot::Rule>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| Ok(serde_json::json!({ "previous": loot::set_rule(&i, &a)? }))))
+    }
+
+    #[tool(description = "LOOT's groups: each one's description, the groups it loads after (the masterlist's, and the user's additions as yours), whether only the userlist has it, and the profile's plugins in it.", annotations(read_only_hint = true))]
+    async fn loot_groups(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::group_list(&i)))
+    }
+
+    #[tool(description = "Set the groups a LOOT group loads after, on top of the masterlist's, making the group if it's new (then set_loot_rule can put plugins in it); remove takes the user's version out of the userlist. Refuses a circle of groups. Saved to loot/userlist.yaml; the next sort_plugins uses it. Not in undo history.")]
+    async fn set_loot_group(&self, Parameters(a): Parameters<GroupArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| loot::set_group(&i, &a.name, &a.after, a.remove)))
+    }
+
+    #[tool(description = "Pack a mod's loose files into archives named after one of its plugins (Skyrim SE: <plugin>.bsa and <plugin> - Textures.bsa; Fallout 4: <plugin> - Main.ba2 and <plugin> - Textures.ba2), as MO2's packer does. Script extender plugins and other files the game only reads loose stay loose. Packed files lose to every loose file, so `loses` lists those another mod has loose that this mod wins now. dry_run defaults to true. One undo step; takes effect at the next deploy.")]
+    async fn pack_mod(&self, Parameters(a): Parameters<PackArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::pack::pack(&i, &a.id, a.plugin.as_deref(), a.dry_run.unwrap_or(true))))
+    }
+
+    #[tool(description = "Plugins that could be flagged light (ESL): their new records fit a light plugin's form ids and they add no cells or worldspaces. Flagging frees full load-order slots.", annotations(read_only_hint = true))]
+    async fn light_candidates(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::health::light_candidates(&i)))
+    }
+
+    #[tool(description = "Flag a mod's plugin light (ESL), or clear the flag (light false). Only light_candidates can be flagged. Ask the user first: a save that already uses the plugin loses what it added, so it's for a new game. One undo step; takes effect at the next deploy.")]
+    async fn set_light_flag(&self, Parameters(a): Parameters<LightArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::plugins::set_light(&i, &a.plugin, a.light)))
+    }
+
+    #[tool(description = "The game's common settings (display, interface, controls, saves, mod-related and Papyrus logging) as the game reads them from its INIs, with kinds, ranges and defaults.", annotations(read_only_hint = true))]
+    async fn game_settings(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::ini_form::read(&i)))
+    }
+
+    #[tool(description = "Set one of game_settings' settings, in the INI that holds it now (else the Prefs INI). Kept in Edits, so it can be put back. Takes effect when the game next starts.")]
+    async fn set_game_setting(&self, Parameters(a): Parameters<SettingArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::ini_form::set(&i, &a.section, &a.key, &a.value, "AI")))
     }
 
     #[tool(description = "Download the latest LOOT masterlist and prelude now. Returns warnings, if any.")]
@@ -1170,7 +1272,7 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; its text output isn't read back), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window; open it to see the game), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell and the screenshot's path. If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
+    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window; open it to see the game), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
     async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<String, String> {
         let mut slot = self.session.lock().unwrap();
         let Some(session) = slot.as_mut() else {
@@ -1234,6 +1336,24 @@ impl Rmm {
             }
             Ok(serde_json::to_value(nexus::install(&inst, &client, &link, None)?)?)
         }))
+    }
+
+    #[tool(description = "Download a mod from another site into downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording the page so check_link_updates finds GitHub releases. Takes GitHub repositories and releases (the latest, or a tag's), ModDB pages and direct links to an archive. Sites that need the user's sign-in (LoversLab, AFK Mods, Patreon) come back with browser: true: ask the user to download the file in their browser, then install_mod the file. dry_run defaults to true: the site, the mod's name and the files to choose from.")]
+    async fn install_from_link(&self, Parameters(a): Parameters<LinkInstallArgs>) -> Result<String, String> {
+        if a.dry_run.unwrap_or(true) {
+            return out(web::plan(&a.url));
+        }
+        out(self.inst_mut().and_then(|i| web::install(&i, &a.url, a.file.as_deref(), None)))
+    }
+
+    #[tool(description = "Mods installed from GitHub releases that have a newer one: installed and latest tag, the page, and the new release's file that replaces the old one (file is null when that isn't clear; pick from files). Leaves out held mods and skipped versions.", annotations(read_only_hint = true))]
+    async fn check_link_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| web::check_updates(&i, a.ids.as_deref())))
+    }
+
+    #[tool(description = "Update a mod installed from GitHub to its repository's latest release, as one undoable step: it keeps its id, place, notes and FOMOD choices.")]
+    async fn update_from_link(&self, Parameters(a): Parameters<LinkUpdateArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| web::update(&i, &a.id, a.file.as_deref(), None)))
     }
 
     #[tool(description = "Install a Nexus collection with the user's account (Premium: every file downloads directly; free accounts: the user downloads each file listed in to_download from its page first, then the install goes ahead): its mods with the curator's FOMOD choices and notes, its mod rules (then the mods sorted by them), its plugin list (then LOOT), and its tools. Mods already installed from the same file are kept and turned on. new_profile puts it in a new profile, as Vortex does, leaving the user's own setup as it was. Mods the collection gives Vortex's dinput or enb type go to the game folder. Into a profile that has an earlier revision (update_from in the result) it is an update: mods with a newer file are updated in place (or installed beside the old one when another profile has that on), mods the revision dropped are turned off (turned_off, still installed), and the user's own mods (yours), the collection's mods they turned off (kept_off) and plugins they changed stay as they are. Without a link it updates the active profile's collection. A big collection takes a long time. dry_run defaults to true: lists what would be installed or updated, the download size, optional mods left out and the curator's notes.")]
@@ -1395,11 +1515,15 @@ The game runs in a small window behind the user's windows, so you see it only th
    - Items and magic: player.additem <form id> 1, player.equipitem <form id>, player.addspell <form id>; wait, screenshot.
    - World: fw <weather form id>, set gamehour to 22, set timescale to 200 to let time pass; wait.
    - Scripts: wait long enough for them to run (30 to 60 seconds) and read the Papyrus log at the end.
+   - Checks: console queries answer in the step's output. getstage <quest editor id> (did the quest advance), player.getav <actor value>, player.getitemcount <form id>, player.getpos x/y/z, getglobalvalue <global>, sqv <quest editor id> (its stage, aliases and variables), help <word> 4 (find an id by name). Prefer these to a screenshot when the answer is a number.
+   - State: {\"state\": {\"quests\": [...], \"refs\": [...]}} gives the player, open menus, the nearest actors and objects with their refs, and what you ask about. Every step's answer also lists the game's events since the last one (deaths, the player's activations, combat, quest stages). {\"wait_for\": {\"dead\": \"<ref>\"}} (or stage, menu, menu_closed, in_combat, near, cell) waits for a condition instead of guessing a wait.
+   - Playing: {\"move_to\": \"<ref>\"} walks there (or moves the player when something is in the way, and says so), {\"activate\": \"<ref>\"} opens doors and containers and starts conversations, {\"face\": \"<ref>\"}. {\"call\": {\"class\": \"Actor\", \"fn\": \"StartCombat\", \"self\": \"<ref>\", \"args\": [\"player\"]}} calls any Papyrus function and returns its value.
+   - Skyrim only: {\"dialogue\": {}} lists the topics, {\"choose\": \"words\"} picks one and waits for the answer; {\"button\": 1} answers a message box; {\"attack\": {\"target\": \"<ref>\"}} swings at it (move_to first: 100 units is in reach); {\"press\": {\"control\": \"Jump\"}}.
 2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Open every screenshot before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
 3. If the game closes, the step's answer ends the session with the crash log read back to the mods it names: report that to the lead and stop.
 4. test_session_stop when done: crash, Papyrus errors with their mods, FPS.
 5. Report per mechanic: worked, didn't, or couldn't tell, with the screenshots; crashes and script errors with the mods behind them; the lowest FPS and where. Don't change the setup: fixing is the installer's job.
-Limits: console commands run, but their text output isn't read back, and you can't press keys or walk except through the console (coc, player.moveto, player.setpos).";
+Limits: move_to walks in a straight line (no pathfinding). Fallout 4 has no dialogue, menu, attack or key steps yet: use the console and Papyrus calls there. A console step without output, or a step the plugin calls unknown, means the harness plugin is older than this rmm.";
 
 const LEAD: &str = "\
 You lead rmm's mod team for this {game} setup. The user wants: {request}

@@ -17,12 +17,22 @@ namespace rmm
 	{
 		// Queue work for the game's main thread (the script extender's task interface).
 		std::function<void(std::function<void()>)> on_main_thread;
-		// Run a console line. Main thread. "" when it ran, else why not.
-		std::function<std::string(const std::string&)> console;
+		// Run a console line. Main thread. "" when it ran, else why not; what it printed goes in
+		// the second argument (left empty without console_output).
+		std::function<std::string(const std::string&, std::string&)> console;
+		// The plugin can read back what console lines print (sent in the hello).
+		bool console_output = false;
+		// When set, runs console lines instead of `console` and answers once what they print is in
+		// (Fallout 4 prints a command's result frames after running it). Main thread.
+		std::function<void(const std::string&, std::function<void(const std::string& error, const std::string& out)>)> console_later;
 		// Start loading a save by name (no extension). Main thread. "" when it started.
 		std::function<std::string(const std::string&)> load_save;
 		// Frames per second and the player's cell ("" in menus). Main thread.
 		std::function<std::pair<double, std::string>()> sample;
+		// Any other command (state, papyrus, dialogue...), as its JSON. Main thread. Call the reply
+		// once, from any thread: "" or why it failed, and the result as JSON ("" for none).
+		using Reply = std::function<void(const std::string& error, const std::string& data)>;
+		std::function<void(const std::string& cmd, Reply reply)> command;
 	};
 
 	// Connect if rmm started the game; false, and nothing else happens, otherwise.
@@ -39,4 +49,8 @@ namespace rmm
 	// Report a step that isn't a milestone (a menu opening, data starting to load). rmm lists the
 	// last few when it gives up waiting for a milestone.
 	void note(const std::string& a_what);
+
+	// Report something that happened in the game, as a JSON object ({"what":"death",...}); it is
+	// sent as {"ev":"game",...}.
+	void game_event(const std::string& a_json);
 }

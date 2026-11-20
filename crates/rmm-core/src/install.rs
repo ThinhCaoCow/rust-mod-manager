@@ -51,6 +51,9 @@ pub fn install_at(inst: &Instance, source: &Path, name: Option<&str>, enable: bo
     if let Some((_, n)) = nexus {
         crate::nexus::remember(inst, &r.id, n)?; // so update checks find a manual download too
     }
+    if let Some(web) = crate::web::of_source(inst, source) {
+        inst.write_mod_meta(&r.id, &ModMeta { web: Some(web), ..inst.mod_meta(&r.id) })?;
+    }
     Ok(r)
 }
 
@@ -311,7 +314,7 @@ fn pick(pool: &[String], paths: &[String]) -> Result<Vec<String>> {
 }
 
 /// Remove the folders a moved file leaves empty, up to (not including) `root`.
-fn prune_empty(root: &Path, file: &Path) {
+pub(crate) fn prune_empty(root: &Path, file: &Path) {
     let mut d = file.parent();
     while let Some(dir) = d.filter(|d| *d != root && d.starts_with(root)) {
         if fs::remove_dir(dir).is_err() {
@@ -377,7 +380,7 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
             }
             let updated = new_source.map(|s| -> Result<ModMeta> {
                 let sha256 = if s.is_file() { Some(crate::lockfile::sha256_file(s)?) } else { None };
-                Ok(ModMeta { source: Some(s.display().to_string()), sha256, ..meta.clone() })
+                Ok(ModMeta { source: Some(s.display().to_string()), sha256, web: crate::web::of_source(inst, s).or_else(|| meta.web.clone()), ..meta.clone() })
             });
             let mut ini_tweaks = meta.ini_tweaks.clone();
             ini_tweaks.extend(script_tweak(&files).into_iter().filter(|t| !meta.ini_tweaks.contains(t)));
@@ -416,6 +419,14 @@ pub fn nexus_id_in_name(file: &str) -> Option<u64> {
 /// When several installed mods came from that page (MfgFix and MfgFix MCM), the one whose file
 /// has the same name; none when no name settles it, so the download installs as a mod of its own.
 pub fn same_mod(inst: &Instance, source: &Path, nexus_mod: Option<u64>) -> Result<Option<(String, String)>> {
+    // From a web page (a GitHub repository): the one mod installed from that page.
+    if let Some(web) = crate::web::of_source(inst, source).filter(|_| nexus_mod.is_none()) {
+        let mut from = inst.profile()?.mods.into_iter().map(|m| (inst.mod_meta(&m.id), m.id)).filter(|(meta, _)| meta.web.as_ref().is_some_and(|w| w.page == web.page));
+        return Ok(match (from.next(), from.next()) {
+            (Some((meta, id)), None) => Some((id, meta.name)),
+            _ => None,
+        });
+    }
     let Some(want) = nexus_mod.or_else(|| nexus_id_in_name(&source.file_name()?.to_string_lossy())) else { return Ok(None) };
     let found: Vec<(String, crate::instance::ModMeta)> = inst
         .profile()?
@@ -787,6 +798,9 @@ pub struct Download {
     /// the mod its file name carries (no `file_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexus: Option<crate::nexus::Identified>,
+    /// The page it came from, when rmm downloaded it from a link or took it from the browser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web: Option<crate::web::WebRef>,
 }
 
 /// The downloads folder, newest first.
@@ -799,6 +813,7 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
         }
     }
     let mut known = crate::nexus::identified(inst);
+    let mut web = crate::web::known(inst);
     let mut out = Vec::new();
     for e in fs::read_dir(inst.downloads_dir()).into_iter().flatten().flatten() {
         let (name, m) = (e.file_name().to_string_lossy().into_owned(), e.metadata()?);
@@ -810,7 +825,7 @@ pub fn downloads(inst: &Instance) -> Result<Vec<Download>> {
         // Not identified: the mod and version a Nexus download's name carries.
         let named = || Path::new(&name).file_stem()?.to_str().and_then(nexus_name).map(|(n, nexus)| crate::nexus::Identified { name: Some(n), nexus });
         let nexus = known.remove(&lower).or_else(named);
-        out.push(Download { mods: from.remove(&lower).unwrap_or_default(), nexus, path: e.path(), size: m.len(), modified, name });
+        out.push(Download { mods: from.remove(&lower).unwrap_or_default(), nexus, web: web.remove(&lower), path: e.path(), size: m.len(), modified, name });
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
     Ok(out)

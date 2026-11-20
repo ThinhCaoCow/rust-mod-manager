@@ -300,6 +300,14 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         }
         "loot_rules" => json!({ "rules": loot::rules(&inst)?, "groups": loot::groups(&inst)? }),
         "set_loot_rule" => json!(loot::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
+        "loot_groups" => json!(loot::group_list(&inst)?),
+        "set_loot_group" => json!(loot::set_group(&inst, &s("name")?, &serde_json::from_value::<Vec<String>>(a["after"].clone()).unwrap_or_default(), flag("remove"))?),
+        "pack_mod" => json!(rmm_core::pack::pack(&inst, &s("id")?, a["plugin"].as_str(), flag("dry_run"))?),
+        "light_candidates" => json!(rmm_core::health::light_candidates(&inst)?),
+        "set_light" => json!(rmm_core::plugins::set_light(&inst, &s("plugin")?, flag("light"))?),
+        "ini_form" => json!(rmm_core::ini_form::read(&inst)?),
+        "revert_edit" => json!(rmm_core::workspace::revert(&inst, a["n"].as_u64().context("missing 'n'")? as usize)?),
+        "ini_form_set" => json!(rmm_core::ini_form::set(&inst, &s("section")?, &s("key")?, &s("value")?, "you")?),
         "uninstall" => json!(install::uninstall_mods(&inst, &ids()?)?),
         "enable_mods" => json!(ops::set_mods_enabled(&inst, &ids()?, flag("enabled"))?),
         "move_mods" => json!(ops::move_mods(&inst, &ids()?, a["priority"].as_u64().context("missing 'priority'")? as usize)?),
@@ -310,7 +318,14 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, &serde_json::from_value::<Vec<String>>(a["moved"].clone()).unwrap_or_default())?),
         "set_rule" => json!(rules::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
         "sort_mods" => json!(rules::sort(&inst, flag("dry_run"))?),
-        "sort_plugins" => json!(loot::sort(&inst, flag("dry_run"))?),
+        "sort_plugins" => {
+            let without: Vec<String> = serde_json::from_value(a["without"].clone()).unwrap_or_default();
+            match loot::sort_without(&inst, flag("dry_run"), &without) {
+                Err(e) if e.downcast_ref::<loot::Cycle>().is_some() => json!({ "cycle": e.downcast_ref::<loot::Cycle>(), "message": e.to_string() }),
+                r => json!(r?),
+            }
+        }
+        "plugin_why" => loot::why(&inst, &s("plugin")?)?,
         "undo" => json!(inst.undo()?),
         "redo" => json!(inst.redo()?),
         "script_extender_mods" => json!(launch::script_extender_mods(&inst)?),
@@ -357,6 +372,19 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "nexus_set_key" => nexus::set_key(&s("key")?)?,
         "nexus_sso" => nexus::sso(&nexus::open_in_browser)?,
         "nexus_forget_key" => json!(nexus::forget_key()?),
+        "link_plan" => json!(rmm_core::web::plan(&s("url")?)?),
+        "link_download" => json!(rmm_core::web::download(&inst, &s("url")?, a["file"].as_str())?),
+        "link_updates" => json!(rmm_core::web::check_updates(&inst, None)?),
+        "link_skip" => json!(rmm_core::web::skip(&inst, &s("id")?, &s("version")?)?),
+        "browser_downloads" => json!(rmm_core::web::browser_downloads(a["since"].as_u64().unwrap_or(0))),
+        "take_browser_download" => json!(rmm_core::web::take_browser_download(&inst, Path::new(&s("path")?), a["page"].as_str())?),
+        "open_page" => {
+            let url = s("url")?;
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                anyhow::bail!("not a web link: {url}");
+            }
+            json!(nexus::open_in_browser(&url)?)
+        }
         "check_updates" => json!(nexus::check_updates(&inst, &nexus::Client::from_env()?, None)?),
         "identify_downloads" => json!(nexus::identify(&inst, &nexus::Client::from_env()?, &serde_json::from_value::<Vec<String>>(a["names"].clone()).unwrap_or_default())?),
         "hold_updates" => json!(nexus::hold_updates(&inst, &serde_json::from_value::<Vec<String>>(a["ids"].clone())?, serde_json::from_value(a["hold"].clone())?)?),
