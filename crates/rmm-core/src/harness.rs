@@ -142,6 +142,19 @@ pub enum Step {
     /// but held movement is slow and uneven (the key reaches the game on some frames only):
     /// walk with move_to. Skyrim only.
     Press(Press),
+    /// Click a point of the game's window, in a screenshot's pixels: {"x": 640, "y": 360}, with
+    /// "button": "right", "double": true, or "wheel": -3 (scroll there instead). It goes to the
+    /// menu on top that shows a cursor (inventory, map, dialogue, a message box), never to the
+    /// real mouse; the result names the menu. Skyrim only.
+    Click(Click),
+    /// Press a key for `ms` milliseconds (default 100) through the game's input: a letter or
+    /// digit, Enter, Escape, Tab, Space, Backspace, Up, Down, Left, Right, Shift, Ctrl, Alt,
+    /// Delete, Home, End, PageUp, PageDown, F1-F12. The game takes it as what the key is bound to
+    /// where the player is (Escape is Cancel in a menu, E is Activate in the world); the result
+    /// names that. Skyrim only.
+    Key(KeyPress),
+    /// Type text into the menu on top (a search box, a character's name). Skyrim only.
+    Type(String),
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Default)]
@@ -239,6 +252,27 @@ pub struct Attack {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Default)]
+pub struct Click {
+    pub x: f64,
+    pub y: f64,
+    /// left (default) or right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double: Option<bool>,
+    /// Scroll the wheel this many notches here instead of clicking (negative: down).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wheel: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct KeyPress {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
@@ -700,6 +734,22 @@ fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, 
             let ms = p.ms.unwrap_or(100).min(30_000);
             c.command(json!({ "cmd": "press", "control": p.control, "ms": ms }), Duration::from_millis(ms + 30_000), alive).map(drop)
         }
+        Step::Click(k) => match k.button.as_deref() {
+            None | Some("left" | "right") => {
+                let button = u8::from(k.button.as_deref() == Some("right"));
+                let mut cmd = json!({ "cmd": "click", "x": k.x, "y": k.y, "button": button, "double": k.double.unwrap_or(false) });
+                if let Some(w) = k.wheel {
+                    cmd["wheel"] = json!(w);
+                }
+                c.command(cmd, Duration::from_secs(30), alive).map(|v| res.data = data(v))
+            }
+            Some(b) => Err(anyhow::anyhow!("no mouse button '{b}' (left or right)")),
+        },
+        Step::Key(k) => {
+            let ms = k.ms.unwrap_or(100).min(30_000);
+            c.command(json!({ "cmd": "key", "key": k.key, "ms": ms }), Duration::from_millis(ms + 30_000), alive).map(|v| res.data = data(v))
+        }
+        Step::Type(text) => c.command(json!({ "cmd": "type", "text": text }), Duration::from_secs(60), alive).map(|v| res.data = data(v)),
     };
     res.events = std::mem::take(&mut c.events);
     if let Err(e) = done {
@@ -1180,6 +1230,43 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn clicks_and_keys_reach_the_plugin() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let game = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let mut c = Conn::new(l.accept().unwrap().0).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let mut rd = BufReader::new(game.try_clone().unwrap());
+            let mut w = game;
+            let mut seen = vec![];
+            for _ in 0..3 {
+                let mut line = String::new();
+                rd.read_line(&mut line).unwrap();
+                let cmd: Value = serde_json::from_str(&line).unwrap();
+                let out = if cmd["cmd"] == "key" { json!({"event": "Cancel"}) } else { json!({"menu": "InventoryMenu"}) };
+                writeln!(w, "{}", json!({"ev": "result", "id": cmd["id"], "ok": true, "out": "", "data": out})).unwrap();
+                seen.push(cmd);
+            }
+            seen
+        });
+        let alive = || true;
+        let click = run_step(&mut c, &Step::Click(Click { x: 640.0, y: 360.0, double: Some(true), ..Default::default() }), Duration::from_secs(5), None, &alive);
+        assert!(click.ok, "{click:?}");
+        assert_eq!(click.data, Some(json!({"menu": "InventoryMenu"})));
+        let scroll = run_step(&mut c, &Step::Click(Click { x: 10.0, y: 20.0, button: Some("right".into()), wheel: Some(-3.0), ..Default::default() }), Duration::from_secs(5), None, &alive);
+        assert!(scroll.ok);
+        let key = run_step(&mut c, &Step::Key(KeyPress { key: "Escape".into(), ms: None }), Duration::from_secs(5), None, &alive);
+        assert_eq!(key.data, Some(json!({"event": "Cancel"})));
+        let bad = run_step(&mut c, &Step::Click(Click { button: Some("middle".into()), ..Default::default() }), Duration::from_secs(5), None, &alive);
+        assert!(!bad.ok && bad.error.as_deref().unwrap_or_default().contains("middle"), "{bad:?}");
+        let seen = plugin.join().unwrap();
+        assert_eq!(seen[0], json!({"cmd": "click", "x": 640.0, "y": 360.0, "button": 0, "double": true, "id": seen[0]["id"]}));
+        assert_eq!((seen[1]["button"].clone(), seen[1]["wheel"].clone()), (json!(1), json!(-3.0)));
+        assert_eq!((seen[2]["cmd"].as_str(), seen[2]["key"].as_str(), seen[2]["ms"].as_u64()), (Some("key"), Some("Escape"), Some(100)));
+        let steps: Vec<Step> = serde_json::from_str(r#"[{"click": {"x": 1, "y": 2}}, {"key": {"key": "E"}}, {"type": "iron"}]"#).unwrap();
+        assert_eq!(steps[2], Step::Type("iron".into()), "steps read as the docs write them");
     }
 
     #[test]

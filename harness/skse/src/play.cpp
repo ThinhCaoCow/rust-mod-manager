@@ -665,6 +665,172 @@ namespace
 		}).detach();
 	}
 
+	// The menu the player works with: the topmost open one that shows a cursor (the inventory, the
+	// map, a message box, dialogue), with its name. UI thread.
+	std::pair<std::string, RE::GPtr<RE::GFxMovieView>> cursor_menu()
+	{
+		const auto ui = RE::UI::GetSingleton();
+		for (auto i = ui->menuStack.size(); i-- > 0;) {
+			const auto& m = ui->menuStack[i];
+			if (!m || !m->uiMovie || !m->UsesCursor()) {
+				continue;
+			}
+			for (const auto& [name, entry] : ui->menuMap) {
+				if (entry.menu.get() == m.get()) {
+					return { std::string(name.c_str()), m->uiMovie };
+				}
+			}
+			return { "a menu", m->uiMovie };
+		}
+		return { {}, nullptr };
+	}
+
+	// A mouse click (or a turn of the wheel) at a point of the game's window, in its pixels, as
+	// the menu on top sees one: straight to its movie, so it works behind other windows and the
+	// real mouse never moves.
+	void click(const json& a_cmd, Reply a_reply)
+	{
+		const auto x = a_cmd.value("x", 0.0f);
+		const auto y = a_cmd.value("y", 0.0f);
+		const auto button = a_cmd.value("button", 0u);
+		const auto times = a_cmd.value("double", false) ? 2 : 1;
+		const auto wheel = a_cmd.value("wheel", 0.0f);
+		std::thread([=] {
+			using T = RE::GFxEvent::EventType;
+			std::string menu;
+			const auto send = [&](T a_type, float a_delta = 0.0f) {
+				on_main(
+					[&] {
+						const auto [name, movie] = cursor_menu();
+						menu = name;
+						if (movie) {
+							movie->HandleEvent(RE::GFxMouseEvent(a_type, button, x, y, a_delta));
+						}
+					},
+					true);
+			};
+			send(T::kMouseMove);  // the pointer goes there first: buttons light up on hover
+			if (menu.empty()) {
+				return a_reply("no menu with a cursor is open; in the world, use press, attack, activate or move_to", "");
+			}
+			if (wheel != 0.0f) {
+				send(T::kMouseWheel, wheel);
+			} else {
+				for (int i = 0; i < times; ++i) {
+					send(T::kMouseDown);
+					std::this_thread::sleep_for(std::chrono::milliseconds(60));
+					send(T::kMouseUp);
+					std::this_thread::sleep_for(std::chrono::milliseconds(60));
+				}
+			}
+			a_reply("", json{ { "menu", menu } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+		}).detach();
+	}
+
+	// A key by name: its Windows key code and its DirectInput scan code (what the game reads).
+	std::optional<std::pair<std::uint32_t, std::uint32_t>> key_named(std::string a_name)
+	{
+		std::ranges::transform(a_name, a_name.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+		if (a_name.size() == 1) {
+			const char*         rows[] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM" };
+			const std::uint32_t starts[] = { 0x02, 0x10, 0x1E, 0x2C };
+			for (int r = 0; r < 4; ++r) {
+				if (const auto p = std::strchr(rows[r], a_name[0]); p && *p) {
+					return std::pair{ static_cast<std::uint32_t>(a_name[0]), starts[r] + static_cast<std::uint32_t>(p - rows[r]) };
+				}
+			}
+			return std::nullopt;
+		}
+		static const std::map<std::string, std::pair<std::uint32_t, std::uint32_t>> named{
+			{ "ESCAPE", { 27, 0x01 } }, { "ESC", { 27, 0x01 } }, { "ENTER", { 13, 0x1C } }, { "TAB", { 9, 0x0F } }, { "SPACE", { 32, 0x39 } },
+			{ "BACKSPACE", { 8, 0x0E } }, { "UP", { 38, 0xC8 } }, { "DOWN", { 40, 0xD0 } }, { "LEFT", { 37, 0xCB } }, { "RIGHT", { 39, 0xCD } },
+			{ "SHIFT", { 16, 0x2A } }, { "CTRL", { 17, 0x1D } }, { "ALT", { 18, 0x38 } }, { "DELETE", { 46, 0xD3 } }, { "HOME", { 36, 0xC7 } },
+			{ "END", { 35, 0xCF } }, { "PAGEUP", { 33, 0xC9 } }, { "PAGEDOWN", { 34, 0xD1 } }, { "F11", { 122, 0x57 } }, { "F12", { 123, 0x58 } },
+		};
+		if (const auto it = named.find(a_name); it != named.end()) {
+			return it->second;
+		}
+		if (a_name.size() <= 3 && a_name[0] == 'F' && std::isdigit(static_cast<unsigned char>(a_name[1]))) {
+			const auto n = std::atoi(a_name.c_str() + 1);
+			if (n >= 1 && n <= 10) {
+				return std::pair{ 111u + n, 0x3Au + n };
+			}
+		}
+		return std::nullopt;
+	}
+
+	// A key pressed for a_ms, through the game's own input like `press`, as the game event it's
+	// bound to where the player is now (Accept and Cancel in a menu, Activate in the world).
+	void key(const json& a_cmd, Reply a_reply)
+	{
+		const auto name = a_cmd.value("key", std::string{});
+		const auto k = key_named(name);
+		if (!k) {
+			return a_reply("no key '" + name + "' (a letter or digit, Enter, Escape, Tab, Space, Backspace, Up, Down, Left, Right, Shift, Ctrl, Alt, Delete, Home, End, PageUp, PageDown, F1-F12)", "");
+		}
+		const auto ms = std::clamp(a_cmd.value("ms", 100), 0, 30000);
+		const auto scan = k->second;
+		std::thread([=] {
+			std::string event;
+			on_main([&] {
+				const auto map = RE::ControlMap::GetSingleton();
+				const auto& stack = map->GetRuntimeData().contextPriorityStack;
+				using C = RE::ControlMap::InputContextID;
+				for (const auto c : { stack.empty() ? C::kGameplay : stack.back(), C::kMenuMode, C::kGameplay }) {
+					if (event.empty()) {
+						event = map->GetUserEventName(scan, RE::INPUT_DEVICE::kKeyboard, c);
+					}
+				}
+			});
+			const auto start = std::chrono::steady_clock::now();
+			const auto held = [&] { return std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count(); };
+			button(RE::INPUT_DEVICE::kKeyboard, event, scan, 1.0f, 0.0f);
+			while (held() * 1000.0f < static_cast<float>(ms)) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+				button(RE::INPUT_DEVICE::kKeyboard, event, scan, 1.0f, held());
+			}
+			button(RE::INPUT_DEVICE::kKeyboard, event, scan, 0.0f, held());
+			a_reply("", json{ { "event", event } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+		}).detach();
+	}
+
+	// Text typed into the menu on top (a search box, a name), a character at a time.
+	void type(const json& a_cmd, Reply a_reply)
+	{
+		const auto text = a_cmd.value("text", std::string{});
+		std::thread([=] {
+			std::string menu;
+			// UTF-8 to code points.
+			std::vector<std::uint32_t> chars;
+			for (std::size_t i = 0; i < text.size();) {
+				const auto     c = static_cast<unsigned char>(text[i]);
+				const int      n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+				std::uint32_t cp = n == 1 ? c : c & (0x3F >> (n - 1));
+				for (int j = 1; j < n && i + j < text.size(); ++j) {
+					cp = (cp << 6) | (static_cast<unsigned char>(text[i + j]) & 0x3F);
+				}
+				chars.push_back(cp);
+				i += n;
+			}
+			for (const auto cp : chars) {
+				on_main(
+					[&] {
+						const auto [name, movie] = cursor_menu();
+						menu = name;
+						if (movie) {
+							movie->HandleEvent(RE::GFxCharEvent(RE::GFxEvent::EventType::kCharEvent, cp));
+						}
+					},
+					true);
+				if (menu.empty()) {
+					return a_reply("no menu with a cursor is open to type into", "");
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			}
+			a_reply("", json{ { "menu", menu } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+		}).detach();
+	}
+
 	// Walk the player straight at a reference with the game's auto-move (what the Auto-Move key
 	// sets), turning toward it, until within reach. Keys sent from outside the input loop only move
 	// the player on some frames. When the player stops getting closer (a rock, a wall), the player
@@ -842,6 +1008,12 @@ namespace play
 				a_reply(ref ? "" : "no reference " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 			} else if (name == "press") {
 				press(cmd, a_reply);
+			} else if (name == "click") {
+				click(cmd, a_reply);
+			} else if (name == "key") {
+				key(cmd, a_reply);
+			} else if (name == "type") {
+				type(cmd, a_reply);
 			} else if (name == "walk") {
 				walk(cmd, a_reply);
 			} else if (name == "activate") {
