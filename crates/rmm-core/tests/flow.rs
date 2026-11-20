@@ -280,6 +280,8 @@ fn updates_a_mod_in_place() {
     assert!(meta.source.unwrap().ends_with("Snow Plus-4567-2-0-1710000000"));
     assert_eq!(read(&inst.mod_dir(&snow).join("textures/snow.dds")), "v2");
     assert_eq!(inst.history().unwrap()[0], format!("update {snow}"));
+    let ids = |id: &str| inst.mod_meta(id).nexus.map(|n| (n.mod_id, n.file_id, n.version.unwrap_or_default()));
+    assert_eq!(ids(&snow), Some((4567, None, "2.0".to_string())), "the new archive's version, from its Nexus file name");
 
     // Undo swaps the old files back; redo brings the update again. A note written in between
     // stays, and the source goes back with the files.
@@ -297,6 +299,21 @@ fn updates_a_mod_in_place() {
     install::empty_trash(&inst).unwrap();
     inst.undo().unwrap();
     assert_eq!(read(&inst.mod_dir(&snow).join("textures/snow.dds")), "v2");
+    // MO2's .meta beside a download gives the file id too; a source that says nothing keeps them.
+    write(&src.join("Other 2/textures/o.dds"), "o2");
+    write(&src.join("Other 2.meta"), "[General]
+gameName=skyrimse
+modID=77
+fileID=5
+version=3.1
+");
+    install::update(&inst, "Other", &src.join("Other 2"), None).unwrap();
+    assert_eq!(ids("Other"), Some((77, Some(5), "3.1".to_string())));
+    install::update(&inst, "Other", &src.join("Other"), None).unwrap();
+    assert_eq!(ids("Other"), Some((77, Some(5), "3.1".to_string())), "kept: nothing says which file this is");
+    inst.undo().unwrap();
+    inst.undo().unwrap();
+    assert_eq!(ids("Other"), None, "undo brings the old ids back with the files");
     assert!(install::update(&inst, "sep:Nope", &v2, None).is_err());
     assert!(install::update(&inst, &snow, &src.join("Gone"), None).unwrap_err().to_string().contains("is gone"));
 }
@@ -3567,8 +3584,17 @@ fn nexus_updates_and_downloads() {
     meta.nexus = Some(rmm_core::instance::NexusRef { mod_id: 9, file_id: Some(1), version: Some("1.0".into()), category: None });
     inst.write_mod_meta("A", &meta).unwrap();
 
+    // A mod whose Nexus page is gone (no files.json here: a 404) is listed, and the check goes on.
+    write(&tmp.path().join("B/textures/b.dds"), "b");
+    install::install(&inst, &tmp.path().join("B"), None, true, None).unwrap();
+    let mut meta = inst.mod_meta("B");
+    meta.nexus = Some(rmm_core::instance::NexusRef { mod_id: 404, file_id: Some(1), version: Some("1.0".into()), category: None });
+    inst.write_mod_meta("B", &meta).unwrap();
+
     let c = client("test-key");
-    let ups = nexus::check_updates(&inst, &c, None).unwrap();
+    let check = nexus::check_updates(&inst, &c, None).unwrap();
+    assert_eq!(check.unavailable.iter().map(|u| (u.id.as_str(), u.mod_id)).collect::<Vec<_>>(), [("B", 404)]);
+    let ups = check.updates;
     assert_eq!(ups.iter().map(|u| (u.id.as_str(), u.file_id, u.latest.as_deref())).collect::<Vec<_>>(), [("A", 2, Some("2.0"))]);
     nexus::check_updates(&inst, &c, None).unwrap();
     assert_eq!(hits.lock().unwrap()[&format!("{d}/9/files.json")], 1, "the second check uses the cache");
@@ -3578,7 +3604,7 @@ fn nexus_updates_and_downloads() {
     assert_eq!((row().version.as_deref(), row().update.map(|u| u.file_id)), (Some("1.0"), Some(2)));
     let hold = |h| nexus::hold_updates(&inst, &["A".to_string()], h);
     hold(nexus::Hold::Skip).unwrap();
-    assert!(row().update.is_none() && nexus::check_updates(&inst, &c, None).unwrap().is_empty(), "the skipped file isn't offered");
+    assert!(row().update.is_none() && nexus::check_updates(&inst, &c, None).unwrap().updates.is_empty(), "the skipped file isn't offered");
     let mut later = nexus::saved_updates(&inst)["A"].clone();
     later.file_id = 3;
     assert!(nexus::offered(&later, &inst.mod_meta("A")), "a later file is");
@@ -3586,9 +3612,9 @@ fn nexus_updates_and_downloads() {
     hold(nexus::Hold::Release).unwrap();
     assert_eq!((inst.mod_meta("A").skip_file, row().update.map(|u| u.file_id)), (None, Some(2)), "release clears the skip too");
     hold(nexus::Hold::Pin).unwrap();
-    assert!(row().pinned && row().update.is_none() && nexus::check_updates(&inst, &c, None).unwrap().is_empty(), "a pinned mod isn't offered updates");
+    assert!(row().pinned && row().update.is_none() && nexus::check_updates(&inst, &c, None).unwrap().updates.is_empty(), "a pinned mod isn't offered updates");
     hold(nexus::Hold::Release).unwrap();
-    assert_eq!(nexus::check_updates(&inst, &c, None).unwrap().len(), 1);
+    assert_eq!(nexus::check_updates(&inst, &c, None).unwrap().updates.len(), 1);
     assert!(nexus::hold_updates(&inst, &["Nope".to_string()], nexus::Hold::Pin).is_err());
     let mut meta = inst.mod_meta("A");
     meta.nexus.as_mut().unwrap().file_id = Some(2);

@@ -949,7 +949,7 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| install::reinstall(&i, &a.id, a.choices.as_ref())))
     }
 
-    #[tool(description = "Update an installed mod in place from a newer archive or folder (a new download of the same mod): it keeps its id, name, place, enabled state, notes, categories, colour, rules and Nexus ids. A FOMOD installer takes the stored choices unless new ones are given (fomod_options on the new file). The old files go to trash, and undo swaps them back.")]
+    #[tool(description = "Update an installed mod in place from a newer archive or folder (a new download of the same mod): it keeps its id, name, place, enabled state, notes, categories, colour, rules; its Nexus ids become the new archive's when that says them (MO2's .meta beside it, a download rmm fetched or identified, or a Nexus file name), so update checks don't offer what's now installed. A FOMOD installer takes the stored choices unless new ones are given (fomod_options on the new file). The old files go to trash, and undo swaps them back.")]
     async fn update_mod(&self, Parameters(a): Parameters<UpdateArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| install::update(&i, &a.id, std::path::Path::new(&a.path), a.choices.as_ref())))
     }
@@ -1362,7 +1362,7 @@ impl Rmm {
         out(Ok(nexus::status()))
     }
 
-    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Leaves out updates the user holds back (hold_updates); list_mods shows the rest on each mod. Needs the user's API key.", annotations(read_only_hint = true))]
+    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Leaves out updates the user holds back (hold_updates); list_mods shows the rest on each mod. Answers {updates, unavailable}: unavailable lists the mods Nexus has no page for any more or won't show (removed, hidden, or a wrong id), which the check skipped; there's nothing to update for those, so keep their archives. Needs the user's API key.", annotations(read_only_hint = true))]
     async fn check_mod_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
     }

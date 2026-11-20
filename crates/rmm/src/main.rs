@@ -85,7 +85,8 @@ enum Cmd {
         run_script: bool,
     },
     /// Update a mod in place from a newer archive or folder: it keeps its id, place, notes,
-    /// categories, colour and rules. The old files go to trash/; undo swaps them back.
+    /// categories, colour and rules, and takes the archive's Nexus ids when it says them. The old
+    /// files go to trash/; undo swaps them back.
     Update {
         id: String,
         path: PathBuf,

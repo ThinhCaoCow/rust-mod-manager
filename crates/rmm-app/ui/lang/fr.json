@@ -1739,5 +1739,7 @@
  "#{0} INIs": "{0} INI",
  "#{0} matches": "{0} résultats",
  "1 match": "1 résultat",
- "Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:": "Claude Code : un testeur sur Haiku, le modèle Claude le moins cher, pour les tests en direct :"
+ "Claude Code: a tester on Haiku, the cheapest Claude model, for live tests:": "Claude Code : un testeur sur Haiku, le modèle Claude le moins cher, pour les tests en direct :",
+ "Nexus no longer has a page for {0}, or hides it (removed, hidden, or a wrong id), so it wasn’t checked: {1}.": "Nexus n’a plus de page pour {0}, ou la masque (supprimée, cachée ou un mauvais id), elle n’a donc pas été vérifiée : {1}.",
+ "Every mod with Nexus ids{0} is up to date{1}.{2}": "Tous les mods avec des ids Nexus{0} sont à jour{1}.{2}"
 }
