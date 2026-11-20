@@ -56,6 +56,9 @@ const savePrefs = () => { try { localStorage.setItem(PREFS, JSON.stringify(prefs
 prefs.cols ??= { conflicts: true, tags: false, notes: false, installed: false, files: true, priority: true };
 prefs.cols.category ??= true;
 prefs.widths ??= {};
+prefs.floating ??= {}; // tab -> { x, y, w, h }: tabs pulled out into windows inside rmm's window
+prefs.docked ??= {}; // tab -> 'left' | 'right' | 'bottom': those of them docked at an edge
+prefs.dockSize ??= { left: 360, right: 360, bottom: 260 };
 // This window's look and habits (Settings, "This window").
 const WIN = { theme: 'system', density: 'comfortable', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
 const W = prefs.win = { ...WIN, ...prefs.win };
@@ -71,6 +74,9 @@ function applyWin() {
   if (S) renderStart();
 }
 const SIMPLE_HIDES = ['data', 'tools', 'mcp'];
+const TAB_IDS = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings'];
+const tabLabel = t => $(`.tabs [data-tab="${t}"]`).firstChild.textContent.trim();
+let winTop = 30; // the front window's z-index; menus (40) and toasts (60) stay above
 const visibleTabs = () => $$('.tabs [data-tab]').filter(b => !b.hidden).map(b => b.dataset.tab);
 // `w`: the default width in pixels, as style.css sets it for `cls`.
 const COLS = {
@@ -84,8 +90,12 @@ const COLS = {
   priority: { title: '#', cls: 'num', w: 64, tip: 'Priority: higher wins file conflicts' },
 };
 const shownCols = () => Object.keys(COLS).filter(k => prefs.cols[k]);
-const splitOn = () => prefs.split !== false && innerWidth >= 1500;
-const pluginSide = () => tab === 'plugins' || (tab === 'mods' && splitOn() && side === 'plugins' && !!selPlugin);
+const splitOn = () => prefs.split !== false && innerWidth >= 1500 && !prefs.floating.plugins && !prefs.floating.mods;
+/** The tab shows: the main window's, or one pulled out into a window of its own. */
+const shown = t => tab === t || !!prefs.floating[t];
+/** The plugin list shows: its own tab, a window, or beside the mods. */
+const plugVis = () => shown('plugins') || (tab === 'mods' && splitOn());
+const pluginSide = () => (tab === 'plugins' && !shown('mods')) || (plugVis() && side === 'plugins' && !!selPlugin);
 const nameOf = id => names.get(id) ?? id;
 const isSep = id => !!byId.get(id)?.separator;
 
@@ -196,23 +206,26 @@ async function load() {
   for (const n of plugSel) if (!S.plugins.some(p => p.name === n)) plugSel.delete(n);
   lootRules = null;
   recordData = null;
-  if (tab === 'plugins' && selPlugin) loadLootRules();
-  if (tab === 'tools' || toolsData) loadTools();
+  if (shown('plugins') && selPlugin) loadLootRules();
+  if (shown('tools') || toolsData) loadTools();
   issuesStale = true;
   historyData = null;
-  if (tab === 'history') loadHistory();
+  if (shown('history')) loadHistory();
   dataLoaded = false;
-  if (tab === 'data') loadData(false);
-  if (tab === 'saves') loadSaves();
-  if (tab === 'downloads' || downloadsData) loadDownloads();
+  if (shown('data')) loadData(false);
+  if (shown('saves')) loadSaves();
+  if (shown('downloads') || downloadsData) loadDownloads();
   render();
   refreshPlan();
   renderStart();
   // The health check reads every plugin; re-run it once a burst of changes settles.
   clearTimeout(healthTimer);
-  healthTimer = setTimeout(runHealth, tab === 'problems' ? 0 : 800);
+  healthTimer = setTimeout(runHealth, shown('problems') ? 0 : 800);
   if (oneMod()) loadDetails();
+  // Windows that came back with the app have nothing in them until the first load.
+  if (!winsFilled) { winsFilled = true; Object.keys(prefs.floating).forEach(fillPane); }
 }
+let winsFilled = false;
 
 /** Per-load lookups: conflicts by mod, broken rules, mods whose plugins miss masters, and the
  *  separator groups (a separator owns the mods after it, up to the next separator). */
@@ -311,7 +324,12 @@ async function rmmUpdateOnStart() {
 
 // The last tab, filter and state chips come back with the window.
 const START = W.startTab === 'last' ? prefs.tab : W.startTab;
-tab = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings'].includes(START) ? START : 'mods';
+tab = TAB_IDS.includes(START) ? START : 'mods';
+for (const t of Object.keys(prefs.floating)) {
+  if (TAB_IDS.includes(t) && !(W.simple && SIMPLE_HIDES.includes(t))) makeWin(t);
+  else { delete prefs.floating[t]; delete prefs.docked[t]; }
+}
+if (prefs.floating[tab]) tab = TAB_IDS.find(t => !prefs.floating[t] && !(W.simple && SIMPLE_HIDES.includes(t))) ?? 'mods';
 $('#filter').value = prefs.filter ?? '';
 filters = new Set((prefs.chips ?? []).filter(f => f in { enabled: 1, disabled: 1, conflicted: 1, overridden: 1, rule: 1, masters: 1, plugins: 1, recent: 1, update: 1, endorsed: 1, tracked: 1, problems: 1 }));
 
@@ -734,7 +752,7 @@ function changeText(c, max = 6) {
 
 async function loadHistory() {
   try { historyData = await call('history_details'); } catch { historyData = null; }
-  if (tab === 'history') renderHistory();
+  if (shown('history')) renderHistory();
   loadTrash();
 }
 
@@ -852,7 +870,7 @@ function renderDetails() {
     box.hidden = !selPlugin;
     return selPlugin && renderPluginDetails(box);
   }
-  box.hidden = tab !== 'mods' || !selected.size;
+  box.hidden = !shown('mods') || !selected.size;
   if (box.hidden) return;
   const ids = selIds();
   if (ids.length > 1) return renderBulk(box, ids);
@@ -1570,21 +1588,27 @@ $('#install-missing').onclick = async () => {
 // ---- Tabs, filters, keys --------------------------------------------------------------------
 
 function showTab(t) {
+  if (prefs.floating[t] && $('#win-' + t)) return frontWin(t);
   tab = t;
   prefs.tab = t;
   savePrefs();
   const split = wasSplit = splitOn();
-  $$('.tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
-  for (const p of ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings']) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
+  $$('.tabs [data-tab]').forEach(b => { b.classList.toggle('on', b.dataset.tab === t); b.classList.toggle('floating', !!prefs.floating[b.dataset.tab]); });
+  for (const p of TAB_IDS) if (!prefs.floating[p]) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
   $('main').classList.toggle('split', split && t === 'mods');
   $('#split').hidden = innerWidth < 1500;
   $('#split').setAttribute('aria-pressed', split);
-  $('#filter').hidden = t !== 'mods' && t !== 'plugins';
-  if (lists[t]) paint(lists[t]);
+  $('#filter').hidden = !shown('mods') && !shown('plugins');
   if (split && t === 'mods') paint(lists.plugins);
+  renderDetails();
+  fillPane(t);
+}
+
+/** Draw a pane that just came into view, reading what it shows when it needs to. */
+function fillPane(t) {
+  if (lists[t]) paint(lists[t]);
   if (t === 'mods') renderTicks();
   if (t === 'history' && !historyData) loadHistory();
-  renderDetails();
   if (t === 'problems' && issuesStale) runHealth();
   if (t === 'tools' && !toolsData) loadTools();
   if (t === 'plugins' && selPlugin && !lootRules) loadLootRules();
@@ -1594,6 +1618,227 @@ function showTab(t) {
   if (t === 'mcp') { drawMcp(); drawMore(); }
   if (t === 'settings') drawMore();
 }
+
+// ---- Tabs as windows inside rmm's window: drag a tab off the tab bar (or right-click it) to pull
+// it out; the window moves by its title bar and resizes from its corner. Dropped on the left, right
+// or bottom edge it docks there (prefs.docked), its edge dragging to resize; Tab puts it back. ----
+
+const DOCK_MIN = { left: 220, right: 220, bottom: 120 };
+
+/** Keep a window's title bar on screen. */
+function fitWin(r) {
+  const top = $('nav.tabs').getBoundingClientRect().bottom;
+  r.w = Math.min(Math.max(r.w, 320), innerWidth);
+  r.h = Math.min(Math.max(r.h, 200), innerHeight - top);
+  r.x = Math.min(Math.max(r.x, 80 - r.w), innerWidth - 80);
+  r.y = Math.min(Math.max(r.y, top), innerHeight - 32);
+  return r;
+}
+
+function frontWin(t) {
+  const w = $('#win-' + t);
+  if (!w || prefs.docked[t]) return;
+  w.style.zIndex = ++winTop > 39 ? (winTop = 31) : winTop;
+  if (winTop === 31) $$('.float-win').forEach(o => { if (o !== w) o.style.zIndex = 30; });
+}
+
+/** Pull tab `t` out into a window, at `at` (a point) or where it was last; `side` docks it. */
+function floatTab(t, at, side) {
+  if ($('#win-' + t)) return side ? dockWin(t, side) : frontWin(t);
+  const docked = visibleTabs().filter(x => !prefs.floating[x]);
+  if (docked.length <= 1) return toast('One tab stays in the main window.');
+  const was = prefs.floating[t] ?? prefs.lastWin?.[t];
+  prefs.floating[t] = fitWin(at ? { x: at.x, y: at.y, w: was?.w ?? 760, h: was?.h ?? 480 } : { ...(was ?? { x: 160, y: 140, w: 760, h: 480 }) });
+  if (side) prefs.docked[t] = side;
+  savePrefs();
+  makeWin(t);
+  showTab(tab === t ? docked.find(x => x !== t) : tab);
+}
+
+/** Follow the pointer until the button comes up, wherever the element under it goes meanwhile. */
+function follow(e, move, up) {
+  e.preventDefault();
+  const end = u => { removeEventListener('pointermove', move); removeEventListener('pointerup', end); up(u); };
+  addEventListener('pointermove', move);
+  addEventListener('pointerup', end);
+}
+
+/** The dock area a point is over: near main's left or right edge, or its bottom. */
+function dockSide(x, y) {
+  const m = $('main').getBoundingClientRect(), E = 48;
+  if (y >= m.bottom - E) return 'bottom';
+  if (y > m.top) return x < m.left + E ? 'left' : x > m.right - E ? 'right' : null;
+  return null;
+}
+
+/** Show where a drop docks (side), or nothing (null). */
+function dockHint(side) {
+  let h = $('.dock-hint');
+  if (!side) return h?.remove();
+  h ??= document.body.appendChild(Object.assign(document.createElement('div'), { className: 'dock-hint' }));
+  const reg = $('#dock-' + side), m = $('main').getBoundingClientRect(), s = prefs.dockSize[side];
+  const r = !reg.hidden ? reg.getBoundingClientRect()
+    : side === 'left' ? { left: m.left, top: m.top, width: s, height: m.height }
+    : side === 'right' ? { left: m.right - s, top: m.top, width: s, height: m.height }
+    : { left: m.left, top: m.bottom - s, width: m.width, height: s };
+  Object.assign(h.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' });
+}
+
+function sizeDock(side) {
+  const reg = $('#dock-' + side);
+  const most = side === 'bottom' ? innerHeight - 260 : innerWidth / 2;
+  const s = prefs.dockSize[side] = Math.round(Math.max(DOCK_MIN[side], Math.min(prefs.dockSize[side], most)));
+  reg.style[side === 'bottom' ? 'height' : 'width'] = s + 'px';
+}
+
+/** Put window `t` where prefs say: in its dock area, or floating over the window. */
+function placeWin(t, win = $('#win-' + t)) {
+  const side = prefs.docked[t], r = prefs.floating[t];
+  win.classList.toggle('docked', !!side);
+  $('[data-float]', win).hidden = !side;
+  if (side) {
+    win.removeAttribute('style');
+    $('#dock-' + side).append(win);
+  } else {
+    Object.assign(win.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+    document.body.append(win);
+    frontWin(t);
+  }
+  $$('.dock').forEach(d => { d.hidden = !$('.float-win', d); });
+}
+
+function dockWin(t, side) {
+  prefs.docked[t] = side;
+  savePrefs();
+  placeWin(t);
+}
+
+function makeWin(t) {
+  const win = document.createElement('div');
+  win.className = 'float-win';
+  win.id = 'win-' + t;
+  win.innerHTML = `<div class="float-bar" title="Drag to move; drop on the left, right or bottom edge to dock"><span>${esc(tabLabel(t))}</span><div class="spacer"></div><button type="button" class="link" data-float title="Make it a window again">Window</button><button type="button" class="link" data-dock title="Put it back in the main window as a tab">Tab</button></div>`;
+  const pane = $('#pane-' + t);
+  pane.hidden = false;
+  win.append(pane);
+  win.addEventListener('pointerdown', () => frontWin(t), true);
+  $('[data-dock]', win).onclick = () => dockTab(t);
+  $('[data-float]', win).onclick = () => { delete prefs.docked[t]; savePrefs(); placeWin(t); };
+  const bar = $('.float-bar', win);
+  bar.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target.closest('button')) return;
+    const r = prefs.floating[t], x0 = e.clientX, y0 = e.clientY;
+    let dx = x0 - r.x, dy = y0 - r.y, moved = false;
+    follow(e, m => {
+      if (prefs.docked[t]) { // pulled out of its dock area: a window again, under the pointer
+        if (Math.hypot(m.clientX - x0, m.clientY - y0) < 8) return;
+        delete prefs.docked[t];
+        [dx, dy] = [60, 14];
+        placeWin(t);
+      }
+      moved = true;
+      Object.assign(r, fitWin({ ...r, x: m.clientX - dx, y: m.clientY - dy }));
+      win.style.left = r.x + 'px';
+      win.style.top = r.y + 'px';
+      dockHint(dockSide(m.clientX, m.clientY));
+    }, u => {
+      dockHint(null);
+      const side = moved && dockSide(u.clientX, u.clientY);
+      if (side) dockWin(t, side);
+      else savePrefs();
+    });
+  });
+  // Its corner resizes it (CSS resize): keep the size, and draw the rows that come into view.
+  let saveSoon;
+  new ResizeObserver(() => {
+    const r = prefs.floating[t];
+    if (!r || !win.isConnected) return;
+    if (!prefs.docked[t]) [r.w, r.h] = [win.offsetWidth, win.offsetHeight];
+    if (lists[t]) paint(lists[t]);
+    clearTimeout(saveSoon);
+    saveSoon = setTimeout(savePrefs, 300);
+  }).observe(win);
+  placeWin(t, win);
+  if (S) fillPane(t);
+}
+
+function dockTab(t) {
+  const win = $('#win-' + t);
+  if (!win) return;
+  (prefs.lastWin ??= {})[t] = prefs.floating[t];
+  delete prefs.floating[t];
+  delete prefs.docked[t];
+  savePrefs();
+  $('main').insertBefore($('#pane-' + t), $('#details'));
+  win.remove();
+  $$('.dock').forEach(d => { d.hidden = !$('.float-win', d); });
+  showTab(t);
+}
+
+// A dock area's inner edge drags to resize it.
+for (const side of ['left', 'right', 'bottom']) {
+  const reg = $('#dock-' + side);
+  sizeDock(side);
+  $('.dock-grip', reg).addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    const r = reg.getBoundingClientRect();
+    follow(e, m => {
+      prefs.dockSize[side] = side === 'left' ? m.clientX - r.left : side === 'right' ? r.right - m.clientX : r.bottom - m.clientY;
+      sizeDock(side);
+    }, savePrefs);
+  });
+}
+
+const DOCK_MENU = t => [['Dock on the left', () => floatTab(t, null, 'left')], ['Dock on the right', () => floatTab(t, null, 'right')], ['Dock at the bottom', () => floatTab(t, null, 'bottom')]];
+
+// Drag a tab off the tab bar to pull it out; a frame shows where its window will go, or the dock
+// area it lands in.
+$$('.tabs [data-tab]').forEach(b => {
+  b.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || prefs.floating[b.dataset.tab]) return;
+    const t = b.dataset.tab, x0 = e.clientX, y0 = e.clientY, bar = $('nav.tabs').getBoundingClientRect();
+    let ghost = null;
+    const size = prefs.lastWin?.[t] ?? { w: 760, h: 480 };
+    b.setPointerCapture(e.pointerId); // moves off the button still come here
+    b.onpointermove = m => {
+      if (!ghost && Math.hypot(m.clientX - x0, m.clientY - y0) < 12) return;
+      if (!ghost) {
+        ghost = document.body.appendChild(Object.assign(document.createElement('div'), { className: 'float-ghost' }));
+        ghost.style.width = size.w + 'px';
+        ghost.style.height = size.h + 'px';
+      }
+      const side = dockSide(m.clientX, m.clientY);
+      dockHint(side);
+      ghost.hidden = !!side || m.clientY < bar.bottom; // dropped back on the tab bar: nothing happens
+      ghost.style.left = m.clientX - 60 + 'px';
+      ghost.style.top = m.clientY - 14 + 'px';
+    };
+    b.onpointerup = u => {
+      b.onpointermove = b.onpointerup = null;
+      if (!ghost) return;
+      const side = dockSide(u.clientX, u.clientY), out = side || !ghost.hidden;
+      ghost.remove();
+      dockHint(null);
+      // The click that follows would switch to the tab.
+      b.addEventListener('click', c => c.stopImmediatePropagation(), { capture: true, once: true });
+      if (out) floatTab(t, { x: u.clientX - 60, y: u.clientY - 14 }, side);
+    };
+  });
+  b.addEventListener('contextmenu', e => {
+    const t = b.dataset.tab, out = !!prefs.floating[t];
+    const items = out ? [['Put back in the main window', () => dockTab(t)], prefs.docked[t] ? ['Make it a window', () => $(`#win-${t} [data-float]`).click()] : ['Bring to front', () => frontWin(t)]] : [['Open in a window', () => floatTab(t)]];
+    ctxMenu(e, [...items, ...DOCK_MENU(t).filter((_, i) => !out || ['left', 'right', 'bottom'][i] !== prefs.docked[t])]);
+  });
+});
+addEventListener('resize', () => {
+  ['left', 'right', 'bottom'].forEach(sizeDock);
+  for (const [t, r] of Object.entries(prefs.floating)) {
+    const w = $('#win-' + t);
+    if (!w || prefs.docked[t]) continue;
+    fitWin(r);
+    Object.assign(w.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+  }
+});
 $$('.tabs [data-tab]').forEach(b => { b.onclick = () => showTab(b.dataset.tab); });
 $('#recheck').onclick = runHealth;
 
@@ -1896,8 +2141,8 @@ document.addEventListener('keydown', e => {
   if (e.ctrlKey && low === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
   else if (e.ctrlKey && (low === 'y' || (low === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
   else if (!(e.target.closest('button') && (k === ' ' || k === 'Enter'))) {
-    if (tab === 'plugins' || (tab === 'mods' && splitOn() && side === 'plugins')) pluginKeys(e);
-    else if (tab === 'mods') modKeys(e);
+    if (plugVis() && (side === 'plugins' || !shown('mods'))) pluginKeys(e);
+    else if (shown('mods')) modKeys(e);
   }
 });
 
@@ -3313,7 +3558,7 @@ async function setMcp(on) {
   }
   prefs.mcp = !!mcpOn;
   savePrefs();
-  if (tab === 'mcp') drawMcp();
+  if (shown('mcp')) drawMcp();
 }
 
 /** A snippet to paste into an AI app's settings, with a Copy button. */
@@ -3938,7 +4183,7 @@ T.webview.getCurrentWebview().onDragDropEvent(async e => {
     $('#dropzone').hidden = !S || busy;
     // Over a mod row: install right after it (a separator: at the end of its group).
     const pos = e.payload.position, r = window.devicePixelRatio || 1;
-    const tr = pos && tab === 'mods' ? document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#mods tr[data-id]') : null;
+    const tr = pos && shown('mods') ? document.elementFromPoint(pos.x / r, pos.y / r)?.closest('#mods tr[data-id]') : null;
     const id = tr?.dataset.id ?? null;
     if (id !== (dropAt?.id ?? null)) {
       dropAt = id ? { id, priority: slotAfter(id) } : null;
