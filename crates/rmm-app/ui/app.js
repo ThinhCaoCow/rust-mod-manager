@@ -60,8 +60,9 @@ prefs.floating ??= {}; // tab -> { x, y, w, h }: tabs pulled out into windows in
 prefs.docked ??= {}; // tab -> 'left' | 'right' | 'bottom': those of them docked at an edge
 prefs.dockSize ??= { left: 360, right: 360, bottom: 260 };
 // This window's look and habits (Settings, "This window").
-const WIN = { theme: 'system', density: 'comfortable', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
+const WIN = { theme: 'system', density: 'compact', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
 const W = prefs.win = { ...WIN, ...prefs.win };
+if (!prefs.compactOnce) { prefs.compactOnce = true; W.density = 'compact'; } // compact became the default
 function applyWin() {
   if (W.theme === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = W.theme;
   document.body.classList.toggle('compact', W.density === 'compact');
@@ -74,6 +75,7 @@ function applyWin() {
   if (S) renderStart();
 }
 const SIMPLE_HIDES = ['data', 'tools', 'mcp'];
+const MAIN_ONLY = ['mods', 'plugins']; // side by side in the main window, never pulled out
 const TAB_IDS = ['mods', 'plugins', 'data', 'saves', 'downloads', 'problems', 'tools', 'history', 'mcp', 'settings'];
 const tabLabel = t => $(`.tabs [data-tab="${t}"]`).firstChild.textContent.trim();
 let winTop = 30; // the front window's z-index; menus (40) and toasts (60) stay above
@@ -90,7 +92,7 @@ const COLS = {
   priority: { title: '#', cls: 'num', w: 64, tip: 'Priority: higher wins file conflicts' },
 };
 const shownCols = () => Object.keys(COLS).filter(k => prefs.cols[k]);
-const splitOn = () => prefs.split !== false && innerWidth >= 1500 && !prefs.floating.plugins && !prefs.floating.mods;
+const splitOn = () => true; // the plugins always show beside the mods; they have no tab of their own
 /** The tab shows: the main window's, or one pulled out into a window of its own. */
 const shown = t => tab === t || !!prefs.floating[t];
 /** The plugin list shows: its own tab, a window, or beside the mods. */
@@ -324,9 +326,9 @@ async function rmmUpdateOnStart() {
 
 // The last tab, filter and state chips come back with the window.
 const START = W.startTab === 'last' ? prefs.tab : W.startTab;
-tab = TAB_IDS.includes(START) ? START : 'mods';
+tab = TAB_IDS.includes(START) && START !== 'plugins' ? START : 'mods';
 for (const t of Object.keys(prefs.floating)) {
-  if (TAB_IDS.includes(t) && !(W.simple && SIMPLE_HIDES.includes(t))) makeWin(t);
+  if (TAB_IDS.includes(t) && !MAIN_ONLY.includes(t) && !(W.simple && SIMPLE_HIDES.includes(t))) makeWin(t);
   else { delete prefs.floating[t]; delete prefs.docked[t]; }
 }
 if (prefs.floating[tab]) tab = TAB_IDS.find(t => !prefs.floating[t] && !(W.simple && SIMPLE_HIDES.includes(t))) ?? 'mods';
@@ -1588,6 +1590,7 @@ $('#install-missing').onclick = async () => {
 // ---- Tabs, filters, keys --------------------------------------------------------------------
 
 function showTab(t) {
+  if (t === 'plugins') t = 'mods'; // the plugins show beside the mods
   if (prefs.floating[t] && $('#win-' + t)) return frontWin(t);
   tab = t;
   prefs.tab = t;
@@ -1596,8 +1599,7 @@ function showTab(t) {
   $$('.tabs [data-tab]').forEach(b => { b.classList.toggle('on', b.dataset.tab === t); b.classList.toggle('floating', !!prefs.floating[b.dataset.tab]); });
   for (const p of TAB_IDS) if (!prefs.floating[p]) $('#pane-' + p).hidden = p !== t && !(split && t === 'mods' && p === 'plugins');
   $('main').classList.toggle('split', split && t === 'mods');
-  $('#split').hidden = innerWidth < 1500;
-  $('#split').setAttribute('aria-pressed', split);
+  $('#mp-grip').hidden = t !== 'mods';
   $('#filter').hidden = !shown('mods') && !shown('plugins');
   if (split && t === 'mods') paint(lists.plugins);
   renderDetails();
@@ -1644,6 +1646,7 @@ function frontWin(t) {
 
 /** Pull tab `t` out into a window, at `at` (a point) or where it was last; `side` docks it. */
 function floatTab(t, at, side) {
+  if (MAIN_ONLY.includes(t)) return toast('The mods and plugins stay in the main window.');
   if ($('#win-' + t)) return side ? dockWin(t, side) : frontWin(t);
   const docked = visibleTabs().filter(x => !prefs.floating[x]);
   if (docked.length <= 1) return toast('One tab stays in the main window.');
@@ -1707,6 +1710,20 @@ function placeWin(t, win = $('#win-' + t)) {
   $$('.dock').forEach(d => { d.hidden = !$('.float-win', d); });
 }
 
+/** Drag window t's edge or corner (`dir`: n, s, e, w or two of them). */
+function resizeWin(t, e, dir) {
+  if (e.button !== 0) return;
+  const r = prefs.floating[t], win = $('#win-' + t), at = { ...r }, x0 = e.clientX, y0 = e.clientY;
+  follow(e, m => {
+    const dx = m.clientX - x0, dy = m.clientY - y0;
+    if (dir.includes('e')) r.w = Math.max(320, at.w + dx);
+    if (dir.includes('s')) r.h = Math.max(200, at.h + dy);
+    if (dir.includes('w')) { r.w = Math.max(320, at.w - dx); r.x = at.x + at.w - r.w; }
+    if (dir.includes('n')) { r.h = Math.max(200, at.h - dy); r.y = Math.max($('nav.tabs').getBoundingClientRect().bottom, at.y + at.h - r.h); r.h = at.y + at.h - r.y; }
+    Object.assign(win.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px', height: r.h + 'px' });
+  }, savePrefs);
+}
+
 function dockWin(t, side) {
   prefs.docked[t] = side;
   savePrefs();
@@ -1721,6 +1738,8 @@ function makeWin(t) {
   const pane = $('#pane-' + t);
   pane.hidden = false;
   win.append(pane);
+  win.insertAdjacentHTML('beforeend', ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map(d => `<i class="rz rz-${d}" data-rz="${d}"></i>`).join(''));
+  $$('[data-rz]', win).forEach(h => h.addEventListener('pointerdown', e => resizeWin(t, e, h.dataset.rz)));
   win.addEventListener('pointerdown', () => frontWin(t), true);
   $('[data-dock]', win).onclick = () => dockTab(t);
   $('[data-float]', win).onclick = () => { delete prefs.docked[t]; savePrefs(); placeWin(t); };
@@ -1748,7 +1767,7 @@ function makeWin(t) {
       else savePrefs();
     });
   });
-  // Its corner resizes it (CSS resize): keep the size, and draw the rows that come into view.
+  // Its edges resize it: keep the size, and draw the rows that come into view.
   let saveSoon;
   new ResizeObserver(() => {
     const r = prefs.floating[t];
@@ -1775,6 +1794,21 @@ function dockTab(t) {
   showTab(t);
 }
 
+// The edge between the mods and the plugins drags to share the width between them.
+const sizePlugins = () => { if (prefs.plugW) $('#pane-plugins').style.flex = `0 1 ${prefs.plugW}px`; };
+sizePlugins();
+$('#mp-grip').addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  const mods = $('#pane-mods').getBoundingClientRect(), right = $('#pane-plugins').getBoundingClientRect().right;
+  follow(e, m => {
+    prefs.plugW = Math.round(Math.min(Math.max(right - m.clientX, 300), right - mods.left - 360));
+    sizePlugins();
+    paint(lists.mods);
+    paint(lists.plugins);
+  }, savePrefs);
+});
+$('#mp-grip').ondblclick = () => { delete prefs.plugW; $('#pane-plugins').style.flex = ''; savePrefs(); paint(lists.mods); paint(lists.plugins); };
+
 // A dock area's inner edge drags to resize it.
 for (const side of ['left', 'right', 'bottom']) {
   const reg = $('#dock-' + side);
@@ -1795,7 +1829,7 @@ const DOCK_MENU = t => [['Dock on the left', () => floatTab(t, null, 'left')], [
 // area it lands in.
 $$('.tabs [data-tab]').forEach(b => {
   b.addEventListener('pointerdown', e => {
-    if (e.button !== 0 || prefs.floating[b.dataset.tab]) return;
+    if (e.button !== 0 || prefs.floating[b.dataset.tab] || MAIN_ONLY.includes(b.dataset.tab)) return;
     const t = b.dataset.tab, x0 = e.clientX, y0 = e.clientY, bar = $('nav.tabs').getBoundingClientRect();
     let ghost = null;
     const size = prefs.lastWin?.[t] ?? { w: 760, h: 480 };
@@ -1826,6 +1860,7 @@ $$('.tabs [data-tab]').forEach(b => {
   });
   b.addEventListener('contextmenu', e => {
     const t = b.dataset.tab, out = !!prefs.floating[t];
+    if (MAIN_ONLY.includes(t)) return;
     const items = out ? [['Put back in the main window', () => dockTab(t)], prefs.docked[t] ? ['Make it a window', () => $(`#win-${t} [data-float]`).click()] : ['Bring to front', () => frontWin(t)]] : [['Open in a window', () => floatTab(t)]];
     ctxMenu(e, [...items, ...DOCK_MENU(t).filter((_, i) => !out || ['left', 'right', 'bottom'][i] !== prefs.docked[t])]);
   });
@@ -2073,7 +2108,6 @@ $('#fchips').onclick = e => {
   filterChanged();
 };
 $('#clear-filter').onclick = clearFilters;
-$('#split').onclick = () => { prefs.split = !splitOn(); savePrefs(); showTab('mods'); };
 
 // Columns: right-click the header to choose them; drag a header's right edge to resize it.
 $('#mods thead').addEventListener('contextmenu', async e => {
@@ -3313,7 +3347,7 @@ async function collectionInstalled(args, list) {
   });
 }
 
-const unsorted = '<p class="muted small">The plugins aren’t in LOOT’s order: new ones load last. Sort with LOOT… on the Plugins tab sorts them, showing what moves first.</p>';
+const unsorted = '<p class="muted small">The plugins aren’t in LOOT’s order: new ones load last. Sort with LOOT…, above the plugins, sorts them, showing what moves first.</p>';
 
 /** The profile already has an earlier revision: update it, keeping the user's own changes. */
 async function updateCollection(link, r, list) {
@@ -4392,7 +4426,7 @@ async function loadConf() {
   return conf;
 }
 const LANGS = [['en', 'English'], ['de', 'Deutsch'], ['es', 'Español'], ['fr', 'Français'], ['it', 'Italiano'], ['ja', '日本語'], ['ko', '한국어'], ['pl', 'Polski'], ['pt_BR', 'Português (Brasil)'], ['ru', 'Русский'], ['sv', 'Svenska'], ['uk', 'Українська'], ['zh_CN', '中文']];
-const TABS = [['mods', 'Mods'], ['plugins', 'Plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['mcp', 'MCP']];
+const TABS = [['mods', 'Mods and plugins'], ['data', 'Data'], ['saves', 'Saves'], ['downloads', 'Downloads'], ['problems', 'Problems'], ['tools', 'Tools'], ['history', 'History'], ['mcp', 'MCP']];
 const MCP_OPTIONS = 'Options', MCP_ROLES = 'Your instructions for each role';
 // [key, label, kind, options or [min, max, step], help]. Keys with "win." are this window's.
 const SETTINGS = [

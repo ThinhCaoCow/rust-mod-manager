@@ -44,7 +44,7 @@
 
   <nav class="tabs">
     <button data-tab="mods">Mods <span class="count" id="n-mods"></span></button>
-    <button data-tab="plugins">Plugins <span class="count" id="n-plugins"></span></button>
+    <button data-tab="plugins" hidden>Plugins <span class="count" id="n-plugins"></span></button>
     <button data-tab="data">Data</button>
     <button data-tab="saves">Saves <span class="count" id="n-saves"></span></button>
     <button data-tab="downloads">Downloads <span class="count" id="n-downloads"></span></button>
@@ -85,7 +85,6 @@
         <button id="enable-matching" hidden>Enable matching</button>
         <button id="disable-matching" hidden>Disable matching</button>
         <button id="updates" title="Check Nexus Mods for newer files">Check for updates</button>
-        <button id="split" title="Show the plugins beside the mods" hidden>Plugins beside</button>
         <button id="add-sep" class="adv" title="Add a separator above the selected rows">＋ Separator</button>
       </div>
       <div class="start" id="start-card" hidden></div>
@@ -100,6 +99,7 @@
       <div class="ticks" id="ticks" aria-hidden="true"></div>
       <div class="notice plain" id="overwrite-bar" hidden></div>
     </section>
+    <div id="mp-grip" title="Drag to share the width between the mods and the plugins; double-click for the default"></div>
     <section class="pane" id="pane-plugins" hidden>
       <div class="toolbar"><span class="muted small" id="plugins-note"></span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
       <div class="scroll">
