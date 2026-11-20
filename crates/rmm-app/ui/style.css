@@ -462,3 +462,9 @@ ul.moves details div { margin-left: 1em; }
 #mp-grip { flex: none; width: 7px; margin: 0 -3px; position: relative; z-index: 3; cursor: col-resize; touch-action: none; background: linear-gradient(var(--line), var(--line)) center / 1px 100% no-repeat; }
 #mp-grip:hover { background: rgb(43 179 143 / 0.35); }
 #mp-grip[hidden] { display: none; }
+.list td.content span { cursor: pointer; margin-right: 2px; }
+#fmode { margin-left: 4px; }
+#dlg .checks { max-height: 260px; overflow: auto; }
+table.form { width: 100%; border-collapse: collapse; }
+table.form td { padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.form.gs { table-layout: fixed; }

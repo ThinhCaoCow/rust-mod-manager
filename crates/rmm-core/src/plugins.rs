@@ -430,6 +430,51 @@ fn edid_and_name(mut d: &[u8]) -> (String, Option<String>) {
     (edid, name)
 }
 
+
+/// Does the plugin add cells or worldspaces of its own (not changes to its masters')?
+pub(crate) fn adds_cells(path: &std::path::Path, masters: usize) -> Result<bool> {
+    let bytes = std::fs::read(path)?;
+    let start = 24 + bytes.get(4..8).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()) as usize);
+    let mut found = false;
+    each_record(bytes.get(start..).unwrap_or_default(), &|k| k == b"CELL" || k == b"WRLD", &mut |_, id, _| {
+        found |= (id >> 24) as usize >= masters;
+    })?;
+    Ok(found)
+}
+
+/// Set or clear a plugin's light (ESL) flag. The plugin must come from a mod; its file is
+/// replaced, never written in place (deployed copies are hard links), and the mod's old files
+/// are kept for undo. Setting it is offered only for `light_candidates`, whose new records fit.
+pub fn set_light(inst: &Instance, plugin: &str, light: bool) -> Result<()> {
+    let profile = inst.profile()?;
+    let all = list(inst, &profile)?;
+    let p = all.iter().find(|p| p.name.eq_ignore_ascii_case(plugin)).with_context(|| format!("no plugin {plugin}"))?;
+    let id = p.mod_id.clone().with_context(|| format!("{plugin} isn't from a mod; rmm changes only mods' plugins"))?;
+    if p.light == light {
+        anyhow::bail!("{plugin} is {} light already", if light { "" } else { "not" });
+    }
+    if light && !p.name.to_lowercase().ends_with(".esl") && !crate::health::esl_candidates(inst, &all).iter().any(|c| c.eq_ignore_ascii_case(plugin)) {
+        anyhow::bail!("{plugin} can't be flagged light: its new records don't fit a light plugin's form ids, or it adds cells or worldspaces");
+    }
+    if !light && p.name.to_lowercase().ends_with(".esl") {
+        anyhow::bail!("an .esl file is light by its name");
+    }
+    let mut bytes = std::fs::read(&p.path)?;
+    if bytes.len() < 24 || &bytes[..4] != b"TES4" {
+        anyhow::bail!("{plugin} isn't a plugin rmm can read");
+    }
+    let flags = u32::from_le_bytes(bytes[8..12].try_into()?);
+    bytes[8..12].copy_from_slice(&(if light { flags | 0x200 } else { flags & !0x200 }).to_le_bytes());
+    let keep = inst.keep_files(&id)?;
+    let label = format!("{} {plugin}", if light { "flag light" } else { "unflag light" });
+    inst.edit_swapping(&label, &[(&id, &keep)], |_| {
+        let tmp = p.path.with_extension("rmm-tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &p.path)?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

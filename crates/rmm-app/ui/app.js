@@ -53,7 +53,7 @@ let dropAt = null;          // { id, priority } while a file is dragged over a m
 const PREFS = 'rmm.prefs';
 const prefs = (() => { try { return JSON.parse(localStorage.getItem(PREFS)) ?? {}; } catch { return {}; } })();
 const savePrefs = () => { try { localStorage.setItem(PREFS, JSON.stringify(prefs)); } catch {} };
-prefs.cols ??= { conflicts: true, tags: false, notes: false, installed: false, files: true, priority: true };
+prefs.cols ??= { conflicts: true, tags: true, notes: false, installed: false, files: true, priority: true };
 prefs.cols.category ??= true;
 prefs.widths ??= {};
 prefs.floating ??= {}; // tab -> { x, y, w, h }: tabs pulled out into windows inside rmm's window
@@ -63,6 +63,7 @@ prefs.dockSize ??= { left: 360, right: 360, bottom: 260 };
 const WIN = { theme: 'system', density: 'compact', zoom: 1, simple: false, gettingStarted: true, startTab: 'last', poll: 1.5, toast: 5, recentDays: 7, confirmDrop: false, deployPreview: true };
 const W = prefs.win = { ...WIN, ...prefs.win };
 if (!prefs.compactOnce) { prefs.compactOnce = true; W.density = 'compact'; } // compact became the default
+if (!prefs.contentOnce) { prefs.contentOnce = true; prefs.cols.tags = true; } // the Content column became a default
 function applyWin() {
   if (W.theme === 'system') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = W.theme;
   document.body.classList.toggle('compact', W.density === 'compact');
@@ -84,7 +85,7 @@ const visibleTabs = () => $$('.tabs [data-tab]').filter(b => !b.hidden).map(b =>
 const COLS = {
   conflicts: { title: 'Conflicts', cls: 'conf-col', w: 200 },
   category: { title: 'Category', cls: 'cat-col', w: 140, tip: 'Click a category to show only its mods' },
-  tags: { title: 'Tags', cls: 'tags-col', w: 160 },
+  tags: { title: 'Content', cls: 'tags-col', w: 160, tip: 'What the mod holds; click one to show only mods with it' },
   notes: { title: 'Notes', cls: 'notes-col', w: 200 },
   installed: { title: 'Installed', cls: 'date-col', w: 96 },
   version: { title: 'Version', cls: 'ver-col', w: 90, tip: 'The installed version, as Nexus names it' },
@@ -192,6 +193,7 @@ async function load() {
   if (run !== loadRun) return;
   S = s;
   stamp = st;
+  lightCands = null;
   names = new Map(S.mods.map(m => [m.id, m.name]));
   byId = new Map(S.mods.map(m => [m.id, m]));
   idByName = new Map();
@@ -521,12 +523,18 @@ function modView() {
   let head = null;
   for (const m of S.mods) {
     if (m.separator) head = m;
-    else if ((!f || matches(m, f)) && crit.every(c => c(m))) {
+    else if ((!f || matchText(m, f)) && (!crit.length || (prefs.anyChips ? crit.some(c => c(m)) : crit.every(c => c(m))))) {
       if (head) { out.push(head); head = null; }
       out.push(m);
     }
   }
   return out;
+}
+
+/** The filter text: alternatives split by " | ", each a run of words that must all match; a
+ *  word starting with "-" must not. */
+function matchText(m, f) {
+  return f.split(/\s+\|\s+/).some(alt => alt.split(/\s+/).filter(Boolean).every(w => w.length > 1 && w[0] === '-' ? !matches(m, w.slice(1)) : matches(m, w)));
 }
 
 /** Filter text: "#tag" matches tags and categories, anything else the name or the notes. */
@@ -585,7 +593,7 @@ function modRow(m, i) {
   const cell = {
     conflicts: () => `<td class="conf">${relTag}${conflictPills(D.C[m.id])}${masters}</td>`,
     category: () => `<td class="cats" title="${esc(m.categories?.join(', '))}">${(m.categories ?? []).map(c => `<span class="cat" data-cat="${esc(c)}">${esc(c)}</span>`).join('')}</td>`,
-    tags: () => `<td class="muted small" title="${esc(m.tags?.join(', '))}">${esc(m.tags?.join(', '))}</td>`,
+    tags: () => `<td class="content">${(m.tags ?? []).map(t => `<span data-tag="${esc(t)}" title="${esc(CONTENT[t]?.[1] ?? t)}">${CONTENT[t]?.[0] ?? '•'}</span>`).join('')}</td>`,
     notes: () => `<td class="muted" title="${esc(m.notes)}">${esc(m.notes)}</td>`,
     installed: () => `<td class="muted small">${m.installed ? new Date(m.installed * 1000).toLocaleDateString() : ''}</td>`,
     version: () => `<td class="muted small" title="${esc(m.version)}">${esc(m.version)}</td>`,
@@ -937,7 +945,7 @@ function renderDetails() {
     <p class="muted small">Rules are suggestions: dragging and enabling are never blocked. Problems lists broken ones, and Sort by rules fixes the order.</p>
     <h3>Files (${m.files.toLocaleString()})</h3>
     ${m.plugins.length ? `<p>Plugins: ${esc(m.plugins.join(', '))}</p>` : ''}
-    <div class="row"><button data-act="hide-files" title="Keep chosen files out of the game, through reinstalls and updates (MO2’s hide)">Hide files…</button><button data-act="move-files" title="Move chosen files into another mod">Move files…</button></div>
+    <div class="row"><button data-act="hide-files" title="Keep chosen files out of the game, through reinstalls and updates (MO2’s hide)">Hide files…</button><button data-act="move-files" title="Move chosen files into another mod">Move files…</button>${m.plugins.length ? '<button data-act="pack" class="adv" title="Pack its loose files into archives named after its plugin (MO2’s BSA packer)">Pack into archives…</button>' : ''}</div>
     <div class="files">${d ? d.files.map(esc).join('<br>') + (d.files_truncated ? '<br>…' : '') : '…'}</div>
     ${d?.meta?.hidden?.length ? `<h3>Hidden (${d.meta.hidden.length})</h3><p class="muted small">Kept out of the game, also after a reinstall or update.</p>
       <div class="files">${d.meta.hidden.map(h => `<div class="row"><span>${esc(h)}</span><div class="spacer"></div><button class="link small" data-unhide="${esc(h)}">Show</button></div>`).join('')}</div>` : ''}
@@ -1065,6 +1073,7 @@ function renderPluginDetails(box) {
     ${p.implicit ? '' : `<label class="row"><input type="checkbox" data-act="lock" ${D.locks.has(p.name.toLowerCase()) ? 'checked' : ''}> Lock at this position</label>`}
     ${p.mod_id ? `<p>From <button class="link" data-goto="${esc(p.mod_id)}">${esc(nameOf(p.mod_id))}</button></p>` : `<p class="muted">${p.implicit ? 'Base game' : 'In the Data folder, not from a mod'}</p>`}
     ${p.error ? `<p><span class="pill bad">Unreadable</span> ${esc(p.error)}</p>` : ''}
+    ${lightRow(p)}
     <h3>Masters (${p.masters.length})</h3>
     ${p.masters.length ? '<p class="muted small">The plugins this one is built on. They have to be on and load before it.</p>' : ''}
     ${p.masters.length ? `<ul>${p.masters.map(m => `<li>${!lower.has(m.toLowerCase()) ? '' : loadsLater(m) ? '<span class="pill bad">Loads after it</span>' : '<span class="pill bad">Missing</span>'}<button class="link" data-plugin="${esc(m)}">${esc(m)}</button></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
@@ -1474,7 +1483,8 @@ function renderProblems() {
   $('#issues').innerHTML = list.length
     ? list.map(i => {
       const k = keyOf(i), ign = ignored.has(k), to = i.kind && targetOf(i);
-      const acts = (i.kind === 'missing_masters' && !ign ? (i.message.startsWith('loads before') ? '<button class="link ign" data-sort>Sort with LOOT…</button>' : `<button class="link ign" data-off="${esc(i.subject)}">Turn it off</button>`) : '')
+      const acts = (i.kind === 'esl_candidates' && !ign ? '<button class="link ign" data-light>Flag them light…</button>' : '')
+        + (i.kind === 'missing_masters' && !ign ? (i.message.startsWith('loads before') ? '<button class="link ign" data-sort>Sort with LOOT…</button>' : `<button class="link ign" data-off="${esc(i.subject)}">Turn it off</button>`) : '')
         + (i.kind ? `<button class="link ign" data-ignore="${esc(k)}">${ign ? 'Stop ignoring' : 'Ignore'}</button>` : '')
         + (failures.includes(i) ? `<button class="link ign" data-dismiss="${failures.indexOf(i)}">Dismiss</button>` : '');
       return `<li class="${esc(i.severity)}${to ? ' link' : ''}${ign ? ' ignored' : ''}" data-key="${esc(k)}" ${to ? `data-mod="${esc(to.mod ?? '')}" data-plugin="${esc(to.plugin ?? '')}" title="Show it in the list"` : ''}>
@@ -2068,6 +2078,7 @@ $('#issues').onclick = e => {
   const link = e.target.closest('[data-link]')?.dataset.link;
   if (link) return void act('Opening the page', () => call('open_link', { url: link }), { reload: false });
   if (e.target.closest('[data-sort]')) return void lootSort();
+  if (e.target.closest('[data-light]')) return void flagLight();
   const off = e.target.closest('[data-off]')?.dataset.off;
   if (off) return void setPluginsEnabled([off], false);
   const ign = e.target.closest('[data-ignore]')?.dataset.ignore;
@@ -2108,6 +2119,9 @@ $('#fchips').onclick = e => {
   filterChanged();
 };
 $('#clear-filter').onclick = clearFilters;
+const drawFmode = () => { $('#fmode').textContent = prefs.anyChips ? 'Any of them' : 'All of them'; };
+drawFmode();
+$('#fmode').onclick = () => { prefs.anyChips = !prefs.anyChips; savePrefs(); drawFmode(); filterChanged(); };
 
 // Columns: right-click the header to choose them; drag a header's right edge to resize it.
 $('#mods thead').addEventListener('contextmenu', async e => {
@@ -2227,7 +2241,10 @@ $('#mods tbody').addEventListener('click', e => {
     setEnabled(selected.has(id) && selected.size > 1 ? selIds() : [id], e.target.checked);
   } else if (e.target.closest('.twisty')) toggleGroup(id);
   else if (e.target.closest('[data-update]')) updateFromNexus(id);
-  else if (e.target.closest('.cat') && !e.shiftKey && !e.ctrlKey) {
+  else if (e.target.closest('[data-tag]') && !e.shiftKey && !e.ctrlKey) {
+    $('#filter').value = `#${e.target.closest('[data-tag]').dataset.tag.split(' ')[0]}`;
+    filterChanged();
+  } else if (e.target.closest('.cat') && !e.shiftKey && !e.ctrlKey) {
     // A category label filters the list to its mods, like MO2's category filter.
     $('#filter').value = `#${e.target.closest('.cat').dataset.cat.toLowerCase()}`;
     filterChanged();
@@ -2383,6 +2400,9 @@ $('#details').addEventListener('click', async e => {
     setModRule(id, key, (S.rules.find(r => r.id === id)?.[key] ?? []).filter(a => a !== t.dataset.unrule));
   } else switch (t.dataset.act) {
     case 'records': return loadRecords(selPlugin);
+    case 'light-on': return flagLight([selPlugin]);
+    case 'light-off': return act('Removing the light flag', () => call('set_light', { plugin: selPlugin, light: false })).then(() => { lightCands = null; });
+    case 'pack': return packDialog(id);
     case 'loot-why': return loadWhy(selPlugin);
     case 'enable':
       if (busy) { busyNote(); return e.preventDefault(); }
@@ -2675,7 +2695,7 @@ $('#mods tbody').addEventListener('contextmenu', e => {
     items.push(['Rename…', () => renameMod(id)], ['Reinstall…', () => reinstall(id)]);
     if (m.update) items.push([`Update from Nexus (${m.update.latest ?? m.update.file_name})`, () => updateFromNexus(id), '', 'Download the newer file and update the mod in place']);
     items.push(['Update from a file…', () => updateFromFile(id), '', 'Install a newer archive of it in its place, keeping its order, rules and notes'], '-');
-    items.push(['File conflicts', () => fileConflicts(id)], ['Hide files…', () => hideFilesDialog(id), '', 'Keep chosen files out of the game (MO2’s hide)'], ['Notes…', () => notesDialog(id)], ['Open folder', () => call('open_mod_folder', { id }).catch(err => toast(String(err), 'error'))]);
+    items.push(['File conflicts', () => fileConflicts(id)], ['Hide files…', () => hideFilesDialog(id), '', 'Keep chosen files out of the game (MO2’s hide)'], ['Notes…', () => notesDialog(id)], ...(m.plugins.length && !W.simple ? [['Pack into archives…', () => packDialog(id), '', 'Pack its loose files into archives named after its plugin']] : []), ['Open folder', () => call('open_mod_folder', { id }).catch(err => toast(String(err), 'error'))]);
   }
   // Nexus: endorse and track the selected mods that have Nexus ids (public, on the account).
   const onNexus = mods.filter(i => byId.get(i)?.nexus_id);
@@ -4625,3 +4645,151 @@ function toast(msg, kind = 'info', action = null) {
 
 applyWin();
 start();
+
+
+// ---- Contents, light plugins, archives, LOOT groups, game settings ------------------------------
+
+const CONTENT = {
+  plugins: ['🧩', 'Plugins'], skse: ['⚙️', 'Script extender plugin (DLL)'], scripts: ['📜', 'Scripts'],
+  meshes: ['🧊', 'Meshes'], textures: ['🖼️', 'Textures'], animations: ['🏃', 'Animations'],
+  interface: ['🖥️', 'Interface (menus)'], sound: ['🔊', 'Sound or music'], archives: ['📦', 'Archives (BSA or BA2)'],
+  root: ['📁', 'Files for the game folder'], ini: ['📝', 'INI settings'], fomod: ['🧙', 'Installed with a FOMOD wizard'],
+  'tool output': ['🛠️', 'A tool’s output'],
+};
+
+let lightCands = null; // plugins that could be flagged light, read when a plugin panel needs them
+function lightRow(p) {
+  if (!p.mod_id || p.implicit || p.error) return '';
+  if (p.light) return p.name.toLowerCase().endsWith('.esl') ? '' : '<p class="small muted">Flagged light (ESL): it takes no full load-order slot. <button class="link" data-act="light-off">Remove the flag</button></p>';
+  if (!lightCands) {
+    lightCands = [];
+    call('light_candidates').then(c => { lightCands = c; if (pluginSide()) renderDetails(); }).catch(() => {});
+    return '';
+  }
+  return lightCands.includes(p.name) ? '<p class="small">It could be a light plugin (ESL), which takes no full load-order slot. <button data-act="light-on">Flag light…</button></p>' : '';
+}
+
+/** Flag plugins light: `names`, or the ones the user picks from every candidate. */
+async function flagLight(names) {
+  const all = names ?? await act('Reading the plugins', () => call('light_candidates'), { reload: false });
+  if (!Array.isArray(all) || !all.length) return toast('No plugin can be flagged light.');
+  const pick = all.length > 1 ? `<div class="checks">${all.map(n => `<label class="row"><input type="checkbox" value="${esc(n)}" checked> ${esc(n)}</label>`).join('')}</div>` : '';
+  const body = `<p>${all.length > 1 ? `These ${all.length} plugins` : esc(all[0])} could be light (ESL): ${all.length > 1 ? 'they then take' : 'it then takes'} no full load-order slot, of which the game has 254. Their new records fit a light plugin’s form ids, and they add no cells or worldspaces.</p>${pick}
+    <p class="small"><b>For a new game.</b> A save that already uses a plugin loses what it added (items, NPCs, quests) once it’s light. Undo takes the flag off again.</p>`;
+  if (await dialog({ title: 'Flag light', body, actions: [['cancel', 'Cancel'], ['ok', 'Flag light', 'primary']] }) !== 'ok') return;
+  const chosen = all.length > 1 ? $$('#dlg .checks input:checked').map(i => i.value) : all;
+  for (const n of chosen) if (!await act(`Flagging ${n} light`, () => call('set_light', { plugin: n, light: true }), { reload: false, problem: true })) break;
+  lightCands = null;
+  load();
+}
+
+/** Pack a mod's loose files into archives, after a preview of what goes in and what changes hands. */
+async function packDialog(id, plugin) {
+  const r = await act('Reading the mod', () => call('pack_mod', { id, plugin, dry_run: true }), { reload: false });
+  if (!r || r === true) return;
+  const files = r.archives.reduce((n, a) => n + a.files, 0), size = r.archives.reduce((n, a) => n + a.bytes, 0);
+  const plugins = byId.get(id)?.plugins ?? [];
+  const pick = plugins.length > 1 ? `<label class="row small">Named after <select id="pack-plugin">${plugins.map(p => `<option ${p === r.plugin ? 'selected' : ''}>${esc(p)}</option>`).join('')}</select></label>` : '';
+  const game = S.info.game === 'fallout4' ? 'Fallout 4' : 'Skyrim';
+  const body = `<p>Packs ${plural(files, 'file')} (${bytes(size)}) into ${r.archives.map(a => `<b>${esc(a.name)}</b>`).join(' and ')}, which ${esc(r.plugin)} loads. The game reads fewer loose files, and the mod’s folder stays tidy.</p>${pick}
+    ${r.kept.length ? `<details><summary class="small">${plural(r.kept.length, 'file')} stay loose</summary><div class="files">${r.kept.map(esc).join('<br>')}</div><p class="muted small">Plugins, script extender plugins and their settings, and files the game reads only loose.</p></details>` : ''}
+    ${r.loses.length ? `<p class="small"><span class="pill bad">${r.loses.length} change hands</span> These win against other mods now; packed, they lose to them, because every loose file beats every archive:</p><div class="files">${r.loses.slice(0, 30).map(esc).join('<br>')}${r.loses.length > 30 ? '<br>…' : ''}</div>` : ''}
+    <p class="muted small">${game === 'Skyrim' ? 'Skyrim’s archives are stored uncompressed. ' : 'Textures go in a texture archive, the rest compressed. '}Undo unpacks it again; Deploy puts it in the game.</p>`;
+  const done = dialog({ title: `Pack ${nameOf(id)}`, body, actions: [['cancel', 'Cancel'], ['ok', 'Pack', 'primary']] });
+  $('#pack-plugin')?.addEventListener('change', e => $('#dlg').close('p:' + e.target.value));
+  const v = await done;
+  if (v?.startsWith('p:')) return packDialog(id, v.slice(2));
+  if (v !== 'ok') return;
+  const out = await act(`Packing ${nameOf(id)}`, () => call('pack_mod', { id, plugin: r.plugin, dry_run: false }), { problem: true });
+  if (out && out !== true) toast(`Packed ${plural(files, 'file')} of ${nameOf(id)} into ${out.archives.map(a => a.name).join(' and ')}. Undo unpacks it.`);
+}
+
+/** LOOT's groups: which load after which, with the user's additions and groups of their own. */
+$('#loot-groups').onclick = async () => {
+  let groups = await act('Reading LOOT’s groups', () => call('loot_groups'), { reload: false });
+  if (!Array.isArray(groups)) return;
+  if (!groups.length) return toast('LOOT’s groups come with its masterlist; Sort with LOOT downloads it.');
+  const draw = () => {
+    const names = groups.map(g => g.name);
+    const rows = groups.map(g => {
+      const others = names.filter(n => n !== g.name && !g.after.includes(n) && !g.yours.includes(n));
+      return `<tr data-g="${esc(g.name)}"><td><b>${esc(g.name)}</b>${g.user_only ? ' <span class="pill plain">yours</span>' : ''}${g.description ? `<div class="muted small">${esc(g.description)}</div>` : ''}<div class="muted small" title="${esc(g.plugins.join(', '))}">${plural(g.plugins.length, 'plugin')}</div></td>
+        <td class="small">${g.after.map(a => `<span class="pill plain" title="LOOT’s masterlist">${esc(a)}</span>`).join(' ')} ${g.yours.map(a => `<span class="pill win">${esc(a)} <button type="button" class="link" data-unafter="${esc(a)}" title="Take your rule away">×</button></span>`).join(' ')}${!g.after.length && !g.yours.length ? '<span class="muted">first</span>' : ''}</td>
+        <td><select data-add aria-label="Load ${esc(g.name)} after another group"><option value="">Load after…</option>${others.map(n => `<option>${esc(n)}</option>`).join('')}</select>${g.user_only ? ' <button type="button" class="link danger" data-drop>Remove</button>' : ''}</td></tr>`;
+    }).join('');
+    $("#lg-body").innerHTML = `<table class="form">${rows}</table>`;
+  };
+  const body = `<p class="small">Each group loads after the groups listed: grey ones are LOOT’s, green ones yours. A plugin’s panel puts it in a group (its LOOT rule).</p><div id="lg-body"></div>
+    <div class="row"><input id="lg-name" placeholder="New group’s name" spellcheck="false"><select id="lg-after"><option value="">after…</option>${groups.map(g => `<option>${esc(g.name)}</option>`).join('')}</select><button type="button" id="lg-new">Make it</button></div>`;
+  const done = dialog({ title: 'LOOT groups', body, actions: [['cancel', 'Close']] });
+  $('#dlg').classList.add('wide');
+  draw();
+  const set = async (name, after, remove = false) => {
+    const r = await act(remove ? `Removing ${name}` : `Saving ${name}`, async () => {
+      await call('set_loot_group', { name, after, remove });
+      return call('loot_groups');
+    }, { reload: false });
+    if (!Array.isArray(r)) return false;
+    groups = r;
+    lootRules = null;
+    draw();
+    $('#lg-after').innerHTML = `<option value="">after…</option>${groups.map(g => `<option>${esc(g.name)}</option>`).join('')}`;
+    return true;
+  };
+  $('#dlg').onchange = e => {
+    const g = groups.find(x => x.name === e.target.closest('tr[data-g]')?.dataset.g);
+    if (g && e.target.matches('[data-add]') && e.target.value) set(g.name, [...g.yours, e.target.value]);
+  };
+  $('#dlg').onclick = e => {
+    if (e.target.id === 'lg-new') {
+      const name = $('#lg-name').value.trim(), after = $('#lg-after').value;
+      if (!name) return toast('Give the group a name.');
+      return set(name, after ? [after] : []).then(ok => { if (ok) $('#lg-name').value = ''; });
+    }
+    const g = groups.find(x => x.name === e.target.closest('tr[data-g]')?.dataset.g);
+    if (!g) return;
+    if (e.target.dataset.unafter) set(g.name, g.yours.filter(a => a !== e.target.dataset.unafter), !g.user_only && g.yours.length === 1);
+    if (e.target.matches('[data-drop]')) set(g.name, [], true);
+  };
+  await done;
+  $('#dlg').onclick = $('#dlg').onchange = null;
+};
+
+/** The game's everyday INI settings as a form. */
+$('#game-settings').onclick = async () => {
+  const list = await act('Reading the game’s INI files', () => call('ini_form'), { reload: false });
+  if (!Array.isArray(list)) return;
+  const groups = [...new Set(list.map(s => s.group))];
+  const control = (s, i) => {
+    const v = s.value ?? s.default, id = `gs-${i}`;
+    if (s.kind === 'bool') return `<input type="checkbox" id="${id}" ${v.trim() === '1' ? 'checked' : ''}>`;
+    if (s.kind === 'choice') return `<select id="${id}">${s.options.map(o => `<option ${o === v.trim() ? 'selected' : ''}>${o}</option>`).join('')}</select>`;
+    if (s.kind === 'int') return `<input type="number" id="${id}" min="${s.min}" max="${s.max}" value="${esc(v)}" style="width:7em">`;
+    return `<input type="range" id="${id}" min="${s.min}" max="${s.max}" step="${s.step}" value="${esc(v)}"> <output class="small">${(+v).toFixed(String(s.step).split('.')[1]?.length ?? 0)}</output>`;
+  };
+  const body = groups.map(g => `<h3>${esc(g)}</h3><table class="form gs"><colgroup><col><col style="width:260px"><col style="width:150px"></colgroup>${list.map((s, i) => s.group !== g ? '' : `<tr><td><label for="gs-${i}">${esc(s.label)}</label>${s.help ? `<div class="muted small">${esc(s.help)}</div>` : ''}</td><td style="white-space:nowrap">${control(s, i)}</td><td class="muted small" title="[${esc(s.section)}] ${esc(s.key)}">${s.file ? esc(s.file) : 'game default'}</td></tr>`).join('')}</table>`).join('')
+    + '<p class="muted small">Saved into the INI that holds each setting now, else the Prefs INI. They take effect when the game starts; the toast after saving can put them back.</p>';
+  const done = dialog({ title: 'Game settings', body, actions: [['cancel', 'Cancel'], ['ok', 'Save', 'primary']] });
+  $('#dlg').classList.add('wide');
+  const now = (s, i) => {
+    const el = $(`#gs-${i}`);
+    return s.kind === 'bool' ? (el.checked ? '1' : '0') : el.value;
+  };
+  const start = list.map(now); // as the controls show them: a slider snaps to its step, which isn't a change
+  $('#dlg').oninput = e => { if (e.target.type === 'range') e.target.nextElementSibling.value = (+e.target.value).toFixed(String(e.target.step).split('.')[1]?.length ?? 0); };
+  const v = await done;
+  $('#dlg').oninput = null;
+  if (v !== 'ok') return;
+  const changed = list.map((s, i) => [s, now(s, i), start[i]]).filter(([, x, was]) => x !== was);
+  if (!changed.length) return;
+  const edits = [];
+  for (const [s, value] of changed) {
+    const e = await act(`Saving ${s.label}`, () => call('ini_form_set', { section: s.section, key: s.key, value }), { reload: false, problem: true });
+    if (!e || e === true) break;
+    edits.push(e.n);
+  }
+  if (edits.length) toast(`Saved ${plural(edits.length, 'setting')}; the game reads them when it starts.`, 'info', ['Put back', async () => {
+    for (const n of edits.reverse()) await call('revert_edit', { n }).catch(err => toast(String(err), 'error'));
+    toast('Put back.');
+  }]);
+};

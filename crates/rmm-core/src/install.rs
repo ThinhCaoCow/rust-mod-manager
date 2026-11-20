@@ -314,7 +314,7 @@ fn pick(pool: &[String], paths: &[String]) -> Result<Vec<String>> {
 }
 
 /// Remove the folders a moved file leaves empty, up to (not including) `root`.
-fn prune_empty(root: &Path, file: &Path) {
+pub(crate) fn prune_empty(root: &Path, file: &Path) {
     let mut d = file.parent();
     while let Some(dir) = d.filter(|d| *d != root && d.starts_with(root)) {
         if fs::remove_dir(dir).is_err() {

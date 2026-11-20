@@ -37,6 +37,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("plugin_limit", "Too many full plugins"),
     ("light_plugin_limit", "Too many light plugins"),
     ("esl_candidates", "Plugins that could be ESL-flagged"),
+    ("old_form_version", "Plugins saved for Skyrim LE (form 43)"),
     ("fully_overridden", "A mod whose every file is overridden"),
     ("archive_not_loaded", "An archive no plugin loads"),
     ("archive_unreadable", "An archive can't be read"),
@@ -146,8 +147,16 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
             if full > MAX_FULL_PLUGINS { "warning" } else { "info" },
             "esl_candidates",
             "load order",
-            format!("{} full plugins could be flagged light (ESL), which frees full slots: {shown}{more}. Flagging changes the plugin; ESLifier or xEdit does it", candidates.len()),
+            format!("{} full plugins could be flagged light (ESL), which frees full slots: {shown}{more}. Flag them light from here or a plugin's panel; for a new game, since a save that already uses one loses what it added", candidates.len()),
         );
+    }
+    // Skyrim LE plugins (form version 43) load in SE, but their records can crash it or lose data.
+    if inst.config.game.base() == crate::Game::SkyrimSe {
+        for p in plugins.iter().filter(|p| p.enabled && !p.implicit && p.mod_id.is_some()) {
+            if form_version(&p.path).is_some_and(|v| v < 44) {
+                add("warning", "old_form_version", &p.name, format!("{} was saved for Skyrim LE (form version 43), which can crash Skyrim SE or lose data. Get the mod's SE version, or open the plugin in the SE Creation Kit and save it again", p.name));
+            }
+        }
     }
 
     let map = crate::conflicts::file_map(inst, &profile)?;
@@ -279,9 +288,23 @@ pub fn check(inst: &Instance) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
+/// The form version in a plugin's header: 43 for Skyrim LE, 44 for SE.
+fn form_version(path: &std::path::Path) -> Option<u16> {
+    use std::io::Read;
+    let mut h = [0u8; 24];
+    std::fs::File::open(path).ok()?.read_exact(&mut h).ok()?;
+    (&h[..4] == b"TES4").then(|| u16::from_le_bytes([h[20], h[21]]))
+}
+
+/// `esl_candidates` for the active profile: the plugins Flag light offers.
+pub fn light_candidates(inst: &Instance) -> Result<Vec<String>> {
+    Ok(esl_candidates(inst, &crate::plugins::list(inst, &inst.profile()?)?))
+}
+
 /// Enabled full plugins (.esp, not master-flagged) whose new records fit a light plugin's
-/// FormID range, so they could take an ESL flag. Results are cached by file size and mtime.
-fn esl_candidates(inst: &Instance, plugins: &[PluginInfo]) -> Vec<String> {
+/// FormID range and that add no cells or worldspaces (which misbehave in light plugins), so
+/// they could take an ESL flag. Results are cached by file size and mtime.
+pub(crate) fn esl_candidates(inst: &Instance, plugins: &[PluginInfo]) -> Vec<String> {
     use esplugin::{ParseOptions, Plugin, plugins_metadata};
     type Seen = HashMap<PathBuf, (u64, SystemTime, bool)>; // size, mtime, candidate
     static CACHE: Mutex<Option<Seen>> = Mutex::new(None);
@@ -318,6 +341,7 @@ fn esl_candidates(inst: &Instance, plugins: &[PluginInfo]) -> Vec<String> {
                     whole.parse_file(ParseOptions::whole_plugin()).is_ok()
                         && whole.resolve_record_ids(meta).is_ok()
                         && whole.is_valid_as_light_plugin().unwrap_or(false)
+                        && !crate::plugins::adds_cells(&p.path, p.masters.len()).unwrap_or(true)
                 };
                 cache.insert(p.path.clone(), (len, mtime, ok));
                 ok

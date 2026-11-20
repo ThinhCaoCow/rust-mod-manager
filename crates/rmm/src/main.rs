@@ -365,6 +365,42 @@ enum Cmd {
         #[arg(long)]
         group: Option<String>,
     },
+    /// LOOT's groups and what each loads after; with a group, set the groups it loads after
+    /// (--after, repeatable; added to the masterlist's), making it if it's new. --remove takes
+    /// it out of the userlist.
+    Group {
+        name: Option<String>,
+        #[arg(long)]
+        after: Vec<String>,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Pack a mod's loose files into archives named after its plugin (Skyrim SE .bsa, Fallout 4
+    /// .ba2); --apply to do it (one undo step). Script extender plugins and other files the game
+    /// reads only loose stay loose.
+    Pack {
+        #[arg(value_name = "MOD")]
+        id: String,
+        /// The plugin to name the archives after; the mod's first by default.
+        #[arg(long)]
+        plugin: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Plugins that could be flagged light (ESL); with a plugin, flag it (--off clears the flag).
+    /// For a new game: a save that already uses the plugin loses what it added. Undoable.
+    Light {
+        plugin: Option<String>,
+        #[arg(long)]
+        off: bool,
+    },
+    /// The game's common settings as the game reads them; with a section, key and value, set one.
+    /// Kept in Edits, so `rmm edits --revert <n>` puts it back.
+    GameSettings {
+        section: Option<String>,
+        key: Option<String>,
+        value: Option<String>,
+    },
     /// Health check. Exits with 1 when it finds errors, so a script can stop before playing.
     Check,
     /// Deploy, check the script extender matches the game, and start it (through Proton on Linux); --apply to do it.
@@ -1111,6 +1147,14 @@ fn run() -> Result<()> {
         Cmd::Why { plugin } => print(&loot::why(&open()?, &plugin)?),
         Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
         Cmd::Rule { plugin: None, .. } => print(&loot::rules(&open()?)?),
+        Cmd::Group { name: None, .. } => print(&loot::group_list(&open()?)?),
+        Cmd::Group { name: Some(name), after, remove } => print(&loot::set_group(&open()?, &name, &after, remove)?),
+        Cmd::Pack { id, plugin, apply } => print(&rmm_core::pack::pack(&open()?, &id, plugin.as_deref(), !apply)?),
+        Cmd::Light { plugin: None, .. } => print(&rmm_core::health::light_candidates(&open()?)?),
+        Cmd::Light { plugin: Some(p), off } => print(&rmm_core::plugins::set_light(&open()?, &p, !off)?),
+        Cmd::GameSettings { section: Some(s), key: Some(k), value: Some(v) } => print(&rmm_core::ini_form::set(&open()?, &s, &k, &v, "you")?),
+        Cmd::GameSettings { section: None, .. } => print(&rmm_core::ini_form::read(&open()?)?),
+        Cmd::GameSettings { .. } => anyhow::bail!("give a section, a key and a value, like: rmm settings Papyrus bEnableLogging 1"),
         Cmd::Rule { plugin: Some(plugin), after, group } => print(&serde_json::json!({ "previous": loot::set_rule(&open()?, &loot::Rule { plugin, after, group })? })),
         Cmd::Check => {
             let issues = health::check(&open()?)?;

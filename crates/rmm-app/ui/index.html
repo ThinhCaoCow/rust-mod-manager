@@ -54,7 +54,7 @@
     <button data-tab="mcp" title="Let AI apps such as Claude use rmm's tools">MCP</button>
     <button data-tab="settings" title="How rmm deploys, sorts, tests and checks, and this window's look">Settings</button>
     <div class="spacer"></div>
-    <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match tags and categories" spellcheck="false">
+    <input id="filter" type="search" placeholder="Filter (#tag)" title="Matches names and notes; #skse, #textures… match contents and categories. Several words must all match; -word leaves out what matches; a | b matches either" spellcheck="false">
     <button id="install" title="Installs after the selected mod, or at the end of the selected separator’s group. You can also drop archives on a row.">＋ Install mod…</button>
     <button id="nxm" title="Download and install a file from Nexus Mods (an nxm:// link, a mod page or a mod id), or a collection">From Nexus…</button>
     <button id="link" title="Download and install a mod from GitHub, ModDB or another site. For sites you sign in to (LoversLab, AFK Mods, Patreon) you download in your browser and rmm takes the file from your Downloads folder">From a link…</button>
@@ -78,6 +78,7 @@
           <button data-f="endorsed" class="adv" title="Mods your Nexus account has endorsed">Endorsed</button>
           <button data-f="tracked" class="adv" title="Mods your Nexus account tracks">Tracked</button>
           <button data-f="problems" title="Mods the health check or the list flags">Problems</button>
+          <button id="fmode" class="link small adv" title="Show mods that match every chosen filter, or any of them">All of them</button>
         </div>
         <span id="match" class="match" hidden></span>
         <button id="clear-filter" class="link" hidden>Clear</button>
@@ -101,7 +102,7 @@
     </section>
     <div id="mp-grip" title="Drag to share the width between the mods and the plugins; double-click for the default"></div>
     <section class="pane" id="pane-plugins" hidden>
-      <div class="toolbar"><span class="muted small" id="plugins-note"></span><div class="spacer"></div><button id="loot">Sort with LOOT…</button></div>
+      <div class="toolbar"><span class="muted small" id="plugins-note"></span><div class="spacer"></div><button id="loot-groups" class="adv" title="LOOT’s groups and which load after which; make your own">LOOT groups…</button><button id="loot">Sort with LOOT…</button></div>
       <div class="scroll">
         <table class="list" id="plugins">
           <thead><tr><th class="grip-col"></th><th class="check-col"></th><th>Plugin</th><th class="type-col">Type</th><th class="from-col">From</th><th class="issue-col">Issues</th><th class="num idx-col" title="Load-order index: the first part of the form ids the plugin's records get in game (FE and three digits for light plugins), as xEdit and the console show them">Index</th><th class="num">#</th></tr></thead>
@@ -176,6 +177,8 @@
     </section>
     <section class="pane" id="pane-settings" hidden>
       <div class="scroll"><div class="settings">
+        <h2>The game</h2>
+        <div class="row"><span class="muted small">Resolution, VSync, subtitles, autosaves, the Papyrus log and other everyday settings in the game’s INI files.</span><div class="spacer"></div><button id="game-settings">Game settings…</button></div>
         <div id="set-more"></div>
         <p class="set-reset"><button data-act="reset" id="set-reset">Reset all settings…</button> <span class="muted small">rmm’s settings are in settings.json in your user folder, also changed with <code>rmm settings</code>.</span></p>
         <h2>rmm</h2>

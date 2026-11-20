@@ -294,6 +294,39 @@ struct HideArgs {
     show: Option<bool>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct GroupArgs {
+    /// The group's name.
+    name: String,
+    /// Groups it loads after, on top of the masterlist's.
+    #[serde(default)]
+    after: Vec<String>,
+    /// Take the user's version out of the userlist instead.
+    #[serde(default)]
+    remove: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+struct PackArgs {
+    /// The mod's id.
+    id: String,
+    /// The plugin to name the archives after; the mod's first by default.
+    plugin: Option<String>,
+    /// Default true: only report.
+    dry_run: Option<bool>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct LightArgs {
+    plugin: String,
+    /// True flags it light, false clears the flag.
+    light: bool,
+}
+#[derive(Deserialize, JsonSchema)]
+struct SettingArgs {
+    /// INI section, as game_settings gives it.
+    section: String,
+    key: String,
+    value: String,
+}
+#[derive(Deserialize, JsonSchema)]
 struct MoveFilesArgs {
     /// The mod the files are in, or "<overwrite>".
     from: String,
@@ -960,6 +993,41 @@ impl Rmm {
     #[tool(description = "Replace one plugin's LOOT user rule: the plugins it loads after and its group (from the masterlist). An empty rule removes it. Saved to loot/userlist.yaml in LOOT's format and used by the next sort_plugins. Not in undo history: returns the previous rule, so set that to revert.")]
     async fn set_loot_rule(&self, Parameters(a): Parameters<loot::Rule>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| Ok(serde_json::json!({ "previous": loot::set_rule(&i, &a)? }))))
+    }
+
+    #[tool(description = "LOOT's groups: each one's description, the groups it loads after (the masterlist's, and the user's additions as yours), whether only the userlist has it, and the profile's plugins in it.", annotations(read_only_hint = true))]
+    async fn loot_groups(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::group_list(&i)))
+    }
+
+    #[tool(description = "Set the groups a LOOT group loads after, on top of the masterlist's, making the group if it's new (then set_loot_rule can put plugins in it); remove takes the user's version out of the userlist. Refuses a circle of groups. Saved to loot/userlist.yaml; the next sort_plugins uses it. Not in undo history.")]
+    async fn set_loot_group(&self, Parameters(a): Parameters<GroupArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| loot::set_group(&i, &a.name, &a.after, a.remove)))
+    }
+
+    #[tool(description = "Pack a mod's loose files into archives named after one of its plugins (Skyrim SE: <plugin>.bsa and <plugin> - Textures.bsa; Fallout 4: <plugin> - Main.ba2 and <plugin> - Textures.ba2), as MO2's packer does. Script extender plugins and other files the game only reads loose stay loose. Packed files lose to every loose file, so `loses` lists those another mod has loose that this mod wins now. dry_run defaults to true. One undo step; takes effect at the next deploy.")]
+    async fn pack_mod(&self, Parameters(a): Parameters<PackArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::pack::pack(&i, &a.id, a.plugin.as_deref(), a.dry_run.unwrap_or(true))))
+    }
+
+    #[tool(description = "Plugins that could be flagged light (ESL): their new records fit a light plugin's form ids and they add no cells or worldspaces. Flagging frees full load-order slots.", annotations(read_only_hint = true))]
+    async fn light_candidates(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::health::light_candidates(&i)))
+    }
+
+    #[tool(description = "Flag a mod's plugin light (ESL), or clear the flag (light false). Only light_candidates can be flagged. Ask the user first: a save that already uses the plugin loses what it added, so it's for a new game. One undo step; takes effect at the next deploy.")]
+    async fn set_light_flag(&self, Parameters(a): Parameters<LightArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::plugins::set_light(&i, &a.plugin, a.light)))
+    }
+
+    #[tool(description = "The game's common settings (display, interface, controls, saves, mod-related and Papyrus logging) as the game reads them from its INIs, with kinds, ranges and defaults.", annotations(read_only_hint = true))]
+    async fn game_settings(&self) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::ini_form::read(&i)))
+    }
+
+    #[tool(description = "Set one of game_settings' settings, in the INI that holds it now (else the Prefs INI). Kept in Edits, so it can be put back. Takes effect when the game next starts.")]
+    async fn set_game_setting(&self, Parameters(a): Parameters<SettingArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| rmm_core::ini_form::set(&i, &a.section, &a.key, &a.value, "AI")))
     }
 
     #[tool(description = "Download the latest LOOT masterlist and prelude now. Returns warnings, if any.")]

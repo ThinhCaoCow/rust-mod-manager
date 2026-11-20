@@ -714,6 +714,105 @@ pub fn set_rule(inst: &Instance, rule: &Rule) -> Result<Option<Rule>> {
     Ok(old.as_ref().map(rule_of))
 }
 
+/// A LOOT group: the groups it loads after (LOOT's masterlist, and the user's additions), and
+/// the profile's plugins in it.
+#[derive(Debug, Serialize)]
+pub struct GroupInfo {
+    pub name: String,
+    pub description: Option<String>,
+    /// From LOOT's masterlist; the userlist can add to these but not take them away.
+    pub after: Vec<String>,
+    /// Added in the userlist.
+    pub yours: Vec<String>,
+    /// Made in the userlist; the masterlist doesn't have it.
+    pub user_only: bool,
+    /// The profile's plugins in it (LOOT's masterlist or the user's rule).
+    pub plugins: Vec<String>,
+}
+
+/// LOOT's groups with how they relate. Empty until a masterlist is cached.
+pub fn group_list(inst: &Instance) -> Result<Vec<GroupInfo>> {
+    if !dir(inst).join("masterlist.yaml").is_file() {
+        return Ok(vec![]);
+    }
+    let profile = inst.profile()?;
+    let (game, _) = handle(inst, &profile)?;
+    let db = game.database();
+    let db = db.read().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
+    let master = db.groups(MergeMode::WithoutUserMetadata);
+    let mut out: Vec<GroupInfo> = db
+        .groups(MergeMode::WithUserMetadata)
+        .iter()
+        .map(|g| {
+            let m = master.iter().find(|x| x.name() == g.name());
+            let yours = db.user_groups().iter().find(|x| x.name() == g.name()).map(|u| u.after_groups().to_vec()).unwrap_or_default();
+            GroupInfo {
+                name: g.name().to_owned(),
+                description: g.description().map(str::to_owned),
+                after: m.map(|m| m.after_groups().to_vec()).unwrap_or_default(),
+                yours: yours.into_iter().filter(|y| !m.is_some_and(|m| m.after_groups().contains(y))).collect(),
+                user_only: m.is_none(),
+                plugins: vec![],
+            }
+        })
+        .collect();
+    for p in plugins::list(inst, &profile)? {
+        let g = db.plugin_metadata(&p.name, MergeMode::WithUserMetadata, EvalMode::DoNotEvaluate)?.and_then(|m| m.group().map(str::to_owned)).unwrap_or_else(|| "default".into());
+        if let Some(info) = out.iter_mut().find(|i| i.name == g) {
+            info.plugins.push(p.name);
+        }
+    }
+    Ok(out)
+}
+
+/// Set the groups `name` loads after in the userlist (on top of the masterlist's), making the
+/// group if it's new. `remove` takes it out of the userlist: a group of the user's own goes,
+/// a masterlist group loses only the user's additions. Refuses a circle.
+pub fn set_group(inst: &Instance, name: &str, after: &[String], remove: bool) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("a group needs a name");
+    }
+    let profile = inst.profile()?;
+    let (game, _) = handle(inst, &profile)?;
+    let db = game.database();
+    let mut db = db.write().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
+    let all = db.groups(MergeMode::WithUserMetadata);
+    let in_master = db.groups(MergeMode::WithoutUserMetadata).iter().any(|g| g.name() == name);
+    let mut user: Vec<libloot::metadata::Group> = db.user_groups().iter().filter(|g| g.name() != name).cloned().collect();
+    if remove {
+        if !in_master {
+            let used: Vec<String> = rules(inst)?.into_iter().filter(|r| r.group.as_deref() == Some(name)).map(|r| r.plugin).collect();
+            if !used.is_empty() {
+                bail!("your rules put {} in {name}; move them to another group first", used.join(", "));
+            }
+            if let Some(g) = all.iter().find(|g| g.name() != name && g.after_groups().iter().any(|a| a == name)) {
+                bail!("{} loads after {name}; change that first", g.name());
+            }
+        }
+    } else {
+        for a in after {
+            if a == name {
+                bail!("a group can't load after itself");
+            }
+            if !all.iter().any(|g| g.name() == a) {
+                bail!("LOOT has no group '{a}'");
+            }
+            // `a` must not already come after `name`, or the groups go in a circle.
+            if all.iter().any(|g| g.name() == name) && !db.groups_path(name, a).unwrap_or_default().is_empty() {
+                bail!("{a} already loads after {name}, so {name} can't load after it");
+            }
+        }
+        user.push(libloot::metadata::Group::new(name.to_owned()).with_after_groups(after.to_vec()));
+    }
+    db.set_user_groups(user);
+    fs::create_dir_all(dir(inst))?;
+    let mut opts = MetadataWriteOptions::new();
+    opts.set_truncate(true);
+    db.write_user_metadata(&dir(inst).join("userlist.yaml"), &opts)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod place_tests {
     use super::*;
