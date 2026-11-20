@@ -355,7 +355,6 @@ fn fps(samples: &[f64]) -> Option<Fps> {
     })
 }
 
-/// The harness plugin's DLL, relative to Data.
 /// Refuse to load a save the game doesn't have: Skyrim takes the name without a word and the
 /// step would wait minutes for a load that never comes.
 pub fn check_saves(inst: &Instance, steps: &[Step]) -> Result<()> {
@@ -383,6 +382,7 @@ pub fn check_saves(inst: &Instance, steps: &[Step]) -> Result<()> {
     Ok(())
 }
 
+/// The harness plugin's DLL, relative to Data.
 pub fn harness_dll(game: Game) -> &'static str {
     if game.base() == Game::SkyrimSe { "SKSE/Plugins/rmm_harness.dll" } else { "F4SE/Plugins/rmm_harness.dll" }
 }

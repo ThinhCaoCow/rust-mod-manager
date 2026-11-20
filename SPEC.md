@@ -431,7 +431,7 @@ A scenario can also carry `steps`, a test plan run after the save and the cells.
   - `{"press": {"control", "ms"}}`: `ButtonEvent`s for a control by its Controls-menu name through `BSInputDeviceManager`, every frame for `ms`. Discrete presses (Jump, Activate) work; held movement is slow and uneven.
   - `{"click": {"x", "y", "button", "double", "wheel"}}`: a `GFxMouseEvent` move, then down and up (or a wheel turn), sent to the movie of the topmost open menu that uses a cursor, at window pixels. Over MCP, x and y are in the last screenshot the AI got and are scaled back by the factor that screenshot was shrunk by. Nothing goes through Windows' input, so the game can stay behind other windows. The result names the menu.
   - `{"key": {"key", "ms"}}`: a key by name, sent as a keyboard `ButtonEvent` with its DirectInput scan code and the user event the `ControlMap` binds to it in the current input context (then menu mode, then gameplay), so Escape is Cancel in a menu and E is Activate in the world. The result names the event.
-  - `{"type": "text"}`: a `GFxCharEvent` per character to the topmost cursor menu's movie (search boxes, names).
+  - `{"type": "text"}`: a `GFxCharEvent` per character to the topmost cursor menu's movie (search boxes, names). The text goes to the field with focus, so a search box is clicked first (tested in SkyUI's inventory).
 
 Each step's result has ok or its error, FPS, the player's cell from the last heartbeat, the screenshot's path, `data` from a playing step, and the game's `events` during it (`rmm test-run --steps <json or @file>`).
 
