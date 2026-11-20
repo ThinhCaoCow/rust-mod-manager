@@ -93,6 +93,8 @@ A profile can keep its own INI files and its own saves (MO2's two profile option
 
 **New playthrough** (`new_playthrough`, `rmm profile playthrough`, the profile menu): a copy of the active profile with its own saves, made active, so a new character's saves stay apart from the others; the saves made so far stay with the profile they were made in. **Copy or move…** on the Saves tab (`transfer_saves`, `rmm saves --copy-to|--move-to <profile> <files>`) puts saves of the active profile into another profile's save folder, each with its `.skse`/`.f4se` co-save. A file of that name already there stops it before anything is done; two profiles without own saves share one folder, so that is refused too.
 
+**INI tweaks** (MO2's): `.ini` files in a mod's `INI Tweaks` folder, each turned on per mod (`ini_tweaks` in `rmm-mod.toml`; the mod panel's checkboxes, `set_ini_tweak`, `rmm ini-tweak <mod> [file] [--off]`). An MO2 import keeps which were on. A real deploy writes the settings of the tweaks that are on, in mod order so a lower mod wins, into My Games: a key goes to `<game>Prefs.ini` if that file already has it, else to `<game>.ini`; a missing INI is skipped. The value each replaced is recorded and put back (a section rmm added goes again) on the next deploy or a purge, before the profile's own INIs are handled, so a tweak turned off comes out.
+
 `ini-state.json` records what is in My Games, so an interrupted switch is finished by the next deploy or purge. The game must not be running (deploy and purge already refuse then): it writes its prefs on exit.
 
 ## Deployment
@@ -233,7 +235,9 @@ The IDE and the AI's file tools reach three roots by workspace path: `mods/<mod 
 - Script-extender conditions check that the loader is present. Game and FOMM version conditions count as met.
 - Paths that climb out with `..` are skipped with a warning.
 
-C# script installers aren't supported.
+**BAIN packages** (Wrye Bash) are read as a FOMOD with one step, "Sub-packages", where any can be picked. Detection follows MO2: at least two top-level folders, each Data-like (Data folders, a `data` folder, or plugins and BSAs), with `fomod`, `omod conversion data`, `images`, `screenshots`, `docs` and `--` folders ignored. Each pick installs its folder to Data, a later one winning; `00…` packages are Recommended, so ticked by default. `wizard.txt` isn't run (a warning says so) and `package.txt` isn't shown. Since it is a FOMOD, choices, reinstall and MCP work as above.
+
+**C# script installers** (`fomod/script.cs`, old FOMM mods) run in `rmm-core::csharp`, Windows only. The script is compiled with .NET Framework 4's `csc.exe` against a stand-in for FOMM's `BaseScript` and run by a small host in a sandboxed AppDomain that may only execute and show windows: it can't read files, the registry or the network itself. Its calls go through a bridge that answers from the mod's files, the game's Data, the instance's winning files and plugins, and records what to install: `CopyDataFile`/`InstallFileFromFomod` copies, `GenerateDataFile` files, plugin activation and INI edits. The script's own dialogs (`Select`, `MessageBox`) are real windows. INI edits become the mod's `INI Tweaks/Installer script.ini`, turned on. A script that reaches outside the mod fails with a message saying to install the folder by hand. A script is only run with consent: the window asks first ("Run … installer?"), the CLI needs `--run-script` on `install`, `reinstall` and `update`. MCP, the built-in AI, collections, lockfiles and imports never run one.
 
 `fomod_options` returns every visible step and the full resolved choices. Choices find their step and group by name; steps or groups sharing a name (some installers name none) are matched in order, the second "" to the second "". An AI edits the choices and calls it again (choices can reveal later steps), then passes them to `install_mod`. Choices use Vortex's `installerChoices` shape and are stored in `rmm-mod.toml`. Choices for a step the installer doesn't show with the other choices aren't used, and the walk says so in its warnings. An archive is unpacked once into `.staging/preview` and reused by the install that follows.
 
@@ -491,6 +495,7 @@ nexus_domain = "skyrimspecialedition"
 
 ## Saves and edits
 
+- **Deleting saves.** **Delete…** on the Saves tab (or a save's right-click menu), `delete_saves`, or `rmm saves --delete <files>` moves each save with its co-save to `trash/saves/<profile>/`, a number added to a name already there. Emptying the trash deletes them.
 - **Orphaned co-saves.** `rmm saves` lists the script extender co-saves whose save is gone (`orphans`). `rmm saves --clean-cosaves --apply`, or Clean co-saves on the Saves tab, moves them to `trash/co-saves/<profile>/`. Emptying the trash deletes them.
 - **Edited mod files.** Each edit made through rmm records a SHA-256 of what it saved. `workspace::live_edits` finds a mod's files that still hold one of its edits; reverts don't count. The window asks before updating or reinstalling such a mod, and the install report names those files afterwards.
 

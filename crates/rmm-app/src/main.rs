@@ -354,10 +354,12 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "health" => json!(health::check(&inst)?),
         "lacking_requirements" => json!(nexus::lacking_requirements(&inst, &p)),
         "details" => ops::mod_details(&inst, &s("id")?, 300)?,
-        // A mod's FOMOD installer as it plays out with the window's choices; null when it has none.
+        // A mod's FOMOD installer as it plays out with the window's choices; null when it has none;
+        // {script: true} for a C# installer script, which the window asks before running.
         "fomod" => {
             let path = s("path")?;
             match install::has_fomod(&inst, Path::new(&path))? {
+                _ if install::has_script(&inst, Path::new(&path))? => json!({ "script": true }),
                 true => {
                     let mut v = json!(install::fomod_options(&inst, Path::new(&path), choices()?.as_ref())?);
                     // For the wizard's hints: which option is for this game version.
@@ -386,7 +388,8 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "install" => {
             let name = a["name"].as_str().map(str::trim).filter(|n| !n.is_empty());
             let at = a["priority"].as_u64().map(|n| n as usize);
-            let r = install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at)?;
+            // run_script: the user agreed, in the window, to run this mod's C# installer script.
+            let r = rmm_core::csharp::allowing(flag("run_script"), || install::install_at(&inst, Path::new(&s("path")?), name, settings::get().install.enable, Some(&choices()?.unwrap_or_default()), at))?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
                 nexus::remember(&inst, &r.id, n)?;
             }
@@ -397,9 +400,9 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
             }
             json!(r)
         }
-        "reinstall" => json!(install::reinstall(&inst, &s("id")?, choices()?.as_ref())?),
+        "reinstall" => json!(rmm_core::csharp::allowing(flag("run_script"), || install::reinstall(&inst, &s("id")?, choices()?.as_ref()))?),
         "update_mod" => {
-            let r = install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref())?;
+            let r = rmm_core::csharp::allowing(flag("run_script"), || install::update(&inst, &s("id")?, Path::new(&s("path")?), choices()?.as_ref()))?;
             if let Ok(n) = serde_json::from_value::<rmm_core::instance::NexusRef>(a["nexus"].clone()) {
                 nexus::remember(&inst, &r.id, n)?;
             }
@@ -581,6 +584,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "saves" => json!(saves::list(&inst)?),
         "newest_save_using" => json!(saves::newest_using(&inst, &serde_json::from_value::<Vec<String>>(a["plugins"].clone())?)?),
         "clean_cosaves" => json!(saves::clean_cosaves(&inst, false)?),
+        "delete_saves" => json!(saves::delete(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?)?),
         "enable_save_plugins" => json!(saves::enable_missing(&inst, &s("file")?)?),
         "transfer_saves" => json!(saves::transfer(&inst, &serde_json::from_value::<Vec<String>>(a["files"].clone())?, &s("profile")?, !flag("move"))?),
         "downloads" => json!(install::downloads(&inst)?),
@@ -596,6 +600,7 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "record_conflicts" => json!(plugins::record_conflicts(&inst, &inst.profile()?, &s("plugin")?)?),
         "restore_preview" => json!(inst.restore_preview(n("n")?)?),
         "restore" => json!(inst.restore(n("n")?)?),
+        "set_ini_tweak" => json!(rmm_core::ini_tweaks::set(&inst, &s("id")?, &s("file")?, flag("on"))?),
         "set_note" => json!(ops::set_mod_note(&inst, &s("id")?, &s("note")?)?),
         "ide_list" => json!(workspace::list(&inst, a["path"].as_str().unwrap_or(""))?),
         "ide_read" => json!(workspace::read(&inst, &s("path")?)?),

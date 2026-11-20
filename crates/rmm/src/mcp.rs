@@ -365,9 +365,22 @@ struct TransferSavesArgs {
     move_them: bool,
 }
 #[derive(Deserialize, JsonSchema)]
+struct DeleteSavesArgs {
+    /// Save file names, as list_saves gives them.
+    files: Vec<String>,
+}
+#[derive(Deserialize, JsonSchema)]
 struct SaveArgs {
     /// The save's file name, as list_saves gives it.
     file: String,
+}
+#[derive(Deserialize, JsonSchema)]
+struct IniTweakArgs {
+    id: String,
+    /// The tweak's file name, as mod_details' ini_tweaks lists it.
+    file: String,
+    /// true turns it on, false off.
+    on: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 struct NoteArgs {
@@ -696,6 +709,11 @@ impl Rmm {
         out(self.inst().and_then(|i| saves::transfer(&i, &a.files, &a.profile, !a.move_them)))
     }
 
+    #[tool(description = "Delete saves of the active profile: each save and its script extender co-save move to the instance's trash (emptying the trash deletes them for good). Ask the user first. Returns the files moved.")]
+    async fn delete_saves(&self, Parameters(a): Parameters<DeleteSavesArgs>) -> Result<String, String> {
+        out(self.inst().and_then(|i| saves::delete(&i, &a.files)))
+    }
+
     #[tool(description = "Archives in the instance's downloads folder (where Nexus downloads go), newest first, with the mods installed from each.", annotations(read_only_hint = true))]
     async fn list_downloads(&self) -> Result<String, String> {
         out(self.inst().and_then(|i| install::downloads(&i)))
@@ -888,6 +906,11 @@ impl Rmm {
     #[tool(description = "Rename a separator and/or set its colour. Returns its id, which follows the name.")]
     async fn edit_separator(&self, Parameters(a): Parameters<EditSeparatorArgs>) -> Result<String, String> {
         out(self.inst_mut().and_then(|i| ops::edit_separator(&i, &a.id, a.name.as_deref(), a.color.as_deref())))
+    }
+
+    #[tool(description = "Turn one of a mod's INI tweaks on or off (mod_details' ini_tweaks lists them, from the mod's INI Tweaks folder, with what each sets). The next deploy writes the settings of the enabled mods' tweaks into the game's INIs in My Games (a mod lower in the list wins a setting), and the deploy after, or a purge, puts the old values back. Not in undo history.")]
+    async fn set_ini_tweak(&self, Parameters(a): Parameters<IniTweakArgs>) -> Result<String, String> {
+        out(self.inst_mut().and_then(|i| rmm_core::ini_tweaks::set(&i, &a.id, &a.file, a.on)))
     }
 
     #[tool(description = "Set or clear a mod's notes (shown in the mod list). Not in undo history; returns the previous notes.")]

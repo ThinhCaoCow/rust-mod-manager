@@ -117,7 +117,7 @@ Items 23, 24, 26 and 27 were done on 2026-11-20, checked in the window (against 
   - **Clean co-saves** (Saves tab; `rmm saves --clean-cosaves [--apply]`). It moves co-saves whose save is gone into the instance's trash.
   - Updating or reinstalling a mod with files edited in rmm asks first. Afterwards the report names them. Edits now record a hash, so a revert back to the archive's text doesn't count as an edit.
 
-Added on 2026-11-19 from the comparison ([rmm vs MO2 and Vortex](rmm%20vs%20MO2%20and%20Vortex.md)), not from a review. The installer (25) is the final stage, after everything else on this list. The comparison lists the smaller gaps (C# FOMODs and BAIN, deleting saves, per-mod INI tweaks, translations).
+Added on 2026-11-19 from the comparison ([rmm vs MO2 and Vortex](rmm%20vs%20MO2%20and%20Vortex.md)), not from a review. The installer (25) is the final stage, after everything else on this list. The comparison lists the smaller gaps (C# FOMODs and BAIN, deleting saves, per-mod INI tweaks, translations). All but translations were done on 2026-11-20 (see SPEC.md: FOMOD, Saves and edits, and the profile INI section).
 
 | # | Item | For | The moment | Where | Size |
 |---|---|---|---|---|---|

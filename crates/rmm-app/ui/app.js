@@ -897,6 +897,7 @@ function renderDetails() {
     ${m.nexus_id && nexus.user ? accountBlock(m) : ''}
     ${d?.meta?.nexus ? nexusBlock(d.meta.nexus.mod_id) : ''}
     ${d?.docs?.length ? `<h3>Read me and settings</h3><div class="files">${d.docs.map(f => `<button class="link" data-doc="${esc(f)}" title="Open in the editor (AI tab)">${esc(f)}</button>`).join('<br>')}</div>` : ''}
+    ${d?.ini_tweaks?.length ? tweaksBlock(d.ini_tweaks) : ''}
     ${d?.images?.length ? `<h3>Pictures (${d.images.length})</h3>${modPics.has(m.id)
       ? `<div class="pics">${modPics.get(m.id).map(([f, url]) => url ? `<img src="${url}" alt="${esc(f)}" title="${esc(f)}" data-pic="${esc(f)}">` : `<span class="muted small">${esc(f)}: can’t be shown</span>`).join('')}</div>`
       : '<div class="row"><button data-act="mod-pics">Show them</button></div>'}` : ''}
@@ -928,6 +929,15 @@ function renderDetails() {
     n.focus();
     n.setSelectionRange(draft[1], draft[2]);
   }
+}
+
+/** The mod's INI tweaks (its INI Tweaks folder). One that's on goes into the game's INIs at the next deploy. */
+function tweaksBlock(tweaks) {
+  const sets = t => t.settings.map(s => `${s.key}=${s.value}`);
+  return `<h3>INI tweaks</h3><div class="stack">${tweaks.map(t => `<label class="row" style="margin:0" title="${esc(t.settings.map(s => `[${s.section}] ${s.key}=${s.value}`).join('\n'))}">
+      <input type="checkbox" data-tweak="${esc(t.file)}"${t.enabled ? ' checked' : ''}> ${esc(t.file.replace(/\.ini$/i, ''))}
+      <span class="muted small">${esc(sets(t).slice(0, 3).join(', '))}${sets(t).length > 3 ? ` and ${sets(t).length - 3} more` : ''}</span></label>`).join('')}</div>
+    <p class="muted small">A tweak that’s on is written into the game’s INIs at the next deploy or Play. Turn it off and it comes out again.</p>`;
 }
 
 /** What the mod's Nexus page lists as required, and whether this setup has each. */
@@ -1312,6 +1322,11 @@ async function editsOk(d, verb) {
   return confirmBox(`${verb} ${nameOf(d.id)}?`, `You edited ${which} in rmm. ${verb === 'Update' ? 'Updating' : 'Reinstalling'} puts the archive’s files in their place. Undo brings your edited ones back; Edits… in the file editor shows what you changed.`, `${verb} anyway`, 'primary');
 }
 
+/** A C# installer script is a program from the mod: it runs only when the user says so. */
+const scriptOk = path => confirmBox(`Run ${basename(path)}’s installer?`,
+  'This mod’s installer is a C# script: a small program its author wrote, which asks about its options in windows of its own and says which files to install. rmm runs it in a sandbox where it can read the mod’s files and the game’s Data and nothing else, then installs what it picked. It is still code from the download: run it only for a mod from a source you trust.',
+  'Run the installer', 'primary');
+
 /** Install a mod again from where it came from; a FOMOD installer opens with its stored choices. */
 async function reinstall(id) {
   const d = details?.id === id ? details : await call('details', { id }).catch(() => null);
@@ -1324,13 +1339,16 @@ async function reinstall(id) {
   }, { reload: false });
   if (!walk) return;
   if (!await editsOk(d, 'Reinstall')) return;
-  if (walk === true) {
+  const run_script = !!walk.script;
+  if (run_script) {
+    if (!await scriptOk(path)) return;
+  } else if (walk === true) {
     if (!await confirmBox(`Reinstall ${nameOf(id)}?`, `Its files are read again from ${path}. The old files go to the instance's trash folder, and Undo puts them back.`, 'Reinstall', 'primary')) return;
   } else {
     choices = await fomodWizard(path, walk);
     if (!choices) return;
   }
-  const r = await act(`Reinstalling ${nameOf(id)}`, () => call('reinstall', { id, choices }));
+  const r = await act(`Reinstalling ${nameOf(id)}`, () => call('reinstall', { id, choices, run_script }));
   if (r) toast(`Reinstalled ${r.name} (${plural(r.files, 'file')}).${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
 }
 
@@ -1345,11 +1363,14 @@ async function updateMod(id, path, nx = null) {
   }, { reload: false, problem: true });
   if (!walk) return;
   let choices;
-  if (walk !== true) {
+  const run_script = !!walk.script;
+  if (run_script) {
+    if (!await scriptOk(path)) return;
+  } else if (walk !== true) {
     choices = walk.steps.length ? await fomodWizard(path, walk) : walk.choices;
     if (!choices) return;
   }
-  const r = await act(`Updating ${nameOf(id)}`, () => call('update_mod', { id, path, choices, nexus: nx?.nexus }), { problem: true });
+  const r = await act(`Updating ${nameOf(id)}`, () => call('update_mod', { id, path, choices, nexus: nx?.nexus, run_script }), { problem: true });
   if (r && r !== true) toast(`Updated ${r.name} from ${basename(path)} (${plural(r.files, 'file')}). Undo puts the old files back.${r.warnings.length ? '\n' + r.warnings.join('\n') : ''}`, r.warnings.length ? 'warn' : 'info');
 }
 
@@ -2157,6 +2178,7 @@ $('#details').addEventListener('change', e => {
   }
   if (t.id === 'loot-group') return setLootRule({ group: t.value.trim() || null });
   if (t.dataset.act === 'color') act('Changing the colour', () => call('edit_separator', { id, color: t.value }));
+  if (t.dataset.tweak !== undefined) return act(t.checked ? 'Turning the INI tweak on' : 'Turning the INI tweak off', () => call('set_ini_tweak', { id, file: t.dataset.tweak, on: t.checked }));
   if (t.dataset.act === 'mod-color') act('Changing the colour', () => call('set_color', { id, color: t.value }));
   if (t.classList.contains('cat-add') && t.value.trim()) return editCategories(selIds().filter(i => !isSep(i)), [t.value.trim()], []);
   if (t.dataset.act === 'lock') act(t.checked ? 'Locking the plugin' : 'Unlocking the plugin', () => call('lock_plugin', { name: selPlugin, lock: t.checked }));
@@ -3579,16 +3601,42 @@ $('#saves tbody').addEventListener('click', e => {
   const file = e.target.closest('tr[data-file]')?.dataset.file;
   if (file && e.target.closest('[data-missing]')) savePlugins(file);
 });
+$('#saves tbody').addEventListener('contextmenu', e => {
+  const file = e.target.closest('tr[data-file]')?.dataset.file;
+  if (!file) return;
+  e.preventDefault();
+  ctxMenu(e, [['Delete…', () => deleteSaves(file), 'danger']]);
+});
 $('#saves-reload').onclick = loadSaves;
+
+/** The profile's saves as ticks, with an All box (#st-all, #st-saves); `ticked` start ticked. */
+const saveChecklist = (saves, ticked = []) => `<label class="row" style="margin:12px 0 4px"><input type="checkbox" id="st-all"> All ${plural(saves.length, 'save')}</label>
+  <div class="stack" id="st-saves" style="max-height:40vh;overflow:auto">${saves.map(s => `<label class="row" style="margin:0" title="${esc(s.file)}"><input type="checkbox" value="${esc(s.file)}"${ticked.includes(s.file) ? ' checked' : ''}> ${esc(s.player || s.file)}${s.level ? `, level ${s.level}` : ''}${s.location ? `, ${esc(s.location)}` : ''} <span class="muted small">${esc(when(s.modified))}</span></label>`).join('')}</div>`;
+
+/** Delete saves: they and their co-saves go to the instance's trash. `file` starts ticked. */
+async function deleteSaves(file) {
+  const saves = savesData?.saves ?? [];
+  if (!saves.length) return toast('This profile has no saves.');
+  const done = dialog({ title: 'Delete saves', body: `${saveChecklist(saves, file ? [file] : [])}
+    <p class="muted small" style="margin-top:10px">Each save goes with its script extender co-save to the instance’s trash, which Empty the trash deletes for good.</p>`,
+    actions: [['cancel', 'Cancel'], ['delete', 'Move to the trash', 'danger']] });
+  $('#st-all').onchange = e => $$('#st-saves input').forEach(c => { c.checked = e.target.checked; });
+  const r = await done;
+  const files = $$('#st-saves input:checked').map(c => c.value);
+  if (r !== 'delete') return;
+  if (!files.length) return toast('No saves were ticked.');
+  const moved = await act('Deleting the saves', () => call('delete_saves', { files }), { reload: false });
+  if (Array.isArray(moved)) toast(`Moved ${plural(files.length, 'save')} to the trash${moved.length > files.length ? (files.length === 1 ? ', with its co-save' : ', with their co-saves') : ''}.`);
+  loadSaves();
+}
+$('#saves-delete').onclick = () => deleteSaves();
 
 $('#saves-transfer').onclick = async () => {
   const cur = S.info.profile, others = S.profiles.filter(p => p !== cur), saves = savesData?.saves ?? [];
   if (!others.length) return toast('There’s no other profile yet. New playthrough… in the profile menu makes one with saves of its own.');
   if (!saves.length) return toast('This profile has no saves to copy or move.');
-  const row = s => `<label class="row" style="margin:0" title="${esc(s.file)}"><input type="checkbox" value="${esc(s.file)}"> ${esc(s.player || s.file)}${s.level ? `, level ${s.level}` : ''}${s.location ? `, ${esc(s.location)}` : ''} <span class="muted small">${esc(when(s.modified))}</span></label>`;
   const body = `<label class="field">To the profile<select id="st-to">${others.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select></label>
-    <label class="row" style="margin:12px 0 4px"><input type="checkbox" id="st-all"> All ${plural(saves.length, 'save')}</label>
-    <div class="stack" id="st-saves" style="max-height:40vh;overflow:auto">${saves.map(row).join('')}</div>
+    ${saveChecklist(saves)}
     <p class="muted small" style="margin-top:10px">Each save goes with its script extender co-save. A save the other profile already has stops it.</p>`;
   const done = dialog({ title: 'Copy or move saves', body, actions: [['cancel', 'Cancel'], ['move', 'Move'], ['copy', 'Copy', 'primary']] });
   $('#st-all').onchange = e => $$('#st-saves input').forEach(c => { c.checked = e.target.checked; });
@@ -3728,13 +3776,16 @@ async function install(paths, at = null, nx0 = null) {
     // Unpacks the archive once; the install below reuses it.
     const walk = await act(`Reading ${basename(path)}`, () => call('fomod', { path }), { reload: false, problem: true });
     if (!walk) continue;
-    let choices, name = nx?.name ?? undefined;
-    if (walk !== true) { // it has a FOMOD installer, which names the mod better than most file names
+    let choices, name = nx?.name ?? undefined, run_script = false;
+    if (walk.script) {
+      if (!await scriptOk(path)) continue;
+      run_script = true;
+    } else if (walk !== true) { // it has a FOMOD installer, which names the mod better than most file names
       choices = walk.steps.length ? await fomodWizard(path, walk) : walk.choices;
       if (!choices) continue;
       name = walk.module;
     }
-    const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus }), { problem: true });
+    const r = await act(`Installing ${basename(path)}`, () => call('install', { path, choices, name, priority: at, nexus: nx?.nexus, run_script }), { problem: true });
     if (!r) continue;
     if (at !== null) at++;
     plugins += r.plugins.length;
@@ -4638,6 +4689,8 @@ const PLAIN = {
   rename_profile: a => [`Rename the profile “${a.from}” to “${a.to}”`, ''],
   delete_profile: a => [`Delete the profile “${a.name}”`, 'It’s kept in profiles\\.deleted.'],
   set_profile_options: () => ['Change whether this profile has its own INIs or saves', UNDO],
+  set_ini_tweak: a => [`Turn ${a.on ? 'on' : 'off'} the INI tweak ${a.file} of ${a.id}`, 'It reaches the game’s INIs at the next deploy.'],
+  delete_saves: a => [`Delete ${plural(a.files?.length ?? 0, 'save')} (to the instance’s trash)`, ''],
   transfer_saves: a => [`${a.move_them ? 'Move' : 'Copy'} ${plural(a.files?.length ?? 0, 'save')} to “${a.profile}”`, ''],
   enable_save_plugins: a => [`Turn on the plugins ${a.file} needs`, UNDO],
   test_run: () => ['Start the game for a test run', ''],

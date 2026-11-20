@@ -499,7 +499,11 @@ fn mo2_meta(folder: &Path, name: &str, downloads: &Path, categories: &HashMap<i6
     // MO2 has a one-line comment and notes (HTML from its editor); rmm keeps both as the note.
     let notes = raw_value(&text, "notes").map(|v| html_text(&qt_unescape(v).into_iter().filter_map(char::from_u32).collect::<String>()));
     let notes: Vec<String> = [get("comments"), notes].into_iter().flatten().filter(|n| !n.is_empty()).collect();
+    // The INI tweaks turned on: `[INI%20Tweaks]` (Qt escapes the space) with `1\name=Grass.ini` for each.
+    let mut ini_tweaks: Vec<String> = ini.get("INI%20Tweaks").or(ini.get("INI Tweaks")).map(|m| m.iter().filter(|(k, v)| k.ends_with("\\name") && !v.is_empty()).map(|(_, v)| v.clone()).collect()).unwrap_or_default();
+    ini_tweaks.sort_by_key(|f| f.to_lowercase());
     let meta = ModMeta {
+        ini_tweaks,
         name: name.into(),
         source: get("installationFile").map(|f| if Path::new(&f).is_absolute() { f } else { downloads.join(f).display().to_string() }),
         notes: (!notes.is_empty()).then(|| notes.join("\n\n")),

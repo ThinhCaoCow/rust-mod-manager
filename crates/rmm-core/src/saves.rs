@@ -117,9 +117,47 @@ pub fn clean_cosaves(inst: &Instance, dry_run: bool) -> Result<Vec<String>> {
     if dry_run || orphans.is_empty() {
         return Ok(orphans);
     }
-    let to = inst.root.join("trash").join("co-saves").join(&inst.config.profile);
+    to_trash(inst, &dir, &orphans, "co-saves")?;
+    Ok(orphans)
+}
+
+/// Move saves of the active profile, each with its co-save, into the instance's trash
+/// (trash/saves/<profile>/), where emptying the trash deletes them. Returns the files moved.
+pub fn delete(inst: &Instance, files: &[String]) -> Result<Vec<String>> {
+    let dir = crate::profile_ini::save_dir(inst, &inst.profile()?).context("cannot work out the save folder")?;
+    let names = with_cosaves(inst.config.game, &dir, files)?;
+    to_trash(inst, &dir, &names, "saves")?;
+    Ok(names)
+}
+
+/// The saves named, checked, each followed by its co-save when it has one.
+fn with_cosaves(game: Game, dir: &Path, files: &[String]) -> Result<Vec<String>> {
+    if files.is_empty() {
+        bail!("no saves given");
+    }
+    let mut names: Vec<String> = Vec::new();
+    for f in files {
+        if f.contains(['/', '\\']) || !Path::new(f).extension().is_some_and(|x| x.eq_ignore_ascii_case(ext(game))) {
+            bail!("not a save file name: {f}");
+        }
+        if !dir.join(f).is_file() {
+            bail!("no save '{f}' in {}", dir.display());
+        }
+        let c = Path::new(f).with_extension(cosave(game)).to_string_lossy().into_owned();
+        for f in [f.clone(), c] {
+            if dir.join(&f).is_file() && !names.contains(&f) {
+                names.push(f);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Move `names` from `dir` into trash/<kind>/<profile>/, renaming any whose name is taken there.
+fn to_trash(inst: &Instance, dir: &Path, names: &[String], kind: &str) -> Result<()> {
+    let to = inst.root.join("trash").join(kind).join(&inst.config.profile);
     fs::create_dir_all(&to)?;
-    for f in &orphans {
+    for f in names {
         let dest = (0..).map(|n| if n == 0 { to.join(f) } else { to.join(format!("{f}.{n}")) }).find(|p| !p.exists()).expect("a free name");
         // My Games is often on another drive than the instance: copy, then delete.
         if fs::rename(dir.join(f), &dest).is_err() {
@@ -127,7 +165,7 @@ pub fn clean_cosaves(inst: &Instance, dry_run: bool) -> Result<Vec<String>> {
             fs::remove_file(dir.join(f))?;
         }
     }
-    Ok(orphans)
+    Ok(())
 }
 
 /// The newest save, with those of `plugins` it was made with; None when it uses none of them.
@@ -192,25 +230,7 @@ pub fn transfer(inst: &Instance, files: &[String], profile: &str, keep: bool) ->
     if from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase() {
         bail!("{cur} and {name} share one save folder; turn on Own saves for one of them");
     }
-    if files.is_empty() {
-        bail!("no saves given");
-    }
-    let (ext, co) = (ext(inst.config.game), cosave(inst.config.game));
-    let mut names: Vec<String> = Vec::new();
-    for f in files {
-        if f.contains(['/', '\\']) || !Path::new(f).extension().is_some_and(|x| x.eq_ignore_ascii_case(ext)) {
-            bail!("not a save file name: {f}");
-        }
-        if !from.join(f).is_file() {
-            bail!("no save '{f}' in {}", from.display());
-        }
-        let c = Path::new(f).with_extension(co).to_string_lossy().into_owned();
-        for f in [f.clone(), c] {
-            if from.join(&f).is_file() && !names.contains(&f) {
-                names.push(f);
-            }
-        }
-    }
+    let names = with_cosaves(inst.config.game, &from, files)?;
     if let Some(f) = names.iter().find(|f| to.join(f).exists()) {
         bail!("{name}'s save folder already has {f}");
     }
@@ -500,6 +520,15 @@ mod tests {
         assert!(!ini.join("Saves/old.skse").exists() && ini.join("Saves/x.skse").is_file());
         assert!(inst.root.join("trash/co-saves/default/old.skse").is_file());
         assert!(list(&inst).unwrap().orphans.is_empty());
+
+        // Deleting a save moves it and its co-save to the trash, beside an earlier one of that name.
+        assert!(delete(&inst, &["../x.ess".into()]).is_err() && delete(&inst, &["nope.ess".into()]).is_err());
+        fs::create_dir_all(inst.root.join("trash/saves/default")).unwrap();
+        fs::write(inst.root.join("trash/saves/default/x.ess"), "an older x").unwrap();
+        assert_eq!(delete(&inst, &["x.ess".into()]).unwrap(), ["x.ess", "x.skse"]);
+        assert!(!ini.join("Saves/x.ess").exists() && !ini.join("Saves/x.skse").exists());
+        assert!(inst.root.join("trash/saves/default/x.ess.1").is_file() && inst.root.join("trash/saves/default/x.skse").is_file());
+        assert!(list(&inst).unwrap().saves.is_empty());
 
         // With its own saves, the profile has a folder of its own.
         crate::ops::set_profile_options(&inst, None, Some(true)).unwrap();

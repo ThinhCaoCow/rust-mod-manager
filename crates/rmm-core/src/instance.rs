@@ -224,6 +224,9 @@ pub struct ModMeta {
     /// reinstall or update (see `install::hide_files`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden: Vec<String>,
+    /// INI tweaks turned on: file names in the mod's `INI Tweaks` folder (see `ini_tweaks`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ini_tweaks: Vec<String>,
     /// Creation Club content rmm took out of the game's Data folder (`import::adopt_creations`):
     /// on in every profile, kept through undo, and put back by `import::restore_creations`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -58,6 +58,10 @@ enum Cmd {
         /// FOMOD choices as JSON, or @file holding it; '{}' takes the installer's defaults.
         #[arg(long)]
         choices: Option<String>,
+        /// Run the mod's C# installer script (fomod/script.cs), a program from the mod, in rmm's
+        /// sandbox. Only for mods from a source you trust.
+        #[arg(long)]
+        run_script: bool,
     },
     /// Show a FOMOD installer's steps and options; --choices previews a selection.
     Fomod {
@@ -71,6 +75,10 @@ enum Cmd {
         id: String,
         #[arg(long)]
         choices: Option<String>,
+        /// Run the mod's C# installer script (fomod/script.cs), a program from the mod, in rmm's
+        /// sandbox. Only for mods from a source you trust.
+        #[arg(long)]
+        run_script: bool,
     },
     /// Update a mod in place from a newer archive or folder: it keeps its id, place, notes,
     /// categories, colour and rules. The old files go to trash/; undo swaps them back.
@@ -80,6 +88,10 @@ enum Cmd {
         /// FOMOD choices as JSON (default: the stored ones).
         #[arg(long)]
         choices: Option<String>,
+        /// Run the mod's C# installer script (fomod/script.cs), a program from the mod, in rmm's
+        /// sandbox. Only for mods from a source you trust.
+        #[arg(long)]
+        run_script: bool,
     },
     /// Rename a mod (its id and folder stay). Prints the previous name.
     Rename { id: String, name: String },
@@ -141,7 +153,7 @@ enum Cmd {
         /// Move them instead.
         #[arg(long, value_name = "PROFILE", conflicts_with = "fix", requires = "files")]
         move_to: Option<String>,
-        /// Save file names, for --copy-to and --move-to.
+        /// Save file names, for --copy-to, --move-to and --delete.
         files: Vec<String>,
         /// Move script extender co-saves whose save is gone into the instance's trash (shows
         /// them without --apply).
@@ -149,6 +161,9 @@ enum Cmd {
         clean_cosaves: bool,
         #[arg(long, requires = "clean_cosaves")]
         apply: bool,
+        /// Move the saves named (file names), with their co-saves, into the instance's trash.
+        #[arg(long, conflicts_with_all = ["fix", "copy_to", "move_to", "clean_cosaves"], requires = "files")]
+        delete: bool,
     },
     /// Archives in the instance's downloads folder and the mods installed from them.
     Downloads {
@@ -240,6 +255,15 @@ enum Cmd {
     },
     /// Set a mod's notes ("" clears them).
     Note { id: String, text: String },
+    /// A mod's INI tweaks (the .ini files in its INI Tweaks folder), or turn one on or off. The
+    /// next deploy writes the enabled ones into the game's INIs; the one after takes them out.
+    IniTweak {
+        id: String,
+        /// The tweak's file name: turns it on (off with --off).
+        file: Option<String>,
+        #[arg(long, requires = "file")]
+        off: bool,
+    },
     /// Add or remove category labels on mods (like MO2's categories).
     Category {
         ids: Vec<String>,
@@ -968,21 +992,21 @@ fn run() -> Result<()> {
         }
         Cmd::Mods => print(&ops::list_mods(&open()?)?),
         Cmd::Show { id } => print(&ops::mod_details(&open()?, &id, usize::MAX)?),
-        Cmd::Install { path, name, at, disabled, choices } => {
+        Cmd::Install { path, name, at, disabled, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&install::install_at(&open()?, &path, name.as_deref(), !disabled, choices.as_ref(), at)?)
+            print(&rmm_core::csharp::allowing(run_script, || install::install_at(&open()?, &path, name.as_deref(), !disabled, choices.as_ref(), at))?)
         }
         Cmd::Fomod { path, choices } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
             print(&install::fomod_options(&open()?, &path, choices.as_ref())?)
         }
-        Cmd::Reinstall { id, choices } => {
+        Cmd::Reinstall { id, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&install::reinstall(&open()?, &id, choices.as_ref())?)
+            print(&rmm_core::csharp::allowing(run_script, || install::reinstall(&open()?, &id, choices.as_ref()))?)
         }
-        Cmd::Update { id, path, choices } => {
+        Cmd::Update { id, path, choices, run_script } => {
             let choices = choices.as_deref().map(parse_choices).transpose()?;
-            print(&install::update(&open()?, &id, &path, choices.as_ref())?)
+            print(&rmm_core::csharp::allowing(run_script, || install::update(&open()?, &id, &path, choices.as_ref()))?)
         }
         Cmd::Rename { id, name } => print(&serde_json::json!({ "previous": ops::rename_mod(&open()?, &id, &name)? })),
         Cmd::Uninstall { ids } => done(install::uninstall_mods(&open()?, &ids)),
@@ -1022,6 +1046,7 @@ fn run() -> Result<()> {
             print(&conflicts::data_view(&inst, &inst.profile()?, &q)?)
         }
         Cmd::Saves { clean_cosaves: true, apply, .. } => print(&serde_json::json!({ "co_saves": saves::clean_cosaves(&open()?, !apply)?, "moved": apply })),
+        Cmd::Saves { delete: true, files, .. } => print(&serde_json::json!({ "to_trash": saves::delete(&open()?, &files)? })),
         Cmd::Saves { fix: Some(file), .. } => print(&serde_json::json!({ "enabled": saves::enable_missing(&open()?, &file)? })),
         Cmd::Saves { copy_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, true)?),
         Cmd::Saves { move_to: Some(to), files, .. } => print(&saves::transfer(&open()?, &files, &to, false)?),
@@ -1062,6 +1087,8 @@ fn run() -> Result<()> {
         Cmd::Edits { revert: None } => print(&rmm_core::workspace::edits(&open()?)?),
         Cmd::Trash { empty: false } => print(&install::trash(&open()?)?),
         Cmd::Trash { empty: true } => print(&install::empty_trash(&open()?)?),
+        Cmd::IniTweak { id, file: None, .. } => print(&rmm_core::ini_tweaks::list(&open()?, &id)?),
+        Cmd::IniTweak { id, file: Some(file), off } => done(rmm_core::ini_tweaks::set(&open()?, &id, &file, !off)),
         Cmd::Note { id, text } => print(&serde_json::json!({ "previous": ops::set_mod_note(&open()?, &id, &text)? })),
         Cmd::Category { ids, add, remove } => print(&ops::edit_categories(&open()?, &ids, &add, &remove)?),
         Cmd::Color { id, color } => done(ops::set_color(&open()?, &id, &color)),

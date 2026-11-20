@@ -127,6 +127,13 @@ pub fn fomod_options(inst: &Instance, source: &Path, choices: Option<&Choices>) 
     Ok(walk)
 }
 
+/// Whether the mod at `source` has a C# script installer (`fomod/script.cs`), which only runs
+/// when the user allows it (`csharp::allowing`).
+pub fn has_script(inst: &Instance, source: &Path) -> Result<bool> {
+    let raw = if source.is_dir() { source.to_path_buf() } else { unpack(inst, source)? };
+    Ok(matches!(find_layout(raw)?, Layout::Script(_)))
+}
+
 /// Whether the mod at `source` has a FOMOD installer. An archive is unpacked into the preview
 /// cache, so fomod_options and the install that follow don't extract it again.
 pub fn has_fomod(inst: &Instance, source: &Path) -> Result<bool> {
@@ -155,7 +162,7 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
     let (files, fomod, warnings) = build(inst, source, staging, &dest, choices)?;
     // An archive's hash lets a lockfile find the same download elsewhere.
     let sha256 = if source.is_file() { Some(crate::lockfile::sha256_file(source)?) } else { None };
-    inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone(), sha256, ..Default::default() })?;
+    inst.write_mod_meta(id, &ModMeta { name: name.into(), source: Some(source.display().to_string()), fomod: fomod.clone(), sha256, ini_tweaks: script_tweak(&files), ..Default::default() })?;
     let plugins = mod_plugins(inst, id, &files);
     inst.edit(&format!("install {id}"), |p| {
         let ids: Vec<String> = p.mods.iter().map(|m| m.id.clone()).collect();
@@ -168,6 +175,12 @@ fn install_inner(inst: &Instance, source: &Path, staging: &Path, id: &str, name:
         Ok(())
     })?;
     Ok(report(id, name, &files, plugins, warnings, fomod))
+}
+
+/// The INI tweak a C# installer script wrote (its INI settings), which starts turned on.
+fn script_tweak(files: &[String]) -> Vec<String> {
+    let t = format!("{}/{}", crate::ini_tweaks::DIR, crate::csharp::TWEAK);
+    files.iter().filter(|f| **f == t).map(|_| crate::csharp::TWEAK.to_string()).collect()
 }
 
 /// Install a mod again from the archive or folder it came from, with new FOMOD choices
@@ -366,7 +379,9 @@ fn replace(inst: &Instance, id: &str, new_source: Option<&Path>, choices: Option
                 let sha256 = if s.is_file() { Some(crate::lockfile::sha256_file(s)?) } else { None };
                 Ok(ModMeta { source: Some(s.display().to_string()), sha256, ..meta.clone() })
             });
-            inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ..updated.transpose()?.unwrap_or_else(|| meta.clone()) })
+            let mut ini_tweaks = meta.ini_tweaks.clone();
+            ini_tweaks.extend(script_tweak(&files).into_iter().filter(|t| !meta.ini_tweaks.contains(t)));
+            inst.write_mod_meta(id, &ModMeta { fomod: fomod.clone(), ini_tweaks, ..updated.transpose()?.unwrap_or_else(|| meta.clone()) })
         })?;
         let plugins = mod_plugins(inst, id, &files);
         let label = if new_source.is_some() { format!("update {id}") } else { format!("reinstall {id}") };
@@ -543,6 +558,37 @@ fn build(inst: &Instance, source: &Path, staging: &Path, dest: &Path, choices: O
             }
             fomod = Some(walk.choices);
         }
+        Layout::Script(root) => {
+            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let out = crate::csharp::run(inst, &root, &name)?;
+            warnings.extend(out.warnings);
+            let put = |to: &str, from: &Path, link: bool| -> Result<()> {
+                let to = to.split('/').filter(|s| !s.is_empty() && *s != ".").collect::<Vec<_>>();
+                if to.is_empty() || to.contains(&"..") {
+                    bail!("the installer script named a file outside Data: {}", to.join("/"));
+                }
+                let d = dest.join(to.join("/"));
+                fs::create_dir_all(d.parent().unwrap())?;
+                if !link || fs::hard_link(from, &d).is_err() {
+                    fs::copy(from, &d)?;
+                }
+                Ok(())
+            };
+            for (from, to) in &out.copies {
+                put(to, &root.join(from), true)?;
+            }
+            for (to, file) in &out.made {
+                put(to, file, false)?;
+            }
+            if !out.ini.is_empty() {
+                let t = dest.join(crate::ini_tweaks::DIR);
+                fs::create_dir_all(&t)?;
+                fs::write(t.join(crate::csharp::TWEAK), &out.ini)?;
+            }
+            if !dest.exists() {
+                bail!("the installer script installed no files");
+            }
+        }
         Layout::Data(d, guessed) => {
             if guessed {
                 warnings.push("no Data folder markers found; installed the archive contents as Data files".into());
@@ -571,8 +617,7 @@ fn build(inst: &Instance, source: &Path, staging: &Path, dest: &Path, choices: O
 
 /// Run a FOMOD installer found at `root` against the instance's current setup.
 fn fomod_walk(inst: &Instance, root: &Path, choices: &Choices) -> Result<Walk> {
-    let config = child_ci(root, "fomod").and_then(|f| child_ci(&f, "moduleconfig.xml")).context("fomod/ModuleConfig.xml is missing")?;
-    let installer = Installer::parse(&fs::read(config)?)?;
+    let installer = installer_at(root)?;
     let profile = inst.profile()?;
     let winners = crate::conflicts::file_map(inst, &profile)?.winners();
     let state = |f: &str| {
@@ -585,7 +630,11 @@ fn fomod_walk(inst: &Instance, root: &Path, choices: &Choices) -> Result<Walk> {
     };
     let loader = inst.config.game.loader();
     let script_extender = inst.config.game_path.join(loader).is_file() || winners.contains_key(&path_key(&format!("root/{loader}")));
-    installer.walk(choices, &Env { file_state: &state, script_extender })
+    let mut walk = installer.walk(choices, &Env { file_state: &state, script_extender })?;
+    if child_ci(root, "wizard.txt").is_some() && child_ci(root, "fomod").and_then(|f| child_ci(&f, "moduleconfig.xml")).is_none() {
+        walk.warnings.push("the package has a BAIN wizard (wizard.txt), which rmm doesn't run: its sub-packages were picked by hand or by name (00… on)".into());
+    }
+    Ok(walk)
 }
 
 fn preview_dir(inst: &Instance) -> PathBuf {
@@ -867,8 +916,10 @@ pub(crate) fn to_game_folder(dir: &Path) -> Result<Vec<String>> {
 }
 
 enum Layout {
-    /// Folder holds `fomod/ModuleConfig.xml`; its installer decides what goes where.
+    /// Folder holds `fomod/ModuleConfig.xml`, or BAIN sub-packages; the installer decides what goes where.
     Fomod(PathBuf),
+    /// Folder holds `fomod/script.cs`, a C# installer script.
+    Script(PathBuf),
     /// Folder is Data contents. `bool` = guessed (no markers found).
     Data(PathBuf, bool),
     /// Folder is game-root contents (ENB, script extender loaders).
@@ -885,6 +936,9 @@ fn find_layout(mut dir: PathBuf) -> Result<Layout> {
 
         if entries.iter().any(|e| is_dir(e) && lower(e) == "fomod" && child_ci(&e.path(), "moduleconfig.xml").is_some()) {
             return Ok(Layout::Fomod(dir));
+        }
+        if crate::csharp::script_in(&dir).is_some() {
+            return Ok(Layout::Script(dir));
         }
         if let Some(data) = entries.iter().find(|e| is_dir(e) && lower(e) == "data") {
             return Ok(Layout::DataWithRoot { data: data.path(), root: dir });
@@ -904,8 +958,43 @@ fn find_layout(mut dir: PathBuf) -> Result<Layout> {
             dir = subdirs[0].path();
             continue;
         }
+        if bain_packages(&dir).is_some() {
+            return Ok(Layout::Fomod(dir));
+        }
         return Ok(Layout::Data(dir, true));
     }
+}
+
+/// A Wrye Bash BAIN package's sub-packages: at least two top-level folders, each like a Data
+/// folder, and no other folders but the ones BAIN ignores (MO2's test).
+fn bain_packages(dir: &Path) -> Option<Vec<String>> {
+    const IGNORED: &[&str] = &["fomod", "omod conversion data", "images", "screenshots", "docs"];
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).ok()?.flatten().filter(|e| e.path().is_dir()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if IGNORED.contains(&name.to_lowercase().as_str()) || name.starts_with("--") {
+            continue;
+        }
+        let data_like = fs::read_dir(e.path()).ok()?.flatten().any(|f| {
+            let n = f.file_name().to_string_lossy().to_lowercase();
+            if f.path().is_dir() { n == "data" || DATA_DIRS.contains(&n.as_str()) } else { ext_of(&n).is_some_and(|x| DATA_EXTS.contains(&x.as_str())) }
+        });
+        if !data_like {
+            return None;
+        }
+        out.push(name);
+    }
+    out.sort_by_key(|n| n.to_lowercase());
+    (out.len() >= 2).then_some(out)
+}
+
+/// The installer at `root`: its FOMOD (`fomod/ModuleConfig.xml`), or its BAIN sub-packages.
+fn installer_at(root: &Path) -> Result<Installer> {
+    if let Some(config) = child_ci(root, "fomod").and_then(|f| child_ci(&f, "moduleconfig.xml")) {
+        return Installer::parse(&fs::read(config)?);
+    }
+    let packages = bain_packages(root).context("fomod/ModuleConfig.xml is missing")?;
+    Ok(Installer::bain(&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), &packages))
 }
 
 pub(crate) fn sanitize(name: &str) -> String {
