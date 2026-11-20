@@ -568,6 +568,18 @@ struct PluginOrderArgs {
     names: Vec<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct SortArgs {
+    /// Preview only (default true). Set false to save the order to the profile.
+    dry_run: Option<bool>,
+    /// Plugins whose rules of the user's to leave out of this one sort, to get past a circle of
+    /// rules they are part of. Only when the user asks: their rules are theirs.
+    without: Option<Vec<String>>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct PluginArg {
+    plugin: String,
+}
+#[derive(Deserialize, JsonSchema)]
 struct DryRun {
     /// Preview only (default true). Set false to change the game folder.
     dry_run: Option<bool>,
@@ -929,9 +941,15 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| ops::set_plugins_enabled(&i, &names, a.enabled)))
     }
 
-    #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move; otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy.")]
-    async fn sort_plugins(&self, Parameters(a): Parameters<DryRun>) -> Result<String, String> {
-        out(self.inst_for(a.dry_run.unwrap_or(true)).and_then(|i| loot::sort(&i, a.dry_run.unwrap_or(true))))
+    #[tool(description = "Sort plugins with LOOT (masterlist refreshed daily, plus loot/userlist.yaml). dry_run defaults to true and returns the new order and which plugins move, each with LOOT's reason (why); otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next deploy. When LOOT's rules go in a circle nothing is sorted and the error names each rule in it and the user's rules among them; tell the user, who can change a rule or ask to sort without it (without).")]
+    async fn sort_plugins(&self, Parameters(a): Parameters<SortArgs>) -> Result<String, String> {
+        let dry = a.dry_run.unwrap_or(true);
+        out(self.inst_for(dry).and_then(|i| loot::sort_without(&i, dry, &a.without.unwrap_or_default())))
+    }
+
+    #[tool(description = "Why LOOT puts a plugin where it does: its place now and in LOOT's order, and the rules (masters, masterlist and user rules, groups, record overlaps) tying it to the nearest plugin before and after it. Runs a sort without saving it.", annotations(read_only_hint = true))]
+    async fn explain_plugin_order(&self, Parameters(a): Parameters<PluginArg>) -> Result<String, String> {
+        out(self.inst().and_then(|i| loot::why(&i, &a.plugin)))
     }
 
     #[tool(description = "The user's LOOT rules (loot/userlist.yaml) for the profile's plugins: load-after lists and groups.", annotations(read_only_hint = true))]

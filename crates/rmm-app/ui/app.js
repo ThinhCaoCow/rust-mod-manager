@@ -38,6 +38,7 @@ let selPlugin = null;       // the plugin the panel shows: the one clicked last
 let plugSel = new Set();    // selected plugin names
 let plugAnchor = null;      // where a Shift-click range starts
 let lootRules = null;       // { rules, groups } once a plugin was selected; null = reload
+let whyData = null;         // { name, r }: plugin_why for the plugin panel
 let recordData = null;      // { name, rows }: record_conflicts for the plugin panel; null = reload
 let toolsData = null;       // { tools, presets }
 let ignored = new Set();    // health findings ignored in this instance ("kind|subject")
@@ -1049,6 +1050,7 @@ function renderPluginDetails(box) {
     ${p.masters.length ? `<ul>${p.masters.map(m => `<li>${!lower.has(m.toLowerCase()) ? '' : loadsLater(m) ? '<span class="pill bad">Loads after it</span>' : '<span class="pill bad">Missing</span>'}<button class="link" data-plugin="${esc(m)}">${esc(m)}</button></li>`).join('')}</ul>` : '<p class="muted">None.</p>'}
     ${loaders.length ? `<h3>Needed by (${loaders.length})</h3><ul>${loaders.slice(0, 50).map(x => `<li><button class="link" data-plugin="${esc(x.name)}">${esc(x.name)}</button></li>`).join('')}</ul>` : ''}
     ${p.enabled && !p.implicit ? `<h3>Record conflicts</h3>${recordData?.name === p.name ? recordsBlock(recordData.rows) : `<p class="muted small">Other plugins that change the same records (NPCs, items, cells…): the game uses the version of the one that loads last. Reads every enabled plugin, so it can take a moment.</p><button data-act="records">Show record conflicts</button>`}` : ''}
+    ${p.implicit ? '' : `<h3>LOOT’s order</h3>${whyData?.name === p.name ? whyBlock(whyData.r) : '<p class="muted small">What ties it to the plugins around it: masters, LOOT’s and your rules, groups, shared records. Runs a sort without saving it.</p>'}<div class="row"><button data-act="loot-why">${whyData?.name === p.name ? 'Ask again' : 'Why here?'}</button></div>`}
     <h3>LOOT rule</h3>
     ${!lootRules ? '<p class="muted">Loading…</p>' : `
     <div class="small muted">Loads after</div>
@@ -2102,6 +2104,7 @@ $('#details').addEventListener('click', async e => {
     setModRule(id, key, (S.rules.find(r => r.id === id)?.[key] ?? []).filter(a => a !== t.dataset.unrule));
   } else switch (t.dataset.act) {
     case 'records': return loadRecords(selPlugin);
+    case 'loot-why': return loadWhy(selPlugin);
     case 'enable':
       if (busy) { busyNote(); return e.preventDefault(); }
       return setEnabled([id], t.checked);
@@ -2437,26 +2440,59 @@ function setAllGroups(open) {
 $('#loot').onclick = () => lootSort();
 
 /** LOOT's order as a preview: only the plugins that really move, each with the plugin it then
- *  loads after; Apply saves it (one undo step). True once the order matches LOOT. */
-async function lootSort(title = 'Sort with LOOT', intro = '') {
+ *  loads after and LOOT's reason; Apply saves it (one undo step). `without`: plugins whose rules
+ *  of the user's this sort leaves out (after a circle of rules). True once the order matches LOOT. */
+async function lootSort(title = 'Sort with LOOT', intro = '', without = []) {
   toast('Sorting with LOOT. The first sort downloads LOOT’s masterlist.');
-  const r = await act('Sorting with LOOT', () => call('sort_plugins', { dry_run: true }), { reload: false });
+  const r = await act('Sorting with LOOT', () => call('sort_plugins', { dry_run: true, without }), { reload: false });
   if (!r) return false;
+  if (r.cycle) return lootCycle(r.cycle, title, intro, without);
   const rest = r.warnings.filter(w => !w.startsWith('LOOT reads which plugins are on'));
   const warnings = rest.length ? `<details><summary>${plural(rest.length, 'warning')}</summary><pre>${esc(rest.join('\n'))}</pre></details>` : '';
   const stale = r.undeployed ? `<p class="small">LOOT saw ${plural(r.undeployed, 'plugin')} on or off differently from this profile, so its rules about other plugins may be off. <b>Deploy, then sort again</b> may fix that.</p>` : '';
+  const left = without.length ? `<p class="small">This sort leaves out your rules for ${esc(without.join(', '))}. They stay saved; change them in the plugin’s panel.</p>` : '';
   const again = r.undeployed ? [['deploy', 'Deploy, then sort again']] : [];
   let choice;
   if (!r.moved.length) {
-    choice = await dialog({ title, body: `${intro}<p>The load order already matches LOOT.</p>${stale}${warnings}`, actions: [...again, ['cancel', 'Close']] });
+    choice = await dialog({ title, body: `${intro}<p>The load order already matches LOOT.</p>${left}${stale}${warnings}`, actions: [...again, ['cancel', 'Close']] });
   } else {
-    const line = m => `${esc(m.name)} <span class="muted">${m.after ? 'moves after' : 'moves to the top'}</span> ${esc(m.after ?? '')}`;
-    const body = `${intro}<p>${plural(r.moved.length, 'plugin')} ${r.moved.length === 1 ? 'moves' : 'move'}; the others keep their order.</p><pre>${r.moved.map(line).join('\n')}</pre>${stale}${warnings}`;
+    const line = m => `<li>${esc(m.name)} <span class="muted">${m.after ? 'moves after' : 'moves to the top'}</span> ${esc(m.after ?? '')}${m.why?.length ? `<details class="small"><summary>Why</summary>${m.why.map(w => `<div>${esc(w)}</div>`).join('')}</details>` : ''}</li>`;
+    const body = `${intro}<p>${plural(r.moved.length, 'plugin')} ${r.moved.length === 1 ? 'moves' : 'move'}; the others keep their order.</p><ul class="moves">${r.moved.map(line).join('')}</ul>${left}${stale}${warnings}`;
     choice = await dialog({ title, body, actions: [['cancel', 'Cancel'], ...again, ['apply', 'Apply order', 'primary']] });
   }
-  if (choice === 'deploy') return !!await act('Deploying', () => call('deploy')) && lootSort(title, intro);
-  if (choice === 'apply') return !!await act('Saving the LOOT order', () => call('sort_plugins', { dry_run: false }));
+  if (choice === 'deploy') return !!await act('Deploying', () => call('deploy')) && lootSort(title, intro, without);
+  if (choice === 'apply') return !!await act('Saving the LOOT order', () => call('sort_plugins', { dry_run: false, without }));
   return !r.moved.length;
+}
+
+/** LOOT's rules go in a circle: show them, and for the user's own rules in it, sort without one
+ *  just this once or remove it. */
+async function lootCycle(c, title, intro, without) {
+  const yours = c.yours.length
+    ? `<p>Your rules for ${esc(c.yours.join(', '))} are part of it. Sort without them just this once (they stay saved), or remove them.</p>`
+    : c.rules.some(r => !/\.es[mpl]$/i.test(r.from)) ? '<p>The circle is in the order of LOOT’s groups; change the group settings involved.</p>'
+    : '<p>None of these rules are yours, so it needs a fix in LOOT’s masterlist or the plugins.</p>';
+  const body = `${intro}<p>LOOT can’t sort: its rules go in a circle.</p><ul class="small">${c.text.map(t => `<li>${esc(t)}</li>`).join('')}</ul>${yours}`;
+  const v = await dialog({ title, body, actions: [['cancel', 'Close'], ...c.yours.flatMap((y, i) => [[`r${i}`, `Remove your rule for ${y}`], [`w${i}`, `Sort without it`, 'primary']])] });
+  const y = v && c.yours[+v.slice(1)];
+  if (!y) return false;
+  if (v[0] === 'w') return lootSort(title, intro, [...without, y]);
+  if (!await act('Removing the LOOT rule', () => call('set_loot_rule', { plugin: y }), { reload: false })) return false;
+  lootRules = null;
+  return lootSort(title, intro, without);
+}
+
+/** Why LOOT puts a plugin where it does, for its panel. */
+async function loadWhy(name) {
+  const r = await act('Sorting with LOOT', () => call('plugin_why', { plugin: name }), { reload: false });
+  if (!r || r === true) return;
+  whyData = { name, r };
+  if (pluginSide()) renderDetails();
+}
+
+function whyBlock(r) {
+  const at = r.profile_position === r.loot_position ? `LOOT puts it here, at ${r.loot_position}.` : `It is at ${r.profile_position ?? '?'}; LOOT would put it at ${r.loot_position}.`;
+  return `<p class="small">${at}</p><ul class="small">${r.why.map(w => `<li>${esc(w)}</li>`).join('')}</ul>`;
 }
 
 // ---- Drag to reorder (pointer events: HTML drag and drop is off so files can be dropped) ----

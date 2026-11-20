@@ -419,3 +419,8 @@ body.busy .top button, body.busy #install, body.busy #loot, body.busy #recheck, 
 ul.addons { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
 ul.addons li > div:last-child { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .danger-text { color: var(--bad); }
+
+/* LOOT preview: each move, with its reason under it. */
+ul.moves { padding-left: 1.2em; margin: 8px 0; }
+ul.moves li { margin: 3px 0; }
+ul.moves details div { margin-left: 1em; }

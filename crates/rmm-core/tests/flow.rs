@@ -1241,6 +1241,11 @@ fn loot_sorts_and_reports() {
     assert!(pos(&plan.order, "Second.esp") < pos(&plan.order, "First.esp"), "{plan:?}");
     assert!(plan.warnings.is_empty() && plan.undeployed == 0, "{plan:?}");
     assert_eq!(plan.moved.len(), 1, "one plugin moves, not both of the pair: {plan:?}");
+    // The reason comes from the rules libloot logs while it sorts.
+    let why = plan.moved[0].why.join(" ");
+    assert!(why.contains("LOOT's masterlist says First.esp loads after it"), "{why}");
+    let here = loot::why(&inst, "First.esp").unwrap();
+    assert!(here["why"].to_string().contains("In LOOT's order it loads after Second.esp"), "{here}");
     let names = |inst: &Instance| inst.profile().unwrap().plugins.into_iter().map(|p| p.name).collect::<Vec<_>>();
     assert_eq!(names(&inst), ["First.esp", "Second.esp", "Dirty.esp"], "a dry run changes nothing");
 
@@ -1268,6 +1273,17 @@ fn loot_sorts_and_reports() {
     let previous = loot::set_rule(&inst, &loot::Rule { plugin: "Second.esp".into(), ..Default::default() }).unwrap();
     assert_eq!(previous.unwrap().after, ["Dirty.esp"]);
     assert!(loot::rules(&inst).unwrap().is_empty());
+
+    // A rule of the user's against the masterlist's: a circle, named, and sortable without it.
+    loot::set_rule(&inst, &loot::Rule { plugin: "Second.esp".into(), after: vec!["First.esp".into()], group: None }).unwrap();
+    let err = loot::sort(&inst, true).unwrap_err();
+    let cycle = err.downcast_ref::<loot::Cycle>().expect("a cycle");
+    assert_eq!(cycle.yours, ["Second.esp"], "{cycle:?}");
+    assert!(err.to_string().contains("your LOOT rule says Second.esp loads after it"), "{err}");
+    let plan = loot::sort_without(&inst, true, &["Second.esp".into()]).unwrap();
+    assert!(pos(&plan.order, "Second.esp") < pos(&plan.order, "First.esp"), "{plan:?}");
+    assert_eq!(loot::rules(&inst).unwrap().len(), 1, "the rule stays saved");
+    assert!(loot::sort_without(&inst, true, &["First.esp".into()]).is_err(), "no rule of yours for it");
 }
 
 /// A fake tool (a .bat) exercising every capture path: directed output, a new Data file, an

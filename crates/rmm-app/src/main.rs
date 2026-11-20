@@ -310,7 +310,14 @@ fn run(root: Option<PathBuf>, name: &str, a: &Value) -> Result<(Value, Option<Pa
         "plugin_order" => json!(ops::set_plugin_order(&inst, &serde_json::from_value::<Vec<String>>(a["names"].clone())?, &serde_json::from_value::<Vec<String>>(a["moved"].clone()).unwrap_or_default())?),
         "set_rule" => json!(rules::set_rule(&inst, &serde_json::from_value(a.clone())?)?),
         "sort_mods" => json!(rules::sort(&inst, flag("dry_run"))?),
-        "sort_plugins" => json!(loot::sort(&inst, flag("dry_run"))?),
+        "sort_plugins" => {
+            let without: Vec<String> = serde_json::from_value(a["without"].clone()).unwrap_or_default();
+            match loot::sort_without(&inst, flag("dry_run"), &without) {
+                Err(e) if e.downcast_ref::<loot::Cycle>().is_some() => json!({ "cycle": e.downcast_ref::<loot::Cycle>(), "message": e.to_string() }),
+                r => json!(r?),
+            }
+        }
+        "plugin_why" => loot::why(&inst, &s("plugin")?)?,
         "undo" => json!(inst.undo()?),
         "redo" => json!(inst.redo()?),
         "script_extender_mods" => json!(launch::script_extender_mods(&inst)?),

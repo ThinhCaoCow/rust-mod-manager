@@ -341,11 +341,17 @@ enum Cmd {
     },
     /// Saved reviews (one mod's, or every reviewed mod's), and whether the files changed since.
     Reviews { id: Option<String> },
-    /// Sort plugins with LOOT; --apply saves the order to the profile.
+    /// Sort plugins with LOOT, with its reason for each move; --apply saves the order to the
+    /// profile. When LOOT's rules go in a circle it says which, and --without leaves your rules
+    /// for a plugin out of this one sort.
     Sort {
         #[arg(long)]
         apply: bool,
+        #[arg(long)]
+        without: Vec<String>,
     },
+    /// Why LOOT puts a plugin where it does: the rules tying it to the plugins nearest it.
+    Why { plugin: String },
     /// Download the latest LOOT masterlist now (sort refreshes it daily by itself).
     Masterlist,
     /// LOOT user rules for the profile's plugins; with a plugin, replace its rule (no --after or
@@ -1101,7 +1107,8 @@ fn run() -> Result<()> {
             }
             print(&plugins::list(&inst, &inst.profile()?)?)
         }
-        Cmd::Sort { apply } => print(&loot::sort(&open()?, !apply)?),
+        Cmd::Sort { apply, without } => print(&loot::sort_without(&open()?, !apply, &without)?),
+        Cmd::Why { plugin } => print(&loot::why(&open()?, &plugin)?),
         Cmd::Masterlist => print(&loot::update_masterlist(&open()?, true)?),
         Cmd::Rule { plugin: None, .. } => print(&loot::rules(&open()?)?),
         Cmd::Rule { plugin: Some(plugin), after, group } => print(&serde_json::json!({ "previous": loot::set_rule(&open()?, &loot::Rule { plugin, after, group })? })),

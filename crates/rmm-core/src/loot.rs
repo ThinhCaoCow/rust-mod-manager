@@ -43,6 +43,256 @@ pub struct Moved {
     pub to: usize,
     /// The plugin it then loads right after; none when it goes first.
     pub after: Option<String>,
+    /// Why it moves, in LOOT's rules: a plugin it now loads before or after, then each rule on
+    /// the way there.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub why: Vec<String>,
+}
+
+/// One of LOOT's rules in a sort: `from` loads before `to`. `kind` is libloot's name for it
+/// ("Master", "User Load After", "Record Overlap"…).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
+/// The rule in plain words.
+fn describe(e: &Edge) -> String {
+    let (from, to) = (&e.from, &e.to);
+    if !crate::install::is_plugin(from) {
+        // A cycle among groups: the vertices are group names.
+        let whose = if e.kind.starts_with("User") { "your group settings" } else { "LOOT's masterlist" };
+        return format!("group {from} comes before group {to} ({whose})");
+    }
+    let why = match e.kind.as_str() {
+        "Hardcoded" => "the game loads it early, in a fixed order".to_string(),
+        "Master Flag" => "it is a master file (ESM flag), and those load before other plugins".into(),
+        "Master" => format!("it is one of {to}'s masters"),
+        "Masterlist Requirement" => format!("LOOT's masterlist says {to} needs it"),
+        "User Requirement" => format!("your LOOT rule says {to} needs it"),
+        "Masterlist Load After" => format!("LOOT's masterlist says {to} loads after it"),
+        "User Load After" => format!("your LOOT rule says {to} loads after it"),
+        "Masterlist Group" => format!("its LOOT group comes before {to}'s"),
+        "User Group" => format!("its LOOT group comes before {to}'s, a group you set"),
+        "Record Overlap" => format!("both change some of the same records and it changes more records overall, so it loads first and {to}'s changes win"),
+        "Asset Overlap" => format!("their archives hold some of the same files and its archive holds more, so it loads first and {to}'s files win"),
+        "Tie Break" => format!("it was already before {to}"),
+        "Blueprint Master" => format!("{to} is a blueprint master, and those load last"),
+        other => format!("LOOT's \"{other}\" rule"),
+    };
+    format!("{from} loads before {to}: {why}.")
+}
+
+/// The rules LOOT used in one sort, read from libloot's log ("Adding Master edge from "A" to
+/// "B"."). libloot has no other way to hand them out; the flow test `loot_sorts_and_reports` breaks if the wording
+/// changes, and Cargo.toml pins the version.
+#[derive(Default)]
+struct Graph {
+    edges: Vec<Edge>,
+}
+
+static EDGES: std::sync::Mutex<Option<Vec<Edge>>> = std::sync::Mutex::new(None);
+/// One sort that reads the rules at a time: libloot's log is the whole program's.
+static READING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn parse_edge(line: &str) -> Option<Edge> {
+    let rest = line.strip_prefix("Adding ")?.strip_suffix("\".")?;
+    let (kind, rest) = rest.split_once(" edge from \"")?;
+    let (from, to) = rest.split_once("\" to \"")?;
+    Some(Edge { from: from.into(), to: to.into(), kind: kind.into() })
+}
+
+/// Sort, keeping the rules LOOT added on the way.
+fn sort_reading(game: &libloot::Game, names: &[&str]) -> (Result<Vec<String>, libloot::error::SortPluginsError>, Graph) {
+    static HOOKED: std::sync::Once = std::sync::Once::new();
+    HOOKED.call_once(|| {
+        libloot::set_logging_callback(|_, line| {
+            if let Some(e) = parse_edge(line)
+                && let Some(v) = EDGES.lock().unwrap_or_else(|p| p.into_inner()).as_mut()
+            {
+                v.push(e);
+            }
+        })
+    });
+    let _one = READING.lock().unwrap_or_else(|p| p.into_inner());
+    *EDGES.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+    let result = game.sort_plugins(names);
+    let edges = EDGES.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+    (result, Graph { edges })
+}
+
+impl Graph {
+    /// Every plugin reachable from `start` through rules other than tie-breaks (which only keep
+    /// the existing order), going forward (loads later) or backward, with the rule that reached
+    /// each one first (by lowercase name).
+    fn reach(&self, start: &str, forward: bool) -> std::collections::HashMap<String, usize> {
+        let key = |s: &str| s.to_lowercase();
+        let mut by: std::collections::HashMap<String, Vec<usize>> = Default::default();
+        for (i, e) in self.edges.iter().enumerate().filter(|(_, e)| e.kind != "Tie Break") {
+            by.entry(key(if forward { &e.from } else { &e.to })).or_default().push(i);
+        }
+        let mut seen: std::collections::HashMap<String, usize> = Default::default();
+        let mut queue = std::collections::VecDeque::from([key(start)]);
+        while let Some(n) = queue.pop_front() {
+            for &i in by.get(&n).into_iter().flatten() {
+                let next = key(if forward { &self.edges[i].to } else { &self.edges[i].from });
+                if next != key(start) && !seen.contains_key(&next) {
+                    seen.insert(next.clone(), i);
+                    queue.push_back(next);
+                }
+            }
+        }
+        seen
+    }
+
+    /// The rules from `start` to `end` in a `reach` from `start`, in load order.
+    fn chain(&self, reached: &std::collections::HashMap<String, usize>, start: &str, end: &str, forward: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut at = end.to_lowercase();
+        while at != start.to_lowercase() {
+            let Some(&i) = reached.get(&at) else { break };
+            let e = &self.edges[i];
+            out.push(describe(e));
+            at = (if forward { &e.from } else { &e.to }).to_lowercase();
+        }
+        if forward {
+            out.reverse();
+        }
+        out
+    }
+}
+
+/// Why `name` moves from its place in `old` to its place in `new`: the nearest plugin it passes
+/// that LOOT's rules put on its other side, and those rules.
+fn why_moved(g: &Graph, old: &[&str], new: &[String], name: &str, master: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let lower = |s: &str| s.to_lowercase();
+    let old_at: std::collections::HashMap<String, usize> = old.iter().enumerate().map(|(i, n)| (lower(n), i)).collect();
+    let (Some(&o), Some(n)) = (old_at.get(&lower(name)), new.iter().position(|x| x.eq_ignore_ascii_case(name))) else { return vec![] };
+    let (later, earlier) = (g.reach(name, true), g.reach(name, false));
+    // Plugins it passes, nearest first: it now loads before ones that were before it, or after
+    // ones that were after it.
+    let mut passed: Vec<(usize, &String, bool)> = new
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let po = *old_at.get(&lower(p))?;
+            if i > n && po < o {
+                Some((i - n, p, true))
+            } else if i < n && po > o {
+                Some((n - i, p, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+    passed.sort_by_key(|p| p.0);
+    for &(_, p, before) in &passed {
+        let reached = if before { &later } else { &earlier };
+        if reached.contains_key(&lower(p)) {
+            let head = if before { format!("It now loads before {p}.") } else { format!("It now loads after {p}.") };
+            return std::iter::once(head).chain(g.chain(reached, name, p, before)).collect();
+        }
+    }
+    if let Some(&(_, p, false)) = passed.iter().find(|(_, p, before)| !before && master(p) && !master(name)) {
+        return vec![format!("It now loads after {p}: {p} is a master file (ESM flag), and those load before other plugins.")];
+    }
+    vec!["No rule of LOOT's moves it by itself: the plugins around it moved, and it keeps its order with them.".into()]
+}
+
+/// Why `name` sits where it does in LOOT's `order`: the nearest plugin before it and the nearest
+/// after it that LOOT's rules tie it to.
+fn why_here(g: &Graph, order: &[String], name: &str, master: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let Some(n) = order.iter().position(|x| x.eq_ignore_ascii_case(name)) else { return vec![] };
+    let (earlier, later) = (g.reach(name, false), g.reach(name, true));
+    let mut out = Vec::new();
+    if let Some(p) = order[..n].iter().rev().find(|p| earlier.contains_key(&p.to_lowercase())) {
+        out.push(format!("In LOOT's order it loads after {p}."));
+        out.extend(g.chain(&earlier, name, p, false));
+    } else if !master(name) && let Some(p) = order[..n].iter().rev().find(|p| master(p)) {
+        out.push(format!("In LOOT's order it loads after {p}: {p} is a master file (ESM flag), and those load before other plugins."));
+    }
+    if let Some(p) = order[n + 1..].iter().find(|p| later.contains_key(&p.to_lowercase())) {
+        out.push(format!("In LOOT's order it loads before {p}."));
+        out.extend(g.chain(&later, name, p, true));
+    }
+    if out.is_empty() {
+        out.push("No rule of LOOT's ties it to the plugins around it, so it keeps its place.".into());
+    }
+    out
+}
+
+/// LOOT's rules go in a circle, so it can't sort.
+#[derive(Debug, Clone, Serialize)]
+pub struct Cycle {
+    /// Each rule loads its `from` before its `to`; the last leads back to the first.
+    pub rules: Vec<Edge>,
+    /// The circle in words.
+    pub text: Vec<String>,
+    /// Plugins in it with rules of yours: sorting without one of them (`sort_without`) may break
+    /// the circle.
+    pub yours: Vec<String>,
+}
+
+impl std::fmt::Display for Cycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LOOT can't sort: its rules go in a circle. {}", self.text.join(" "))?;
+        match &self.yours[..] {
+            [] if self.rules.iter().any(|r| !crate::install::is_plugin(&r.from)) => write!(f, " The circle is in the order of LOOT's groups; change the group settings involved."),
+            [] => write!(f, " None of the rules are yours, so it needs a fix in LOOT's masterlist or the plugins."),
+            yours => write!(f, " Your rules for {} are part of it: sort without them just this once (--without), or change them.", yours.join(", ")),
+        }
+    }
+}
+
+impl std::error::Error for Cycle {}
+
+/// A failed sort as an error: a circle of rules as a `Cycle` (the window takes it apart).
+fn sort_error(game: &libloot::Game, e: libloot::error::SortPluginsError) -> anyhow::Error {
+    let libloot::error::SortPluginsError::CycleFound(vertices) = &e else { return e.into() };
+    let rules: Vec<Edge> = vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| Edge {
+            from: v.name().to_owned(),
+            to: vertices[(i + 1) % vertices.len()].name().to_owned(),
+            kind: v.out_edge_type().map_or_else(|| "?".into(), |t| t.to_string()),
+        })
+        .collect();
+    let mut yours = Vec::new();
+    if rules.iter().any(|r| r.kind.starts_with("User")) {
+        let db = game.database();
+        if let Ok(db) = db.read() {
+            for v in vertices {
+                if crate::install::is_plugin(v.name()) && matches!(db.plugin_user_metadata(v.name(), EvalMode::DoNotEvaluate), Ok(Some(_))) && !yours.iter().any(|y: &String| y.eq_ignore_ascii_case(v.name())) {
+                    yours.push(v.name().to_owned());
+                }
+            }
+        }
+    }
+    let text = rules.iter().map(describe).collect();
+    Cycle { rules, text, yours }.into()
+}
+
+/// Leave the user's rules for `plugins` out of this sort (the userlist stays as it is).
+fn forget(game: &libloot::Game, plugins: &[String]) -> Result<()> {
+    if plugins.is_empty() {
+        return Ok(());
+    }
+    let db = game.database();
+    let mut db = db.write().map_err(|_| anyhow::anyhow!("LOOT database lock poisoned"))?;
+    for p in plugins {
+        if db.plugin_user_metadata(p, EvalMode::DoNotEvaluate)?.is_none() {
+            bail!("you have no LOOT rule for {p}");
+        }
+        db.discard_plugin_user_metadata(p);
+    }
+    Ok(())
+}
+
+fn is_master(game: &libloot::Game) -> impl Fn(&str) -> bool + '_ {
+    |n| game.plugin(n).is_some_and(|p| p.is_master())
 }
 
 fn dir(inst: &Instance) -> PathBuf {
@@ -177,7 +427,7 @@ fn load<'a>(game: &mut libloot::Game, infos: &'a [PluginInfo], warnings: &mut Ve
 /// Put only the `new` plugins where LOOT's sort would, each right after the nearest plugin LOOT puts
 /// before it; every other plugin keeps the user's order. Saved to the profile (undoable).
 pub fn place(inst: &Instance, new: &[String]) -> Result<SortReport> {
-    let mut r = sort(inst, true)?;
+    let (mut r, graph, masters) = run(inst, true, &[])?;
     let mut moved = vec![];
     inst.edit("place new plugins (LOOT)", |p| {
         let before = p.plugins.clone();
@@ -187,7 +437,8 @@ pub fn place(inst: &Instance, new: &[String]) -> Result<SortReport> {
             .iter()
             .filter_map(|n| {
                 let to = at(&p.plugins, n)?;
-                Some(Moved { name: n.clone(), from: at(&before, n)?, to, after: to.checked_sub(1).map(|i| p.plugins[i].name.clone()) })
+                let why = why_here(&graph, &r.order, n, &|x: &str| masters.iter().any(|m| m.eq_ignore_ascii_case(x)));
+                Some(Moved { name: n.clone(), from: at(&before, n)?, to, after: to.checked_sub(1).map(|i| p.plugins[i].name.clone()), why })
             })
             .filter(|m| m.from != m.to)
             .collect();
@@ -212,24 +463,53 @@ fn placed(plugins: &[PluginEntry], loot: &[String], new: &[String]) -> Vec<Plugi
     out
 }
 
-/// Sort plugins with LOOT. A dry run returns the new order and what moves; otherwise the order
-/// is saved to the profile (undoable) and reaches plugins.txt on the next deploy.
+/// Sort plugins with LOOT. A dry run returns the new order and what moves, with LOOT's reasons;
+/// otherwise the order is saved to the profile (undoable) and reaches plugins.txt on the next
+/// deploy. When LOOT's rules go in a circle the error is a `Cycle`.
 pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
+    sort_without(inst, dry_run, &[])
+}
+
+/// `sort`, leaving the user's rules for `without` out of this one sort (to get past a `Cycle`
+/// they are part of). The userlist keeps them.
+pub fn sort_without(inst: &Instance, dry_run: bool, without: &[String]) -> Result<SortReport> {
+    Ok(run(inst, dry_run, without)?.0)
+}
+
+/// Why LOOT puts `plugin` where it does: where it is now, where LOOT's sort puts it, and the
+/// rules that tie it to the plugins nearest it.
+pub fn why(inst: &Instance, plugin: &str) -> Result<serde_json::Value> {
+    let (r, graph, masters) = run(inst, true, &[])?;
+    let Some(to) = r.order.iter().position(|n| n.eq_ignore_ascii_case(plugin)) else { bail!("LOOT doesn't sort a plugin named {plugin} in this profile") };
+    let now = plugins::list(inst, &inst.profile()?)?.iter().position(|p| p.name.eq_ignore_ascii_case(plugin));
+    let why = why_here(&graph, &r.order, plugin, &|x: &str| masters.iter().any(|m| m.eq_ignore_ascii_case(x)));
+    let moves = r.moved.iter().find(|m| m.name.eq_ignore_ascii_case(plugin)).map(|m| &m.why);
+    Ok(serde_json::json!({ "plugin": r.order[to], "loot_position": to, "profile_position": now, "why": why, "why_it_would_move": moves }))
+}
+
+/// A sort, with the rules LOOT used and the master-flagged plugins.
+fn run(inst: &Instance, dry_run: bool, without: &[String]) -> Result<(SortReport, Graph, Vec<String>)> {
     crate::progress::report("sorting plugins with LOOT", 0, 0);
     let mut warnings = update_masterlist(inst, false).unwrap_or_else(|e| vec![format!("{e:#}")]);
     let profile = inst.profile()?;
     let infos = plugins::list(inst, &profile)?;
     let (mut game, w) = handle(inst, &profile)?;
     warnings.extend(w);
+    forget(&game, without)?;
     let current = load(&mut game, &infos, &mut warnings)?;
     let names: Vec<&str> = current.iter().map(|p| p.name.as_str()).collect();
-    let order = game.sort_plugins(&names)?;
+    let (result, graph) = sort_reading(&game, &names);
+    let order = result.map_err(|e| sort_error(&game, e))?;
+    let masters: Vec<String> = names.iter().filter(|n| is_master(&game)(n)).map(|n| n.to_string()).collect();
 
     let undeployed = current.iter().filter(|p| game.is_plugin_active(&p.name) != p.enabled).count();
     if undeployed > 0 {
         warnings.push(format!("LOOT saw {undeployed} plugins on or off differently from this profile"));
     }
-    let moved = moves(&names, &order);
+    let mut moved = moves(&names, &order);
+    for m in &mut moved {
+        m.why = why_moved(&graph, &names, &order, &m.name, &is_master(&game));
+    }
 
     if !dry_run && !moved.is_empty() {
         inst.edit("sort plugins (LOOT)", |p| {
@@ -251,7 +531,7 @@ pub fn sort(inst: &Instance, dry_run: bool) -> Result<SortReport> {
             Ok(())
         })?;
     }
-    Ok(SortReport { dry_run, order, moved, undeployed, warnings })
+    Ok((SortReport { dry_run, order, moved, undeployed, warnings }, graph, masters))
 }
 
 /// The plugins that move from `old` to `new`: all but one longest run that keeps its order, so
@@ -263,7 +543,7 @@ fn moves(old: &[&str], new: &[String]) -> Vec<Moved> {
     both.iter()
         .enumerate()
         .filter(|(k, _)| !keep.contains(k))
-        .map(|(_, &(to, from))| Moved { name: new[to].clone(), from, to, after: to.checked_sub(1).map(|i| new[i].clone()) })
+        .map(|(_, &(to, from))| Moved { name: new[to].clone(), from, to, after: to.checked_sub(1).map(|i| new[i].clone()), why: vec![] })
         .collect()
 }
 
