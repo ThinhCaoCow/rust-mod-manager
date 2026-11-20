@@ -32,8 +32,11 @@ pub struct Rmm {
     /// Background tool runs by tool id. In memory only; a finished run's report is also in
     /// tools/<id>/last-run.json.
     jobs: Arc<Mutex<BTreeMap<String, Job>>>,
-    /// The live test (test_session_*); dropping it closes the game.
-    session: Arc<Mutex<Option<harness::Session>>>,
+    /// The live test (test_session_*) and the client that started it; dropping it closes the
+    /// game. One game runs at a time, so every client of this server shares the slot.
+    session: Arc<Mutex<Option<(u64, harness::Session)>>>,
+    /// This client, among the ones the HTTP server serves (0 for stdio's one).
+    client: u64,
     /// Some when the client's calls are kept as a chat (an AI app's session; see `recorded`).
     log: Option<Arc<Mutex<Option<chats::Chat>>>>,
     tool_router: ToolRouter<Self>,
@@ -770,15 +773,21 @@ impl Rmm {
     /// The instance for a change: refused while a background tool run owns the game folder, or a
     /// live test's game is running on it.
     fn inst_mut(&self) -> anyhow::Result<Instance> {
-        let jobs = self.jobs.lock().unwrap();
-        if let Some((id, _)) = jobs.iter().find(|(_, j)| matches!(j, Job::Running { .. })) {
-            anyhow::bail!("tool '{id}' is running in the background; wait for it (tool_job) before changing the setup");
-        }
+        self.no_job()?;
         // A step holds the lock while it plays, so a locked session is a running one.
         if self.session.try_lock().map_or(true, |s| s.is_some()) {
             anyhow::bail!("a live test is running; end it (test_session_stop) before changing the setup");
         }
         self.inst()
+    }
+
+    /// Refused while a background tool run owns the game folder.
+    fn no_job(&self) -> anyhow::Result<()> {
+        let jobs = self.jobs.lock().unwrap();
+        if let Some((id, _)) = jobs.iter().find(|(_, j)| matches!(j, Job::Running { .. })) {
+            anyhow::bail!("tool '{id}' is running in the background; wait for it (tool_job) before changing the setup");
+        }
+        Ok(())
     }
 
     fn inst_for(&self, dry_run: bool) -> anyhow::Result<Instance> {
@@ -1343,10 +1352,10 @@ impl Rmm {
         if slot.is_some() {
             return Err("a live test is running; end it with test_session_stop first".into());
         }
-        out(self.inst_mut().and_then(|i| {
+        out(self.no_job().and_then(|_| self.inst()).and_then(|i| {
             let session = harness::Session::start(&i, &a.scenario)?;
             let report = serde_json::to_value(session.progress())?;
-            *slot = Some(session);
+            *slot = Some((self.client, session));
             Ok(report)
         }))
     }
@@ -1354,16 +1363,19 @@ impl Rmm {
     #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window, which comes back as an image after the results, in step order, at most 1280 wide), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
     async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<CallToolResult, String> {
         let mut slot = self.session.lock().unwrap();
-        let Some(session) = slot.as_mut() else {
+        let Some((owner, session)) = slot.as_mut() else {
             return Err("no live test is running; start one with test_session_start".into());
         };
+        if *owner != self.client {
+            return Err("another AI app's live test is running; end it with test_session_stop first".into());
+        }
         self.inst().and_then(|i| rmm_core::harness::check_saves(&i, &a.steps)).map_err(|e| format!("{e:#}"))?;
         let steps = session.steps(&a.steps);
         let shots: Vec<_> = steps.iter().filter_map(|s| s.screenshot.as_deref()).filter_map(|p| shot_image(p).ok()).collect();
         let text = if session.alive() {
             out(Ok(serde_json::json!({ "steps": steps })))?
         } else {
-            let session = slot.take().expect("checked above");
+            let (_, session) = slot.take().expect("checked above");
             out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": "the game closed", "run": session.stop(&i)? }))))?
         };
         // The screenshots come along as images, after the steps, in their order.
@@ -1372,7 +1384,8 @@ impl Rmm {
 
     #[tool(description = "End the live test: quit the game and report the whole session: every step, timings, FPS, screenshots, a crash log read back to mods, and the Papyrus log's errors with their mods. The INIs changed for the small window are put back.")]
     async fn test_session_stop(&self) -> Result<String, String> {
-        let Some(session) = self.session.lock().unwrap().take() else {
+        // Any client may end it: the one that started it may be gone.
+        let Some((_, session)) = self.session.lock().unwrap().take() else {
             return Err("no live test is running".into());
         };
         out(self.inst().and_then(|i| session.stop(&i)))
@@ -1684,7 +1697,13 @@ impl ServerHandler for Rmm {
         // An app's calls go to its session's chat; save_chat_note adds its note itself.
         let call = (self.log.is_some() && request.name != "save_chat_note")
             .then(|| (request.name.to_string(), request.arguments.clone().map(serde_json::Value::Object).unwrap_or_default(), app_name(&context.peer)));
-        let r = self.tool_router.call(ToolCallContext::new(self, request, context)).await;
+        // Tools do their work (deploys, downloads, a live test's steps) without awaiting: on a
+        // worker of its own, so other requests (another app's, a session's next) aren't held up.
+        let run = self.tool_router.call(ToolCallContext::new(self, request, context));
+        let r = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| h.block_on(run)),
+            _ => run.await,
+        };
         if let Some((name, args, app)) = call {
             let (ok, text) = match &r {
                 Ok(CallToolResponse::Complete(res)) => (res.is_error != Some(true), res.content.iter().filter_map(|c| c.as_text()).map(|t| t.text.as_str()).collect::<Vec<_>>().join("\n")),
@@ -1708,13 +1727,35 @@ impl ServerHandler for Rmm {
 
 impl Rmm {
     pub fn new(root: PathBuf) -> Rmm {
-        Rmm { root, jobs: Default::default(), session: Default::default(), log: None, tool_router: Rmm::tool_router(), prompt_router: Rmm::prompt_router() }
+        Rmm { root, jobs: Default::default(), session: Default::default(), client: 0, log: None, tool_router: Rmm::tool_router(), prompt_router: Rmm::prompt_router() }
     }
 
     /// This server for one outside AI app's session: its calls are kept as a chat in the instance.
     pub fn recorded(mut self) -> Rmm {
         self.log = Some(Default::default());
         self
+    }
+
+    /// This server for a client of its own: the HTTP server's sessions each get one.
+    pub fn for_new_client(mut self) -> Rmm {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.client = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    /// The client is gone: end the live test it started, so its game doesn't run on with no one
+    /// to stop it. Blocks while the game quits.
+    pub fn client_gone(&self) {
+        let mine = {
+            let mut slot = self.session.lock().unwrap();
+            if slot.as_ref().is_some_and(|(owner, _)| *owner == self.client) { slot.take() } else { None }
+        };
+        if let Some((_, session)) = mine {
+            match self.inst() {
+                Ok(i) => drop(session.stop(&i)),
+                Err(_) => drop(session),
+            }
+        }
     }
 
     /// `recorded` unless the user turned keeping sessions off (mcp.record_sessions).

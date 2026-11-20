@@ -335,6 +335,17 @@ pub fn check_saves(inst: &Instance, steps: &[Step]) -> Result<()> {
             bail!("there's no save named '{name}' in {} (name it without .{ext})", dir.display());
         }
     }
+    // A save that needs plugins the profile doesn't load makes the game ask before loading.
+    let loads: Vec<&String> = steps.iter().filter_map(|s| if let Step::Load(n) = s { Some(n) } else { None }).collect();
+    if !loads.is_empty() {
+        for save in crate::saves::list(inst)?.saves {
+            let stem = save.file.rsplit_once('.').map_or(save.file.as_str(), |(s, _)| s);
+            if !save.missing.is_empty() && loads.iter().any(|n| n.eq_ignore_ascii_case(stem) || n.eq_ignore_ascii_case(&save.file)) {
+                let names: Vec<&str> = save.missing.iter().take(8).map(|m| m.plugin.as_str()).collect();
+                bail!("'{stem}' needs plugins this profile doesn't load ({}{}), so the game would ask before loading it; enable them or load another save", names.join(", "), if save.missing.len() > 8 { ", …" } else { "" });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1043,15 +1054,24 @@ impl Conn {
 
     /// Wait for an event, failing on timeout or when the game goes away.
     fn until(&mut self, ev: &str, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<Value> {
+        // A load the game stops to ask about (a save that needs missing content, a damaged one)
+        // never finishes on its own.
+        let asks = |v: &Value| ev == "game_loaded" && v["ev"] == "message_box";
+        if self.early.iter().any(asks) {
+            bail!("the game asked a question instead of loading (a save that needs plugins that aren't loaded asks first); answer it with a button step, or load another save");
+        }
         if let Some(i) = self.early.iter().position(|v| v["ev"] == ev) {
             return Ok(self.early.remove(i));
         }
         let start = Instant::now();
         loop {
-            if let Some(v) = self.read(Duration::from_millis(500))?
-                && v["ev"] == ev
-            {
-                return Ok(v);
+            if let Some(v) = self.read(Duration::from_millis(500))? {
+                if v["ev"] == ev {
+                    return Ok(v);
+                }
+                if asks(&v) {
+                    bail!("the game asked a question instead of loading (a save that needs plugins that aren't loaded asks first); answer it with a button step, or load another save");
+                }
             }
             let last = if self.notes.is_empty() { String::new() } else { format!(" (the game's last steps: {})", self.notes.join(", ")) };
             if !alive() {
@@ -1171,6 +1191,12 @@ mod tests {
         assert!(c.read(Duration::from_millis(100)).unwrap().is_none(), "half a message: wait for the rest");
         game.write_all(b"ult\",\"id\":1}\n").unwrap();
         assert_eq!(c.read(Duration::from_secs(2)).unwrap().unwrap()["ev"], "result");
+
+        // A load the game stops to ask about fails at once, not at the timeout.
+        game.write_all(b"{\"ev\":\"message_box\"}\n").unwrap();
+        let t = Instant::now();
+        let err = c.until("game_loaded", Duration::from_secs(60), &|| true).unwrap_err().to_string();
+        assert!(err.contains("asked a question") && t.elapsed() < Duration::from_secs(5), "{err}");
 
         // Between steps (the AI thinking) nothing asks for messages, yet the game's sends go
         // through: a full socket would hold up its main thread.
