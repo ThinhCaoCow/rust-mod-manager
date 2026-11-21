@@ -479,7 +479,7 @@ struct SessionStartArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 struct SessionStepArgs {
-    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}, {"state": {}}, {"wait_for": {...}}, {"call": {...}}, {"move_to": ref}, {"activate": ref}, {"face": ref}; Skyrim also {"dialogue": {}}, {"choose": words or index}, {"button": n}, {"menu_call": {...}}, {"menu_get": {...}}, {"attack": {...}}, {"press": {...}}.
+    /// Steps in order: {"cell": id}, {"console": command}, {"wait": seconds}, {"screenshot": name}, {"load": save}, {"state": {}}, {"wait_for": {...}}, {"call": {...}}, {"move_to": ref}, {"activate": ref}, {"face": ref}; Skyrim also {"dialogue": {}}, {"choose": words or index}, {"button": n}, {"menu_call": {...}}, {"menu_get": {...}}, {"attack": {...}}, {"press": {...}}, {"click": {"x", "y"}} (pixels of the last screenshot you got), {"key": {"key": "Escape"}}, {"type": "text"}.
     steps: Vec<harness::Step>,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -700,6 +700,15 @@ fn shot_image(path: &std::path::Path) -> anyhow::Result<ContentBlock> {
     let bytes = std::fs::read(path)?;
     let png = shrink_png(&bytes)?.unwrap_or(bytes);
     Ok(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png"))
+}
+
+/// How many of the window's pixels one pixel of a screenshot the AI got stands for: the whole
+/// factor `shrink_png` scales a wide one down by, 1 when it sends it as it is.
+fn shot_factor(path: &std::path::Path) -> u32 {
+    let Some((w, h)) = std::fs::read(path).ok().and_then(|b| png::Decoder::new(std::io::Cursor::new(b)).read_info().ok().map(|r| (r.info().width, r.info().height))) else {
+        return 1;
+    };
+    if w <= SHOT_WIDTH || h < w.div_ceil(SHOT_WIDTH) { 1 } else { w.div_ceil(SHOT_WIDTH) }
 }
 
 /// A tool call's arguments as a chat keeps them: long text cut, and nxm links without their
@@ -1360,7 +1369,7 @@ impl Rmm {
         }))
     }
 
-    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window, which comes back as an image after the results, in step order, at most 1280 wide), {\"load\": \"save name\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
+    #[tool(description = "Run steps in the live test's game, in order: {\"cell\": \"Riverwood\"} (coc, then wait for the load), {\"console\": \"player.placeatme 0001A694 2\"} (any console command; what it prints is the step's output, so queries work: getstage <quest>, player.getav health, player.getpos x, sqv <quest>, help <word>), {\"wait\": 10} (seconds, sampling FPS), {\"screenshot\": \"name\"} (a PNG of the window, which comes back as an image after the results, in step order, at most 1280 wide), {\"load\": \"save name\"}, and in Skyrim's menus {\"click\": {\"x\": 640, \"y\": 360}} (a point of the last screenshot you got), {\"key\": {\"key\": \"Escape\"}} and {\"type\": \"text\"}. Each result has ok or its error, FPS, the player's cell, the screenshot's path and a console step's output (missing when the harness plugin predates console output). If the game closes, the live test ends and the answer has the whole run with the crash log read back to mods.")]
     async fn test_session_step(&self, Parameters(a): Parameters<SessionStepArgs>) -> Result<CallToolResult, String> {
         let mut slot = self.session.lock().unwrap();
         let Some((owner, session)) = slot.as_mut() else {
@@ -1370,7 +1379,21 @@ impl Rmm {
             return Err("another AI app's live test is running; end it with test_session_stop first".into());
         }
         self.inst().and_then(|i| rmm_core::harness::check_saves(&i, &a.steps)).map_err(|e| format!("{e:#}"))?;
-        let steps = session.steps(&a.steps);
+        // The AI clicks in the screenshots it got, which a wide window shrinks.
+        let f = session.progress().screenshots.last().map_or(1, |p| shot_factor(p)) as f64;
+        let wanted: Vec<harness::Step> = a
+            .steps
+            .iter()
+            .cloned()
+            .map(|s| match s {
+                harness::Step::Click(mut k) => {
+                    (k.x, k.y) = (k.x * f, k.y * f);
+                    harness::Step::Click(k)
+                }
+                s => s,
+            })
+            .collect();
+        let steps = session.steps(&wanted);
         let shots: Vec<_> = steps.iter().filter_map(|s| s.screenshot.as_deref()).filter_map(|p| shot_image(p).ok()).collect();
         let text = if session.alive() {
             out(Ok(serde_json::json!({ "steps": steps })))?
@@ -1616,11 +1639,12 @@ The game runs in a small window behind the user's windows, so you see it only th
    - State: {\"state\": {\"quests\": [...], \"refs\": [...]}} gives the player, open menus, the nearest actors and objects with their refs, and what you ask about. Every step's answer also lists the game's events since the last one (deaths, the player's activations, combat, quest stages). {\"wait_for\": {\"dead\": \"<ref>\"}} (or stage, menu, menu_closed, in_combat, near, cell) waits for a condition instead of guessing a wait.
    - Playing: {\"move_to\": \"<ref>\"} walks there (or moves the player when something is in the way, and says so), {\"activate\": \"<ref>\"} opens doors and containers and starts conversations, {\"face\": \"<ref>\"}. {\"call\": {\"class\": \"Actor\", \"fn\": \"StartCombat\", \"self\": \"<ref>\", \"args\": [\"player\"]}} calls any Papyrus function and returns its value.
    - Skyrim only: {\"dialogue\": {}} lists the topics, {\"choose\": \"words\"} picks one and waits for the answer; {\"button\": 1} answers a message box; {\"attack\": {\"target\": \"<ref>\"}} swings at it (move_to first: 100 units is in reach); {\"press\": {\"control\": \"Jump\"}}.
+   - Skyrim only, in menus (inventory, map, dialogue, message boxes, the level-up screen): {\"click\": {\"x\": 640, \"y\": 360}} clicks that point of the last screenshot you got (\"button\": \"right\", \"double\": true, or \"wheel\": -3 to scroll); {\"key\": {\"key\": \"Escape\"}} presses a key as the game would take it there (Escape closes a menu, Enter accepts, Tab opens the Tween menu; E is Activate in the world); {\"type\": \"iron\"} types into a search box once it has focus (click the box first). Take a screenshot, click, then take another to see what happened. Your mouse and keyboard are never touched.
 2. test_session_start with the save (or a first cell, which starts the game from the main menu) and the first steps. Then test_session_step in small batches. Look at every screenshot (they come back as images with the step's answer) before the next batch: did the move land (the step's cell), does the fight happen, did the quest start, is the item there? The FPS of each wait shows the cost.
 3. If the game closes, the step's answer ends the session with the crash log read back to the mods it names: report that to the lead and stop.
 4. test_session_stop when done: crash, Papyrus errors with their mods, FPS.
 5. Report per mechanic: worked, didn't, or couldn't tell, with the screenshots; crashes and script errors with the mods behind them; the lowest FPS and where. Don't change the setup: fixing is the installer's job.
-Limits: move_to walks in a straight line (no pathfinding). Fallout 4 has no dialogue, menu, attack or key steps yet: use the console and Papyrus calls there. A console step without output, or a step the plugin calls unknown, means the harness plugin is older than this rmm.";
+Limits: move_to walks in a straight line (no pathfinding). Fallout 4 has no dialogue, menu, attack, click or key steps yet: use the console and Papyrus calls there. A console step without output, or a step the plugin calls unknown, means the harness plugin is older than this rmm.";
 
 /// Where the client can start helper agents, the live test goes to a cheaper one.
 const HAND_OFF: &str = "If you can start helper agents and one named rmm-tester is available (Claude Code, after `rmm tester-agent --apply`), make the plan yourself and give the live test to it: it runs on Haiku, the cheapest Claude model, and sees the screenshots. Read its report and send it follow-ups. Otherwise run the test yourself.";
@@ -1820,6 +1844,15 @@ mod tests {
     #[test]
     fn short_screenshots_and_chat_arguments() {
         assert!(shrink_png(&png_of(2600, 2, [0, 0, 0])).unwrap().is_none(), "too short to scale: sent as it is");
+        let dir = tempfile::tempdir().unwrap();
+        for (w, f) in [(1280, 1), (1920, 2), (3840, 3)] {
+            let p = dir.path().join(format!("{w}.png"));
+            std::fs::write(&p, png_of(w, 720, [0, 0, 0])).unwrap();
+            assert_eq!(shot_factor(&p), f, "{w} wide");
+            let sent = shrink_png(&png_of(w, 720, [0, 0, 0])).unwrap();
+            let sent_w = sent.map_or(w, |b| png::Decoder::new(std::io::Cursor::new(b)).read_info().unwrap().info().width);
+            assert_eq!(sent_w, w / f, "a click at the sent image's pixel x lands at x * {f}");
+        }
         let v = for_chat(serde_json::json!({ "link": "nxm://skyrimspecialedition/mods/9/files/2?key=SECRET&expires=5", "text": "x".repeat(5000), "n": 3 }));
         assert_eq!(v["link"], "nxm://skyrimspecialedition/mods/9/files/2");
         assert!(v["text"].as_str().unwrap().len() < 2100);
