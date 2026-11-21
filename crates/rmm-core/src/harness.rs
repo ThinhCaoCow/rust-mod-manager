@@ -324,6 +324,9 @@ pub struct TestRun {
     pub crash: Option<CrashReport>,
     /// The Papyrus log, when the game wrote one during the run.
     pub papyrus: Option<PapyrusReport>,
+    /// Script extender plugins that didn't load in this run, from its log, with why and their mod.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub plugins_not_loaded: Vec<logs::SePlugin>,
     pub launch: Option<launch::LaunchReport>,
     /// PNGs of the game's window (with `screenshots`).
     pub screenshots: Vec<std::path::PathBuf>,
@@ -453,9 +456,14 @@ impl Run {
         Ok(Run { r, t0: Instant::now(), started, before, prefs, game: inst.config.game_path.clone(), exe: inst.config.game.exe().into() })
     }
 
-    fn alive(&self) -> impl Fn() -> bool + Send + 'static {
+    fn alive(&self) -> impl Fn() -> GameState + Send + 'static {
         let (game, exe) = (self.game.clone(), self.exe.clone());
-        move || deploy::game_running(&game, &exe)
+        // A box from the loader comes before the game runs, so it's looked for first.
+        move || match message_box(&game) {
+            Some(m) => GameState::Asking(m),
+            None if deploy::game_running(&game, &exe) => GameState::Running,
+            None => GameState::Closed,
+        }
     }
 
     /// Start the game with the harness's port and token; with `shots`, a folder for screenshots.
@@ -480,7 +488,7 @@ impl Run {
     /// the INIs back.
     fn end(mut self, inst: &Instance, keep_open: bool) -> Result<TestRun> {
         let alive = self.alive();
-        if !keep_open && alive() {
+        if !keep_open && alive() != GameState::Closed {
             close(&self.game.join(&self.exe));
         }
         let mut r = std::mem::take(&mut self.r);
@@ -503,6 +511,8 @@ impl Run {
             r.crash = Some(report);
         }
         r.papyrus = logs::read_papyrus_log(inst, 20).ok().filter(|p| p.modified.is_some_and(|m| m >= self.started));
+        let se = logs::script_extender_log(inst, false).ok().filter(|l| l.modified.is_some_and(|m| m >= self.started));
+        r.plugins_not_loaded = se.map(|l| l.plugins).unwrap_or_default();
         Ok(r)
     }
 }
@@ -514,7 +524,7 @@ pub struct Session {
     conn: Conn,
     shots: std::path::PathBuf,
     timeout: Duration,
-    alive: Box<dyn Fn() -> bool + Send>,
+    alive: Box<dyn Fn() -> GameState + Send>,
 }
 
 impl Session {
@@ -566,15 +576,15 @@ impl Session {
             run.r.screenshots.extend(res.screenshot.clone());
             run.r.steps.push(res.clone());
             out.push(res);
-            if !alive() {
+            if alive() != GameState::Running {
                 break;
             }
         }
         out
     }
 
-    /// Whether the game is still running.
-    pub fn alive(&self) -> bool {
+    /// Whether the game is still running, or stopped on a message box.
+    pub fn state(&self) -> GameState {
         (self.alive)()
     }
 
@@ -585,10 +595,10 @@ impl Session {
 
     /// Quit the game and report the whole session, crash log and Papyrus log included.
     pub fn stop(mut self, inst: &Instance) -> Result<TestRun> {
-        if (self.alive)() {
+        if (self.alive)() == GameState::Running {
             let _ = self.conn.command(json!({ "cmd": "quit" }), Duration::from_secs(10), &self.alive);
             let end = Instant::now();
-            while (self.alive)() && end.elapsed() < Duration::from_secs(30) {
+            while (self.alive)() == GameState::Running && end.elapsed() < Duration::from_secs(30) {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
@@ -602,11 +612,11 @@ impl Drop for Session {
     /// A session nobody stopped (the AI client went away): close the game, then put the INIs back.
     fn drop(&mut self) {
         if let Some(run) = self.run.take() {
-            if (self.alive)() {
+            if (self.alive)() != GameState::Closed {
                 close(&run.game.join(&run.exe));
             }
             let end = Instant::now();
-            while (self.alive)() && end.elapsed() < Duration::from_secs(10) {
+            while (self.alive)() != GameState::Closed && end.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
@@ -672,14 +682,14 @@ fn windowed(inst: &Instance, w: u32, h: u32) -> Result<Restore> {
 }
 
 /// Ask the plugin for a PNG of the game's window.
-fn screenshot(c: &mut Conn, dir: &Path, name: &str, alive: &dyn Fn() -> bool) -> Result<std::path::PathBuf> {
+fn screenshot(c: &mut Conn, dir: &Path, name: &str, alive: &dyn Fn() -> GameState) -> Result<std::path::PathBuf> {
     let file = dir.join(format!("{}.png", name.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-', "_")));
     let target = if cfg!(windows) { file.display().to_string() } else { crate::proton::windows_path(&file) };
     c.command(json!({ "cmd": "screenshot", "path": target }), Duration::from_secs(30), alive)?;
     Ok(file)
 }
 
-fn shot(c: &mut Conn, dir: Option<&Path>, name: &str, alive: &dyn Fn() -> bool, r: &mut TestRun) {
+fn shot(c: &mut Conn, dir: Option<&Path>, name: &str, alive: &dyn Fn() -> GameState, r: &mut TestRun) {
     let Some(dir) = dir else { return };
     match screenshot(c, dir, name, alive) {
         Ok(file) => r.screenshots.push(file),
@@ -688,14 +698,14 @@ fn shot(c: &mut Conn, dir: Option<&Path>, name: &str, alive: &dyn Fn() -> bool, 
 }
 
 /// Do one step; its failure is in the result.
-fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, alive: &dyn Fn() -> bool) -> StepResult {
+fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, alive: &dyn Fn() -> GameState) -> StepResult {
     let mut res = StepResult { step: step.clone(), ok: true, error: None, fps: None, cell: None, screenshot: None, output: None, data: None, events: vec![] };
     c.events.clear();
     let console = |c: &mut Conn, line: String| c.command(json!({ "cmd": "console", "line": line }), Duration::from_secs(60), alive);
     let done = match step {
         // A cell that doesn't exist never loads; the console doesn't say so.
         Step::Cell(cell) => console(c, format!("coc {cell}"))
-            .and_then(|_| c.until("game_loaded", timeout, alive).map_err(|e| if alive() { anyhow::anyhow!("{cell} didn't load") } else { e }))
+            .and_then(|_| c.until("game_loaded", timeout, alive).map_err(|e| if alive() == GameState::Running { anyhow::anyhow!("{cell} didn't load") } else { e }))
             .map(drop),
         Step::Load(save) => c.command(json!({ "cmd": "load_save", "name": save }), Duration::from_secs(30), alive).and_then(|_| c.until("game_loaded", Duration::from_secs(300), alive)).map(drop),
         Step::Console(line) => console(c, line.clone()).map(|v| {
@@ -764,17 +774,17 @@ fn data(v: Value) -> Option<Value> {
     v.get("data").cloned()
 }
 
-fn papyrus(c: &mut Conn, call: &Call, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<Value> {
+fn papyrus(c: &mut Conn, call: &Call, timeout: Duration, alive: &dyn Fn() -> GameState) -> Result<Value> {
     c.command(json!({ "cmd": "papyrus", "class": call.class, "fn": call.function, "self": call.this, "args": call.args }), timeout, alive)
 }
 
 /// The plugin walks the player straight at the target (Forward held, turning toward it).
-fn move_to(c: &mut Conn, target: &str, alive: &dyn Fn() -> bool) -> Result<Value> {
+fn move_to(c: &mut Conn, target: &str, alive: &dyn Fn() -> GameState) -> Result<Value> {
     Ok(c.command(json!({ "cmd": "walk", "target": target, "within": 100, "timeout": 120 }), Duration::from_secs(150), alive)?["data"].take())
 }
 
 /// Poll the state until every condition holds; the last state is the result.
-fn wait_for(c: &mut Conn, w: &WaitFor, alive: &dyn Fn() -> bool) -> Result<Value> {
+fn wait_for(c: &mut Conn, w: &WaitFor, alive: &dyn Fn() -> GameState) -> Result<Value> {
     let refs: Vec<&String> = w.dead.iter().chain(w.near.as_ref().map(|n| &n.target)).collect();
     let quests: Vec<&String> = w.stage.as_ref().map(|s| &s.quest).into_iter().collect();
     let query = json!({ "cmd": "state", "radius": 0, "refs": refs, "quests": quests });
@@ -785,7 +795,7 @@ fn wait_for(c: &mut Conn, w: &WaitFor, alive: &dyn Fn() -> bool) -> Result<Value
             Ok(mut v) => v["data"].take(),
             // The game gone ends the wait; anything else (a loading screen, a slow frame) is a
             // condition not met yet.
-            Err(e) if !alive() => return Err(e),
+            Err(e) if alive() != GameState::Running => return Err(e),
             Err(_) if start.elapsed() < timeout => {
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
@@ -867,11 +877,16 @@ fn secs(t0: Instant) -> f64 {
 }
 
 /// Without the harness: the game has to show up and still be running when the time is up.
-fn watch(s: &Scenario, t0: Instant, alive: &dyn Fn() -> bool, r: &mut TestRun) {
+fn watch(s: &Scenario, t0: Instant, alive: &dyn Fn() -> GameState, r: &mut TestRun) {
     let limit = Duration::from_secs(s.timeout.unwrap_or(120));
     let mut seen = false;
     while t0.elapsed() < limit {
-        let up = alive();
+        let state = alive();
+        if let GameState::Asking(m) = state {
+            r.summary = format!("the game stopped on a message box: {m}");
+            return;
+        }
+        let up = state == GameState::Running;
         if up && !seen {
             seen = true;
             r.timings.insert("running".into(), secs(t0));
@@ -895,7 +910,7 @@ fn watch(s: &Scenario, t0: Instant, alive: &dyn Fn() -> bool, r: &mut TestRun) {
 }
 
 /// Play the scenario over a connected harness. Failures end up in `r.summary`.
-fn drive(mut c: Conn, s: &Scenario, t0: Instant, shots: Option<&Path>, alive: &dyn Fn() -> bool, r: &mut TestRun) {
+fn drive(mut c: Conn, s: &Scenario, t0: Instant, shots: Option<&Path>, alive: &dyn Fn() -> GameState, r: &mut TestRun) {
     let dwell = Duration::from_secs(s.dwell.unwrap_or_else(|| crate::settings::get().test.dwell));
     let step = |c: &mut Conn, r: &mut TestRun| -> Result<()> {
         let timeout = Duration::from_secs(s.timeout.unwrap_or_else(|| crate::settings::get().test.timeout));
@@ -931,14 +946,14 @@ fn drive(mut c: Conn, s: &Scenario, t0: Instant, shots: Option<&Path>, alive: &d
             let res = run_step(c, step, timeout, shots, alive);
             r.screenshots.extend(res.screenshot.clone());
             r.steps.push(res);
-            if !alive() {
+            if alive() != GameState::Running {
                 break;
             }
         }
-        if !s.keep_open {
+        if !s.keep_open && alive() == GameState::Running {
             let _ = c.command(json!({ "cmd": "quit" }), Duration::from_secs(10), alive);
             let end = Instant::now();
-            while alive() && end.elapsed() < Duration::from_secs(30) {
+            while alive() == GameState::Running && end.elapsed() < Duration::from_secs(30) {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
@@ -967,6 +982,87 @@ fn close(exe: &Path) {
     }
 }
 
+/// What the game is doing, as the waits check it a few times a second.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GameState {
+    Running,
+    Closed,
+    /// A Windows message box from the game or its loader holds it up (a plugin that didn't load,
+    /// a missing file): "title: text [buttons]".
+    Asking(String),
+}
+
+/// Ends a wait when the game closed (`closed` says during what) or stopped on a message box.
+fn going(alive: &dyn Fn() -> GameState, closed: impl FnOnce() -> String) -> Result<()> {
+    match alive() {
+        GameState::Running => Ok(()),
+        GameState::Closed => bail!("{}", closed()),
+        GameState::Asking(m) => bail!("the game stopped on a message box: {m}"),
+    }
+}
+
+/// A Windows message box open in a program from the game's folder (the game, or its script
+/// extender's loader), as "title: text [buttons]". Read from the window itself, so the game can
+/// be behind other windows; nothing is clicked.
+#[cfg(windows)]
+pub fn message_box(folder: &Path) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible};
+    use windows_sys::core::BOOL;
+    fn text(get: unsafe extern "system" fn(HWND, *mut u16, i32) -> i32, h: HWND) -> String {
+        let mut buf = [0u16; 2048];
+        let n = unsafe { get(h, buf.as_mut_ptr(), buf.len() as i32) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize]).split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    unsafe extern "system" fn dialog(h: HWND, found: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(found as *mut Vec<HWND>) };
+        if unsafe { IsWindowVisible(h) } != 0 && text(GetClassNameW, h) == "#32770" {
+            found.push(h);
+        }
+        1
+    }
+    unsafe extern "system" fn part(h: HWND, parts: LPARAM) -> BOOL {
+        let (lines, buttons) = unsafe { &mut *(parts as *mut (Vec<String>, Vec<String>)) };
+        let t = text(GetWindowTextW, h);
+        if !t.is_empty() {
+            match text(GetClassNameW, h).as_str() {
+                "Static" => lines.push(t),
+                "Button" => buttons.push(t.replace('&', "")),
+                _ => {}
+            }
+        }
+        1
+    }
+    let mut found: Vec<HWND> = Vec::new();
+    unsafe { EnumWindows(Some(dialog), &mut found as *mut _ as LPARAM) };
+    let folder = folder.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    found.into_iter().find_map(|h| {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(h, &mut pid) };
+        let p = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if p.is_null() {
+            return None;
+        }
+        let (mut buf, mut n) = ([0u16; 1024], 1024u32);
+        let ok = unsafe { QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut n) } != 0;
+        unsafe { CloseHandle(p) };
+        let exe = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+        if !ok || exe.rsplit_once('\\').map(|(dir, _)| dir) != Some(folder.as_str()) {
+            return None;
+        }
+        let mut parts = (Vec::<String>::new(), Vec::<String>::new());
+        unsafe { EnumChildWindows(h, Some(part), &mut parts as *mut _ as LPARAM) };
+        let buttons = if parts.1.is_empty() { String::new() } else { format!(" [{}]", parts.1.join(" / ")) };
+        Some(format!("{}: {}{buttons}", text(GetWindowTextW, h), parts.0.join(" ")))
+    })
+}
+
+#[cfg(not(windows))]
+pub fn message_box(_folder: &Path) -> Option<String> {
+    None
+}
+
 /// The listening side, on a free port with a one-time token.
 pub struct Server {
     listener: TcpListener,
@@ -991,7 +1087,7 @@ impl Server {
     }
 
     /// Wait for the plugin's hello with the right token. Gives up when the game has gone.
-    pub fn accept(&self, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<(Conn, Option<String>)> {
+    pub fn accept(&self, timeout: Duration, alive: &dyn Fn() -> GameState) -> Result<(Conn, Option<String>)> {
         let start = Instant::now();
         let mut seen = false;
         loop {
@@ -1008,10 +1104,11 @@ impl Server {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
             }
-            let up = alive();
-            seen |= up;
-            if seen && !up {
-                bail!("the game closed before the harness connected");
+            match alive() {
+                GameState::Running => seen = true,
+                GameState::Asking(m) => bail!("the game stopped on a message box before the harness connected: {m}"),
+                GameState::Closed if seen => bail!("the game closed before the harness connected"),
+                GameState::Closed => {}
             }
             if start.elapsed() > timeout {
                 bail!("the harness didn't connect within {} seconds", timeout.as_secs());
@@ -1103,7 +1200,7 @@ impl Conn {
     }
 
     /// Wait for an event, failing on timeout or when the game goes away.
-    fn until(&mut self, ev: &str, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<Value> {
+    fn until(&mut self, ev: &str, timeout: Duration, alive: &dyn Fn() -> GameState) -> Result<Value> {
         // A load the game stops to ask about (a save that needs missing content, a damaged one)
         // never finishes on its own.
         let asks = |v: &Value| ev == "game_loaded" && v["ev"] == "message_box";
@@ -1124,9 +1221,7 @@ impl Conn {
                 }
             }
             let last = if self.notes.is_empty() { String::new() } else { format!(" (the game's last steps: {})", self.notes.join(", ")) };
-            if !alive() {
-                bail!("the game closed while waiting for {ev}{last}");
-            }
+            going(alive, || format!("the game closed while waiting for {ev}{last}"))?;
             if start.elapsed() > timeout {
                 bail!("no {ev} within {} seconds{last}", timeout.as_secs());
             }
@@ -1134,7 +1229,7 @@ impl Conn {
     }
 
     /// Send a command and wait for its result; a result with ok=false is an error.
-    fn command(&mut self, mut cmd: Value, timeout: Duration, alive: &dyn Fn() -> bool) -> Result<Value> {
+    fn command(&mut self, mut cmd: Value, timeout: Duration, alive: &dyn Fn() -> GameState) -> Result<Value> {
         let id = self.next;
         self.next += 1;
         cmd["id"] = json!(id);
@@ -1155,9 +1250,7 @@ impl Conn {
                     self.early.push(v);
                 }
             }
-            if !alive() {
-                bail!("the game closed during {}", cmd["cmd"]);
-            }
+            going(alive, || format!("the game closed during {}", cmd["cmd"]))?;
             if start.elapsed() > timeout {
                 bail!("no answer to {} within {} seconds", cmd["cmd"], timeout.as_secs());
             }
@@ -1165,14 +1258,12 @@ impl Conn {
     }
 
     /// FPS from the heartbeats over the next `dwell`.
-    fn sample(&mut self, dwell: Duration, alive: &dyn Fn() -> bool) -> Result<Vec<f64>> {
+    fn sample(&mut self, dwell: Duration, alive: &dyn Fn() -> GameState) -> Result<Vec<f64>> {
         self.fps.clear();
         let start = Instant::now();
         while start.elapsed() < dwell {
             self.read(Duration::from_millis(200))?;
-            if !alive() {
-                bail!("the game closed");
-            }
+            going(alive, || "the game closed".into())?;
         }
         Ok(std::mem::take(&mut self.fps))
     }
@@ -1251,7 +1342,7 @@ mod tests {
             }
             seen
         });
-        let alive = || true;
+        let alive = || GameState::Running;
         let click = run_step(&mut c, &Step::Click(Click { x: 640.0, y: 360.0, double: Some(true), ..Default::default() }), Duration::from_secs(5), None, &alive);
         assert!(click.ok, "{click:?}");
         assert_eq!(click.data, Some(json!({"menu": "InventoryMenu"})));
@@ -1269,6 +1360,31 @@ mod tests {
         assert_eq!(steps[2], Step::Type("iron".into()), "steps read as the docs write them");
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "shows a message box on the desktop for a moment"]
+    fn reads_a_message_box_from_the_game_folder() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, IDNO, MB_YESNO, MessageBoxW, PostMessageW, WM_COMMAND};
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (title, text) = (wide("rmm test box"), wide("'KiENBExtender.dll' - DLL dependency\nmissing: KiHalloc.dll"));
+        let t = title.clone();
+        let shown = std::thread::spawn(move || unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), t.as_ptr(), MB_YESNO) });
+        // The test's own folder stands in for the game's.
+        let here = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let start = Instant::now();
+        let found = loop {
+            if let Some(m) = message_box(&here) {
+                break m;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "the box wasn't found");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(message_box(Path::new(r"C:\Windows")), None, "only programs from the given folder count");
+        unsafe { PostMessageW(FindWindowW(std::ptr::null(), title.as_ptr()), WM_COMMAND, IDNO as usize, 0) };
+        assert_eq!(shown.join().unwrap(), IDNO);
+        assert_eq!(found, "rmm test box: 'KiENBExtender.dll' - DLL dependency missing: KiHalloc.dll [Yes / No]");
+    }
+
     #[test]
     fn a_message_split_by_a_timeout_comes_whole() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1282,7 +1398,7 @@ mod tests {
         // A load the game stops to ask about fails at once, not at the timeout.
         game.write_all(b"{\"ev\":\"message_box\"}\n").unwrap();
         let t = Instant::now();
-        let err = c.until("game_loaded", Duration::from_secs(60), &|| true).unwrap_err().to_string();
+        let err = c.until("game_loaded", Duration::from_secs(60), &|| GameState::Running).unwrap_err().to_string();
         assert!(err.contains("asked a question") && t.elapsed() < Duration::from_secs(5), "{err}");
 
         // Between steps (the AI thinking) nothing asks for messages, yet the game's sends go
@@ -1304,7 +1420,7 @@ mod tests {
     fn drives_a_scenario_over_the_protocol() {
         let server = Server::start().unwrap();
         let plugin = fake_plugin(server.port, server.token.clone(), "Nowhere");
-        let alive = || !plugin.is_finished(); // the game quits when the plugin is told to
+        let alive = || if plugin.is_finished() { GameState::Closed } else { GameState::Running }; // the game quits when the plugin is told to
         let (conn, runtime) = server.accept(Duration::from_secs(10), &alive).unwrap();
         assert_eq!(runtime.as_deref(), Some("1.6.1170"));
         let steps = vec![Step::Console("tgm".into()), Step::Wait(1), Step::Screenshot("after tgm".into()), Step::Console("player.getav health".into())];
@@ -1367,8 +1483,8 @@ mod tests {
                 writeln!(s, "{}", json!({"ev": "result", "id": id, "ok": true, "out": "", "data": reply})).unwrap();
             }
         });
-        let (mut c, _) = server.accept(Duration::from_secs(5), &|| true).unwrap();
-        let alive = || true;
+        let (mut c, _) = server.accept(Duration::from_secs(5), &|| GameState::Running).unwrap();
+        let alive = || GameState::Running;
         let steps: Vec<Step> = serde_json::from_value(json!([{"move_to": "door"}, {"wait_for": {"dead": "wolf", "timeout": 5}}, {"activate": "chest"}, {"dialogue": {}}, {"choose": "Rumors"}, {"choose": 1}])).unwrap();
         let r: Vec<StepResult> = steps.iter().take(3).map(|st| run_step(&mut c, st, Duration::from_secs(5), None, &alive)).collect();
         assert!(r.iter().all(|x| x.ok), "{r:?}");
@@ -1406,16 +1522,26 @@ mod tests {
             }
             std::thread::sleep(Duration::from_secs(3));
         });
-        let (mut c, _) = server.accept(Duration::from_secs(5), &|| true).unwrap();
-        let err = c.until("main_menu", Duration::from_secs(1), &|| true).unwrap_err().to_string();
+        let (mut c, _) = server.accept(Duration::from_secs(5), &|| GameState::Running).unwrap();
+        let err = c.until("main_menu", Duration::from_secs(1), &|| GameState::Running).unwrap_err().to_string();
         assert_eq!(err, "no main_menu within 1 seconds (the game's last steps: data loading, MainMenu opened)");
+        // A message box ends the wait at once, with what it says.
+        let t = Instant::now();
+        let err = c.until("main_menu", Duration::from_secs(60), &|| GameState::Asking("Plugin error: … [Yes / No]".into())).unwrap_err().to_string();
+        assert_eq!(err, "the game stopped on a message box: Plugin error: … [Yes / No]");
+        assert!(t.elapsed() < Duration::from_secs(2));
         plugin.join().unwrap();
     }
 
     #[test]
     fn gives_up_when_the_game_is_gone() {
         let server = Server::start().unwrap();
-        let err = server.accept(Duration::from_secs(1), &|| false).err().unwrap().to_string();
+        let err = server.accept(Duration::from_secs(1), &|| GameState::Closed).err().unwrap().to_string();
         assert!(err.contains("didn't connect") || err.contains("closed"), "{err}");
+        // A box from the loader or a plugin comes before the harness can connect.
+        let t = Instant::now();
+        let err = server.accept(Duration::from_secs(60), &|| GameState::Asking("Plugin error: … [Yes / No]".into())).err().unwrap().to_string();
+        assert_eq!(err, "the game stopped on a message box before the harness connected: Plugin error: … [Yes / No]");
+        assert!(t.elapsed() < Duration::from_secs(2));
     }
 }
