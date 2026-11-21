@@ -1395,11 +1395,16 @@ impl Rmm {
             .collect();
         let steps = session.steps(&wanted);
         let shots: Vec<_> = steps.iter().filter_map(|s| s.screenshot.as_deref()).filter_map(|p| shot_image(p).ok()).collect();
-        let text = if session.alive() {
-            out(Ok(serde_json::json!({ "steps": steps })))?
-        } else {
-            let (_, session) = slot.take().expect("checked above");
-            out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": "the game closed", "run": session.stop(&i)? }))))?
+        let text = match session.state() {
+            harness::GameState::Running => out(Ok(serde_json::json!({ "steps": steps })))?,
+            state => {
+                let ended = match state {
+                    harness::GameState::Asking(m) => format!("the game stopped on a message box: {m}"),
+                    _ => "the game closed".into(),
+                };
+                let (_, session) = slot.take().expect("checked above");
+                out(self.inst().and_then(|i| Ok(serde_json::json!({ "steps": steps, "ended": ended, "run": session.stop(&i)? }))))?
+            }
         };
         // The screenshots come along as images, after the steps, in their order.
         Ok(CallToolResult::success(std::iter::once(ContentBlock::text(text)).chain(shots).collect()))
