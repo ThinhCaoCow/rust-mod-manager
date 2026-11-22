@@ -272,7 +272,10 @@ namespace rmm
 	{
 		if (std::getenv("RMM_HARNESS_BEHIND")) {
 			if (const HWND wnd = game_window()) {
-				SetWindowPos(wnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+				// Posted, not waited for: called from the UI thread as the main menu opens, a
+				// waiting SetWindowPos needs the main thread (which owns the window) to answer
+				// while it may be waiting on the UI thread, and both stop for good.
+				SetWindowPos(wnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS);
 			}
 		}
 	}

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <format>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <numbers>
 #include <thread>
@@ -343,7 +344,22 @@ namespace
 					if (!form) {
 						return a_reply(std::format("argument {} ({}): no form {}", i + 1, name.c_str(), a.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)), "");
 					}
-					RE::BSScript::PackHandle(&v, form, static_cast<RE::VMTypeID>(form->GetFormType()));
+					// Packed as the parameter's class (Form for HasSpell): packed as its own (Spell),
+					// the VM refuses it with "Type mismatch for argument". Its own class, or one of
+					// its parents, has to be the parameter's.
+					auto       id = static_cast<RE::VMTypeID>(form->GetFormType());
+					const auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+					RE::BSTSmartPointer<RE::BSScript::ObjectTypeInfo> own;
+					RE::VMTypeID                                      wanted{};
+					if (const auto param = t.GetTypeInfo(); param && vm->GetTypeIDForScriptObject(param->GetName(), wanted) && vm->GetScriptObjectType(id, own)) {
+						for (auto c = own.get(); c; c = c->GetParent()) {
+							if (same(c->GetName(), param->GetName())) {
+								id = wanted;
+								break;
+							}
+						}
+					}
+					RE::BSScript::PackHandle(&v, form, id);
 				}
 			} else {
 				switch (t.GetRawType()) {
@@ -638,6 +654,208 @@ namespace
 		});
 	}
 
+	// Keys rmm holds down. The game rebuilds the player's movement from each frame's input, so a
+	// key sent on its own from a task (at some other point in the frame) moves the player only on
+	// the odd frame. Held keys are added to the input the game hands its two input sinks each
+	// frame instead: PlayerControls (moving, jumping, activating) and MenuControls (the keys that
+	// open menus), each getting the press, the held frames and the release once, as from a key.
+	struct Held
+	{
+		RE::INPUT_DEVICE                      device;
+		std::string                           event;
+		std::uint32_t                         key;
+		std::chrono::steady_clock::time_point since;
+		bool                                  up = false;
+		std::uint8_t                          down = 0;      // the sinks that got the press
+		std::uint8_t                          released = 0;  // the sinks that got the release
+	};
+	std::mutex        held_lock;
+	std::vector<Held> held_keys;
+
+	using SinkInput = RE::BSEventNotifyControl(RE::BSTEventSink<RE::InputEvent*>*, RE::InputEvent* const*, RE::BSTEventSource<RE::InputEvent*>*);
+	std::array<SinkInput*, 2> sink_input{};  // 0 PlayerControls, 1 MenuControls: ProcessEvent, past the hook
+	std::uint8_t              hooked = 0;    // their bits, once hooked
+
+	template <int I>
+	RE::BSEventNotifyControl on_sink_input(RE::BSTEventSink<RE::InputEvent*>* a_sink, RE::InputEvent* const* a_events, RE::BSTEventSource<RE::InputEvent*>* a_source)
+	{
+		constexpr std::uint8_t        bit = 1 << I;
+		std::vector<RE::ButtonEvent*> made;
+		{
+			std::lock_guard l(held_lock);
+			const auto      now = std::chrono::steady_clock::now();
+			for (auto& h : held_keys) {
+				if (h.released & bit) {
+					continue;
+				}
+				// Down (held 0), then held for so long, then up (value 0): as a real key.
+				const bool first = !(h.down & bit);
+				const bool release = h.up && !first;
+				const auto secs = first ? 0.0f : std::chrono::duration<float>(now - h.since).count();
+				if (const auto e = RE::ButtonEvent::Create(h.device, h.event, h.key, release ? 0.0f : 1.0f, secs)) {
+					made.push_back(e);
+				}
+				h.down |= bit;
+				h.released |= release ? bit : 0;
+			}
+			std::erase_if(held_keys, [](const Held& h) { return h.up && (h.released & hooked) == hooked; });
+		}
+		if (made.empty()) {
+			return sink_input[I](a_sink, a_events, a_source);
+		}
+		for (std::size_t i = 0; i + 1 < made.size(); ++i) {
+			made[i]->next = made[i + 1];
+		}
+		made.back()->next = a_events ? *a_events : nullptr;
+		RE::InputEvent* head = made.front();
+		const auto      r = sink_input[I](a_sink, &head, a_source);
+		for (const auto e : made) {
+			RE::free(e);
+		}
+		return r;
+	}
+
+	// Slot 1 (ProcessEvent) of a live sink's input vtable, taken from the object itself and
+	// checked by its RTTI name before anything is written, so a wrong address-library id can't
+	// hook some other class. Without the hooks, held keys go out from a task as before.
+	template <int I>
+	void hook_sink(void* a_object, std::string_view a_class)
+	{
+		const auto vtable = a_object ? *static_cast<std::uintptr_t**>(a_object) : nullptr;
+		if (!vtable) {
+			return rmm::note(std::format("held keys: {} isn't there", a_class));
+		}
+		// vtable[-1] is the complete object locator: offset of this base at +4, the type
+		// descriptor's image offset at +12, whose name starts at +16.
+		const auto col = reinterpret_cast<const std::uint8_t*>(vtable[-1]);
+		const auto offset = *reinterpret_cast<const std::uint32_t*>(col + 4);
+		const auto name = reinterpret_cast<const char*>(REL::Module::get().base() + *reinterpret_cast<const std::uint32_t*>(col + 12) + 16);
+		if (offset != 0 || std::string_view(name) != std::format(".?AV{}@@", a_class)) {
+			return rmm::note(std::format("held keys: not through {} (its vtable is {})", a_class, name));
+		}
+		sink_input[I] = reinterpret_cast<SinkInput*>(vtable[1]);
+		const auto hook = reinterpret_cast<std::uintptr_t>(&on_sink_input<I>);
+		REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[1]), &hook, sizeof hook);
+		hooked |= 1 << I;
+		rmm::note(std::format("held keys: through {}", a_class));
+	}
+
+	// Once, from the first held key, so a run that presses nothing starts the game untouched.
+	// Main thread.
+	void hook_player_input()
+	{
+		static bool done = false;
+		if (std::exchange(done, true)) {
+			return;
+		}
+		hook_sink<0>(RE::PlayerControls::GetSingleton(), "PlayerControls");
+		hook_sink<1>(RE::MenuControls::GetSingleton(), "MenuControls");
+	}
+
+	std::pair<std::string, RE::GPtr<RE::GFxMovieView>> cursor_menu();
+
+	// What moved the player while a key was held, to tell where walking stops: the input the
+	// player's controls got (moveInputVec, 0 to 1), the speed the animation graph asked for
+	// ("Speed"), the character controller's state and speed, and how far the player went.
+	struct Motion
+	{
+		RE::NiPoint3          from;
+		float                 input = 0.0f, anim_speed = 0.0f, controller_speed = 0.0f;
+		bool                  auto_move = false;
+		std::set<std::string> states;
+
+		// Main thread.
+		void sample()
+		{
+			const auto  player = RE::PlayerCharacter::GetSingleton();
+			const auto& d = RE::PlayerControls::GetSingleton()->data;
+			input = (std::max)(input, d.moveInputVec.Length());
+			auto_move |= d.autoMove;
+			if (float s = 0.0f; player->GetGraphVariableFloat("Speed", s)) {
+				anim_speed = (std::max)(anim_speed, s);
+			}
+			if (const auto c = player->GetCharController()) {
+				static constexpr std::array<const char*, 6> names{ "on_ground", "jumping", "in_air", "climbing", "flying", "swimming" };
+				const auto                                    s = static_cast<std::uint32_t>(c->context.currentState);
+				states.insert(s < names.size() ? names[s] : std::to_string(s));
+				alignas(16) float v[4];
+				_mm_store_ps(v, c->outVelocity.quad);
+				// Havok units to game units: 1 / 0.0142875.
+				controller_speed = (std::max)(controller_speed, std::hypot(v[0], v[1]) * 69.99f);
+			}
+		}
+
+		json result() const
+		{
+			const auto at = RE::PlayerCharacter::GetSingleton()->GetPosition();
+			return { { "moved", std::round(std::hypot(at.x - from.x, at.y - from.y)) },
+				{ "input", std::round(input * 100.0f) / 100.0f },
+				{ "auto_move", auto_move },
+				{ "anim_speed", std::round(anim_speed) },
+				{ "controller_speed", std::round(controller_speed) },
+				{ "controller", std::vector<std::string>(states.begin(), states.end()) } };
+		}
+	};
+
+	// A key held for a_ms as the game's input gives it: a press, then a held event each frame, then
+	// the release. Returns how the player moved meanwhile. Not on the main thread.
+	json hold(RE::INPUT_DEVICE a_device, const std::string& a_event, std::uint32_t a_key, int a_ms)
+	{
+		Motion m;
+		on_main([&] {
+			m.from = RE::PlayerCharacter::GetSingleton()->GetPosition();
+			m.sample();
+		});
+		bool in_menu = false;
+		on_main([&] { in_menu = !cursor_menu().first.empty(); }, true);
+		on_main([] { hook_player_input(); });
+		const auto start = std::chrono::steady_clock::now();
+		const auto held = [&] { return std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count(); };
+		if ((hooked & 1) && !in_menu) {
+			const auto mine = [&](const Held& h) { return h.device == a_device && h.key == a_key; };
+			{
+				std::lock_guard l(held_lock);
+				held_keys.push_back({ a_device, a_event, a_key, start });
+			}
+			while (held() * 1000.0f < static_cast<float>(a_ms)) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+				on_main([&] { m.sample(); });
+			}
+			{
+				std::lock_guard l(held_lock);
+				for (auto& h : held_keys) {
+					h.up |= mine(h);
+				}
+			}
+			// The release goes out with the next frame's input; a sink the game didn't call by
+			// then doesn't get it.
+			for (int i = 0;; ++i) {
+				{
+					std::lock_guard l(held_lock);
+					if (std::ranges::none_of(held_keys, mine)) {
+						break;
+					}
+					if (i == 100) {
+						std::erase_if(held_keys, mine);
+						break;
+					}
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			}
+		} else {
+			button(a_device, a_event, a_key, 1.0f, 0.0f);
+			while (held() * 1000.0f < static_cast<float>(a_ms)) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+				button(a_device, a_event, a_key, 1.0f, held());
+				on_main([&] { m.sample(); });
+			}
+			button(a_device, a_event, a_key, 0.0f, held());
+		}
+		json out;
+		on_main([&] { out = m.result(); });
+		return out;
+	}
+
 	void press(const json& a_cmd, Reply a_reply)
 	{
 		const auto control = a_cmd.value("control", std::string{});
@@ -653,15 +871,8 @@ namespace
 			return a_reply("no control '" + control + "' (names as in the Controls menu: Forward, Back, Strafe Left, Activate, Jump, Sprint, Sneak, Ready Weapon, Right Attack/Block, Left Attack/Block, Tween Menu, Journal, Wait, Favorites)", "");
 		}
 		std::thread([control, ms, key, device, a_reply] {
-			const auto start = std::chrono::steady_clock::now();
-			const auto held = [&] { return std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count(); };
-			button(device, control, key, 1.0f, 0.0f);
-			while (held() * 1000.0f < static_cast<float>(ms)) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(16));
-				button(device, control, key, 1.0f, held());
-			}
-			button(device, control, key, 0.0f, held());
-			a_reply("", "");
+			const auto motion = hold(device, control, key, ms);
+			a_reply("", motion.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 		}).detach();
 	}
 
@@ -782,15 +993,9 @@ namespace
 					}
 				}
 			});
-			const auto start = std::chrono::steady_clock::now();
-			const auto held = [&] { return std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count(); };
-			button(RE::INPUT_DEVICE::kKeyboard, event, scan, 1.0f, 0.0f);
-			while (held() * 1000.0f < static_cast<float>(ms)) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(16));
-				button(RE::INPUT_DEVICE::kKeyboard, event, scan, 1.0f, held());
-			}
-			button(RE::INPUT_DEVICE::kKeyboard, event, scan, 0.0f, held());
-			a_reply("", json{ { "event", event } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+			auto out = hold(RE::INPUT_DEVICE::kKeyboard, event, scan, ms);
+			out["event"] = event;
+			a_reply("", out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 		}).detach();
 	}
 
@@ -852,6 +1057,9 @@ namespace
 			float       dist = 0.0f;
 			std::string error;
 			float       stuck = 0.0f;
+			Motion      m;
+			json        motion;
+			on_main([&] { m.from = RE::PlayerCharacter::GetSingleton()->GetPosition(); });
 			const auto  move = [](bool a_on) { on_main([=] { RE::PlayerControls::GetSingleton()->data.autoMove = a_on; }); };
 			for (;;) {
 				bool gone = false;
@@ -870,6 +1078,7 @@ namespace
 					}
 					// Set every time: turning, a menu or the player's own keys can turn it off.
 					RE::PlayerControls::GetSingleton()->data.autoMove = dist > within;
+					m.sample();
 				});
 				const auto now = std::chrono::steady_clock::now();
 				if (gone) {
@@ -893,6 +1102,7 @@ namespace
 			}
 			move(false);
 			if (stuck > 0.0f) {
+				on_main([&] { motion = m.result(); });
 				on_main([&] {
 					if (const auto target = handle.get()) {
 						RE::PlayerCharacter::GetSingleton()->MoveTo(target.get());
@@ -909,6 +1119,8 @@ namespace
 			if (stuck > 0.0f) {
 				out["moved_from"] = std::round(stuck);
 				out["note"] = "something was in the way, so the player was moved there";
+				// Before the move: whether the player walked at all, and what held it back.
+				out["motion"] = motion;
 			}
 			a_reply(error, error.empty() ? out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) : "");
 		}).detach();
@@ -964,6 +1176,21 @@ namespace
 
 namespace play
 {
+	void message_box_opened()
+	{
+		// Read from the box's movie once it has its text (a UI task after the one opening it), not
+		// from the game's message queue: its lock's address isn't known for every runtime.
+		SKSE::GetTaskInterface()->AddUITask([] {
+			json       out{ { "what", "message_box" } };
+			const auto menu = RE::UI::GetSingleton()->GetMenu(RE::MessageBoxMenu::MENU_NAME);
+			RE::GFxValue text;
+			if (menu && menu->uiMovie && menu->uiMovie->GetVariable(&text, "_root.MessageMenu.MessageText.text") && text.IsString()) {
+				out["text"] = text.GetString();
+			}
+			rmm::game_event(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+		});
+	}
+
 	void watch_events()
 	{
 		static Events events;
@@ -1023,8 +1250,30 @@ namespace play
 				if (!ref) {
 					return a_reply("no reference " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "");
 				}
-				const auto done = ref->ActivateRef(RE::PlayerCharacter::GetSingleton(), 0, nullptr, 1, false);
-				a_reply(done ? "" : "the game didn't activate " + cmd.value("target", json()).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), json{ { "activated", true } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+				std::thread([handle = ref->CreateRefHandle(), target = cmd.value("target", json()), a_reply] {
+					json before, after;
+					on_main([&] { before = open_menus(); }, true);
+					bool done = false;
+					on_main([&] {
+						if (const auto r = handle.get()) {
+							done = r->ActivateRef(RE::PlayerCharacter::GetSingleton(), 0, nullptr, 1, false);
+						}
+					});
+					// What opens a menu (a book, a container, a crafting station) reports false, and its
+					// menu opens a frame or two later.
+					json out{ { "activated", true } };
+					if (!done) {
+						std::this_thread::sleep_for(std::chrono::milliseconds(500));
+						on_main([&] { after = open_menus(); }, true);
+						for (const auto& m : after) {
+							if (std::ranges::find(before, m) == before.end()) {
+								out["menu"] = m;
+							}
+						}
+					}
+					const bool ok = done || out.contains("menu");
+					a_reply(ok ? "" : "the game didn't activate " + target.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+				}).detach();
 			} else {
 				a_reply("unknown command '" + name + "'", "");
 			}

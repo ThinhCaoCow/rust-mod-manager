@@ -27,6 +27,7 @@ namespace
 			// A question (missing content, a damaged save) stops a load until it's answered.
 			if (a_event->opening && a_event->menuName == RE::MessageBoxMenu::MENU_NAME) {
 				rmm::event("message_box");
+				play::message_box_opened();
 			}
 			// Closing a loading screen in the world is a finished load: of a save, or of a coc,
 			// which also starts a game from the main menu (and fires no load message).
@@ -110,7 +111,7 @@ namespace
 		}
 		script->SetCommand(a_line);
 		const auto        log = RE::ConsoleLog::GetSingleton();
-		const std::size_t before = log ? std::string_view(log->buffer.c_str()).size() : 0;
+		const std::string before = log && log->buffer.c_str() ? log->buffer.c_str() : "";
 		// As when typed into the console: some commands print only in console mode.
 		auto&       mode = RE::GetStaticTLSData()->consoleMode;
 		const bool  was = mode;
@@ -121,11 +122,17 @@ namespace
 		capturing = nullptr;
 		mode = was;
 		delete script;
-		if (vprint) {
+		// The hook catches nothing when another plugin prints the console's lines another way
+		// (More Informative Console, a replacement console); the log may still have them.
+		if (!printed.empty()) {
 			a_out = std::move(printed);
-		} else if (log) {
+		} else if (log && log->buffer.c_str()) {
+			// The log keeps only its last part, dropping the oldest lines as it fills, so where it
+			// was is found by the text it ended with.
 			const std::string_view all(log->buffer.c_str());
-			a_out = all.size() > before ? std::string(all.substr(before)) : std::string{};
+			const auto             tail = std::string_view(before).substr(before.size() - (std::min)(before.size(), std::size_t{ 256 }));
+			const auto             at = tail.empty() ? 0 : all.rfind(tail);
+			a_out = at == std::string_view::npos ? std::string(all) : std::string(all.substr(at + tail.size()));
 		}
 		return {};
 	}
