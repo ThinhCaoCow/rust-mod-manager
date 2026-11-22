@@ -742,7 +742,7 @@ fn run_step(c: &mut Conn, step: &Step, timeout: Duration, shots: Option<&Path>, 
         Step::Face(target) => c.command(json!({ "cmd": "face", "target": target }), Duration::from_secs(30), alive).map(drop),
         Step::Press(p) => {
             let ms = p.ms.unwrap_or(100).min(30_000);
-            c.command(json!({ "cmd": "press", "control": p.control, "ms": ms }), Duration::from_millis(ms + 30_000), alive).map(drop)
+            c.command(json!({ "cmd": "press", "control": p.control, "ms": ms }), Duration::from_millis(ms + 30_000), alive).map(|v| res.data = data(v))
         }
         Step::Click(k) => match k.button.as_deref() {
             None | Some("left" | "right") => {
