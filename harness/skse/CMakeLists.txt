@@ -21,6 +21,8 @@ add_commonlibsse_plugin(rmm_harness
 target_compile_features(rmm_harness PRIVATE cxx_std_23)
 target_include_directories(rmm_harness PRIVATE ../common)
 target_link_libraries(rmm_harness PRIVATE nlohmann_json::nlohmann_json ws2_32 windowscodecs)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../common/source_hash.cmake")
+rmm_harness_source(rmm_harness skse)
 # The plugin-info file that helper generates expects a precompiled header with CommonLib in it.
 # harness.cpp can't have one (CommonLib's Windows declarations clash with Winsock), so only that
 # file gets src/plugin_info.h.

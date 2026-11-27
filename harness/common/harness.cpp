@@ -18,6 +18,11 @@
 #include <thread>
 #include <vector>
 
+// Set by source_hash.cmake.
+#ifndef RMM_HARNESS_SOURCE
+#	define RMM_HARNESS_SOURCE ""
+#endif
+
 namespace rmm
 {
 	namespace
@@ -219,7 +224,7 @@ namespace rmm
 				}
 				sock = s;
 				up = true;
-				send_line(nlohmann::json{ { "ev", "hello" }, { "token", a_token }, { "runtime", a_runtime }, { "console_output", game.console_output } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n");
+				send_line(nlohmann::json{ { "ev", "hello" }, { "token", a_token }, { "runtime", a_runtime }, { "console_output", game.console_output }, { "source", RMM_HARNESS_SOURCE } }.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n");
 				for (const auto& line : backlog) {
 					send_line(line);
 				}

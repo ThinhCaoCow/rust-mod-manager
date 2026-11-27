@@ -706,6 +706,8 @@ impl Instance {
     pub fn trash_mod(&self, id: &str) -> Result<()> {
         let dest = self.root.join("trash").join(id);
         let _ = fs::remove_dir_all(&dest);
+        // A first mod trashed in a new instance: no trash folder yet ("path not found").
+        fs::create_dir_all(self.root.join("trash"))?;
         fs::rename(self.mod_dir(id), dest)?;
         Ok(())
     }

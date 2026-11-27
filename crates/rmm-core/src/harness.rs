@@ -417,6 +417,7 @@ pub fn test_run(inst: &Instance, s: &Scenario) -> Result<TestRun> {
         match server.accept(Duration::from_secs(s.timeout.unwrap_or_else(|| crate::settings::get().test.timeout)), &alive) {
             Ok((conn, runtime)) => {
                 run.r.runtime = runtime;
+                run.r.warnings.extend(conn.stale.clone());
                 run.r.timings.insert("hello".into(), secs(run.t0));
                 drive(conn, s, run.t0, shots.as_deref(), &alive, &mut run.r);
             }
@@ -541,6 +542,7 @@ impl Session {
             let (server, shots) = run.launch_harness(inst, true)?;
             let (mut c, runtime) = server.accept(timeout, &alive)?;
             run.r.runtime = runtime;
+            run.r.warnings.extend(c.stale.clone());
             run.r.timings.insert("hello".into(), secs(run.t0));
             for ev in ["data_loaded", "main_menu"] {
                 c.until(ev, timeout, &alive)?;
@@ -1098,6 +1100,7 @@ impl Server {
                     let Ok(Some(hello)) = c.read(Duration::from_secs(10)) else { continue };
                     if hello["ev"] == "hello" && hello["token"] == self.token.as_str() {
                         c.console_output = hello["console_output"] == true;
+                        c.stale = stale_plugin(hello["source"].as_str());
                         return Ok((c, hello["runtime"].as_str().map(str::to_owned)));
                     }
                 }
@@ -1116,6 +1119,16 @@ impl Server {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Why the plugin in the game may not do what this rmm expects: it was built from other harness
+/// source (or before plugins said theirs). build.rs hashes the source as the plugin's build does.
+fn stale_plugin(source: Option<&str>) -> Option<String> {
+    let ours = [env!("RMM_HARNESS_SKSE"), env!("RMM_HARNESS_F4SE")];
+    if ours.iter().all(|s| s.is_empty()) || source.is_some_and(|s| ours.contains(&s)) {
+        return None;
+    }
+    Some("the harness plugin in the game was built from other harness source than this rmm, so steps may be missing or behave differently: rebuild it (harness/README.md) and put the new DLL in the harness mod with `rmm update`".into())
 }
 
 pub struct Conn {
@@ -1137,6 +1150,8 @@ pub struct Conn {
     console_output: bool,
     /// What happened in the game (deaths, combat, quest stages, activations) since the step began.
     events: Vec<Value>,
+    /// Why the plugin may not match this rmm, from its hello.
+    stale: Option<String>,
 }
 
 impl Drop for Conn {
@@ -1161,7 +1176,7 @@ impl Conn {
                 }
             }
         });
-        Ok(Conn { writer, lines, next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![] })
+        Ok(Conn { writer, lines, next: 1, fps: vec![], early: vec![], notes: vec![], cell: None, console_output: false, events: vec![], stale: None })
     }
 
     /// The next event, or None when nothing came within `wait`.
@@ -1272,6 +1287,14 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_plugin_built_from_other_source_is_named() {
+        assert_eq!(stale_plugin(Some(env!("RMM_HARNESS_SKSE"))), None);
+        assert_eq!(stale_plugin(Some(env!("RMM_HARNESS_F4SE"))), None);
+        assert!(stale_plugin(Some("0123")).is_some());
+        assert!(stale_plugin(None).is_some(), "a plugin from before the hello said its source");
+    }
+
 
     /// A stand-in for the C++ plugin: answers the protocol from a thread.
     fn fake_plugin(port: u16, token: String, fail_cell: &'static str) -> std::thread::JoinHandle<Vec<String>> {

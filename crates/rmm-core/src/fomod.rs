@@ -134,6 +134,8 @@ enum Cond {
 pub struct Env<'a> {
     pub file_state: &'a dyn Fn(&str) -> FileState,
     pub script_extender: bool,
+    /// The game exe's version, when known: defaults prefer the option for it (`version_pick`).
+    pub game_version: Option<[u32; 4]>,
 }
 
 type Flags = HashMap<String, String>;
@@ -298,7 +300,16 @@ impl Installer {
                 let kind = g.effective_kind();
                 let sel = match given.and_then(|sc| nth_named(&sc.groups, &g.name, &mut seen_groups, |c| &c.name)) {
                     Some(gc) => g.pick(kind, &kinds, gc).with_context(|| format!("step '{}'", step.name))?,
-                    None => default_pick(kind, &kinds),
+                    None => {
+                        let mut sel = default_pick(kind, &kinds);
+                        if let Some((i, v)) = env.game_version.and_then(|v| Some((version_pick(g, kind, &kinds, &sel, v)?, v))) {
+                            let was = sel.iter().position(|s| *s).map_or("", |d| g.plugins[d].name.as_str());
+                            let v = v.map(|n| n.to_string()).join(".");
+                            out.warnings.push(format!("'{}': took '{}' for game version {v} instead of the installer's default '{was}'", g.name, g.plugins[i].name));
+                            sel = (0..sel.len()).map(|j| j == i).collect();
+                        }
+                        sel
+                    }
                 };
                 let mut gview = GroupView { name: g.name.clone(), kind, options: vec![] };
                 let mut gchoice = GroupChoice { name: g.name.clone(), choices: vec![] };
@@ -481,6 +492,56 @@ fn default_pick(kind: GroupKind, kinds: &[Kind]) -> Vec<bool> {
     sel
 }
 
+/// With the defaults, a one-option group whose options name game versions takes the one for
+/// `game` when the default names only others and exactly one usable option names it (Moons and
+/// Stars' default DLL is for 1.7.99+). Option names are read first, as descriptions often name
+/// the other versions too.
+fn version_pick(g: &Group, kind: GroupKind, kinds: &[Kind], sel: &[bool], game: [u32; 4]) -> Option<usize> {
+    if !matches!(kind, GroupKind::SelectExactlyOne | GroupKind::SelectAtMostOne) {
+        return None;
+    }
+    let by_name = g.plugins.iter().any(|p| names_version(&p.name, game).is_some());
+    let fits = |i: usize| names_version(if by_name { &g.plugins[i].name } else { &g.plugins[i].description }, game);
+    let default = sel.iter().position(|s| *s)?;
+    if kinds[default] == Kind::Required || fits(default) != Some(false) {
+        return None;
+    }
+    let mut ok = (0..kinds.len()).filter(|&i| kinds[i] != Kind::NotUsable && fits(i) == Some(true));
+    match (ok.next(), ok.next()) {
+        (Some(i), None) => Some(i),
+        _ => None,
+    }
+}
+
+/// Whether `text` names the game version `game` ("1.6.1170", "1.6.640+", "1.7.x", "1.5.97 -
+/// 1.6.353", "1.6.1130 or older"); None when it names no game version. Only numbers with the
+/// game's major version and three parts (or a `.x`) count, so "Moons and Stars 2.1.0" isn't one.
+// ponytail: "before 1.6.640", "AE"/"SE"/"VR" without a number aren't read; the default stands.
+fn names_version(text: &str, game: [u32; 4]) -> Option<bool> {
+    const V: &str = r"(\d+(?:\.\d+)+)";
+    let re = regex::Regex::new(&format!(r"{V}(\.[x*])?\s*(?:(\+|(?:or|and) (?:newer|later|higher|above|up))|((?:or|and) (?:older|earlier|lower|below))|(?:-|–|to)\s*v?{V})?")).unwrap();
+    let parse = |s: &str| s.split('.').map_while(|p| p.parse().ok()).take(4).collect::<Vec<u32>>();
+    let cmp = |v: &[u32]| game[..v.len()].cmp(v);
+    let mut named = None;
+    for c in re.captures_iter(&text.to_lowercase()) {
+        let v = parse(&c[1]);
+        if v.first() != Some(&game[0]) || (v.len() < 3 && c.get(2).is_none()) {
+            continue;
+        }
+        let fits = if c.get(3).is_some() {
+            cmp(&v).is_ge()
+        } else if c.get(4).is_some() {
+            cmp(&v).is_le()
+        } else if let Some(hi) = c.get(5) {
+            cmp(&v).is_ge() && cmp(&parse(hi.as_str())).is_le()
+        } else {
+            cmp(&v).is_eq()
+        };
+        named = Some(named.unwrap_or(false) || fits);
+    }
+    named
+}
+
 impl Plugin {
     fn kind(&self, flags: &Flags, env: &Env) -> Kind {
         self.patterns.iter().find(|(c, _)| c.holds(flags, env)).map_or(self.default, |(_, k)| *k)
@@ -635,4 +696,38 @@ fn clean(p: &str) -> Option<String> {
         return None;
     }
     Some(parts.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_game_versions_in_option_names() {
+        let ae = [1, 6, 1170, 0];
+        let n = |t: &str| names_version(t, ae);
+        assert_eq!((n("For 1.6.1170"), n("AE 1.6.629+"), n("1.6.640 and later"), n("1.5.97 - 1.6.1170")), (Some(true), Some(true), Some(true), Some(true)));
+        assert_eq!((n("1.7.99+"), n("SE 1.5.97"), n("1.7.x"), n("1.6.1130 or older")), (Some(false), Some(false), Some(false), Some(false)));
+        assert_eq!((n("Moons and Stars 2.1.0"), n("Main files"), n("1.6")), (None, None, None));
+    }
+
+    #[test]
+    fn defaults_take_the_option_for_the_game_version() {
+        let xml = r#"<config><moduleName>M</moduleName><installSteps order="Explicit"><installStep name="S"><optionalFileGroups order="Explicit">
+            <group name="DLL" type="SelectExactlyOne"><plugins order="Explicit">
+              <plugin name="Skyrim 1.7.99+"><description/><files><file source="new.dll"/></files><typeDescriptor><type name="Recommended"/></typeDescriptor></plugin>
+              <plugin name="Skyrim 1.6.640 - 1.6.1170"><description/><files><file source="ae.dll"/></files><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+              <plugin name="Skyrim SE 1.5.97"><description/><files><file source="se.dll"/></files><typeDescriptor><type name="Optional"/></typeDescriptor></plugin>
+            </plugins></group></optionalFileGroups></installStep></installSteps></config>"#;
+        let i = Installer::parse(xml.as_bytes()).unwrap();
+        let picked = |v: Option<[u32; 4]>| {
+            let w = i.walk(&Choices::default(), &Env { file_state: &|_| FileState::Missing, script_extender: false, game_version: v }).unwrap();
+            w.choices.options[0].groups[0].choices[0].name.clone()
+        };
+        assert_eq!(picked(Some([1, 6, 1170, 0])), "Skyrim 1.6.640 - 1.6.1170");
+        assert_eq!(picked(Some([1, 5, 97, 0])), "Skyrim SE 1.5.97");
+        assert_eq!(picked(Some([1, 7, 104, 0])), "Skyrim 1.7.99+", "the default fits");
+        assert_eq!(picked(None), "Skyrim 1.7.99+", "game version unknown");
+        assert_eq!(picked(Some([1, 6, 353, 0])), "Skyrim 1.7.99+", "no option fits: the default stands");
+    }
 }

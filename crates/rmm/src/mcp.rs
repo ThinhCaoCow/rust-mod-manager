@@ -250,6 +250,9 @@ struct NexusInstallArgs {
     link: Option<String>,
     mod_id: Option<u64>,
     file_id: Option<u64>,
+    /// FOMOD choices; `{}` takes the installer's defaults. A FOMOD file without them is only
+    /// downloaded: look at its options with fomod_options and install it with install_mod.
+    choices: Option<Choices>,
     /// Default true: show the file without downloading it.
     dry_run: Option<bool>,
 }
@@ -1424,7 +1427,7 @@ impl Rmm {
         out(Ok(nexus::status()))
     }
 
-    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Leaves out updates the user holds back (hold_updates); list_mods shows the rest on each mod. Answers {updates, unavailable}: unavailable lists the mods Nexus has no page for any more or won't show (removed, hidden, or a wrong id), which the check skipped; there's nothing to update for those, so keep their archives. Needs the user's API key.", annotations(read_only_hint = true))]
+    #[tool(description = "Mods with a newer file on Nexus: installed and newest version, the new file's id and name, and its page. Uses the mods' Nexus ids (from installs through Nexus, MO2 or Vortex imports). Asks Nexus which mods changed in the last month and re-reads only those, so repeated checks are cheap. It also reads the requirements on the pages it re-reads, which health_check compares with what's installed. Leaves out updates the user holds back (hold_updates); list_mods shows the rest on each mod. Answers {updates, unavailable, unknown}: unavailable lists the mods Nexus has no page for any more or won't show (removed, hidden, or a wrong id), which the check skipped; there's nothing to update for those, so keep their archives. unknown lists mods the check can't tell about (no file id, version or date to compare, or no main file on Nexus), each with the reason. Needs the user's API key.", annotations(read_only_hint = true))]
     async fn check_mod_updates(&self, Parameters(a): Parameters<UpdatesArgs>) -> Result<String, String> {
         out(self.inst().and_then(|i| nexus::check_updates(&i, &nexus::Client::from_env()?, a.ids.as_deref())))
     }
@@ -1444,7 +1447,7 @@ impl Rmm {
         out(self.inst_mut().and_then(|i| nexus::hold_updates(&i, &a.ids, a.hold)))
     }
 
-    #[tool(description = "Download a file from Nexus with the user's account into the instance's downloads/ and install it (FOMOD installers take their defaults; reinstall_mod changes them), recording its Nexus ids. Give an nxm:// link, a mod page link, or a mod id (the newest main file unless file_id names one). Without Premium, Nexus only allows downloads through an nxm:// link from the website's button. Needs the user signed in (nexus_status). dry_run defaults to true: shows the file.")]
+    #[tool(description = "Download a file from Nexus with the user's account into the instance's downloads/ and install it (a FOMOD installer needs choices, else the file is only downloaded), recording its Nexus ids. Give an nxm:// link, a mod page link, or a mod id (the newest main file unless file_id names one). Without Premium, Nexus only allows downloads through an nxm:// link from the website's button. Needs the user signed in (nexus_status). dry_run defaults to true: shows the file.")]
     async fn install_from_nexus(&self, Parameters(a): Parameters<NexusInstallArgs>) -> Result<String, String> {
         let inst = self.inst_for(a.dry_run.unwrap_or(true)).map_err(|e| format!("{e:#}"))?;
         let what = match (&a.link, a.mod_id, a.file_id) {
@@ -1459,7 +1462,7 @@ impl Rmm {
             if a.dry_run.unwrap_or(true) {
                 return client.get(&format!("/v1/games/{}/mods/{}/files/{}.json", inst.config.game.nexus_domain(), link.mod_id, link.file_id));
             }
-            Ok(serde_json::to_value(nexus::install(&inst, &client, &link, None)?)?)
+            Ok(serde_json::to_value(nexus::install(&inst, &client, &link, a.choices.as_ref())?)?)
         }))
     }
 

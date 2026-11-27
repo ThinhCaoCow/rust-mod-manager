@@ -243,6 +243,24 @@ fn changes_are_detected_by_file_identity() {
     assert!(!game.join("Data/meshes/stray.nif").exists() && inst.mod_files(rmm_core::instance::OVERWRITE).unwrap().is_empty());
 }
 
+/// A mod file replaced by a new file (an editor or `sed -i` writing a new file and renaming it
+/// over the old one) leaves Data linked to the old file: the next deploy links it again.
+#[test]
+fn a_replaced_mod_file_is_linked_again() {
+    isolate();
+    let tmp = tempfile::tempdir().unwrap();
+    let (inst, game) = deployed_setup(tmp.path());
+    let src = inst.mod_dir(&inst.profile().unwrap().mods[0].id).join("meshes/a.nif");
+    let new = src.with_extension("tmp");
+    write(&new, "edited");
+    fs::rename(&new, &src).unwrap();
+    let plan = deploy::deploy(&inst, false).unwrap();
+    assert_eq!((plan.link.as_slice(), plan.external_changes.len()), (["Data/meshes/a.nif".to_string()].as_slice(), 0), "{plan:?}");
+    assert_eq!(read(&game.join("Data/meshes/a.nif")), "edited");
+    assert!(same_file::is_same_file(game.join("Data/meshes/a.nif"), &src).unwrap());
+    assert!(deploy::deploy(&inst, true).unwrap().is_noop());
+}
+
 #[test]
 fn updates_a_mod_in_place() {
     isolate();
@@ -416,9 +434,7 @@ fn a_manifest_without_file_ids_still_checks_identity() {
     let strip = || {
         let mut man: serde_json::Value = serde_json::from_str(&read(&path)).unwrap();
         for e in man["files"].as_object_mut().unwrap().values_mut() {
-            for k in ["id", "dir"] {
-                assert_ne!(e.as_object_mut().unwrap().remove(k).expect("deploy.json keeps file ids"), 0);
-            }
+            assert_ne!(e.as_object_mut().unwrap().remove("id").expect("deploy.json keeps file ids"), 0);
         }
         fs::write(&path, man.to_string()).unwrap();
     };
@@ -1348,6 +1364,8 @@ fn tool_runs_capture_output_into_a_generated_mod() {
             r"@echo off",
             r#"mkdir "%~1\meshes""#,
             r#"echo built> "%~1\meshes\body.nif""#,
+            r#"mkdir "%~1\Data\meshes""#,
+            r#"echo lifted> "%~1\Data\meshes\lifted.nif""#,
             r#"echo setting>> "%~2\CalienteTools\BodySlide\Config.xml""#,
             r#"echo new> "%~2\newfile.json""#,
             r#"echo cleaned> "%~2\vanilla.ini""#,
@@ -1380,6 +1398,8 @@ fn tool_runs_capture_output_into_a_generated_mod() {
     assert!(r.log_tail.contains("done"), "{r:?}");
     let out = root.join("mods/gen Output");
     assert!(read(&out.join("meshes/body.nif")).contains("built"));
+    // Written to {output}\Data (BodySlide's --targetdir, as users give it): moved to the top.
+    assert!(read(&out.join("meshes/lifted.nif")).contains("lifted") && !out.join("Data").exists());
     assert!(read(&out.join("newfile.json")).contains("new"));
     assert!(read(&out.join("vanilla.ini")).contains("cleaned"));
     assert!(read(&out.join("CalienteTools/BodySlide/Config.xml")).contains("setting"));
@@ -2991,6 +3011,8 @@ fn identifies_downloads_and_downloads_again() {
             (format!("{d}/7/files/8.json"), json(serde_json::json!({ "file_id": 8, "file_name": "Big.zip", "size_in_bytes": 10 }))),
             (format!("{d}/7/files/8/download_link.json"), json(serde_json::json!([{ "URI": format!("{base}/cdn/big.zip") }]))),
             ("/cdn/big.zip".to_string(), b"0123456789".to_vec()),
+            (format!("{d}/7/files/9.json"), json(serde_json::json!({ "file_id": 9, "file_name": "Zero.zip", "size_in_bytes": 0 }))),
+            (format!("{d}/7/files/9/download_link.json"), json(serde_json::json!([{ "URI": format!("{base}/cdn/big.zip") }]))),
         ])
     });
     let mut client = nexus::Client::new("test-key").unwrap();
@@ -3016,6 +3038,8 @@ fn identifies_downloads_and_downloads_again() {
     assert_eq!(fs::read(nexus::download(&inst, &client, &link).unwrap()).unwrap(), b"0123456789");
     assert!(!dl.join("Big.zip.part").exists());
     assert_eq!(hits.lock().unwrap()["/cdn/big.zip"], 3, "once to try to resume, once whole, once whole");
+    // Nexus says size 0 for some files: that's an unknown size, not an empty file.
+    assert_eq!(fs::read(nexus::download(&inst, &client, &nexus::premium_link(&inst, 7, 9)).unwrap()).unwrap(), b"0123456789");
 }
 
 /// Hiding a mod's files takes them out of deploys, conflicts and the plugin list, and a reinstall

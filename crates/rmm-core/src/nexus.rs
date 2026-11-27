@@ -533,6 +533,9 @@ pub struct UpdateCheck {
     /// Mods Nexus has no page for any more, or won't show (removed, hidden, or a wrong id): the
     /// check went on without them.
     pub unavailable: Vec<Unavailable>,
+    /// Mods rmm can't tell are up to date (no file id, a version or date to compare with, or a
+    /// main file on Nexus): the reason says what's missing.
+    pub unknown: Vec<Unavailable>,
 }
 
 #[derive(Serialize, Debug)]
@@ -732,11 +735,15 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
         } else if !known.contains_key(&n.mod_id) {
             reread.push(n.mod_id);
         }
-        if let Some(u) = newer(id, &meta.name, n, &cache.files[&n.mod_id], domain) {
-            if offered(&u, meta) {
-                out.updates.push(u.clone());
+        match newer(id, meta, &cache.files[&n.mod_id], domain) {
+            Ok(Some(u)) => {
+                if offered(&u, meta) {
+                    out.updates.push(u.clone());
+                }
+                found.insert(id.clone(), u);
             }
-            found.insert(id.clone(), u);
+            Ok(None) => {}
+            Err(reason) => out.unknown.push(Unavailable { id: id.clone(), name: meta.name.clone(), mod_id: n.mod_id, reason }),
         }
     }
     fs::write(&cache_path, serde_json::to_string(&cache)?)?;
@@ -745,11 +752,16 @@ pub fn check_updates(inst: &Instance, client: &Client, ids: Option<&[String]>) -
     Ok(out)
 }
 
-/// The update for one mod from its files.json, if there is one.
-fn newer(id: &str, name: &str, n: &crate::instance::NexusRef, files: &Value, domain: &str) -> Option<Update> {
-    let list = files["files"].as_array()?;
+/// The update for one mod from its files.json: None when it has the newest, Err(why) when rmm
+/// can't tell which file is installed or whether a newer one came since.
+fn newer(id: &str, meta: &crate::instance::ModMeta, files: &Value, domain: &str) -> Result<Option<Update>, String> {
+    let Some(n) = &meta.nexus else { return Ok(None) };
+    let list = files["files"].as_array().ok_or("Nexus listed no files")?;
     let file = |fid: u64| list.iter().find(|f| f["file_id"].as_u64() == Some(fid));
-    let target = match n.file_id {
+    // MO2 writes file id 0 for a file it didn't know; the installed archive's name may still say.
+    let archive = meta.source.as_deref().and_then(|s| Path::new(s).file_name()).map(|f| f.to_string_lossy().to_lowercase());
+    let by_name = || list.iter().find(|f| f["file_name"].as_str().is_some_and(|f| Some(crate::install::sanitize(f).to_lowercase()) == archive))?["file_id"].as_u64();
+    let target = match n.file_id.filter(|&f| f > 0).or_else(by_name) {
         // Follow old -> new until the end of the chain.
         Some(mut fid) => {
             let updates = files["file_updates"].as_array().cloned().unwrap_or_default();
@@ -760,32 +772,63 @@ fn newer(id: &str, name: &str, n: &crate::instance::NexusRef, files: &Value, dom
                     None => break,
                 }
             }
-            if fid == start {
-                return None;
+            match file(fid) {
+                Some(f) if fid != start => f,
+                _ => return Ok(None),
             }
-            file(fid)?
         }
-        // No file id (an MO2 import, say): the newest main file, if its version differs.
+        // No file id (an MO2 import, say): the newest main file, if it's a different version, or
+        // uploaded after the day the mod's file came (MO2's "d2026.1.29.0" date versions, or the
+        // archive's date when there's no version).
         None => {
-            let main = newest_main(files)?;
-            let v = main["version"].as_str()?;
-            if n.version.as_deref().is_some_and(|have| !version_after(v, have)) {
-                return None;
+            let main = newest_main(files).ok_or("Nexus lists no main file to compare with")?;
+            let have = n.version.as_deref().map(str::trim).filter(|v| !v.is_empty());
+            let got = have.map_or_else(|| meta.source.as_deref().and_then(archive_day), date_version);
+            let newer = match (got, have) {
+                // ponytail: whole days; a file uploaded later on the day the mod's came isn't offered.
+                (Some(day), _) => main["uploaded_timestamp"].as_u64().ok_or("Nexus gave no upload time")? >= day + 86400,
+                (None, Some(have)) => version_after(main["version"].as_str().ok_or("Nexus gave no version")?, have),
+                (None, None) => return Err("neither the installed file nor its version is known".into()),
+            };
+            if !newer {
+                return Ok(None);
             }
             main
         }
     };
-    let fid = target["file_id"].as_u64()?;
-    Some(Update {
+    let fid = target["file_id"].as_u64().ok_or("Nexus gave no file id")?;
+    Ok(Some(Update {
         id: id.into(),
-        name: name.into(),
+        name: meta.name.clone(),
         mod_id: n.mod_id,
         installed: n.version.clone(),
         latest: target["version"].as_str().map(str::to_owned),
         file_id: fid,
         file_name: target["file_name"].as_str().or(target["name"].as_str()).unwrap_or_default().to_string(),
         url: format!("https://www.nexusmods.com/{domain}/mods/{}?tab=files&file_id={fid}", n.mod_id),
-    })
+    }))
+}
+
+/// The start of the day (UTC, seconds since 1970) in MO2's date version for a mod it didn't know
+/// the version of: "d2026.1.29.0".
+fn date_version(v: &str) -> Option<u64> {
+    let v = v.strip_prefix(['d', 'D'])?;
+    let k = ver_key(v);
+    let (y, m, d) = (*k.first()?, *k.get(1)?, *k.get(2)?);
+    if !v.chars().all(|c| c.is_ascii_digit() || c == '.') || y < 1970 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm), years starting in March.
+    let (y, m) = if m > 2 { (y, m - 3) } else { (y - 1, m + 9) };
+    let (era, yoe) = (y / 400, y % 400);
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * m + 2) / 5 + d - 1;
+    Some((era * 146097 + doe - 719468) * 86400)
+}
+
+/// The start of the day an archive was saved (its modified time), when it's still there.
+fn archive_day(path: &str) -> Option<u64> {
+    let t = fs::metadata(path).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(t - t % 86400)
 }
 
 /// Whether Nexus's `latest` is a different version from `have`: plain numbers compare as numbers
@@ -850,7 +893,7 @@ pub(crate) fn fetch_file(inst: &Instance, client: &Client, mod_id: u64, file_id:
     let links = client.get(&format!("{base}/download_link.json{query}"))?;
     let uri = links.as_array().and_then(|l| l.first()).and_then(|l| l["URI"].as_str()).context("Nexus sent no download link")?;
     fs::create_dir_all(dest.parent().unwrap())?;
-    fetch_sized(uri, &dest, info["size_in_bytes"].as_u64(), &format!("downloading {name} (MB)"))?;
+    fetch_sized(uri, &dest, known_size(&info), &format!("downloading {name} (MB)"))?;
     Ok((dest, info))
 }
 
@@ -860,8 +903,13 @@ pub(crate) fn downloaded(inst: &Instance, client: &Client, mod_id: u64, file_id:
     let info = client.get(&format!("/v1/games/{}/mods/{mod_id}/files/{file_id}.json", inst.config.game.nexus_domain()))?;
     let name = info["file_name"].as_str().map(crate::install::sanitize).unwrap_or_else(|| format!("{mod_id}-{file_id}"));
     let dest = inst.downloads_dir().join(&name);
-    let there = info["size_in_bytes"].as_u64().is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s));
+    let there = known_size(&info).is_some_and(|s| fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == s));
     Ok((dest, info, there))
+}
+
+/// A Nexus file's size, when Nexus knows it: some files say 0, which means unknown.
+fn known_size(info: &Value) -> Option<u64> {
+    info["size_in_bytes"].as_u64().filter(|&s| s > 0)
 }
 
 pub(crate) fn fetch_url(url: &str, dest: &Path) -> Result<()> {
@@ -1089,11 +1137,12 @@ pub fn remember(inst: &Instance, id: &str, nexus: crate::instance::NexusRef) -> 
     inst.write_mod_meta(id, &meta)
 }
 
-/// Download a file and install it (FOMOD installers take their defaults unless `choices` are
-/// given), recording its Nexus ids so update checks find it.
+/// Download a file and install it, recording its Nexus ids so update checks find it. A FOMOD
+/// installer needs `choices` (`{}` takes its defaults): without them the file stays downloaded
+/// and nothing is installed, so a second try with choices doesn't make a second copy.
 pub fn install(inst: &Instance, client: &Client, link: &NxmLink, choices: Option<&crate::fomod::Choices>) -> Result<crate::install::InstallReport> {
     let f = fetch(inst, client, link)?;
-    let r = crate::install::install(inst, &f.path, f.name.as_deref(), true, Some(&choices.cloned().unwrap_or_default()))?;
+    let r = crate::install::install(inst, &f.path, f.name.as_deref(), true, choices)?;
     remember(inst, &r.id, f.nexus)?;
     let _ = refresh_requirements(inst, client, &[link.mod_id]); // Problems uses them; the install stands without
     Ok(r)
@@ -1375,12 +1424,29 @@ mod tests {
             ],
             "file_updates": [{ "old_file_id": 1, "new_file_id": 2 }, { "old_file_id": 2, "new_file_id": 3 }]
         });
-        let r = |file_id, version: &str| crate::instance::NexusRef { mod_id: 9, file_id, version: Some(version.into()), category: None };
-        let u = newer("A", "A", &r(Some(1), "1.0"), &files, "skyrimspecialedition").unwrap();
+        let r = |file_id, version: &str| crate::instance::ModMeta {
+            name: "A".into(),
+            nexus: Some(crate::instance::NexusRef { mod_id: 9, file_id, version: Some(version.into()).filter(|v: &String| !v.is_empty()), category: None }),
+            ..Default::default()
+        };
+        let u = newer("A", &r(Some(1), "1.0"), &files, "skyrimspecialedition").unwrap().unwrap();
         assert_eq!((u.file_id, u.latest.as_deref(), u.url.as_str()), (3, Some("1.2"), "https://www.nexusmods.com/skyrimspecialedition/mods/9?tab=files&file_id=3"));
-        assert!(newer("A", "A", &r(Some(3), "1.2"), &files, "x").is_none());
-        assert_eq!(newer("A", "A", &r(None, "1.1"), &files, "x").unwrap().file_id, 3, "by version without a file id");
-        assert!(newer("A", "A", &r(None, "1.2"), &files, "x").is_none());
+        assert_eq!(newer("A", &r(Some(3), "1.2"), &files, "x"), Ok(None));
+        assert_eq!(newer("A", &r(None, "1.1"), &files, "x").unwrap().unwrap().file_id, 3, "by version without a file id");
+        assert_eq!(newer("A", &r(None, "1.2"), &files, "x"), Ok(None));
+        // MO2's file id 0 and date versions: the archive's name finds the file, else the date
+        // compares with the main file's upload.
+        let mut m = r(Some(0), "d2026.1.29.0");
+        m.source = Some("D:/downloads/A-1.zip".into());
+        assert_eq!(newer("A", &m, &files, "x").unwrap().unwrap().file_id, 3, "by the archive's name");
+        let day = date_version("d2026.1.29.0").unwrap();
+        assert_eq!(day, 1_769_644_800, "2026-01-29");
+        let at = |t: u64| serde_json::json!({ "files": [{ "file_id": 3, "version": "1.2", "category_name": "MAIN", "uploaded_timestamp": t }] });
+        assert_eq!(newer("A", &r(Some(0), "d2026.1.29.0"), &at(day + 86400 * 3), "x").unwrap().unwrap().file_id, 3, "uploaded after");
+        assert_eq!(newer("A", &r(Some(0), "d2026.1.29.0"), &at(day + 3600), "x"), Ok(None), "uploaded that day");
+        assert!(newer("A", &r(Some(0), ""), &at(day), "x").is_err(), "nothing to tell by is unknown, not skipped");
+        assert!(newer("A", &r(None, "1.0"), &serde_json::json!({ "files": [] }), "x").is_err(), "no main file");
+        assert_eq!(date_version("1.2.3"), None);
     }
 }
 

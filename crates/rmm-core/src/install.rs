@@ -13,9 +13,14 @@ const DATA_DIRS: &[&str] = &[
     "f4se", "materials", "vis", "lodsettings", "grass", "shadersfx", "video", "nemesis_engine",
     "calientetools", "dyndolod", "meta", "facegen", "mcm", "netscriptframework", "terrain",
     "dialogueviews", "trees", "lod", "distantlod", "source", "particles", "effects", "sky",
+    "shaders",
 ];
 const DATA_EXTS: &[&str] = &["esp", "esm", "esl", "bsa", "ba2"];
 const ROOT_EXTS: &[&str] = &["exe", "dll"];
+/// An ENB preset's files, which go in the game folder.
+const ROOT_NAMES: &[&str] = &["enbseries", "enbseries.ini", "enblocal.ini"];
+/// Files a wrapper folder may sit beside: unwrapping it leaves only these out.
+const DOC_EXTS: &[&str] = &["txt", "md", "pdf", "htm", "html", "url", "rtf", "jpg", "jpeg", "png", "webp", "gif"];
 
 #[derive(Debug, Serialize)]
 pub struct InstallReport {
@@ -577,12 +582,14 @@ fn build(inst: &Instance, source: &Path, staging: &Path, dest: &Path, choices: O
     }
     match layout {
         Layout::Fomod(root) => {
-            let choices = choices.context("this mod has a FOMOD installer: look at its options with fomod_options, then install with choices ({} takes the defaults)")?;
+            let Some(choices) = choices else {
+                bail!("{} has a FOMOD installer, so nothing was installed: see its options with `rmm fomod <archive>` (MCP fomod_options), then install with choices (`--choices '{{}}'` takes the installer's defaults)", source.display());
+            };
             let walk = fomod_walk(inst, &root, choices)?;
             let (files, w) = walk.resolve(&root)?;
             warnings.extend(walk.warnings.iter().cloned().chain(w));
             if files.is_empty() {
-                bail!("the chosen options install no files");
+                bail!("{}", no_files(&walk, &warnings));
             }
             for (rel, src) in files.values() {
                 let d = dest.join(rel);
@@ -650,6 +657,19 @@ fn build(inst: &Instance, source: &Path, staging: &Path, dest: &Path, choices: O
     Ok((files, fomod, warnings))
 }
 
+/// Why a FOMOD installs nothing with these choices, and what to do.
+fn no_files(walk: &Walk, warnings: &[String]) -> String {
+    let mut msg = String::from("the chosen FOMOD options install no files");
+    let unusable: Vec<&str> = walk.steps.iter().flat_map(|s| &s.groups).flat_map(|g| &g.options).filter(|o| o.kind == crate::fomod::Kind::NotUsable).map(|o| o.name.as_str()).collect();
+    if !unusable.is_empty() {
+        msg += &format!("; the installer marks these options unusable with this setup, usually because they need other mods installed and enabled first (a patch needs the mods it patches): {}", unusable.join(", "));
+    }
+    if !warnings.is_empty() {
+        msg += &format!("; {}", warnings.join("; "));
+    }
+    msg + "; see the options with `rmm fomod <archive>` (MCP fomod_options) and pick the ones to install with choices"
+}
+
 /// Run a FOMOD installer found at `root` against the instance's current setup.
 fn fomod_walk(inst: &Instance, root: &Path, choices: &Choices) -> Result<Walk> {
     let installer = installer_at(root)?;
@@ -669,7 +689,8 @@ fn fomod_walk(inst: &Instance, root: &Path, choices: &Choices) -> Result<Walk> {
     };
     let loader = inst.config.game.loader();
     let script_extender = inst.config.game_path.join(loader).is_file() || winners.contains_key(&path_key(&format!("root/{loader}")));
-    let mut walk = installer.walk(choices, &Env { file_state: &state, script_extender })?;
+    let game_version = crate::launch::game_version(&inst.config.game_path, inst.config.game).ok();
+    let mut walk = installer.walk(choices, &Env { file_state: &state, script_extender, game_version })?;
     if child_ci(root, "wizard.txt").is_some() && child_ci(root, "fomod").and_then(|f| child_ci(&f, "moduleconfig.xml")).is_none() {
         walk.warnings.push("the package has a BAIN wizard (wizard.txt), which rmm doesn't run: its sub-packages were picked by hand or by name (00… on)".into());
     }
@@ -901,17 +922,54 @@ pub(crate) fn extract(source: &Path, dest: &Path) -> Result<()> {
 
 /// RAR through libarchive's bsdtar, which reads RAR4 and RAR5 (not encrypted ones). Windows 10
 /// and 11 ship it as System32\tar.exe; elsewhere it's `bsdtar` (libarchive-tools). Like any bsdtar
-/// run without -P, it won't write outside `dest`.
+/// run without -P, it won't write outside `dest`. Where it fails (old archives using RAR VM
+/// filters, as Depths of Skyrim 1.1.7), 7-Zip or WinRAR's UnRAR, where installed, try again; they
+/// leave out paths that climb out of `dest` too.
 fn extract_rar(source: &Path, dest: &Path) -> Result<()> {
-    let tar = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("tar.exe")).filter(|t| t.is_file()).unwrap_or_else(|| "bsdtar".into());
-    fs::create_dir_all(dest)?;
-    let mut cmd = crate::hidden(&tar);
-    cmd.arg("-xf").arg(source).arg("-C").arg(dest);
-    let out = cmd.output().with_context(|| format!("RAR needs {}", tar.display()))?;
-    if !out.status.success() {
-        bail!("RAR: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let tools = rar_tools(source, dest);
+    let hint = if tools.len() < 2 { "; installing 7-Zip (7-zip.org) lets rmm unpack it" } else { "" };
+    let mut failed = Vec::new();
+    for (i, (exe, args)) in tools.into_iter().enumerate() {
+        if i > 0 {
+            let _ = fs::remove_dir_all(dest); // what the last one left half done
+        }
+        fs::create_dir_all(dest)?;
+        let mut cmd = crate::hidden(&exe);
+        cmd.args(&args).stdin(std::process::Stdio::null());
+        match cmd.output() {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                let text = String::from_utf8_lossy(if out.stderr.trim_ascii().is_empty() { &out.stdout } else { &out.stderr }).trim().to_string();
+                failed.push(format!("{}: {}", exe.display(), text.lines().last().unwrap_or_default()));
+            }
+            Err(e) => failed.push(format!("{}: {e}", exe.display())),
+        }
     }
-    Ok(())
+    bail!("RAR: {}{hint}", failed.join("; "))
+}
+
+/// The programs that unpack RAR, in the order to try them, with their arguments.
+fn rar_tools(source: &Path, dest: &Path) -> Vec<(PathBuf, Vec<std::ffi::OsString>)> {
+    let tar = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("tar.exe")).filter(|t| t.is_file()).unwrap_or_else(|| "bsdtar".into());
+    let mut out = vec![(tar, vec!["-xf".into(), source.into(), "-C".into(), dest.into()])];
+    let installed = |dir: &str, exe: &str| -> Vec<PathBuf> {
+        if !cfg!(windows) {
+            return vec![exe.to_lowercase().trim_end_matches(".exe").into()]; // from PATH: 7z, unrar
+        }
+        ["ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(std::env::var_os).map(|p| Path::new(&p).join(dir).join(exe)).filter(|p| p.is_file()).take(1).collect()
+    };
+    let mut to = std::ffi::OsString::from("-o");
+    to.push(dest);
+    for exe in installed("7-Zip", "7z.exe") {
+        out.push((exe, vec!["x".into(), "-y".into(), to.clone(), "--".into(), source.into()]));
+    }
+    // UnRAR takes the folder with a trailing separator; -p- asks for no password.
+    let mut folder = dest.as_os_str().to_owned();
+    folder.push(std::path::MAIN_SEPARATOR_STR);
+    for exe in installed("WinRAR", "UnRAR.exe") {
+        out.push((exe, vec!["x".into(), "-y".into(), "-o+".into(), "-p-".into(), "--".into(), source.into(), folder.clone()]));
+    }
+    out
 }
 
 pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
@@ -968,41 +1026,44 @@ enum Layout {
     DataWithRoot { root: PathBuf, data: PathBuf },
 }
 
-fn find_layout(mut dir: PathBuf) -> Result<Layout> {
-    loop {
-        let entries: Vec<_> = fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
-        let lower = |e: &fs::DirEntry| e.file_name().to_string_lossy().to_lowercase();
-        let is_dir = |e: &fs::DirEntry| e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+fn find_layout(dir: PathBuf) -> Result<Layout> {
+    let entries: Vec<_> = fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
+    let lower = |e: &fs::DirEntry| e.file_name().to_string_lossy().to_lowercase();
+    let is_dir = |e: &fs::DirEntry| e.file_type().map(|t| t.is_dir()).unwrap_or(false);
 
-        if entries.iter().any(|e| is_dir(e) && lower(e) == "fomod" && child_ci(&e.path(), "moduleconfig.xml").is_some()) {
-            return Ok(Layout::Fomod(dir));
-        }
-        if crate::csharp::script_in(&dir).is_some() {
-            return Ok(Layout::Script(dir));
-        }
-        if let Some(data) = entries.iter().find(|e| is_dir(e) && lower(e) == "data") {
-            return Ok(Layout::DataWithRoot { data: data.path(), root: dir });
-        }
-        let data_like = entries.iter().any(|e| {
-            let n = lower(e);
-            if is_dir(e) { DATA_DIRS.contains(&n.as_str()) } else { ext_of(&n).is_some_and(|x| DATA_EXTS.contains(&x.as_str())) }
-        });
-        if data_like {
-            return Ok(Layout::Data(dir, false));
-        }
-        if entries.iter().any(|e| !is_dir(e) && ext_of(&lower(e)).is_some_and(|x| ROOT_EXTS.contains(&x.as_str()))) {
-            return Ok(Layout::Root(dir));
-        }
-        let subdirs: Vec<_> = entries.iter().filter(|e| is_dir(e)).collect();
-        if subdirs.len() == 1 {
-            dir = subdirs[0].path();
-            continue;
-        }
-        if bain_packages(&dir).is_some() {
-            return Ok(Layout::Fomod(dir));
-        }
-        return Ok(Layout::Data(dir, true));
+    if entries.iter().any(|e| is_dir(e) && lower(e) == "fomod" && child_ci(&e.path(), "moduleconfig.xml").is_some()) {
+        return Ok(Layout::Fomod(dir));
     }
+    if crate::csharp::script_in(&dir).is_some() {
+        return Ok(Layout::Script(dir));
+    }
+    if let Some(data) = entries.iter().find(|e| is_dir(e) && lower(e) == "data") {
+        return Ok(Layout::DataWithRoot { data: data.path(), root: dir });
+    }
+    let data_like = entries.iter().any(|e| {
+        let n = lower(e);
+        if is_dir(e) { DATA_DIRS.contains(&n.as_str()) } else { ext_of(&n).is_some_and(|x| DATA_EXTS.contains(&x.as_str())) }
+    });
+    if data_like {
+        return Ok(Layout::Data(dir, false));
+    }
+    if entries.iter().any(|e| ROOT_NAMES.contains(&lower(e).as_str()) || (!is_dir(e) && ext_of(&lower(e)).is_some_and(|x| ROOT_EXTS.contains(&x.as_str())))) {
+        return Ok(Layout::Root(dir));
+    }
+    // A lone folder is a wrapper ("Lux/meshes/...") only when nothing but docs sits beside it
+    // and rmm knows what's inside; otherwise it's part of the mod ("Shaders/DetailMaps/...").
+    let subdirs: Vec<_> = entries.iter().filter(|e| is_dir(e)).collect();
+    let docs_only = entries.iter().all(|e| is_dir(e) || ext_of(&lower(e)).is_some_and(|x| DOC_EXTS.contains(&x.as_str())));
+    if subdirs.len() == 1 && docs_only {
+        let inner = find_layout(subdirs[0].path())?;
+        if !matches!(inner, Layout::Data(_, true)) {
+            return Ok(inner);
+        }
+    }
+    if bain_packages(&dir).is_some() {
+        return Ok(Layout::Fomod(dir));
+    }
+    Ok(Layout::Data(dir, true))
 }
 
 /// A Wrye Bash BAIN package's sub-packages: at least two top-level folders, each like a Data
@@ -1057,4 +1118,51 @@ pub(crate) fn unique_id(inst: &Instance, base: &str) -> String {
         return base.into();
     }
     (2..).map(|n| format!("{base} ({n})")).find(|id| !taken(id)).unwrap()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn tree(files: &[&str]) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        for f in files {
+            let p = t.path().join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "x").unwrap();
+        }
+        t
+    }
+
+    /// The layout's kind and its folder, relative to the archive's top.
+    fn layout(files: &[&str]) -> (&'static str, String) {
+        let t = tree(files);
+        let rel = |p: &Path| p.strip_prefix(t.path()).unwrap().to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+        match find_layout(t.path().to_path_buf()).unwrap() {
+            Layout::Data(d, guessed) => (if guessed { "guessed" } else { "data" }, rel(&d)),
+            Layout::Root(r) => ("root", rel(&r)),
+            Layout::Fomod(r) => ("fomod", rel(&r)),
+            Layout::Script(r) => ("script", rel(&r)),
+            Layout::DataWithRoot { root, .. } => ("data+root", rel(&root)),
+        }
+    }
+
+    #[test]
+    fn keeps_meaningful_top_folders() {
+        assert_eq!(layout(&["enbseries/effect.txt", "enbseries.ini"]), ("root", "".into()), "an ENB preset goes in the game folder");
+        assert_eq!(layout(&["Everwild/enbseries/effect.txt", "Everwild/enbseries.ini"]), ("root", "Everwild".into()));
+        assert_eq!(layout(&["Shaders/DetailMaps/a.hlsl"]), ("data", "".into()));
+        assert_eq!(layout(&["Stuff/Inner/a.txt"]), ("guessed", "".into()), "an unknown folder isn't unwrapped");
+        assert_eq!(layout(&["Lux/meshes/a.nif", "readme.txt"]), ("data", "Lux".into()), "a wrapper beside docs is");
+        assert_eq!(layout(&["Lux/meshes/a.nif", "Lux.ini"]), ("guessed", "".into()), "not when that leaves a file out");
+    }
+
+    #[test]
+    fn a_broken_rar_names_what_was_tried() {
+        let t = tree(&[]);
+        let rar = t.path().join("bad.rar");
+        fs::write(&rar, b"Rar!\x1a\x07\x00garbage").unwrap();
+        let e = extract(&rar, &t.path().join("out")).unwrap_err().to_string();
+        assert!(e.starts_with("RAR: ") && e.contains("tar"), "{e}");
+    }
 }

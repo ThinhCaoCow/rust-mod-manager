@@ -6,7 +6,10 @@
 #include <SKSE/SKSE.h>
 
 #include <cstdarg>
+#include <algorithm>
 #include <cstring>
+#include <format>
+#include <sstream>
 
 namespace
 {
@@ -102,8 +105,32 @@ namespace
 		return true;
 	}
 
+	// getgs/setgs with a game setting that doesn't exist crashes the game in its lookup, so the
+	// name is checked first. "" when the line is fine.
+	std::string unknown_setting(const std::string& a_line)
+	{
+		std::istringstream in(a_line);
+		std::string        cmd, name;
+		in >> cmd >> name;
+		std::ranges::transform(cmd, cmd.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (name.empty() || (cmd != "getgs" && cmd != "getgamesetting" && cmd != "setgs" && cmd != "setgamesetting")) {
+			return {};
+		}
+		if (name.size() > 1 && name.front() == '"' && name.back() == '"') {
+			name = name.substr(1, name.size() - 2);
+		}
+		const auto settings = RE::GameSettingCollection::GetSingleton();
+		if (!settings || settings->GetSetting(name.c_str())) {
+			return {};
+		}
+		return std::format("there is no game setting '{}' (`help {} 4` lists the names); {} with an unknown name crashes the game", name, name, cmd);
+	}
+
 	std::string console(const std::string& a_line, std::string& a_out)
 	{
+		if (auto why = unknown_setting(a_line); !why.empty()) {
+			return why;
+		}
 		const auto factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::Script>();
 		const auto script = factory ? factory->Create() : nullptr;
 		if (!script) {
