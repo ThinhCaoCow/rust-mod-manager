@@ -30,12 +30,9 @@ pub(crate) struct Deployed {
     pub src: String,
     size: u64,
     mtime: u64,
-    /// The deployed file's id (NTFS file reference or inode), and the id of the mod's folder when
-    /// it was linked; 0 in manifests from before they were kept.
+    /// The deployed file's id (NTFS file reference or inode); 0 in manifests from before it was kept.
     #[serde(default)]
     id: u64,
-    #[serde(default)]
-    dir: u64,
     backed_up: bool,
     pub copied: bool,
 }
@@ -150,40 +147,46 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
         // far, so the next deploy doesn't take rmm's own links for the user's files.
         let applied = (|| -> Result<()> {
             capture_played(inst, &man, &mut plan, dry_run)?;
-            // The game folder is listed once, with each file's size, time and id, and each mod
-            // folder's id is read once. Mods are installed whole and never changed in place
-            // (reinstalls and tool reruns replace the folder), so a link that is still the file rmm
-            // linked, from the same mod folder, is still the mod's file: no file is opened for it.
+            // The game folder and each mod folder are listed once, with each file's size, time and
+            // id, so no file is opened: a link that is still the file rmm linked, and still the
+            // file at its source path, needs nothing more. A source replaced by a new file (an
+            // editor or `sed -i` writing a new file) fails this and is linked again.
             // overwrite/ changes in place, so its files, and whatever fails this, are checked one by one.
-            let seen = listing(game);
-            let mut folders: HashMap<String, u64> = HashMap::new();
-            for id in man.files.values().map(|e| &e.mod_id) {
-                if !folders.contains_key(id) {
-                    folders.insert(id.clone(), stat(&inst.mod_dir(id)).map_or(0, |s| s.id));
-                }
-            }
-            let same_folder = |e: &Deployed| e.mod_id != OVERWRITE && e.dir != 0 && folders.get(&e.mod_id) == Some(&e.dir);
+            // Listed side by side: hundreds of mod folders one after another doubled a deploy's time.
+            let mut ids: Vec<&String> = man.files.values().map(|e| &e.mod_id).filter(|id| *id != OVERWRITE).collect();
+            ids.sort();
+            ids.dedup();
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+            let (seen, sources) = std::thread::scope(|s| {
+                let seen = s.spawn(|| listing(game));
+                let parts: Vec<_> = ids
+                    .chunks(ids.len().div_ceil(threads).max(1))
+                    .map(|part| s.spawn(move || part.iter().map(|id| ((*id).clone(), listing(&inst.mod_dir(id)))).collect::<Vec<_>>()))
+                    .collect();
+                let sources: HashMap<String, HashMap<String, Option<Stat>>> = parts.into_iter().flat_map(|p| p.join().unwrap_or_default()).collect();
+                (seen.join().unwrap_or_default(), sources)
+            });
+            let source_id = |e: &Deployed| sources.get(&e.mod_id)?.get(&path_key(&e.src)).copied().flatten().map(|s| s.id);
 
             // Files changed outside rmm go to overwrite/ first, so they win the layering below.
             let mut changed: HashSet<String> = HashSet::new();
             let mut ok: HashSet<String> = HashSet::new();
             // Entries from manifests that didn't keep ids yet, and the ids they get.
-            let mut learned: HashMap<String, (u64, u64)> = HashMap::new();
+            let mut learned: HashMap<String, u64> = HashMap::new();
             let checks = man.files.len();
             for (i, (key, e)) in man.files.iter().enumerate() {
                 crate::progress::report("checking deployed files", i, checks);
                 let Some(&found) = seen.get(key) else { continue }; // gone: linked again below
                 let path = game.join(&e.target);
                 let verdict = match found {
-                    Some(f) if !e.copied && f.id == e.id && same_folder(e) => Some(true),
+                    Some(f) if !e.copied && f.id != 0 && f.id == e.id && source_id(e) == Some(f.id) => Some(true),
                     Some(f) if e.copied && (f.size, f.mtime) == (e.size, e.mtime) => Some(true),
                     _ => ours(inst, e, &path),
                 };
-                if let (Some(true), Some(f)) = (verdict, found) {
-                    let dir = folders.get(&e.mod_id).copied().unwrap_or(0);
-                    if (e.id, e.dir) != (f.id, dir) {
-                        learned.insert(key.clone(), (f.id, dir));
-                    }
+                if let (Some(true), Some(f)) = (verdict, found)
+                    && e.id != f.id
+                {
+                    learned.insert(key.clone(), f.id);
                 }
                 match verdict {
                     Some(true) => {
@@ -243,9 +246,8 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
                 };
                 if ok.contains(key) && fresh && want.is_some_and(|w| w.mod_id == e.mod_id && w.src == e.src) {
                     plan.unchanged += 1;
-                    if !dry_run && let Some(&(id, dir)) = learned.get(key) {
-                        let ent = man.files.get_mut(key).unwrap();
-                        (ent.id, ent.dir) = (id, dir);
+                    if !dry_run && let Some(&id) = learned.get(key) {
+                        man.files.get_mut(key).unwrap().id = id;
                     }
                     continue;
                 }
@@ -295,8 +297,7 @@ pub fn deploy_with(inst: &Instance, dry_run: bool, data: bool) -> Result<DeployP
                     continue;
                 }
                 // Recorded before linking, so a failed link is retried and its backup still restored.
-                let dir = *folders.entry(w.mod_id.clone()).or_insert_with(|| stat(&inst.mod_dir(&w.mod_id)).map_or(0, |s| s.id));
-                man.files.insert(key.clone(), Deployed { target, mod_id: w.mod_id.clone(), src: w.src.clone(), size: 0, mtime: 0, id: 0, dir, backed_up, copied: false });
+                man.files.insert(key.clone(), Deployed { target, mod_id: w.mod_id.clone(), src: w.src.clone(), size: 0, mtime: 0, id: 0, backed_up, copied: false });
                 let e = man.files.get_mut(&key).unwrap();
                 create_parents(game, &path, &mut man.dirs)?;
                 let src = inst.mod_dir(&w.mod_id).join(&w.src);
@@ -726,6 +727,8 @@ fn list_into(dir: &Path, prefix: &str, out: &mut HashMap<String, Option<Stat>>) 
 fn capture(inst: &Instance, target: &str, path: &Path) -> Result<()> {
     let dest = inst.root.join("overwrite").join(mod_rel(target));
     fs::create_dir_all(dest.parent().unwrap())?;
+    // An older overwrite/ file may be a link to somewhere; copying onto it would write through.
+    remove_file_if_exists(&dest)?;
     fs::copy(path, dest)?;
     Ok(())
 }

@@ -774,11 +774,15 @@ enum NexusCmd {
     },
     /// A mod's page: description, tags, what it needs and which mods need it.
     Info { mod_id: u64 },
-    /// Download and install a file by ids (Premium accounts) or nxm link.
+    /// Download and install a file by ids (Premium accounts) or nxm link. A FOMOD installer needs
+    /// --choices; without them the file is only downloaded and its options are named.
     Install {
         /// An nxm:// link, a mod page link, a mod id (its newest main file) or <mod id>/<file id>.
         /// All but nxm links need Premium.
         what: String,
+        /// FOMOD choices as JSON, or @file holding it; '{}' takes the installer's defaults.
+        #[arg(long)]
+        choices: Option<String>,
     },
     /// Install a collection: its mods with the curator's installer choices, its mod rules, plugin
     /// list and tools. Shows what it would install; --apply installs. Premium downloads each file;
@@ -1382,11 +1386,12 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Nexus(NexusCmd::Install { what }) => {
+        Cmd::Nexus(NexusCmd::Install { what, choices }) => {
+            let choices = choices.as_deref().map(parse_choices).transpose()?;
             let inst = open()?;
             let client = nexus::Client::from_env()?;
             let link = nexus::resolve(&inst, &client, &what)?;
-            print(&nexus::install(&inst, &client, &link, None)?)
+            print(&nexus::install(&inst, &client, &link, choices.as_ref())?)
         }
         Cmd::Nexus(NexusCmd::Collection { link, revision, optional, profile, no_sort, apply }) => {
             print(&rmm_core::collection::install(&mut open()?, &nexus::Client::from_env()?, &link.unwrap_or_default(), revision, optional, profile.as_deref(), !apply, !no_sort)?)

@@ -3414,7 +3414,7 @@ async function checkUpdates(quiet) {
   const fromGh = S.mods.some(m => m.web?.startsWith('https://github.com/'));
   const g = fromGh ? await (quiet ? call('link_updates').catch(() => null) : act('Checking GitHub for updates', () => call('link_updates'), { reload: false })) : [];
   const gh = Array.isArray(g) ? g : [];
-  let r = [], gone = [];
+  let r = [], gone = [], unsure = [];
   if (quiet || nexus.user || !gh.length) {
     if (!quiet && !await nexusReady('Update checks ask Nexus Mods about your mods, which needs your API key.')) {
       if (!gh.length) return;
@@ -3427,6 +3427,7 @@ async function checkUpdates(quiet) {
       } else {
         r = c.updates;
         gone = c.unavailable;
+        unsure = c.unknown ?? [];
       }
     }
   }
@@ -3435,7 +3436,11 @@ async function checkUpdates(quiet) {
   const held = S.mods.filter(m => m.pinned).length;
   // Mods whose Nexus page is gone: the check skipped them; there's nothing to update.
   const goneNote = gone.length ? `Nexus no longer has a page for ${plural(gone.length, 'mod')}, or hides it (removed, hidden, or a wrong id), so it wasn’t checked: ${gone.map(g => nameOf(g.id)).join(', ')}.` : '';
-  if (!all) return toast(`Every mod with Nexus ids${fromGh ? ' or a GitHub page' : ''} is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.${goneNote ? ' ' + goneNote : ''}`, goneNote ? 'info' : undefined);
+  // Mods with nothing to compare (no file id, version or date): said, not passed off as up to date.
+  const names = l => l.slice(0, 8).map(g => nameOf(g.id)).join(', ') + (l.length > 8 ? `, and ${l.length - 8} more` : '');
+  const unsureNote = unsure.length ? `rmm can’t tell whether ${plural(unsure.length, 'mod')} ${unsure.length === 1 ? 'is' : 'are'} up to date (no Nexus file id, version or date to compare with): ${names(unsure)}.` : '';
+  const notes = [goneNote, unsureNote].filter(Boolean).join(' ');
+  if (!all) return toast(`Every ${unsure.length ? 'other ' : ''}mod with Nexus ids${fromGh ? ' or a GitHub page' : ''} is up to date${held ? ` (${plural(held, 'mod')} held at their versions)` : ''}.${notes ? ' ' + notes : ''}`, notes ? 'info' : undefined);
   const premium = !!nexus.user?.is_premium;
   const rows = r.map(u => `<tr data-id="${esc(u.id)}"><td>${esc(nameOf(u.id))}<details class="changelog" data-mod="${u.mod_id}" data-since="${esc(u.installed ?? '')}"><summary class="small">What’s new</summary><div class="muted small">Loading…</div></details></td><td>${esc(u.installed ?? '?')} → <b>${esc(u.latest ?? u.file_name)}</b></td>
     <td style="white-space:nowrap"><button type="button" data-hold="skip" title="Don’t offer this file; a later one is offered">Skip</button> <button type="button" data-hold="pin" title="Keep the mod at its version until you release it in its panel">Hold</button> <button type="button" class="primary" data-get title="${premium ? 'Download it and update the mod in place' : 'Open its Files tab: Mod manager download brings it back here as an update'}">${premium ? 'Update' : 'Files tab'}</button></td></tr>`).join('')
@@ -3449,7 +3454,7 @@ async function checkUpdates(quiet) {
   ].filter(Boolean).join(' ');
   // Update all: what downloads here (GitHub, and Nexus with Premium), one mod after another.
   const auto = (premium ? r.length : 0) + gh.length;
-  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>${goneNote ? `<p class="muted small">${esc(goneNote)}</p>` : ''}`, actions: [['cancel', 'Close'], ...(auto > 1 ? [['all', 'Update all', 'primary']] : [])] });
+  const done = dialog({ title: plural(all, 'update'), body: `<table class="fc">${rows}</table><p class="muted small">${how} Skip passes over this version; Hold keeps the mod at its version.</p>${notes ? `<p class="muted small">${esc(notes)}</p>` : ''}`, actions: [['cancel', 'Close'], ...(auto > 1 ? [['all', 'Update all', 'primary']] : [])] });
   $('#dlg').classList.add('wide');
   let changed = false;
   $('#dlg').onclick = async e => {

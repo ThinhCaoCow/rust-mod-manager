@@ -260,10 +260,11 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
             output_mod: Some("Cleaned {plugin}".into()),
             ..tool(&format!("{xedit} QuickAutoClean"), s(&[&xedit_args[..], &["-qac", "-autoload", "-autoexit", "{plugin}"]].concat()))
         },
-        // Truncates its config XMLs (next to the exe, usually in Data) on every exit.
+        // Truncates its config XMLs (next to the exe, usually in Data) on every exit. Released
+        // builds reject --quiet (exit 255), which only its source has.
         "bodyslide" => Tool {
             rewrites: s(&["CalienteTools/BodySlide/*.xml"]),
-            ..tool("BodySlide", s(&["--groupbuild", "{groups}", "--targetdir", "{output}", "--trimorphs", "--quiet"]))
+            ..tool("BodySlide", s(&["--groupbuild", "{groups}", "--targetdir", "{output}", "--trimorphs"]))
         },
         // The CLI isn't in Synthesis releases; build Synthesis.Bethesda.CLI. Without -m Text it
         // keeps no FormID mapping between runs.
@@ -277,13 +278,15 @@ pub fn preset(game: Game, name: &str) -> Option<Tool> {
         // must be enabled when DynDOLOD runs. DynDOLOD has no Fallout 4 object LOD.
         "texgen" => tool("TexGen", s(&lod_args)),
         "dyndolod" if skyrim => tool("DynDOLOD", s(&lod_args)),
-        // 4.1 takes --tesv (the game folder) and --output; without them it writes to the Data
-        // folder of the game in the registry, whatever rmm's game is. Older versions read the
-        // paths only from Settings.json, where outputPath must exist or output goes to Data.
+        // Pandora 5 takes -tesv (the game folder), -o, -ar (auto run) and -ac (auto close), as
+        // its --help lists them; without them it writes to the Data folder of the game in the
+        // registry, whatever rmm's game is. It may also take outputPath from Settings.json over
+        // -o (older versions only read that), so both are set; the run warns when its
+        // PreviousOutput.txt names another folder.
         "pandora" if skyrim => Tool {
             settings: settings("Settings.json", &[("games.SkyrimSE.gameDataPath", "{data}".into()), ("games.SkyrimSE.outputPath", "{output}".into())]),
             keep: s(&["Pandora_Engine/ActiveMods.json"]),
-            ..tool("Pandora", s(&["--tesv", "{game}", "--output", "{output}", "--auto_run", "--auto_close"]))
+            ..tool("Pandora", s(&["-tesv", "{game}", "-o", "{output}", "-ar", "-ac"]))
         },
         // Mod manager 0 (None) reads the deployed Data folder. It reuses the previous
         // PGPatcher.esp for stable FormIDs. The run ends in a dialog someone has to close.
@@ -762,8 +765,26 @@ fn run_inner(inst: &Instance, id: &str, over: Option<&Tool>, given: &BTreeMap<St
     }
     r.log_tail = tail(&log);
     r.log = Some(log);
+    // {output} is the mod's Data folder; a tool given `{output}\Data` (BodySlide's --targetdir, as
+    // users write it) would otherwise make a mod deployed to Data\Data.
+    if let Some(d) = fs::read_dir(&staging)?.flatten().find(|e| e.file_name().eq_ignore_ascii_case("data") && e.path().is_dir()) {
+        for f in index_dir(&d.path())? {
+            move_file(&d.path().join(&f), &staging.join(&f), &staging)?;
+        }
+    }
 
     let after = snapshot(game)?;
+    // Pandora notes where it wrote; with outputPath from its Settings.json over -o, that has been
+    // the game's Data folder, through the links into other mods.
+    if chain_preset(inst, id, tool) == Some("pandora") {
+        let key = "data/pandora_engine/previousoutput.txt";
+        let in_data = after.get(key).filter(|s| before.get(key) != Some(*s)).map(|(rel, ..)| game.join(rel));
+        for note in std::iter::once(staging.join("Pandora_Engine").join("PreviousOutput.txt")).chain(in_data) {
+            if let Some(w) = elsewhere(&fs::read_to_string(&note).unwrap_or_default(), &vars["output"]) {
+                r.warnings.push(format!("Pandora says it wrote to {w}, not to {{output}}; check outputPath in its Settings.json"));
+            }
+        }
+    }
     let mut added_plugins: Vec<String> = vec![];
     // Editing in place, new files join the output mod if it's installed; mods rmm changes are
     // kept as they were first (mod id -> folder under trash/), so undo can swap them back.
@@ -1010,6 +1031,18 @@ fn edit_json(path: &Path, changes: Vec<(String, Option<Value>)>) -> Result<Vec<(
     Ok(previous)
 }
 
+/// The first full path in a tool's note of where it wrote (a folder, or a list of files) that
+/// isn't inside `output`.
+fn elsewhere(note: &str, output: &str) -> Option<String> {
+    let norm = |p: &str| p.trim().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let out = norm(output);
+    note.lines().map(str::trim).find(|l| {
+        let p = norm(l);
+        (p.contains(":\\") || p.starts_with('\\')) && p != out && !p.starts_with(&format!("{out}\\"))
+    })
+    .map(str::to_string)
+}
+
 /// Fill `{name}` placeholders. Braces around anything but a name stay as they are.
 fn expand(s: &str, vars: &BTreeMap<String, String>) -> Result<String> {
     let mut out = String::new();
@@ -1168,5 +1201,14 @@ mod tests {
         assert_eq!(expand("-D:{data}", &vars).unwrap(), r"-D:C:\g\Data");
         assert_eq!(expand(r#"{"json": {data}}"#, &vars).unwrap(), r#"{"json": C:\g\Data}"#);
         assert!(expand("{missing}", &vars).is_err());
+    }
+
+    #[test]
+    fn where_pandora_wrote() {
+        let out = r"C:\i\.staging\tool-pandora";
+        assert_eq!(elsewhere(r"c:/i/.staging/tool-pandora/", out), None);
+        assert_eq!(elsewhere("C:\\i\\.staging\\tool-pandora\\meshes\\a.hkx\nmeshes\\b.hkx", out), None);
+        assert_eq!(elsewhere("\r\nD:\\Games\\Skyrim\\Data\r\n", out).as_deref(), Some(r"D:\Games\Skyrim\Data"));
+        assert_eq!(elsewhere(r"C:\i\.staging\tool-pandora2", out).as_deref(), Some(r"C:\i\.staging\tool-pandora2"));
     }
 }

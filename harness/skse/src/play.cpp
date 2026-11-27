@@ -637,19 +637,42 @@ namespace
 		data->action = action;
 		using perform_t = bool(RE::TESActionData*);
 		static REL::Relocation<perform_t> perform{ RELOCATION_ID(40551, 41557) };
-		return perform(data) ? std::string{} : "the game didn't start the " + name + " (drawing the weapon takes a moment; try again)";
+		if (perform(data)) {
+			return {};
+		}
+		return "the game didn't start the " + name + (player->AsActorState()->GetWeaponState() == RE::WEAPON_STATE::kDrawn ? " (the player may still be in the last attack, staggered, or out of stamina; try again)" : " (the weapon isn't out yet; try again)");
 	}
 
 	// A control (as the Controls menu names it: Forward, Activate, Jump, Sprint, Sneak, Ready Weapon,
 	// Right Attack/Block, Tween Menu, Wait...) pressed for a_ms, sent to the game's input handlers
 	// each frame. Works behind other windows: nothing goes through Windows' input.
+	// A button event from a fixed set that is reused in turn and never freed. Mods can keep an
+	// input event and handle it later from a task (One Click Power Attack and others do with
+	// attack and block), and the game's own events stay valid for that: they live in its input
+	// queue's fixed slots. Freed ones crashed the game in AttackBlockHandler. Main thread.
+	RE::ButtonEvent* make_button(RE::INPUT_DEVICE a_device, const RE::BSFixedString& a_event, std::uint32_t a_key, float a_value, float a_held)
+	{
+		static std::array<RE::ButtonEvent*, 64> made{};
+		static std::size_t                      at = 0;
+		auto&                                   e = made[at++ % made.size()];
+		if (!e) {
+			return e = RE::ButtonEvent::Create(a_device, a_event, a_key, a_value, a_held);
+		}
+		e->device = a_device;
+		e->next = nullptr;
+		e->SetUserEvent(a_event);
+		e->SetIDCode(a_key);
+		e->GetRuntimeData().value = a_value;
+		e->GetRuntimeData().heldDownSecs = a_held;
+		return e;
+	}
+
 	void button(RE::INPUT_DEVICE a_device, const std::string& a_control, std::uint32_t a_key, float a_value, float a_held)
 	{
 		on_main([&] {
-			if (const auto e = RE::ButtonEvent::Create(a_device, a_control, a_key, a_value, a_held)) {
+			if (const auto e = make_button(a_device, a_control, a_key, a_value, a_held)) {
 				RE::InputEvent* list = e;
 				RE::BSInputDeviceManager::GetSingleton()->SendEvent(&list);
-				RE::free(e);
 			}
 		});
 	}
@@ -692,7 +715,7 @@ namespace
 				const bool first = !(h.down & bit);
 				const bool release = h.up && !first;
 				const auto secs = first ? 0.0f : std::chrono::duration<float>(now - h.since).count();
-				if (const auto e = RE::ButtonEvent::Create(h.device, h.event, h.key, release ? 0.0f : 1.0f, secs)) {
+				if (const auto e = make_button(h.device, h.event, h.key, release ? 0.0f : 1.0f, secs)) {
 					made.push_back(e);
 				}
 				h.down |= bit;
@@ -708,11 +731,7 @@ namespace
 		}
 		made.back()->next = a_events ? *a_events : nullptr;
 		RE::InputEvent* head = made.front();
-		const auto      r = sink_input[I](a_sink, &head, a_source);
-		for (const auto e : made) {
-			RE::free(e);
-		}
-		return r;
+		return sink_input[I](a_sink, &head, a_source);
 	}
 
 	// Slot 1 (ProcessEvent) of a live sink's input vtable, taken from the object itself and
@@ -858,7 +877,10 @@ namespace
 
 	void press(const json& a_cmd, Reply a_reply)
 	{
-		const auto control = a_cmd.value("control", std::string{});
+		// "Forward+Sprint": controls held together; the first one gets the movement readout.
+		const auto spec = a_cmd.value("control", std::string{});
+		const auto plus = spec.find('+');
+		const auto control = spec.substr(0, plus);
 		const auto ms = std::clamp(a_cmd.value("ms", 100), 0, 30000);
 		const auto map = RE::ControlMap::GetSingleton();
 		auto       key = map->GetMappedKey(control, RE::INPUT_DEVICE::kKeyboard);
@@ -870,8 +892,31 @@ namespace
 		if (key == RE::ControlMap::kInvalid) {
 			return a_reply("no control '" + control + "' (names as in the Controls menu: Forward, Back, Strafe Left, Activate, Jump, Sprint, Sneak, Ready Weapon, Right Attack/Block, Left Attack/Block, Tween Menu, Journal, Wait, Favorites)", "");
 		}
-		std::thread([control, ms, key, device, a_reply] {
+		std::vector<std::pair<std::string, std::pair<RE::INPUT_DEVICE, std::uint32_t>>> extra;
+		for (auto at = plus; at != std::string::npos;) {
+			const auto next = spec.find('+', at + 1);
+			const auto name = spec.substr(at + 1, next == std::string::npos ? next : next - at - 1);
+			at = next;
+			auto       d = RE::INPUT_DEVICE::kKeyboard;
+			auto       k = map->GetMappedKey(name, d);
+			if (k == RE::ControlMap::kInvalid) {
+				d = RE::INPUT_DEVICE::kMouse;
+				k = map->GetMappedKey(name, d);
+			}
+			if (k == RE::ControlMap::kInvalid) {
+				return a_reply("no control '" + name + "'", "");
+			}
+			extra.push_back({ name, { d, k } });
+		}
+		std::thread([control, ms, key, device, a_reply, extra] {
+			std::vector<std::thread> others;
+			for (const auto& [name, dk] : extra) {
+				others.emplace_back([name, dk, ms] { hold(dk.first, name, dk.second, ms); });
+			}
 			const auto motion = hold(device, control, key, ms);
+			for (auto& t : others) {
+				t.join();
+			}
 			a_reply("", motion.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 		}).detach();
 	}
@@ -1225,7 +1270,25 @@ namespace play
 					a_reply(v.contains("error") ? v["error"].get<std::string>() : "", v.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
 				});
 			} else if (name == "act") {
-				a_reply(act(cmd), "");
+				// The game refuses attacks while the weapon is still coming out: draw it, wait up
+				// to 3 s for it, then act.
+				std::thread([cmd, a_reply] {
+					const auto drawn = [] { return RE::PlayerCharacter::GetSingleton()->AsActorState()->GetWeaponState() == RE::WEAPON_STATE::kDrawn; };
+					bool       ready = false;
+					on_main([&] {
+						ready = drawn();
+						if (!ready) {
+							RE::PlayerCharacter::GetSingleton()->DrawWeaponMagicHands(true);
+						}
+					});
+					for (int i = 0; !ready && i < 30; ++i) {
+						std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						on_main([&] { ready = drawn(); });
+					}
+					std::string error;
+					on_main([&] { error = act(cmd); });
+					a_reply(error, "");
+				}).detach();
 			} else if (name == "face") {
 				const auto form = form_of(cmd.value("target", json()));
 				const auto ref = form ? form->AsReference() : nullptr;
